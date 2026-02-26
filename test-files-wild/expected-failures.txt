@@ -1,0 +1,27 @@
+# Expected validation failures for test-files-wild/
+#
+# Format: <relative-path> <expected-error-pattern>
+#
+# Files listed here are expected to fail validation. The script will:
+#   - Flag a REGRESSION if a file not listed here fails
+#   - Flag an UNEXPECTED FIX if a file listed here passes
+#
+# Error patterns are matched as substrings against pq validate output.
+
+# Hadoop LZ4 — deprecated format, replaced by LZ4_RAW (not planned)
+parquet-testing/data/hadoop_lz4_compressed.parquet UnsupportedCompression
+parquet-testing/data/hadoop_lz4_compressed_larger.parquet UnsupportedCompression
+parquet-testing/data/non_hadoop_lz4_compressed.parquet UnsupportedCompression
+
+# Intentionally malformed files
+parquet-testing/bad_data/ARROW-GH-41321.parquet InvalidBitWidth
+parquet-testing/bad_data/ARROW-RS-GH-6229-DICTHEADER.parquet InvalidPageSize
+parquet-testing/bad_data/PARQUET-1481.parquet SchemaParseError
+parquet-testing/data/nation.dict-malformed.parquet EndOfData
+
+# Malformed: REQUIRED column with RLE-encoded nulls (PyArrow also fails)
+parquet-testing/data/fixed_length_byte_array.parquet EndOfData
+
+# Intentionally corrupt CRC32 checksums
+parquet-testing/data/datapage_v1-corrupt-checksum.parquet PageChecksumMismatch
+parquet-testing/data/rle-dict-uncompressed-corrupt-checksum.parquet PageChecksumMismatch

@@ -1,0 +1,78 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  zig-parquet:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Build library
+        working-directory: zig-parquet
+        run: zig build
+
+      - name: Run tests
+        working-directory: zig-parquet
+        run: zig build test
+
+      - name: WASM smoke test
+        working-directory: zig-parquet
+        run: zig build wasm-smoke
+
+      - name: Build examples
+        run: |
+          cd zig-parquet/examples/basic && zig build
+          cd ../../examples/large_file && zig build
+          cd ../../examples/gen-eeg && zig build
+          cd ../../examples/wasm_demo && zig build
+          cd ../../examples/wasm_freestanding && zig build
+
+      - name: Check interop artifacts are up to date
+        run: git diff --exit-code test-files-arrow/interop/
+
+  interop:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Run interop tests
+        working-directory: test-files-arrow
+        run: uv run pytest test_interop.py -v
+
+  pqi:
+    needs: zig-parquet
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Build pqi
+        working-directory: cli
+        run: zig build
+
+      - name: Run tests
+        working-directory: cli
+        run: zig build test

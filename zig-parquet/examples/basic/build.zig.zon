@@ -1,0 +1,15 @@
+.{
+    .name = .parquet_basic_examples,
+    .version = "0.0.0",
+    .fingerprint = 0x2111cbca509121ea,
+    .dependencies = .{
+        .parquet = .{
+            .path = "../../",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

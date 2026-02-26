@@ -1,0 +1,15 @@
+.{
+    .name = .gen_power_grid,
+    .version = "0.1.0",
+    .fingerprint = 0xf817614aa697f6d7,
+    .dependencies = .{
+        .parquet = .{
+            .path = "../../",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

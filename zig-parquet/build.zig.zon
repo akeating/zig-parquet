@@ -1,0 +1,33 @@
+.{
+    .name = .parquet,
+    .version = "0.1.0",
+    .description = "Native Parquet reader/writer for Zig with C ABI, all standard encodings, nested types, and compression support",
+    .fingerprint = 0xffe52780a478c7e9,
+    .dependencies = .{
+        .lz4 = .{
+            .url = "https://github.com/lz4/lz4/archive/refs/tags/v1.10.0.tar.gz",
+            .hash = "N-V-__8AAPaNGQD6bmfRjArvYAnsL8DYxbXiNxVE_B6HRpUx",
+        },
+        .brotli = .{
+            .url = "https://github.com/google/brotli/archive/refs/tags/v1.2.0.tar.gz",
+            .hash = "N-V-__8AAJudKgCQCuIiH6MJjAiIJHfg_tT_Ew-0vZwVkCo_",
+        },
+        .snappy = .{
+            .url = "https://github.com/google/snappy/archive/refs/tags/1.2.2.tar.gz",
+            .hash = "N-V-__8AAKIfMwDk1au912zZAJLGmqHl769-gDkJe6on4cq8",
+        },
+        .zstd = .{
+            .url = "https://github.com/facebook/zstd/archive/refs/tags/v1.5.7.tar.gz",
+            .hash = "N-V-__8AAPZ7fwBg4JoCzM_0o2A8wxH2hsUUeiU1iuZv53L5",
+        },
+        .zlib = .{
+            .url = "https://github.com/madler/zlib/archive/refs/tags/v1.3.1.tar.gz",
+            .hash = "N-V-__8AAB0eQwD-0MdOEBmz7intriBReIsIDNlukNVoNu6o",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

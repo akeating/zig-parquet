@@ -1,0 +1,17 @@
+# Generated test files (regenerate with: uv run generate.py)
+*.parquet
+manifest.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pylibs/
+
+# uv
+uv.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp

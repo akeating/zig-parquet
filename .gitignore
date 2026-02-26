@@ -1,0 +1,20 @@
+arrow
+parquet-go
+parquet-format
+parquet-java
+.pylibs
+
+# Zig
+.zig-cache/
+zig-out/
+
+# Cursor
+.cursor/
+
+# Python
+__pycache__/
+*.py[cod]
+
+avro
+iceberg
+docs

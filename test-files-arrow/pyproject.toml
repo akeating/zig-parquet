@@ -1,0 +1,13 @@
+[project]
+name = "test-files-arrow"
+version = "0.1.0"
+description = "Canonical Parquet test files for validating reader implementations"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=2.4.1",
+    "pyarrow>=18.0.0",
+    "pytest>=8.0",
+]
+
+[project.scripts]
+generate = "generate:main"
