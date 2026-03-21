@@ -1348,3 +1348,62 @@ Systematic audit of nested type support (LIST, MAP, STRUCT) across all API layer
 - [x] `map_string_string.parquet` — `pa.map_(pa.string(), pa.string())` with unicode
 - [x] `map_int_int.parquet` — `pa.map_(pa.int32(), pa.int32())`
 - [x] Zig read-back tests for all four new files in `row_reader_test.zig`
+
+### P7 — Nested Type Test Coverage & CI Fix ✅
+
+Follow-up to P6. Fixed CI pipeline, removed 55 force-tracked generated files from git, and added comprehensive DynamicReader and deep-composition round-trip tests.
+
+#### CI Fix
+
+- [x] Add `setup-uv` + `uv run python generate.py` steps to `test.yml` and `release.yml` (generate PyArrow test files in CI)
+- [x] Update `test-files-arrow/.gitignore` with `!interop/*.parquet` negation (keep Zig-generated interop files tracked)
+- [x] Remove 55 force-tracked PyArrow-generated `.parquet` files and `manifest.json` from git (`git rm --cached`)
+
+#### DynamicReader Gap Tests (4 tests in `nested_test.zig`)
+
+- [x] `list<list<i32>>` — nested list with empty inner/outer lists
+- [x] `optional<list<i32>>` — nullable list with null rows
+- [x] `list<optional<i32>>` — list with null elements
+- [x] `map<string, i32>` with null rows — maps are inherently OPTIONAL in generated Parquet schema
+
+#### Deep Composition Round-Trip Tests (4 tests in `nested_test.zig`)
+
+- [x] `map<string, list<i32>>` — map with list values
+- [x] `list<map<string, i32>>` — list of maps
+- [x] `struct<id:i32, meta:map<string, i32>>` — struct with map field
+- [x] `map<string, struct<x:i32, y:i32>>` — map with struct values
+
+#### C ABI Composition Test (1 test in `c_abi_test.zig`)
+
+- [x] `struct<id:i32, tags:list<i32>>` — write with RowWriter, read with C ABI reader
+
+### P8 — Nested Type Bug Fixes ✅
+
+Four correctness and hardening fixes for nested type support.
+
+#### FLBA Nested Writer Fix (`column_writer.zig`)
+
+- [x] Add `fixed_byte_array` variant to `ValuePhysicalType` enum
+- [x] Route `fixed_bytes_val` to `writeDataPageWithLevelsFixedByteArray` (no length prefixes) instead of `writeDataPageWithLevelsByteArray`
+- [x] UUID round-trip test now verifies read-back data (was previously skipped due to this bug)
+
+#### 2-Level List Schema Reconstruction (`schema.zig`)
+
+- [x] Fix `buildListNode` to detect 2-level nested LIST/MAP encoding (repeated child with `converted_type=LIST/MAP`)
+- [x] Follows Arrow C++ approach: if the repeated child is itself a LIST or MAP, treat it as the element rather than a 3-level wrapper
+- [x] Add schema test for legacy `list<list<int32>>` encoding
+- [x] Add file-based test reading `old_list_structure.parquet` from parquet-testing
+
+#### `optional<map>` Def-Level Mismatch (`writer.zig`, `schema.zig`, `nested.zig`)
+
+- [x] Map container now uses `rep_type` parameter instead of hardcoded `.optional` in `generateSchemaFromNodeStatic`
+- [x] `computeLeafLevelsRecursive` `.map` branch reduced from +2/+3 to +1/+2 (key_value group only; container optionality comes from `.optional` wrapper)
+- [x] `flattenRecursive` `.map` branch reduced from +2 to +1 for non-empty maps; empty maps no longer add extra def
+- [x] All bare `SchemaNode.map` usages in tests wrapped in `.optional` to match Parquet convention
+- [x] New `optional<map>` round-trip test verifying null, empty, and populated maps are distinguishable
+
+#### Recursion Depth Limit (`nested.zig`)
+
+- [x] Add `max_nesting_depth = 64` constant
+- [x] `flattenRecursive` and `assembleRecursive` now accept a `depth` parameter and return `error.NestingTooDeep` when exceeded
+- [x] Prevents stack overflow on pathologically deep schemas

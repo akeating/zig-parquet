@@ -1,5 +1,6 @@
-# Generated test files (regenerate with: uv run generate.py)
+# Generated test files (regenerate with: uv run python generate.py)
 *.parquet
+!interop/*.parquet
 manifest.json
 
 # Python

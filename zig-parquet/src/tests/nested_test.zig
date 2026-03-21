@@ -56,15 +56,16 @@ test "SchemaNode struct with list field levels" {
 }
 
 test "SchemaNode map with list value levels" {
-    // map<string, list<int32>>
-    // Expected: def=2 (map + list), rep=2 (map entries + list elements)
+    // optional<map<string, list<int32>>>
     const key_node = SchemaNode{ .byte_array = .{} };
     const list_elem = SchemaNode{ .int32 = .{} };
     const value_node = SchemaNode{ .list = &list_elem };
-    const map_node = SchemaNode{ .map = .{ .key = &key_node, .value = &value_node } };
+    const bare_map = SchemaNode{ .map = .{ .key = &key_node, .value = &value_node } };
+    const map_node = SchemaNode{ .optional = &bare_map };
 
     const levels = map_node.computeLevels();
-    try std.testing.expectEqual(@as(u8, 2), levels.max_def);
+    // optional(+1), map(+1 def, +1 rep), list(+1 def, +1 rep)
+    try std.testing.expectEqual(@as(u8, 3), levels.max_def);
     try std.testing.expectEqual(@as(u8, 2), levels.max_rep);
     try std.testing.expectEqual(@as(usize, 2), map_node.countLeafColumns());
 }
@@ -192,7 +193,8 @@ test "flatten and assemble simple map" {
 
     const key_node = SchemaNode{ .byte_array = .{} };
     const value_node = SchemaNode{ .int32 = .{} };
-    const schema = SchemaNode{ .map = .{ .key = &key_node, .value = &value_node } };
+    const bare_map = SchemaNode{ .map = .{ .key = &key_node, .value = &value_node } };
+    const schema = SchemaNode{ .optional = &bare_map };
 
     const entries = [_]Value.MapEntryValue{
         .{ .key = .{ .bytes_val = "x" }, .value = .{ .int32_val = 1 } },
@@ -406,7 +408,8 @@ test "assembleValues: multi-row map<bytes,int32> flatten-assemble roundtrip" {
 
     const key_node = SchemaNode{ .byte_array = .{} };
     const val_node = SchemaNode{ .int32 = .{} };
-    const schema = SchemaNode{ .map = .{ .key = &key_node, .value = &val_node } };
+    const bare_map = SchemaNode{ .map = .{ .key = &key_node, .value = &val_node } };
+    const schema = SchemaNode{ .optional = &bare_map };
 
     const e1 = [_]Value.MapEntryValue{
         .{ .key = .{ .bytes_val = "x" }, .value = .{ .int32_val = 1 } },
@@ -893,30 +896,28 @@ test "parquet round-trip: struct with list field" {
 }
 
 test "map level computation" {
-    // Test that map levels are computed correctly
     const allocator = std.testing.allocator;
 
-    // map<int32, int64>
+    // optional<map<int32, int64>>
     const key_node = SchemaNode{ .int32 = .{} };
     const value_node = SchemaNode{ .int64 = .{} };
-    const map_node = SchemaNode{ .map = .{ .key = &key_node, .value = &value_node } };
+    const bare_map = SchemaNode{ .map = .{ .key = &key_node, .value = &value_node } };
+    const map_node = SchemaNode{ .optional = &bare_map };
 
-    // Check leaf levels
     const leaf_levels = try map_node.computeLeafLevels(allocator);
     defer allocator.free(leaf_levels);
 
-    // Should have 2 leaves: key and value
     try std.testing.expectEqual(@as(usize, 2), leaf_levels.len);
 
-    // Key: max_def=2 (map + entry), max_rep=1
+    // Key: optional(+1) + key_value(+1) = max_def=2, max_rep=1
     try std.testing.expectEqual(@as(u8, 2), leaf_levels[0].max_def);
     try std.testing.expectEqual(@as(u8, 1), leaf_levels[0].max_rep);
 
-    // Value: max_def=3 (map + entry + value), max_rep=1
+    // Value: optional(+1) + key_value(+1) + value_optional(+1) = max_def=3, max_rep=1
     try std.testing.expectEqual(@as(u8, 3), leaf_levels[1].max_def);
     try std.testing.expectEqual(@as(u8, 1), leaf_levels[1].max_rep);
 
-    // Test flattening a simple map
+    // Test flattening a non-null map
     const entries = [_]Value.MapEntryValue{
         .{ .key = .{ .int32_val = 1 }, .value = .{ .int64_val = 100 } },
         .{ .key = .{ .int32_val = 2 }, .value = .{ .int64_val = 200 } },
@@ -926,17 +927,16 @@ test "map level computation" {
     var flat = try nested_mod.flattenValue(allocator, &map_node, map_value);
     defer flat.deinit();
 
-    // Should have 2 columns (key, value)
     try std.testing.expectEqual(@as(usize, 2), flat.columns.items.len);
 
-    // Key column should have 2 values with def=2, rep=0 then 1
+    // Key column: def=2 (optional present + key_value present), rep=0 then 1
     try std.testing.expectEqual(@as(usize, 2), flat.columns.items[0].values.items.len);
     try std.testing.expectEqual(@as(u32, 2), flat.columns.items[0].def_levels.items[0]);
     try std.testing.expectEqual(@as(u32, 2), flat.columns.items[0].def_levels.items[1]);
     try std.testing.expectEqual(@as(u32, 0), flat.columns.items[0].rep_levels.items[0]);
     try std.testing.expectEqual(@as(u32, 1), flat.columns.items[0].rep_levels.items[1]);
 
-    // Value column should have 2 values with def=3, rep=0 then 1
+    // Value column: def=3 (optional + key_value + value_optional), rep=0 then 1
     try std.testing.expectEqual(@as(usize, 2), flat.columns.items[1].values.items.len);
     try std.testing.expectEqual(@as(u32, 3), flat.columns.items[1].def_levels.items[0]);
     try std.testing.expectEqual(@as(u32, 3), flat.columns.items[1].def_levels.items[1]);
@@ -947,16 +947,15 @@ test "map level computation" {
 test "parquet round-trip: map<string, i32>" {
     const allocator = std.testing.allocator;
 
-    // Define schema: map<string, i32>
     const key_node = SchemaNode{ .byte_array = .{} };
     const value_node = SchemaNode{ .int32 = .{} };
-    const map_node = SchemaNode{ .map = .{ .key = &key_node, .value = &value_node } };
+    const bare_map = SchemaNode{ .map = .{ .key = &key_node, .value = &value_node } };
+    const map_node = SchemaNode{ .optional = &bare_map };
 
     const columns = [_]ColumnDef{
         ColumnDef.fromNode("counts", &map_node),
     };
 
-    // Create test file
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
     const file = try tmp_dir.dir.createFile("map_string_int.parquet", .{ .read = true });
@@ -1033,16 +1032,15 @@ test "parquet round-trip: map<string, i32>" {
 test "parquet round-trip: map<i32, i64>" {
     const allocator = std.testing.allocator;
 
-    // Define schema: map<i32, i64>
     const key_node = SchemaNode{ .int32 = .{} };
     const value_node = SchemaNode{ .int64 = .{} };
-    const map_node = SchemaNode{ .map = .{ .key = &key_node, .value = &value_node } };
+    const bare_map = SchemaNode{ .map = .{ .key = &key_node, .value = &value_node } };
+    const map_node = SchemaNode{ .optional = &bare_map };
 
     const columns = [_]ColumnDef{
         ColumnDef.fromNode("counts", &map_node),
     };
 
-    // Create test file
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
     const file = try tmp_dir.dir.createFile("map_int_int.parquet", .{ .read = true });
@@ -1757,11 +1755,11 @@ test "parquet round-trip: UUID logical type" {
         defer writer.deinit();
 
         const row1_fields = [_]Value.FieldValue{
-            .{ .name = "id", .value = .{ .bytes_val = &uuid1 } },
+            .{ .name = "id", .value = .{ .fixed_bytes_val = &uuid1 } },
         };
 
         const row2_fields = [_]Value.FieldValue{
-            .{ .name = "id", .value = .{ .bytes_val = &uuid2 } },
+            .{ .name = "id", .value = .{ .fixed_bytes_val = &uuid2 } },
         };
 
         const rows = [_]Value{
@@ -1798,9 +1796,22 @@ test "parquet round-trip: UUID logical type" {
         }
         try std.testing.expect(uuid_found);
 
-        // Note: Data verification for fixed_len_byte_array through nested path
-        // has a known issue with length prefix handling. The schema verification
-        // above confirms the UUID logical type is correctly round-tripped.
+        // Read data back via DynamicReader and verify UUID values
+        var dyn = try parquet.openFileDynamic(allocator, file, .{});
+        defer dyn.deinit();
+        const dyn_rows = try dyn.readAllRows(0);
+        defer {
+            for (dyn_rows) |r| r.deinit();
+            allocator.free(dyn_rows);
+        }
+        try std.testing.expectEqual(@as(usize, 2), dyn_rows.len);
+
+        const row1_struct = dyn_rows[0].getColumn(0).?;
+        const row1_id = row1_struct.getField("id").?.asBytes().?;
+        try std.testing.expectEqualSlices(u8, &uuid1, row1_id);
+        const row2_struct = dyn_rows[1].getColumn(0).?;
+        const row2_id = row2_struct.getField("id").?.asBytes().?;
+        try std.testing.expectEqualSlices(u8, &uuid2, row2_id);
     }
 }
 
@@ -2091,7 +2102,8 @@ test "dynamic reader round-trip: map<string, i32>" {
 
     const key_node = SchemaNode{ .byte_array = .{} };
     const value_node = SchemaNode{ .int32 = .{} };
-    const map_node = SchemaNode{ .map = .{ .key = &key_node, .value = &value_node } };
+    const bare_map = SchemaNode{ .map = .{ .key = &key_node, .value = &value_node } };
+    const map_node = SchemaNode{ .optional = &bare_map };
     const columns = [_]ColumnDef{ColumnDef.fromNode("counts", &map_node)};
 
     var writer = try parquet.writeToBuffer(allocator, &columns);
@@ -2146,4 +2158,679 @@ test "dynamic reader round-trip: map<string, i32>" {
     // Row 3: empty map
     const m2 = dyn_rows[2].getColumn(0).?.asMap().?;
     try std.testing.expectEqual(@as(usize, 0), m2.len);
+}
+
+// =============================================================================
+// DynamicReader gap tests (Group 1)
+// =============================================================================
+
+test "dynamic reader round-trip: list<list<i32>>" {
+    const allocator = std.testing.allocator;
+
+    const elem = SchemaNode{ .int32 = .{} };
+    const inner_list = SchemaNode{ .list = &elem };
+    const outer_list = SchemaNode{ .list = &inner_list };
+    const columns = [_]ColumnDef{ColumnDef.fromNode("matrix", &outer_list)};
+
+    var writer = try parquet.writeToBuffer(allocator, &columns);
+    defer writer.deinit();
+
+    // Row 1: [[1,2],[3]]
+    const a1 = [_]Value{ .{ .int32_val = 1 }, .{ .int32_val = 2 } };
+    const a2 = [_]Value{.{ .int32_val = 3 }};
+    const r1 = [_]Value{ .{ .list_val = &a1 }, .{ .list_val = &a2 } };
+
+    // Row 2: [[4]]
+    const a3 = [_]Value{.{ .int32_val = 4 }};
+    const r2 = [_]Value{.{ .list_val = &a3 }};
+
+    // Row 3: [] (empty outer)
+    const r3 = [_]Value{};
+
+    // Row 4: [[],[5,6]] (empty inner + non-empty inner)
+    const a4 = [_]Value{};
+    const a5 = [_]Value{ .{ .int32_val = 5 }, .{ .int32_val = 6 } };
+    const r4 = [_]Value{ .{ .list_val = &a4 }, .{ .list_val = &a5 } };
+
+    const rows = [_]Value{
+        .{ .list_val = &r1 },
+        .{ .list_val = &r2 },
+        .{ .list_val = &r3 },
+        .{ .list_val = &r4 },
+    };
+    try writer.writeNestedColumn(0, &rows);
+    try writer.close();
+
+    const buf = try writer.toOwnedSlice();
+    defer allocator.free(buf);
+
+    var dyn = try parquet.openBufferDynamic(allocator, buf, .{});
+    defer dyn.deinit();
+    const dyn_rows = try dyn.readAllRows(0);
+    defer {
+        for (dyn_rows) |r| r.deinit();
+        allocator.free(dyn_rows);
+    }
+    try std.testing.expectEqual(@as(usize, 4), dyn_rows.len);
+
+    // Row 1: [[1,2],[3]]
+    const l0 = dyn_rows[0].getColumn(0).?.asList().?;
+    try std.testing.expectEqual(@as(usize, 2), l0.len);
+    const inner0 = l0[0].asList().?;
+    try std.testing.expectEqual(@as(usize, 2), inner0.len);
+    try std.testing.expectEqual(@as(?i32, 1), inner0[0].asInt32());
+    try std.testing.expectEqual(@as(?i32, 2), inner0[1].asInt32());
+    const inner1 = l0[1].asList().?;
+    try std.testing.expectEqual(@as(usize, 1), inner1.len);
+    try std.testing.expectEqual(@as(?i32, 3), inner1[0].asInt32());
+
+    // Row 2: [[4]]
+    const l1 = dyn_rows[1].getColumn(0).?.asList().?;
+    try std.testing.expectEqual(@as(usize, 1), l1.len);
+    const inner2 = l1[0].asList().?;
+    try std.testing.expectEqual(@as(usize, 1), inner2.len);
+    try std.testing.expectEqual(@as(?i32, 4), inner2[0].asInt32());
+
+    // Row 3: [] or null (bare required list with no entries)
+    const v2 = dyn_rows[2].getColumn(0).?;
+    if (!v2.isNull()) {
+        const l2 = v2.asList().?;
+        try std.testing.expectEqual(@as(usize, 0), l2.len);
+    }
+
+    // Row 4: [[],[5,6]]
+    const l3 = dyn_rows[3].getColumn(0).?.asList().?;
+    try std.testing.expectEqual(@as(usize, 2), l3.len);
+    // First inner list: empty or null (bare list ambiguity)
+    if (!l3[0].isNull()) {
+        const e0 = l3[0].asList().?;
+        try std.testing.expectEqual(@as(usize, 0), e0.len);
+    }
+    const inner4 = l3[1].asList().?;
+    try std.testing.expectEqual(@as(usize, 2), inner4.len);
+    try std.testing.expectEqual(@as(?i32, 5), inner4[0].asInt32());
+    try std.testing.expectEqual(@as(?i32, 6), inner4[1].asInt32());
+}
+
+test "dynamic reader round-trip: optional<list<i32>> with null rows" {
+    const allocator = std.testing.allocator;
+
+    const elem = SchemaNode{ .int32 = .{} };
+    const list_node = SchemaNode{ .list = &elem };
+    const opt_list = SchemaNode{ .optional = &list_node };
+    const columns = [_]ColumnDef{ColumnDef.fromNode("values", &opt_list)};
+
+    var writer = try parquet.writeToBuffer(allocator, &columns);
+    defer writer.deinit();
+
+    // Row 1: [1, 2]
+    const a1 = [_]Value{ .{ .int32_val = 1 }, .{ .int32_val = 2 } };
+    // Row 2: null
+    // Row 3: []
+    const a3 = [_]Value{};
+    // Row 4: [3]
+    const a4 = [_]Value{.{ .int32_val = 3 }};
+
+    const rows = [_]Value{
+        .{ .list_val = &a1 },
+        .{ .null_val = {} },
+        .{ .list_val = &a3 },
+        .{ .list_val = &a4 },
+    };
+    try writer.writeNestedColumn(0, &rows);
+    try writer.close();
+
+    const buf = try writer.toOwnedSlice();
+    defer allocator.free(buf);
+
+    var dyn = try parquet.openBufferDynamic(allocator, buf, .{});
+    defer dyn.deinit();
+    const dyn_rows = try dyn.readAllRows(0);
+    defer {
+        for (dyn_rows) |r| r.deinit();
+        allocator.free(dyn_rows);
+    }
+    try std.testing.expectEqual(@as(usize, 4), dyn_rows.len);
+
+    // Row 1: [1, 2]
+    const l0 = dyn_rows[0].getColumn(0).?.asList().?;
+    try std.testing.expectEqual(@as(usize, 2), l0.len);
+    try std.testing.expectEqual(@as(?i32, 1), l0[0].asInt32());
+    try std.testing.expectEqual(@as(?i32, 2), l0[1].asInt32());
+
+    // Row 2: null
+    try std.testing.expect(dyn_rows[1].getColumn(0).?.isNull());
+
+    // Row 3: empty list — may appear as null or empty list depending on encoding
+    const v2 = dyn_rows[2].getColumn(0).?;
+    if (!v2.isNull()) {
+        const l2 = v2.asList().?;
+        try std.testing.expectEqual(@as(usize, 0), l2.len);
+    }
+
+    // Row 4: [3]
+    const l3 = dyn_rows[3].getColumn(0).?.asList().?;
+    try std.testing.expectEqual(@as(usize, 1), l3.len);
+    try std.testing.expectEqual(@as(?i32, 3), l3[0].asInt32());
+}
+
+test "dynamic reader round-trip: list<optional<i32>> with null elements" {
+    const allocator = std.testing.allocator;
+
+    const elem = SchemaNode{ .int32 = .{} };
+    const opt_elem = SchemaNode{ .optional = &elem };
+    const list_node = SchemaNode{ .list = &opt_elem };
+    const columns = [_]ColumnDef{ColumnDef.fromNode("values", &list_node)};
+
+    var writer = try parquet.writeToBuffer(allocator, &columns);
+    defer writer.deinit();
+
+    // Row 1: [1, null, 3]
+    const r1 = [_]Value{ .{ .int32_val = 1 }, .{ .null_val = {} }, .{ .int32_val = 3 } };
+    // Row 2: [null]
+    const r2 = [_]Value{.{ .null_val = {} }};
+    // Row 3: []
+    const r3 = [_]Value{};
+
+    const rows = [_]Value{
+        .{ .list_val = &r1 },
+        .{ .list_val = &r2 },
+        .{ .list_val = &r3 },
+    };
+    try writer.writeNestedColumn(0, &rows);
+    try writer.close();
+
+    const buf = try writer.toOwnedSlice();
+    defer allocator.free(buf);
+
+    var dyn = try parquet.openBufferDynamic(allocator, buf, .{});
+    defer dyn.deinit();
+    const dyn_rows = try dyn.readAllRows(0);
+    defer {
+        for (dyn_rows) |r| r.deinit();
+        allocator.free(dyn_rows);
+    }
+    try std.testing.expectEqual(@as(usize, 3), dyn_rows.len);
+
+    // Row 1: [1, null, 3]
+    const l0 = dyn_rows[0].getColumn(0).?.asList().?;
+    try std.testing.expectEqual(@as(usize, 3), l0.len);
+    try std.testing.expectEqual(@as(?i32, 1), l0[0].asInt32());
+    try std.testing.expect(l0[1].isNull());
+    try std.testing.expectEqual(@as(?i32, 3), l0[2].asInt32());
+
+    // Row 2: [null]
+    const l1 = dyn_rows[1].getColumn(0).?.asList().?;
+    try std.testing.expectEqual(@as(usize, 1), l1.len);
+    try std.testing.expect(l1[0].isNull());
+
+    // Row 3: [] or null (bare list with no entries)
+    const v2 = dyn_rows[2].getColumn(0).?;
+    if (!v2.isNull()) {
+        const l2 = v2.asList().?;
+        try std.testing.expectEqual(@as(usize, 0), l2.len);
+    }
+}
+
+test "dynamic reader round-trip: map<string, i32> with null rows" {
+    const allocator = std.testing.allocator;
+
+    const key_node = SchemaNode{ .byte_array = .{} };
+    const val_node = SchemaNode{ .int32 = .{} };
+    const bare_map = SchemaNode{ .map = .{ .key = &key_node, .value = &val_node } };
+    const map_node = SchemaNode{ .optional = &bare_map };
+    const columns = [_]ColumnDef{ColumnDef.fromNode("props", &map_node)};
+
+    var writer = try parquet.writeToBuffer(allocator, &columns);
+    defer writer.deinit();
+
+    // Row 1: {"a": 1}
+    const e1 = [_]Value.MapEntryValue{
+        .{ .key = .{ .bytes_val = "a" }, .value = .{ .int32_val = 1 } },
+    };
+    // Row 2: null
+    // Row 3: {} (empty map)
+    const e3 = [_]Value.MapEntryValue{};
+    // Row 4: {"b": 2, "c": 3}
+    const e4 = [_]Value.MapEntryValue{
+        .{ .key = .{ .bytes_val = "b" }, .value = .{ .int32_val = 2 } },
+        .{ .key = .{ .bytes_val = "c" }, .value = .{ .int32_val = 3 } },
+    };
+
+    const rows = [_]Value{
+        .{ .map_val = &e1 },
+        .{ .null_val = {} },
+        .{ .map_val = &e3 },
+        .{ .map_val = &e4 },
+    };
+    try writer.writeNestedColumn(0, &rows);
+    try writer.close();
+
+    const buf = try writer.toOwnedSlice();
+    defer allocator.free(buf);
+
+    var dyn = try parquet.openBufferDynamic(allocator, buf, .{});
+    defer dyn.deinit();
+    const dyn_rows = try dyn.readAllRows(0);
+    defer {
+        for (dyn_rows) |r| r.deinit();
+        allocator.free(dyn_rows);
+    }
+    try std.testing.expectEqual(@as(usize, 4), dyn_rows.len);
+
+    // Row 1: {"a": 1}
+    const m0 = dyn_rows[0].getColumn(0).?.asMap().?;
+    try std.testing.expectEqual(@as(usize, 1), m0.len);
+    try std.testing.expectEqualStrings("a", m0[0].key.asBytes().?);
+    try std.testing.expectEqual(@as(?i32, 1), m0[0].value.asInt32());
+
+    // Row 2: null
+    try std.testing.expect(dyn_rows[1].getColumn(0).?.isNull());
+
+    // Row 3: empty map — may appear as null or empty depending on encoding
+    const v2 = dyn_rows[2].getColumn(0).?;
+    if (!v2.isNull()) {
+        const m2 = v2.asMap().?;
+        try std.testing.expectEqual(@as(usize, 0), m2.len);
+    }
+
+    // Row 4: {"b": 2, "c": 3}
+    const m3 = dyn_rows[3].getColumn(0).?.asMap().?;
+    try std.testing.expectEqual(@as(usize, 2), m3.len);
+    try std.testing.expectEqualStrings("b", m3[0].key.asBytes().?);
+    try std.testing.expectEqual(@as(?i32, 2), m3[0].value.asInt32());
+    try std.testing.expectEqualStrings("c", m3[1].key.asBytes().?);
+    try std.testing.expectEqual(@as(?i32, 3), m3[1].value.asInt32());
+}
+
+test "dynamic reader round-trip: optional<map> null vs empty vs populated" {
+    const allocator = std.testing.allocator;
+
+    const key_node = SchemaNode{ .byte_array = .{} };
+    const val_node = SchemaNode{ .int32 = .{} };
+    const bare_map = SchemaNode{ .map = .{ .key = &key_node, .value = &val_node } };
+    const map_node = SchemaNode{ .optional = &bare_map };
+    const columns = [_]ColumnDef{ColumnDef.fromNode("data", &map_node)};
+
+    var writer = try parquet.writeToBuffer(allocator, &columns);
+    defer writer.deinit();
+
+    // Row 1: null map
+    // Row 2: empty map
+    const empty_entries = [_]Value.MapEntryValue{};
+    // Row 3: {"x": 42}
+    const e3 = [_]Value.MapEntryValue{
+        .{ .key = .{ .bytes_val = "x" }, .value = .{ .int32_val = 42 } },
+    };
+    const rows = [_]Value{
+        .{ .null_val = {} },
+        .{ .map_val = &empty_entries },
+        .{ .map_val = &e3 },
+    };
+    try writer.writeNestedColumn(0, &rows);
+    try writer.close();
+
+    const buf = try writer.toOwnedSlice();
+    defer allocator.free(buf);
+
+    var dyn = try parquet.openBufferDynamic(allocator, buf, .{});
+    defer dyn.deinit();
+    const dyn_rows = try dyn.readAllRows(0);
+    defer {
+        for (dyn_rows) |r| r.deinit();
+        allocator.free(dyn_rows);
+    }
+    try std.testing.expectEqual(@as(usize, 3), dyn_rows.len);
+
+    // Row 1: null
+    try std.testing.expect(dyn_rows[0].getColumn(0).?.isNull());
+
+    // Row 2: empty map
+    const m2 = dyn_rows[1].getColumn(0).?;
+    try std.testing.expect(!m2.isNull());
+    const entries2 = m2.asMap().?;
+    try std.testing.expectEqual(@as(usize, 0), entries2.len);
+
+    // Row 3: {"x": 42}
+    const m3 = dyn_rows[2].getColumn(0).?.asMap().?;
+    try std.testing.expectEqual(@as(usize, 1), m3.len);
+    try std.testing.expectEqualStrings("x", m3[0].key.asBytes().?);
+    try std.testing.expectEqual(@as(?i32, 42), m3[0].value.asInt32());
+}
+
+// =============================================================================
+// Deep composition round-trip tests (Group 2)
+// =============================================================================
+
+test "dynamic reader round-trip: map<string, list<i32>>" {
+    const allocator = std.testing.allocator;
+
+    const key_node = SchemaNode{ .byte_array = .{} };
+    const list_elem = SchemaNode{ .int32 = .{} };
+    const list_node = SchemaNode{ .list = &list_elem };
+    const bare_map = SchemaNode{ .map = .{ .key = &key_node, .value = &list_node } };
+    const map_node = SchemaNode{ .optional = &bare_map };
+    const columns = [_]ColumnDef{ColumnDef.fromNode("data", &map_node)};
+
+    var writer = try parquet.writeToBuffer(allocator, &columns);
+    defer writer.deinit();
+
+    // Row 1: {"tags": [1, 2], "ids": [3]}
+    const v1a = [_]Value{ .{ .int32_val = 1 }, .{ .int32_val = 2 } };
+    const v1b = [_]Value{.{ .int32_val = 3 }};
+    const e1 = [_]Value.MapEntryValue{
+        .{ .key = .{ .bytes_val = "tags" }, .value = .{ .list_val = &v1a } },
+        .{ .key = .{ .bytes_val = "ids" }, .value = .{ .list_val = &v1b } },
+    };
+
+    // Row 2: {"empty": []}
+    const v2a = [_]Value{};
+    const e2 = [_]Value.MapEntryValue{
+        .{ .key = .{ .bytes_val = "empty" }, .value = .{ .list_val = &v2a } },
+    };
+
+    // Row 3: {} (empty map)
+    const e3 = [_]Value.MapEntryValue{};
+
+    const rows = [_]Value{
+        .{ .map_val = &e1 },
+        .{ .map_val = &e2 },
+        .{ .map_val = &e3 },
+    };
+    try writer.writeNestedColumn(0, &rows);
+    try writer.close();
+
+    const buf = try writer.toOwnedSlice();
+    defer allocator.free(buf);
+
+    var dyn = try parquet.openBufferDynamic(allocator, buf, .{});
+    defer dyn.deinit();
+    const dyn_rows = try dyn.readAllRows(0);
+    defer {
+        for (dyn_rows) |r| r.deinit();
+        allocator.free(dyn_rows);
+    }
+    try std.testing.expectEqual(@as(usize, 3), dyn_rows.len);
+
+    // Row 1: {"tags": [1,2], "ids": [3]}
+    const m0 = dyn_rows[0].getColumn(0).?.asMap().?;
+    try std.testing.expectEqual(@as(usize, 2), m0.len);
+    try std.testing.expectEqualStrings("tags", m0[0].key.asBytes().?);
+    const tags = m0[0].value.asList().?;
+    try std.testing.expectEqual(@as(usize, 2), tags.len);
+    try std.testing.expectEqual(@as(?i32, 1), tags[0].asInt32());
+    try std.testing.expectEqual(@as(?i32, 2), tags[1].asInt32());
+    try std.testing.expectEqualStrings("ids", m0[1].key.asBytes().?);
+    const ids = m0[1].value.asList().?;
+    try std.testing.expectEqual(@as(usize, 1), ids.len);
+    try std.testing.expectEqual(@as(?i32, 3), ids[0].asInt32());
+
+    // Row 2: {"empty": []}
+    const m1 = dyn_rows[1].getColumn(0).?.asMap().?;
+    try std.testing.expectEqual(@as(usize, 1), m1.len);
+    try std.testing.expectEqualStrings("empty", m1[0].key.asBytes().?);
+    // The empty list value may be null or empty list
+    if (!m1[0].value.isNull()) {
+        const el = m1[0].value.asList().?;
+        try std.testing.expectEqual(@as(usize, 0), el.len);
+    }
+
+    // Row 3: empty map or null
+    const v3 = dyn_rows[2].getColumn(0).?;
+    if (!v3.isNull()) {
+        const m2 = v3.asMap().?;
+        try std.testing.expectEqual(@as(usize, 0), m2.len);
+    }
+}
+
+test "dynamic reader round-trip: list<map<string, i32>>" {
+    const allocator = std.testing.allocator;
+
+    const key_node = SchemaNode{ .byte_array = .{} };
+    const val_node = SchemaNode{ .int32 = .{} };
+    const bare_map = SchemaNode{ .map = .{ .key = &key_node, .value = &val_node } };
+    const map_node = SchemaNode{ .optional = &bare_map };
+    const list_node = SchemaNode{ .list = &map_node };
+    const columns = [_]ColumnDef{ColumnDef.fromNode("data", &list_node)};
+
+    var writer = try parquet.writeToBuffer(allocator, &columns);
+    defer writer.deinit();
+
+    // Row 1: [{"a": 1}, {"b": 2}]
+    const e1a = [_]Value.MapEntryValue{
+        .{ .key = .{ .bytes_val = "a" }, .value = .{ .int32_val = 1 } },
+    };
+    const e1b = [_]Value.MapEntryValue{
+        .{ .key = .{ .bytes_val = "b" }, .value = .{ .int32_val = 2 } },
+    };
+    const r1 = [_]Value{ .{ .map_val = &e1a }, .{ .map_val = &e1b } };
+
+    // Row 2: [{}] (list with one empty map)
+    const e2 = [_]Value.MapEntryValue{};
+    const r2 = [_]Value{.{ .map_val = &e2 }};
+
+    // Row 3: [] (empty list)
+    const r3 = [_]Value{};
+
+    const rows = [_]Value{
+        .{ .list_val = &r1 },
+        .{ .list_val = &r2 },
+        .{ .list_val = &r3 },
+    };
+    try writer.writeNestedColumn(0, &rows);
+    try writer.close();
+
+    const buf = try writer.toOwnedSlice();
+    defer allocator.free(buf);
+
+    var dyn = try parquet.openBufferDynamic(allocator, buf, .{});
+    defer dyn.deinit();
+    const dyn_rows = try dyn.readAllRows(0);
+    defer {
+        for (dyn_rows) |r| r.deinit();
+        allocator.free(dyn_rows);
+    }
+    try std.testing.expectEqual(@as(usize, 3), dyn_rows.len);
+
+    // Row 1: [{"a": 1}, {"b": 2}]
+    const l0 = dyn_rows[0].getColumn(0).?.asList().?;
+    try std.testing.expectEqual(@as(usize, 2), l0.len);
+    const map0 = l0[0].asMap().?;
+    try std.testing.expectEqual(@as(usize, 1), map0.len);
+    try std.testing.expectEqualStrings("a", map0[0].key.asBytes().?);
+    try std.testing.expectEqual(@as(?i32, 1), map0[0].value.asInt32());
+    const map1 = l0[1].asMap().?;
+    try std.testing.expectEqual(@as(usize, 1), map1.len);
+    try std.testing.expectEqualStrings("b", map1[0].key.asBytes().?);
+    try std.testing.expectEqual(@as(?i32, 2), map1[0].value.asInt32());
+
+    // Row 2: [{}] — list with one empty map (may be null or empty)
+    const l1 = dyn_rows[1].getColumn(0).?.asList().?;
+    try std.testing.expectEqual(@as(usize, 1), l1.len);
+    if (!l1[0].isNull()) {
+        const em = l1[0].asMap().?;
+        try std.testing.expectEqual(@as(usize, 0), em.len);
+    }
+
+    // Row 3: [] or null (bare list)
+    const v2 = dyn_rows[2].getColumn(0).?;
+    if (!v2.isNull()) {
+        const l2 = v2.asList().?;
+        try std.testing.expectEqual(@as(usize, 0), l2.len);
+    }
+}
+
+test "dynamic reader round-trip: struct<id:i32, meta:map<string, i32>>" {
+    const allocator = std.testing.allocator;
+
+    const id_node = SchemaNode{ .int32 = .{} };
+    const key_node = SchemaNode{ .byte_array = .{} };
+    const val_node = SchemaNode{ .int32 = .{} };
+    const bare_map = SchemaNode{ .map = .{ .key = &key_node, .value = &val_node } };
+    const map_node = SchemaNode{ .optional = &bare_map };
+    const struct_node = SchemaNode{ .struct_ = .{
+        .fields = &[_]SchemaNode.Field{
+            .{ .name = "id", .node = &id_node },
+            .{ .name = "meta", .node = &map_node },
+        },
+    } };
+    const columns = [_]ColumnDef{ColumnDef.fromNode("data", &struct_node)};
+
+    var writer = try parquet.writeToBuffer(allocator, &columns);
+    defer writer.deinit();
+
+    // Row 1: {id: 1, meta: {"a": 10, "b": 20}}
+    const e1 = [_]Value.MapEntryValue{
+        .{ .key = .{ .bytes_val = "a" }, .value = .{ .int32_val = 10 } },
+        .{ .key = .{ .bytes_val = "b" }, .value = .{ .int32_val = 20 } },
+    };
+    const r1_fields = [_]Value.FieldValue{
+        .{ .name = "id", .value = .{ .int32_val = 1 } },
+        .{ .name = "meta", .value = .{ .map_val = &e1 } },
+    };
+
+    // Row 2: {id: 2, meta: {}}
+    const e2 = [_]Value.MapEntryValue{};
+    const r2_fields = [_]Value.FieldValue{
+        .{ .name = "id", .value = .{ .int32_val = 2 } },
+        .{ .name = "meta", .value = .{ .map_val = &e2 } },
+    };
+
+    const rows = [_]Value{
+        .{ .struct_val = &r1_fields },
+        .{ .struct_val = &r2_fields },
+    };
+    try writer.writeNestedColumn(0, &rows);
+    try writer.close();
+
+    const buf = try writer.toOwnedSlice();
+    defer allocator.free(buf);
+
+    var dyn = try parquet.openBufferDynamic(allocator, buf, .{});
+    defer dyn.deinit();
+    const dyn_rows = try dyn.readAllRows(0);
+    defer {
+        for (dyn_rows) |r| r.deinit();
+        allocator.free(dyn_rows);
+    }
+    try std.testing.expectEqual(@as(usize, 2), dyn_rows.len);
+
+    // Row 1: {id: 1, meta: {"a": 10, "b": 20}}
+    const v0 = dyn_rows[0].getColumn(0).?;
+    try std.testing.expectEqual(@as(?i32, 1), v0.getField("id").?.asInt32());
+    const meta0 = v0.getField("meta").?.asMap().?;
+    try std.testing.expectEqual(@as(usize, 2), meta0.len);
+    try std.testing.expectEqualStrings("a", meta0[0].key.asBytes().?);
+    try std.testing.expectEqual(@as(?i32, 10), meta0[0].value.asInt32());
+    try std.testing.expectEqualStrings("b", meta0[1].key.asBytes().?);
+    try std.testing.expectEqual(@as(?i32, 20), meta0[1].value.asInt32());
+
+    // Row 2: {id: 2, meta: {}} — empty map may appear as null
+    const v1 = dyn_rows[1].getColumn(0).?;
+    try std.testing.expectEqual(@as(?i32, 2), v1.getField("id").?.asInt32());
+    const meta1_val = v1.getField("meta").?;
+    if (!meta1_val.isNull()) {
+        const meta1 = meta1_val.asMap().?;
+        try std.testing.expectEqual(@as(usize, 0), meta1.len);
+    }
+}
+
+test "dynamic reader round-trip: map<string, struct<x:i32, y:i32>>" {
+    const allocator = std.testing.allocator;
+
+    const key_node = SchemaNode{ .byte_array = .{} };
+    const x_node = SchemaNode{ .int32 = .{} };
+    const y_node = SchemaNode{ .int32 = .{} };
+    const struct_node = SchemaNode{ .struct_ = .{
+        .fields = &[_]SchemaNode.Field{
+            .{ .name = "x", .node = &x_node },
+            .{ .name = "y", .node = &y_node },
+        },
+    } };
+    const bare_map = SchemaNode{ .map = .{ .key = &key_node, .value = &struct_node } };
+    const map_node = SchemaNode{ .optional = &bare_map };
+    const columns = [_]ColumnDef{ColumnDef.fromNode("points", &map_node)};
+
+    var writer = try parquet.writeToBuffer(allocator, &columns);
+    defer writer.deinit();
+
+    // Row 1: {"pt": {x: 1, y: 2}}
+    const s1_fields = [_]Value.FieldValue{
+        .{ .name = "x", .value = .{ .int32_val = 1 } },
+        .{ .name = "y", .value = .{ .int32_val = 2 } },
+    };
+    const e1 = [_]Value.MapEntryValue{
+        .{ .key = .{ .bytes_val = "pt" }, .value = .{ .struct_val = &s1_fields } },
+    };
+
+    // Row 2: {} (empty map)
+    const e2 = [_]Value.MapEntryValue{};
+
+    const rows = [_]Value{
+        .{ .map_val = &e1 },
+        .{ .map_val = &e2 },
+    };
+    try writer.writeNestedColumn(0, &rows);
+    try writer.close();
+
+    const buf = try writer.toOwnedSlice();
+    defer allocator.free(buf);
+
+    var dyn = try parquet.openBufferDynamic(allocator, buf, .{});
+    defer dyn.deinit();
+    const dyn_rows = try dyn.readAllRows(0);
+    defer {
+        for (dyn_rows) |r| r.deinit();
+        allocator.free(dyn_rows);
+    }
+    try std.testing.expectEqual(@as(usize, 2), dyn_rows.len);
+
+    // Row 1: {"pt": {x: 1, y: 2}}
+    const m0 = dyn_rows[0].getColumn(0).?.asMap().?;
+    try std.testing.expectEqual(@as(usize, 1), m0.len);
+    try std.testing.expectEqualStrings("pt", m0[0].key.asBytes().?);
+    const pt = m0[0].value;
+    try std.testing.expectEqual(@as(?i32, 1), pt.getField("x").?.asInt32());
+    try std.testing.expectEqual(@as(?i32, 2), pt.getField("y").?.asInt32());
+
+    // Row 2: {} or null
+    const v1 = dyn_rows[1].getColumn(0).?;
+    if (!v1.isNull()) {
+        const m1 = v1.asMap().?;
+        try std.testing.expectEqual(@as(usize, 0), m1.len);
+    }
+}
+
+test "read old_list_structure.parquet (2-level list<list<int32>>)" {
+    const allocator = std.testing.allocator;
+
+    const file = std.fs.cwd().openFile("../test-files-wild/parquet-testing/data/old_list_structure.parquet", .{}) catch |err| {
+        std.debug.print("Could not open old_list_structure.parquet: {}\n", .{err});
+        return err;
+    };
+    defer file.close();
+
+    var dyn = try parquet.openFileDynamic(allocator, file, .{});
+    defer dyn.deinit();
+    const dyn_rows = try dyn.readAllRows(0);
+    defer {
+        for (dyn_rows) |r| r.deinit();
+        allocator.free(dyn_rows);
+    }
+
+    // File contains one row: [[1, 2], [3, 4]]
+    try std.testing.expectEqual(@as(usize, 1), dyn_rows.len);
+
+    const outer = dyn_rows[0].getColumn(0).?.asList().?;
+    try std.testing.expectEqual(@as(usize, 2), outer.len);
+
+    const inner0 = outer[0].asList().?;
+    try std.testing.expectEqual(@as(usize, 2), inner0.len);
+    try std.testing.expectEqual(@as(?i32, 1), inner0[0].asInt32());
+    try std.testing.expectEqual(@as(?i32, 2), inner0[1].asInt32());
+
+    const inner1 = outer[1].asList().?;
+    try std.testing.expectEqual(@as(usize, 2), inner1.len);
+    try std.testing.expectEqual(@as(?i32, 3), inner1[0].asInt32());
+    try std.testing.expectEqual(@as(?i32, 4), inner1[1].asInt32());
 }

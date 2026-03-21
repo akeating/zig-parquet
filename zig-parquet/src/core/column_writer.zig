@@ -811,6 +811,7 @@ pub const ValuePhysicalType = enum {
     float,
     double,
     byte_array,
+    fixed_byte_array,
     boolean,
     unknown,
 };
@@ -823,7 +824,8 @@ pub fn detectValueType(values: []const Value) ValuePhysicalType {
             .int64_val => return .int64,
             .float_val => return .float,
             .double_val => return .double,
-            .bytes_val, .fixed_bytes_val => return .byte_array,
+            .bytes_val => return .byte_array,
+            .fixed_bytes_val => return .fixed_byte_array,
             .bool_val => return .boolean,
             .null_val => continue,
             else => return .unknown,
@@ -854,6 +856,7 @@ pub fn writeColumnChunkFromValues(
         .float => writeColumnChunkFromValuesTyped(f32, allocator, output, path_in_schema, values, def_levels, rep_levels, max_def_level, max_rep_level, start_offset, codec),
         .double => writeColumnChunkFromValuesTyped(f64, allocator, output, path_in_schema, values, def_levels, rep_levels, max_def_level, max_rep_level, start_offset, codec),
         .byte_array => writeColumnChunkFromValuesBytes(allocator, output, path_in_schema, values, def_levels, rep_levels, max_def_level, max_rep_level, start_offset, codec),
+        .fixed_byte_array => writeColumnChunkFromValuesFixedBytes(allocator, output, path_in_schema, values, def_levels, rep_levels, max_def_level, max_rep_level, start_offset, codec),
         .boolean => writeColumnChunkFromValuesBool(allocator, output, path_in_schema, values, def_levels, rep_levels, max_def_level, max_rep_level, start_offset, codec),
         .unknown => error.WriteError,
     };
@@ -980,6 +983,68 @@ fn writeColumnChunkFromValuesBytes(
         start_offset,
         codec,
         true, // Default: write page checksums
+    );
+}
+
+fn writeColumnChunkFromValuesFixedBytes(
+    allocator: std.mem.Allocator,
+    output: *std.Io.Writer,
+    path_in_schema: []const []const u8,
+    values: []const Value,
+    def_levels: []const u32,
+    rep_levels: []const u32,
+    max_def_level: u8,
+    max_rep_level: u8,
+    start_offset: i64,
+    codec: format.CompressionCodec,
+) ColumnWriteError!ColumnChunkResult {
+    var byte_values: std.ArrayList([]const u8) = .empty;
+    defer byte_values.deinit(allocator);
+
+    var fixed_len: usize = 0;
+    for (values) |v| {
+        switch (v) {
+            .fixed_bytes_val => |b| {
+                if (fixed_len == 0) fixed_len = b.len;
+                byte_values.append(allocator, b) catch return error.OutOfMemory;
+            },
+            .bytes_val => |b| {
+                if (fixed_len == 0) fixed_len = b.len;
+                byte_values.append(allocator, b) catch return error.OutOfMemory;
+            },
+            .null_val => {},
+            else => {},
+        }
+    }
+
+    if (fixed_len == 0) return error.InvalidFixedLength;
+
+    var page_result = page_writer.writeDataPageWithLevelsFixedByteArray(
+        allocator,
+        byte_values.items,
+        fixed_len,
+        def_levels,
+        rep_levels,
+        max_def_level,
+        max_rep_level,
+    ) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidFixedLength => return error.InvalidFixedLength,
+        error.IntegerOverflow => return error.IntegerOverflow,
+        error.ValueTooLarge => return error.ValueTooLarge,
+    };
+    defer page_result.deinit(allocator);
+
+    return writeColumnChunkWithPath(
+        allocator,
+        output,
+        path_in_schema,
+        .fixed_len_byte_array,
+        page_result.data,
+        page_result.num_values,
+        start_offset,
+        codec,
+        true,
     );
 }
 

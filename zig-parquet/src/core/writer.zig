@@ -1339,11 +1339,10 @@ pub const Writer = struct {
                 idx = try generateSchemaFromNodeStatic(schema, idx, "element", element, .required);
             },
             .map => |m| {
-                // Maps are OPTIONAL by default to match typed path behavior
                 schema[idx] = .{
                     .type_ = null,
                     .type_length = null,
-                    .repetition_type = .optional,
+                    .repetition_type = rep_type,
                     .name = name,
                     .num_children = 1,
                     .converted_type = format.ConvertedType.MAP,

@@ -185,16 +185,13 @@ pub const SchemaNode = union(enum) {
                 computeLeafLevelsRecursive(element, current_def + 1, current_rep + 1, result, index);
             },
             .map => |m| {
-                // Parquet maps have 3-level schema:
-                // map container (OPTIONAL) -> key_value (REPEATED) -> key (REQUIRED) / value (OPTIONAL)
-                // Level contributions:
-                //   - Map container (optional): +1 def
+                // Map levels account for key_value group only.
+                // Container optionality is handled by the .optional wrapper.
                 //   - key_value group (repeated): +1 def, +1 rep
                 //   - Key (required): +0 def
                 //   - Value (optional): +1 def
-                // Total: Key = 2 def, 1 rep; Value = 3 def, 1 rep
-                computeLeafLevelsRecursive(m.key, current_def + 2, current_rep + 1, result, index);
-                computeLeafLevelsRecursive(m.value, current_def + 3, current_rep + 1, result, index);
+                computeLeafLevelsRecursive(m.key, current_def + 1, current_rep + 1, result, index);
+                computeLeafLevelsRecursive(m.value, current_def + 2, current_rep + 1, result, index);
             },
             .struct_ => |s| {
                 // Struct fields each get their own path, inheriting current levels
@@ -512,8 +509,18 @@ pub const SchemaNode = union(enum) {
 
         const repeated_group = schema[inner_idx];
         if (repeated_group.num_children != null) {
-            inner_idx += 1;
-            if (inner_idx >= schema.len) return error.InvalidSchema;
+            // Check if the repeated child is itself a LIST or MAP (2-level nested encoding).
+            // In this case the repeated group IS the element, not a 3-level wrapper.
+            const is_nested_type = if (repeated_group.converted_type) |ct|
+                ct == format.ConvertedType.LIST or ct == format.ConvertedType.MAP or ct == format.ConvertedType.MAP_KEY_VALUE
+            else
+                false;
+
+            if (!is_nested_type) {
+                // Standard 3-level: skip the wrapper group to reach the element
+                inner_idx += 1;
+                if (inner_idx >= schema.len) return error.InvalidSchema;
+            }
         }
 
         const element_result = try buildFromElements(allocator, schema, inner_idx);
@@ -652,11 +659,12 @@ test "SchemaNode map levels" {
     const key_node = SchemaNode{ .byte_array = .{} };
     const value_node = SchemaNode{ .int32 = .{} };
     const opt_value = SchemaNode{ .optional = &value_node };
-    const map_node = SchemaNode{ .map = .{ .key = &key_node, .value = &opt_value } };
+    const bare_map = SchemaNode{ .map = .{ .key = &key_node, .value = &opt_value } };
+    const map_node = SchemaNode{ .optional = &bare_map };
 
     const levels = map_node.computeLevels();
-    // map adds def=1, rep=1; optional value adds def=1
-    try std.testing.expectEqual(@as(u8, 2), levels.max_def);
+    // optional(+1), map(+1 def, +1 rep), optional value(+1)
+    try std.testing.expectEqual(@as(u8, 3), levels.max_def);
     try std.testing.expectEqual(@as(u8, 1), levels.max_rep);
 }
 
@@ -714,7 +722,8 @@ test "SchemaNode countLeafColumns struct" {
 test "SchemaNode countLeafColumns map" {
     const key_node = SchemaNode{ .byte_array = .{} };
     const value_node = SchemaNode{ .int32 = .{} };
-    const map_node = SchemaNode{ .map = .{ .key = &key_node, .value = &value_node } };
+    const bare_map = SchemaNode{ .map = .{ .key = &key_node, .value = &value_node } };
+    const map_node = SchemaNode{ .optional = &bare_map };
     try std.testing.expectEqual(@as(usize, 2), map_node.countLeafColumns());
 }
 
@@ -923,6 +932,37 @@ test "buildFromElements: multi-column schema" {
             try std.testing.expectEqualStrings("name", root.fields[1].name);
             switch (root.fields[1].node.*) {
                 .optional => |inner| try std.testing.expect(inner.* == .byte_array),
+                else => return error.TestUnexpectedResult,
+            }
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "buildFromElements: 2-level list<list<int32>> (legacy encoding)" {
+    // 2-level LIST encoding from old_list_structure.parquet:
+    // required group a (LIST) { repeated group array (LIST) { repeated int32 array; } }
+    const elements = [_]format.SchemaElement{
+        .{ .name = "schema", .num_children = 1 },
+        .{ .name = "a", .num_children = 1, .repetition_type = .required, .converted_type = format.ConvertedType.LIST },
+        .{ .name = "array", .num_children = 1, .repetition_type = .repeated, .converted_type = format.ConvertedType.LIST },
+        .{ .name = "array", .type_ = .int32, .repetition_type = .repeated },
+    };
+    const allocator = std.testing.allocator;
+    const result = try SchemaNode.buildFromElements(allocator, &elements, 0);
+    defer freeSchemaNode(allocator, result.node);
+    try std.testing.expectEqual(@as(usize, 4), result.next_idx);
+
+    // Should produce: struct { a: list<list<int32>> }
+    switch (result.node.*) {
+        .struct_ => |root| {
+            try std.testing.expectEqual(@as(usize, 1), root.fields.len);
+            try std.testing.expectEqualStrings("a", root.fields[0].name);
+            switch (root.fields[0].node.*) {
+                .list => |outer_elem| switch (outer_elem.*) {
+                    .list => |inner_elem| try std.testing.expect(inner_elem.* == .int32),
+                    else => return error.TestUnexpectedResult,
+                },
                 else => return error.TestUnexpectedResult,
             }
         },

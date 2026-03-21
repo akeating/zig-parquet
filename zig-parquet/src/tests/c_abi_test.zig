@@ -1784,3 +1784,59 @@ test "C ABI writer: list<struct> roundtrip" {
     try std.testing.expectEqualStrings("cherry", np2[0..nl2]);
     try std.testing.expectEqual(@as(i32, 1), c_row_reader.zp_value_get_int32(c_row_reader.zp_value_get_struct_field_value(sv2, 1)));
 }
+
+test "C ABI reader: struct<id:i32, tags:list<i32>>" {
+    const allocator = std.testing.allocator;
+
+    const Entry = struct {
+        id: i32,
+        tags: []const i32,
+    };
+
+    const rows = [_]Entry{
+        .{ .id = 1, .tags = &[_]i32{ 10, 20, 30 } },
+        .{ .id = 2, .tags = &[_]i32{40} },
+    };
+
+    var rw = try parquet.writeToBufferRows(Entry, allocator, .{});
+    defer rw.deinit();
+    for (&rows) |*row| try rw.writeRow(row.*);
+    try rw.close();
+
+    const buffer = try rw.toOwnedSlice();
+    defer allocator.free(buffer);
+
+    var r_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_reader.zp_row_reader_open_memory(buffer.ptr, buffer.len, &r_handle));
+    defer c_row_reader.zp_row_reader_close(r_handle);
+
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_reader.zp_row_reader_read_row_group(r_handle, 0));
+
+    // Row 1: {id: 1, tags: [10, 20, 30]}
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_reader.zp_row_reader_next(r_handle));
+
+    // Column 0 is "id"
+    const id0 = c_row_reader.zp_row_reader_get_value(r_handle, 0);
+    try std.testing.expect(id0 != null);
+    try std.testing.expectEqual(@as(i32, 1), c_row_reader.zp_value_get_int32(id0));
+
+    // Column 1 is "tags" (list<i32>)
+    const tags0 = c_row_reader.zp_row_reader_get_value(r_handle, 1);
+    try std.testing.expect(tags0 != null);
+    try std.testing.expectEqual(c_err.ZP_TYPE_LIST, c_row_reader.zp_value_get_type(tags0));
+    try std.testing.expectEqual(@as(c_int, 3), c_row_reader.zp_value_get_list_len(tags0));
+    try std.testing.expectEqual(@as(i32, 10), c_row_reader.zp_value_get_int32(c_row_reader.zp_value_get_list_element(tags0, 0)));
+    try std.testing.expectEqual(@as(i32, 20), c_row_reader.zp_value_get_int32(c_row_reader.zp_value_get_list_element(tags0, 1)));
+    try std.testing.expectEqual(@as(i32, 30), c_row_reader.zp_value_get_int32(c_row_reader.zp_value_get_list_element(tags0, 2)));
+
+    // Row 2: {id: 2, tags: [40]}
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_reader.zp_row_reader_next(r_handle));
+
+    const id1 = c_row_reader.zp_row_reader_get_value(r_handle, 0);
+    try std.testing.expectEqual(@as(i32, 2), c_row_reader.zp_value_get_int32(id1));
+
+    const tags1 = c_row_reader.zp_row_reader_get_value(r_handle, 1);
+    try std.testing.expectEqual(c_err.ZP_TYPE_LIST, c_row_reader.zp_value_get_type(tags1));
+    try std.testing.expectEqual(@as(c_int, 1), c_row_reader.zp_value_get_list_len(tags1));
+    try std.testing.expectEqual(@as(i32, 40), c_row_reader.zp_value_get_int32(c_row_reader.zp_value_get_list_element(tags1, 0)));
+}

@@ -13,6 +13,8 @@ const value_mod = @import("value.zig");
 const SchemaNode = schema_mod.SchemaNode;
 const Value = value_mod.Value;
 
+const max_nesting_depth: u32 = 64;
+
 /// Represents a single leaf column's flattened data
 pub const FlatColumn = struct {
     values: std.ArrayList(Value),
@@ -96,7 +98,7 @@ pub fn flattenValue(
         .column_index = 0,
     };
 
-    try flattenRecursive(node, value, &ctx, false);
+    try flattenRecursive(node, value, &ctx, false, 0);
 
     return columns;
 }
@@ -106,7 +108,9 @@ fn flattenRecursive(
     value: Value,
     ctx: *FlattenContext,
     is_repeated: bool,
+    depth: u32,
 ) !void {
+    if (depth > max_nesting_depth) return error.NestingTooDeep;
     switch (node.*) {
         .optional => |child| {
             if (value.isNull()) {
@@ -114,7 +118,7 @@ fn flattenRecursive(
                 try writeNullToLeaves(child, ctx);
             } else {
                 ctx.current_def += 1;
-                try flattenRecursive(child, value, ctx, is_repeated);
+                try flattenRecursive(child, value, ctx, is_repeated, depth + 1);
                 ctx.current_def -= 1;
             }
         },
@@ -143,8 +147,7 @@ fn flattenRecursive(
                         // Subsequent elements: rep=rep_depth (indicates repetition at this list level)
                         ctx.current_rep = ctx.rep_depth;
                     }
-                    // First element keeps rep=0 (or inherited rep from outer context)
-                    try flattenRecursive(element, item, ctx, true);
+                    try flattenRecursive(element, item, ctx, true, depth + 1);
                 }
                 ctx.rep_depth -= 1;
                 ctx.current_def -= 1;
@@ -155,56 +158,43 @@ fn flattenRecursive(
             }
         },
         .map => |m| {
-            // Parquet maps have 3-level schema: map -> key_value (repeated) -> key/value
-            // Definition levels:
-            //   def=0: map is null
-            //   def=1: map is empty (key_value group not present)
-            //   def=2: entry exists (key present - key is required)
-            //   def=3: value present (if value is optional, which it always is for maps)
-            // Repetition levels:
-            //   rep=0: new map (new row)
-            //   rep=1: additional entry in same map
+            // Map levels account for key_value group only.
+            // Container optionality is handled by .optional wrapper above.
+            //   key_value group (repeated): +1 def, +1 rep
+            //   Key (required): +0 def
+            //   Value (optional): +1 def
             const entries = value.asMap();
             const key_leaves = m.key.countLeafColumns();
 
             if (entries == null or value.isNull()) {
-                // Null map - def=0 for both key and value columns
                 try writeNullToLeaves(m.key, ctx);
                 ctx.column_index += key_leaves;
                 try writeNullToLeaves(m.value, ctx);
                 ctx.column_index -= key_leaves;
             } else if (entries.?.len == 0) {
-                // Empty map - def=1 (map present but no entries)
-                ctx.current_def += 1;
+                // Empty map — key_value group not present, no extra def
                 try writeNullToLeaves(m.key, ctx);
                 ctx.column_index += key_leaves;
                 try writeNullToLeaves(m.value, ctx);
                 ctx.column_index -= key_leaves;
-                ctx.current_def -= 1;
             } else {
-                // Non-empty map: def=1 (map present) + 1 (entry exists) = 2 for key
-                // Value gets +1 more if present (so def=3)
-                ctx.current_def += 2; // +1 for map presence, +1 for key_value group
+                // Non-empty map: +1 for key_value group
+                ctx.current_def += 1;
                 ctx.rep_depth += 1;
                 for (entries.?, 0..) |entry, i| {
                     if (i > 0) {
-                        // Subsequent entries: rep=1 (repeated at map entry level)
                         ctx.current_rep = ctx.rep_depth;
                     }
-                    // First entry keeps rep=0 (or inherited rep from outer context)
-                    // Flatten key (required, so no extra def)
-                    try flattenRecursive(m.key, entry.key, ctx, true);
+                    try flattenRecursive(m.key, entry.key, ctx, true, depth + 1);
                     ctx.column_index += key_leaves;
-                    // Flatten value (optional, so +1 def if present)
                     ctx.current_def += 1;
-                    try flattenRecursive(m.value, entry.value, ctx, true);
+                    try flattenRecursive(m.value, entry.value, ctx, true, depth + 1);
                     ctx.current_def -= 1;
                     ctx.column_index -= key_leaves;
                 }
                 ctx.rep_depth -= 1;
-                ctx.current_def -= 2;
+                ctx.current_def -= 1;
                 if (!is_repeated) {
-                    // Reset rep to 0 after processing map (ready for next top-level record)
                     ctx.current_rep = 0;
                 }
             }
@@ -227,7 +217,7 @@ fn flattenRecursive(
                     var found = false;
                     for (fields.?) |value_field| {
                         if (std.mem.eql(u8, schema_field.name, value_field.name)) {
-                            try flattenRecursive(schema_field.node, value_field.value, ctx, is_repeated);
+                            try flattenRecursive(schema_field.node, value_field.value, ctx, is_repeated, depth + 1);
                             found = true;
                             break;
                         }
@@ -322,7 +312,7 @@ pub fn assembleValue(
         .positions = positions,
     };
 
-    return try assembleRecursive(node, &ctx, 0, 0);
+    return try assembleRecursive(node, &ctx, 0, 0, 0);
 }
 
 /// Assemble multiple rows of nested Values from flat columns.
@@ -359,7 +349,7 @@ pub fn assembleValues(
 
     for (0..num_rows) |i| {
         ctx.column_index = 0;
-        result[i] = try assembleRecursive(node, &ctx, 0, 0);
+        result[i] = try assembleRecursive(node, &ctx, 0, 0, 0);
     }
     return result;
 }
@@ -369,7 +359,9 @@ fn assembleRecursive(
     ctx: *AssembleContext,
     def_threshold: u32,
     rep_threshold: u32,
+    depth: u32,
 ) !Value {
+    if (depth > max_nesting_depth) return error.NestingTooDeep;
     switch (node.*) {
         .optional => |child| {
             // Check if we have data
@@ -386,7 +378,7 @@ fn assembleRecursive(
                 return .{ .null_val = {} };
             }
 
-            return try assembleRecursive(child, ctx, def_threshold + 1, rep_threshold);
+            return try assembleRecursive(child, ctx, def_threshold + 1, rep_threshold, depth + 1);
         },
         .list => |element| {
             const col = ctx.columns[ctx.column_index];
@@ -424,7 +416,7 @@ fn assembleRecursive(
                     break;
                 }
 
-                const item = try assembleRecursive(element, ctx, def_threshold + 1, rep_threshold + 1);
+                const item = try assembleRecursive(element, ctx, def_threshold + 1, rep_threshold + 1, depth + 1);
                 try items.append(ctx.allocator, item);
                 first = false;
             }
@@ -478,9 +470,9 @@ fn assembleRecursive(
                     break;
                 }
 
-                const key = try assembleRecursive(m.key, ctx, def_threshold + 1, rep_threshold + 1);
+                const key = try assembleRecursive(m.key, ctx, def_threshold + 1, rep_threshold + 1, depth + 1);
                 ctx.column_index += key_leaves;
-                const val = try assembleRecursive(m.value, ctx, def_threshold + 1, rep_threshold + 1);
+                const val = try assembleRecursive(m.value, ctx, def_threshold + 1, rep_threshold + 1, depth + 1);
                 ctx.column_index -= key_leaves;
 
                 try entries.append(ctx.allocator, .{ .key = key, .value = val });
@@ -501,7 +493,7 @@ fn assembleRecursive(
             }
 
             for (s.fields) |schema_field| {
-                const field_value = try assembleRecursive(schema_field.node, ctx, def_threshold, rep_threshold);
+                const field_value = try assembleRecursive(schema_field.node, ctx, def_threshold, rep_threshold, depth + 1);
                 const name_copy = try ctx.allocator.dupe(u8, schema_field.name);
                 try fields.append(ctx.allocator, .{ .name = name_copy, .value = field_value });
                 ctx.column_index += schema_field.node.countLeafColumns();
