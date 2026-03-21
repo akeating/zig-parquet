@@ -71,6 +71,9 @@ zig fetch --save https://github.com/akeating/zig-parquet/releases/download/v0.1.
 Then in your `build.zig`:
 
 ```zig
+const target = b.standardTargetOptions(.{});
+const optimize = b.standardOptimizeOption(.{});
+
 const parquet = b.dependency("parquet", .{
     .target = target,
     .optimize = optimize,
