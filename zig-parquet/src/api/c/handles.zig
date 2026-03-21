@@ -1100,6 +1100,8 @@ pub const RowWriterHandle = struct {
     fn getStructFields(node: *const SchemaNode) ?[]const SchemaNode.Field {
         return switch (node.*) {
             .optional => |child| getStructFields(child),
+            .list => |element| getStructFields(element),
+            .map => |m| getStructFields(m.value),
             .struct_ => |s| s.fields,
             else => null,
         };

@@ -963,13 +963,17 @@ pub fn RowReader(comptime T: type) type {
             end: usize,
             max_def: u32,
         ) RowReaderError![]const InnerElemType {
-            // For nested lists, value is present when def == max_def
-            // Count slots where def == max_def as actual elements
+            // For optional elements, def == max_def means non-null,
+            // def == max_def - 1 means null element (still an element in the list).
+            const elem_threshold: u32 = if (comptime isOptionalType(InnerElemType))
+                max_def - 1
+            else
+                max_def;
+
             var count: usize = 0;
             for (start..end) |i| {
                 if (def_levels) |dl| {
-                    // def == max_def means actual element in inner list
-                    if (dl[i] == max_def) {
+                    if (dl[i] >= elem_threshold) {
                         count += 1;
                     }
                 } else {
@@ -986,7 +990,7 @@ pub fn RowReader(comptime T: type) type {
 
             var result_idx: usize = 0;
             for (start..end) |i| {
-                const is_element = if (def_levels) |dl| dl[i] == max_def else true;
+                const is_element = if (def_levels) |dl| dl[i] >= elem_threshold else true;
                 if (!is_element) continue;
 
                 if (result_idx >= inner_result.len) break;

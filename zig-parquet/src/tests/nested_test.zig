@@ -2085,3 +2085,65 @@ test "dynamic reader round-trip: struct<id:i32, tags:list<i32>>" {
     try std.testing.expectEqual(@as(usize, 1), tags1.len);
     try std.testing.expectEqual(@as(?i32, 4), tags1[0].asInt32());
 }
+
+test "dynamic reader round-trip: map<string, i32>" {
+    const allocator = std.testing.allocator;
+
+    const key_node = SchemaNode{ .byte_array = .{} };
+    const value_node = SchemaNode{ .int32 = .{} };
+    const map_node = SchemaNode{ .map = .{ .key = &key_node, .value = &value_node } };
+    const columns = [_]ColumnDef{ColumnDef.fromNode("counts", &map_node)};
+
+    var writer = try parquet.writeToBuffer(allocator, &columns);
+    defer writer.deinit();
+
+    // Row 1: {"a": 1, "b": 2}
+    const e1 = [_]Value.MapEntryValue{
+        .{ .key = .{ .bytes_val = "a" }, .value = .{ .int32_val = 1 } },
+        .{ .key = .{ .bytes_val = "b" }, .value = .{ .int32_val = 2 } },
+    };
+    // Row 2: {"x": 100}
+    const e2 = [_]Value.MapEntryValue{
+        .{ .key = .{ .bytes_val = "x" }, .value = .{ .int32_val = 100 } },
+    };
+    // Row 3: empty map
+    const e3 = [_]Value.MapEntryValue{};
+
+    const rows = [_]Value{
+        .{ .map_val = &e1 },
+        .{ .map_val = &e2 },
+        .{ .map_val = &e3 },
+    };
+    try writer.writeNestedColumn(0, &rows);
+    try writer.close();
+
+    const buf = try writer.toOwnedSlice();
+    defer allocator.free(buf);
+
+    var dyn = try parquet.openBufferDynamic(allocator, buf, .{});
+    defer dyn.deinit();
+    const dyn_rows = try dyn.readAllRows(0);
+    defer {
+        for (dyn_rows) |r| r.deinit();
+        allocator.free(dyn_rows);
+    }
+    try std.testing.expectEqual(@as(usize, 3), dyn_rows.len);
+
+    // Row 1: map with 2 entries
+    const m0 = dyn_rows[0].getColumn(0).?.asMap().?;
+    try std.testing.expectEqual(@as(usize, 2), m0.len);
+    try std.testing.expectEqualStrings("a", m0[0].key.asBytes().?);
+    try std.testing.expectEqual(@as(?i32, 1), m0[0].value.asInt32());
+    try std.testing.expectEqualStrings("b", m0[1].key.asBytes().?);
+    try std.testing.expectEqual(@as(?i32, 2), m0[1].value.asInt32());
+
+    // Row 2: map with 1 entry
+    const m1 = dyn_rows[1].getColumn(0).?.asMap().?;
+    try std.testing.expectEqual(@as(usize, 1), m1.len);
+    try std.testing.expectEqualStrings("x", m1[0].key.asBytes().?);
+    try std.testing.expectEqual(@as(?i32, 100), m1[0].value.asInt32());
+
+    // Row 3: empty map
+    const m2 = dyn_rows[2].getColumn(0).?.asMap().?;
+    try std.testing.expectEqual(@as(usize, 0), m2.len);
+}

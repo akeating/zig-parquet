@@ -370,8 +370,6 @@ fn assembleRecursive(
     def_threshold: u32,
     rep_threshold: u32,
 ) !Value {
-    _ = rep_threshold;
-
     switch (node.*) {
         .optional => |child| {
             // Check if we have data
@@ -388,7 +386,7 @@ fn assembleRecursive(
                 return .{ .null_val = {} };
             }
 
-            return try assembleRecursive(child, ctx, def_threshold + 1, 0);
+            return try assembleRecursive(child, ctx, def_threshold + 1, rep_threshold);
         },
         .list => |element| {
             const col = ctx.columns[ctx.column_index];
@@ -417,7 +415,7 @@ fn assembleRecursive(
                 if (current_pos >= col.def_levels.len) break;
 
                 const current_rep = col.rep_levels[current_pos];
-                if (!first and current_rep == 0) break; // New row
+                if (!first and current_rep <= rep_threshold) break;
 
                 const current_def = col.def_levels[current_pos];
                 if (current_def <= def_threshold) {
@@ -426,7 +424,7 @@ fn assembleRecursive(
                     break;
                 }
 
-                const item = try assembleRecursive(element, ctx, def_threshold + 1, 1);
+                const item = try assembleRecursive(element, ctx, def_threshold + 1, rep_threshold + 1);
                 try items.append(ctx.allocator, item);
                 first = false;
             }
@@ -442,8 +440,9 @@ fn assembleRecursive(
             }
 
             const def = col.def_levels[pos];
-            if (def <= def_threshold) {
-                // Null map
+            if (def < def_threshold) {
+                // Null map (for required maps, this never triggers; for optional
+                // maps the .optional wrapper handles null before reaching here)
                 consumeNullFromLeaves(m.key, ctx);
                 ctx.column_index += m.key.countLeafColumns();
                 consumeNullFromLeaves(m.value, ctx);
@@ -467,11 +466,11 @@ fn assembleRecursive(
                 if (current_pos >= col.def_levels.len) break;
 
                 const current_rep = col.rep_levels[current_pos];
-                if (!first and current_rep == 0) break;
+                if (!first and current_rep <= rep_threshold) break;
 
                 const current_def = col.def_levels[current_pos];
                 if (current_def <= def_threshold) {
-                    // Empty map marker
+                    // Empty map marker or end of entries
                     consumeNullFromLeaves(m.key, ctx);
                     ctx.column_index += key_leaves;
                     consumeNullFromLeaves(m.value, ctx);
@@ -479,9 +478,9 @@ fn assembleRecursive(
                     break;
                 }
 
-                const key = try assembleRecursive(m.key, ctx, def_threshold + 1, 1);
+                const key = try assembleRecursive(m.key, ctx, def_threshold + 1, rep_threshold + 1);
                 ctx.column_index += key_leaves;
-                const val = try assembleRecursive(m.value, ctx, def_threshold + 1, 1);
+                const val = try assembleRecursive(m.value, ctx, def_threshold + 1, rep_threshold + 1);
                 ctx.column_index -= key_leaves;
 
                 try entries.append(ctx.allocator, .{ .key = key, .value = val });
@@ -502,7 +501,7 @@ fn assembleRecursive(
             }
 
             for (s.fields) |schema_field| {
-                const field_value = try assembleRecursive(schema_field.node, ctx, def_threshold, 0);
+                const field_value = try assembleRecursive(schema_field.node, ctx, def_threshold, rep_threshold);
                 const name_copy = try ctx.allocator.dupe(u8, schema_field.name);
                 try fields.append(ctx.allocator, .{ .name = name_copy, .value = field_value });
                 ctx.column_index += schema_field.node.countLeafColumns();

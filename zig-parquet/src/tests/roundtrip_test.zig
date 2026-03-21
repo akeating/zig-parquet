@@ -5689,3 +5689,101 @@ test "RowWriter.initWithTarget round-trip via BufferTarget" {
     }
     try std.testing.expectEqual(@as(usize, 3), idx);
 }
+
+test "round-trip nested list of optionals ([][]?i32)" {
+    const allocator = std.testing.allocator;
+
+    const Row = struct {
+        values: []const []const ?i32,
+    };
+
+    const a1 = [_]?i32{ 1, null, 3 };
+    const a2 = [_]?i32{null};
+    const a3 = [_]?i32{ 10, 20 };
+    const o1 = [_][]const ?i32{ &a1, &a2 };
+    const o2 = [_][]const ?i32{&a3};
+    const o3 = [_][]const ?i32{ &[_]?i32{}, &[_]?i32{null} };
+
+    const rows = [_]Row{
+        .{ .values = &o1 },
+        .{ .values = &o2 },
+        .{ .values = &o3 },
+    };
+
+    var rw = try parquet.writeToBufferRows(Row, allocator, .{});
+    defer rw.deinit();
+    for (&rows) |*row| try rw.writeRow(row.*);
+    try rw.close();
+
+    const buffer = try rw.toOwnedSlice();
+    defer allocator.free(buffer);
+
+    var reader = try parquet.openBufferRowReader(Row, allocator, buffer, .{});
+    defer reader.deinit();
+
+    var idx: usize = 0;
+    while (try reader.next()) |row| {
+        defer reader.freeRow(&row);
+        const expected = rows[idx].values;
+        const actual = row.values;
+        try std.testing.expectEqual(expected.len, actual.len);
+        for (expected, 0..) |exp_inner, outer| {
+            try std.testing.expectEqual(exp_inner.len, actual[outer].len);
+            for (exp_inner, 0..) |exp_val, inner| {
+                try std.testing.expectEqual(exp_val, actual[outer][inner]);
+            }
+        }
+        idx += 1;
+    }
+    try std.testing.expectEqual(rows.len, idx);
+}
+
+test "round-trip optional nested list (?[][]i32)" {
+    const allocator = std.testing.allocator;
+
+    const Row = struct {
+        values: ?[]const []const i32,
+    };
+
+    const a1 = [_]i32{ 1, 2, 3 };
+    const a2 = [_]i32{42};
+    const o1 = [_][]const i32{ &a1, &a2 };
+    const o2 = [_][]const i32{&[_]i32{}};
+
+    const rows = [_]Row{
+        .{ .values = &o1 },
+        .{ .values = null },
+        .{ .values = &o2 },
+    };
+
+    var rw = try parquet.writeToBufferRows(Row, allocator, .{});
+    defer rw.deinit();
+    for (&rows) |*row| try rw.writeRow(row.*);
+    try rw.close();
+
+    const buffer = try rw.toOwnedSlice();
+    defer allocator.free(buffer);
+
+    var reader = try parquet.openBufferRowReader(Row, allocator, buffer, .{});
+    defer reader.deinit();
+
+    var idx: usize = 0;
+    while (try reader.next()) |row| {
+        defer reader.freeRow(&row);
+        if (rows[idx].values) |expected| {
+            try std.testing.expect(row.values != null);
+            const actual = row.values.?;
+            try std.testing.expectEqual(expected.len, actual.len);
+            for (expected, 0..) |exp_inner, outer| {
+                try std.testing.expectEqual(exp_inner.len, actual[outer].len);
+                for (exp_inner, 0..) |exp_val, inner| {
+                    try std.testing.expectEqual(exp_val, actual[outer][inner]);
+                }
+            }
+        } else {
+            try std.testing.expect(row.values == null);
+        }
+        idx += 1;
+    }
+    try std.testing.expectEqual(rows.len, idx);
+}

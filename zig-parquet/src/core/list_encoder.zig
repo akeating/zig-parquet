@@ -173,6 +173,9 @@ pub fn flattenList(
 ///   - def=2: inner list is empty (element container exists but inner list is empty)
 ///   - def=3: element value is present
 ///
+/// When leaf elements are optional, the null element level is inserted before the value level:
+///   - inner_empty_def shifts down by 1 to make room for null_element_def
+///
 ///   - rep=0: new record (row)
 ///   - rep=1: new inner list (outer element)
 ///   - rep=2: continue same inner list
@@ -182,11 +185,14 @@ pub fn flattenNestedList(
     outer_lists: []const Optional([]const Optional([]const Optional(T))),
     max_def_level: u8,
     max_rep_level: u8,
+    leaf_element_optional: bool,
 ) !FlattenedList(T) {
     _ = max_rep_level; // Always 2 for nested lists
     const value_def: u32 = max_def_level;
-    const inner_empty_def: u32 = max_def_level - 1;
-    const outer_empty_def: u32 = if (max_def_level >= 2) max_def_level - 2 else 0;
+    const leaf_opt_delta: u32 = if (leaf_element_optional) 1 else 0;
+    const null_element_def: u32 = max_def_level - 1;
+    const inner_empty_def: u32 = if (max_def_level >= 1 + leaf_opt_delta) max_def_level - 1 - leaf_opt_delta else 0;
+    const outer_empty_def: u32 = if (inner_empty_def >= 1) inner_empty_def - 1 else 0;
 
     // First pass: count total slots and values
     var num_slots: usize = 0;
@@ -286,7 +292,7 @@ pub fn flattenNestedList(
 
                                         switch (elem) {
                                             .null_value => {
-                                                def_levels[slot_idx] = inner_empty_def;
+                                                def_levels[slot_idx] = null_element_def;
                                             },
                                             .value => |v| {
                                                 def_levels[slot_idx] = value_def;

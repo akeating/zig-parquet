@@ -1118,8 +1118,12 @@ Note: Most "—" entries share physical-level code paths with tested types (e.g.
 | Geometry | n/a | Y | Y |
 | Geography | n/a | Y | Y |
 | List (i32) | Y | Y | Y |
+| List (i64) | Y | — | Y |
+| List (f32) | Y | — | Y |
 | Struct | Y | Y | Y |
-| Map | Y | — | Y |
+| Map (string→i32) | Y | — | Y |
+| Map (string→string) | Y | — | Y |
+| Map (i32→i32) | Y | — | Y |
 | Delta encodings | Y | — | Y |
 | Byte Stream Split | Y | — | Y |
 
@@ -1310,3 +1314,37 @@ Eliminated all `@intCast` from production code in the API layer and Arrow batch 
 
 - [x] Update HARDENING.md `@intCast` elimination table with Arrow Batch, C API, and WASM API rows
 - [x] Update test count from ~80 to ~96 (including arrow_batch.zig test blocks)
+
+### P6 — Nested Type Gap Analysis & Fixes ✅
+
+Systematic audit of nested type support (LIST, MAP, STRUCT) across all API layers — Row, Column, DynamicReader, C ABI — identifying and fixing bugs and test coverage gaps.
+
+#### Bug Fixes — 5 fixes
+
+- [x] Fix `list_encoder.flattenNestedList` conflating definition levels for null elements vs empty inner lists in `[][]?T` patterns
+  - Added `leaf_element_optional` parameter to distinguish null element (def=max-1) from empty inner list (def=max-1-delta)
+- [x] Fix `row_reader.buildInnerList` miscounting elements in optional-element nested lists
+  - Changed to dynamic `elem_threshold = max_def - 1` for optional elements
+- [x] Fix `nested.assembleRecursive` map assembly with incorrect `def_threshold` for empty maps under `optional` wrapper
+  - Changed null map check from `def <= def_threshold` to `def < def_threshold`
+- [x] Fix `nested.assembleRecursive` ignoring `rep_threshold` in list/map assembly loops
+  - Now uses `current_rep <= rep_threshold` as break condition and propagates to recursive calls
+- [x] Fix `handles.getStructFields` not navigating through `list`/`map` nodes for C ABI `list<struct>` writing
+  - Extended to unwrap `list` and `map` schema nodes when resolving struct fields
+
+#### Missing Tests Added
+
+- [x] `[][]?i32` and `?[][]i32` round-trip tests in `roundtrip_test.zig`
+- [x] DynamicReader `map<string, i32>` round-trip test in `nested_test.zig`
+- [x] Multi-page map column test in `multipage_test.zig`
+- [x] Multi-page struct-with-list field test in `multipage_test.zig`
+- [x] C ABI reader: nested list (`list<list<int32>>`) and list-of-struct tests in `c_abi_test.zig`
+- [x] C ABI writer: nested list and list-of-struct round-trip tests in `c_abi_test.zig`
+
+#### PyArrow Interop Files Added
+
+- [x] `list_int64.parquet` — `pa.list_(pa.int64())` with boundary values
+- [x] `list_f32.parquet` — `pa.list_(pa.float32())` with special values (inf, -inf)
+- [x] `map_string_string.parquet` — `pa.map_(pa.string(), pa.string())` with unicode
+- [x] `map_int_int.parquet` — `pa.map_(pa.int32(), pa.int32())`
+- [x] Zig read-back tests for all four new files in `row_reader_test.zig`

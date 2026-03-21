@@ -3527,3 +3527,274 @@ test "RowWriter/RowReader roundtrip: list of strings with freeRow" {
     defer reader.freeRow(&r2);
     try std.testing.expectEqual(@as(usize, 0), r2.names.len);
 }
+
+// =============================================================================
+// Additional nested interop tests: list_int64, list_f32, map_string_string, map_int_int
+// =============================================================================
+
+// --- nested/list_int64.parquet ---
+// Schema: list_col (list<int64>)
+// Data: [[100,200,300], [i64_max,i64_min], null, [], [0,1]]
+
+const ListInt64Test = struct {
+    list_col: ?[]const i64,
+};
+
+test "RowReader interop: list_int64.parquet" {
+    const allocator = std.testing.allocator;
+
+    const file = std.fs.cwd().openFile("../test-files-arrow/nested/list_int64.parquet", .{}) catch |err| {
+        std.debug.print("Could not open test file: {}\n", .{err});
+        return err;
+    };
+    defer file.close();
+
+    var reader = try parquet.openFileRowReader(ListInt64Test, allocator, file, .{});
+    defer reader.deinit();
+
+    try std.testing.expectEqual(@as(usize, 5), reader.rowCount());
+
+    // Row 0: [100, 200, 300]
+    const row0 = (try reader.next()).?;
+    defer reader.freeRow(&row0);
+    try std.testing.expect(row0.list_col != null);
+    try std.testing.expectEqual(@as(usize, 3), row0.list_col.?.len);
+    try std.testing.expectEqual(@as(i64, 100), row0.list_col.?[0]);
+    try std.testing.expectEqual(@as(i64, 200), row0.list_col.?[1]);
+    try std.testing.expectEqual(@as(i64, 300), row0.list_col.?[2]);
+
+    // Row 1: [i64_max, i64_min]
+    const row1 = (try reader.next()).?;
+    defer reader.freeRow(&row1);
+    try std.testing.expect(row1.list_col != null);
+    try std.testing.expectEqual(@as(usize, 2), row1.list_col.?.len);
+    try std.testing.expectEqual(@as(i64, 9223372036854775807), row1.list_col.?[0]);
+    try std.testing.expectEqual(@as(i64, -9223372036854775808), row1.list_col.?[1]);
+
+    // Row 2: null
+    const row2 = (try reader.next()).?;
+    defer reader.freeRow(&row2);
+    try std.testing.expect(row2.list_col == null);
+
+    // Row 3: []
+    const row3 = (try reader.next()).?;
+    defer reader.freeRow(&row3);
+    try std.testing.expect(row3.list_col != null);
+    try std.testing.expectEqual(@as(usize, 0), row3.list_col.?.len);
+
+    // Row 4: [0, 1]
+    const row4 = (try reader.next()).?;
+    defer reader.freeRow(&row4);
+    try std.testing.expect(row4.list_col != null);
+    try std.testing.expectEqual(@as(usize, 2), row4.list_col.?.len);
+    try std.testing.expectEqual(@as(i64, 0), row4.list_col.?[0]);
+    try std.testing.expectEqual(@as(i64, 1), row4.list_col.?[1]);
+}
+
+// --- nested/list_f32.parquet ---
+// Schema: list_col (list<float32>)
+// Data: [[1.5,-2.5,0.0], [inf,-inf], null, [], [3.14]]
+
+const ListF32Test = struct {
+    list_col: ?[]const f32,
+};
+
+test "RowReader interop: list_f32.parquet" {
+    const allocator = std.testing.allocator;
+
+    const file = std.fs.cwd().openFile("../test-files-arrow/nested/list_f32.parquet", .{}) catch |err| {
+        std.debug.print("Could not open test file: {}\n", .{err});
+        return err;
+    };
+    defer file.close();
+
+    var reader = try parquet.openFileRowReader(ListF32Test, allocator, file, .{});
+    defer reader.deinit();
+
+    try std.testing.expectEqual(@as(usize, 5), reader.rowCount());
+
+    // Row 0: [1.5, -2.5, 0.0]
+    const row0 = (try reader.next()).?;
+    defer reader.freeRow(&row0);
+    try std.testing.expect(row0.list_col != null);
+    try std.testing.expectEqual(@as(usize, 3), row0.list_col.?.len);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.5), row0.list_col.?[0], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, -2.5), row0.list_col.?[1], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), row0.list_col.?[2], 0.001);
+
+    // Row 1: [inf, -inf]
+    const row1 = (try reader.next()).?;
+    defer reader.freeRow(&row1);
+    try std.testing.expect(row1.list_col != null);
+    try std.testing.expectEqual(@as(usize, 2), row1.list_col.?.len);
+    try std.testing.expect(std.math.isInf(row1.list_col.?[0]));
+    try std.testing.expect(std.math.isNegativeInf(row1.list_col.?[1]));
+
+    // Row 2: null
+    const row2 = (try reader.next()).?;
+    defer reader.freeRow(&row2);
+    try std.testing.expect(row2.list_col == null);
+
+    // Row 3: []
+    const row3 = (try reader.next()).?;
+    defer reader.freeRow(&row3);
+    try std.testing.expect(row3.list_col != null);
+    try std.testing.expectEqual(@as(usize, 0), row3.list_col.?.len);
+
+    // Row 4: [3.14]
+    const row4 = (try reader.next()).?;
+    defer reader.freeRow(&row4);
+    try std.testing.expect(row4.list_col != null);
+    try std.testing.expectEqual(@as(usize, 1), row4.list_col.?.len);
+    try std.testing.expectApproxEqAbs(@as(f32, 3.14), row4.list_col.?[0], 0.01);
+}
+
+// --- nested/map_string_string.parquet ---
+// Schema: map_col: map<string, string>
+// Data: [
+//   [('key1','val1'),('key2','val2')],
+//   [('hello','world')],
+//   [],
+//   null,
+//   [('a',''),('b','test'),('c','unicode: 🎉')],
+// ]
+
+const MapSSEntry = struct {
+    key: ?[]const u8,
+    value: ?[]const u8,
+};
+
+const MapSSTest = struct {
+    map_col: ?[]const MapSSEntry,
+};
+
+test "RowReader interop: map_string_string.parquet" {
+    const allocator = std.testing.allocator;
+
+    const file = std.fs.cwd().openFile("../test-files-arrow/nested/map_string_string.parquet", .{}) catch |err| {
+        std.debug.print("Could not open test file: {}\n", .{err});
+        return err;
+    };
+    defer file.close();
+
+    var reader = try parquet.openFileRowReader(MapSSTest, allocator, file, .{});
+    defer reader.deinit();
+
+    try std.testing.expectEqual(@as(usize, 5), reader.rowCount());
+
+    // Row 0: [('key1','val1'),('key2','val2')]
+    const row0 = (try reader.next()).?;
+    defer reader.freeRow(&row0);
+    try std.testing.expect(row0.map_col != null);
+    try std.testing.expectEqual(@as(usize, 2), row0.map_col.?.len);
+    try std.testing.expectEqualStrings("key1", row0.map_col.?[0].key.?);
+    try std.testing.expectEqualStrings("val1", row0.map_col.?[0].value.?);
+    try std.testing.expectEqualStrings("key2", row0.map_col.?[1].key.?);
+    try std.testing.expectEqualStrings("val2", row0.map_col.?[1].value.?);
+
+    // Row 1: [('hello','world')]
+    const row1 = (try reader.next()).?;
+    defer reader.freeRow(&row1);
+    try std.testing.expect(row1.map_col != null);
+    try std.testing.expectEqual(@as(usize, 1), row1.map_col.?.len);
+    try std.testing.expectEqualStrings("hello", row1.map_col.?[0].key.?);
+    try std.testing.expectEqualStrings("world", row1.map_col.?[0].value.?);
+
+    // Row 2: []
+    const row2 = (try reader.next()).?;
+    defer reader.freeRow(&row2);
+    try std.testing.expect(row2.map_col != null);
+    try std.testing.expectEqual(@as(usize, 0), row2.map_col.?.len);
+
+    // Row 3: null
+    const row3 = (try reader.next()).?;
+    defer reader.freeRow(&row3);
+    try std.testing.expect(row3.map_col == null);
+
+    // Row 4: [('a',''),('b','test'),('c','unicode: 🎉')]
+    const row4 = (try reader.next()).?;
+    defer reader.freeRow(&row4);
+    try std.testing.expect(row4.map_col != null);
+    try std.testing.expectEqual(@as(usize, 3), row4.map_col.?.len);
+    try std.testing.expectEqualStrings("a", row4.map_col.?[0].key.?);
+    try std.testing.expectEqualStrings("", row4.map_col.?[0].value.?);
+    try std.testing.expectEqualStrings("b", row4.map_col.?[1].key.?);
+    try std.testing.expectEqualStrings("test", row4.map_col.?[1].value.?);
+    try std.testing.expectEqualStrings("c", row4.map_col.?[2].key.?);
+    try std.testing.expectEqualStrings("unicode: \xf0\x9f\x8e\x89", row4.map_col.?[2].value.?);
+}
+
+// --- nested/map_int_int.parquet ---
+// Schema: map_col: map<int32, int32>
+// Data: [
+//   [(1,100),(2,200)],
+//   [(3,300)],
+//   [],
+//   null,
+//   [(10,1000),(20,2000),(30,3000)],
+// ]
+
+const MapIIEntry = struct {
+    key: ?i32,
+    value: ?i32,
+};
+
+const MapIITest = struct {
+    map_col: ?[]const MapIIEntry,
+};
+
+test "RowReader interop: map_int_int.parquet" {
+    const allocator = std.testing.allocator;
+
+    const file = std.fs.cwd().openFile("../test-files-arrow/nested/map_int_int.parquet", .{}) catch |err| {
+        std.debug.print("Could not open test file: {}\n", .{err});
+        return err;
+    };
+    defer file.close();
+
+    var reader = try parquet.openFileRowReader(MapIITest, allocator, file, .{});
+    defer reader.deinit();
+
+    try std.testing.expectEqual(@as(usize, 5), reader.rowCount());
+
+    // Row 0: [(1,100),(2,200)]
+    const row0 = (try reader.next()).?;
+    defer reader.freeRow(&row0);
+    try std.testing.expect(row0.map_col != null);
+    try std.testing.expectEqual(@as(usize, 2), row0.map_col.?.len);
+    try std.testing.expectEqual(@as(?i32, 1), row0.map_col.?[0].key);
+    try std.testing.expectEqual(@as(?i32, 100), row0.map_col.?[0].value);
+    try std.testing.expectEqual(@as(?i32, 2), row0.map_col.?[1].key);
+    try std.testing.expectEqual(@as(?i32, 200), row0.map_col.?[1].value);
+
+    // Row 1: [(3,300)]
+    const row1 = (try reader.next()).?;
+    defer reader.freeRow(&row1);
+    try std.testing.expect(row1.map_col != null);
+    try std.testing.expectEqual(@as(usize, 1), row1.map_col.?.len);
+    try std.testing.expectEqual(@as(?i32, 3), row1.map_col.?[0].key);
+    try std.testing.expectEqual(@as(?i32, 300), row1.map_col.?[0].value);
+
+    // Row 2: []
+    const row2 = (try reader.next()).?;
+    defer reader.freeRow(&row2);
+    try std.testing.expect(row2.map_col != null);
+    try std.testing.expectEqual(@as(usize, 0), row2.map_col.?.len);
+
+    // Row 3: null
+    const row3 = (try reader.next()).?;
+    defer reader.freeRow(&row3);
+    try std.testing.expect(row3.map_col == null);
+
+    // Row 4: [(10,1000),(20,2000),(30,3000)]
+    const row4 = (try reader.next()).?;
+    defer reader.freeRow(&row4);
+    try std.testing.expect(row4.map_col != null);
+    try std.testing.expectEqual(@as(usize, 3), row4.map_col.?.len);
+    try std.testing.expectEqual(@as(?i32, 10), row4.map_col.?[0].key);
+    try std.testing.expectEqual(@as(?i32, 1000), row4.map_col.?[0].value);
+    try std.testing.expectEqual(@as(?i32, 20), row4.map_col.?[1].key);
+    try std.testing.expectEqual(@as(?i32, 2000), row4.map_col.?[1].value);
+    try std.testing.expectEqual(@as(?i32, 30), row4.map_col.?[2].key);
+    try std.testing.expectEqual(@as(?i32, 3000), row4.map_col.?[2].value);
+}

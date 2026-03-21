@@ -1071,6 +1071,82 @@ def generate_map_string_int() -> dict:
     )
 
 
+def generate_list_int64() -> dict:
+    """List of int64 values with nulls."""
+    table = pa.table({
+        "list_col": pa.array([
+            [100, 200, 300],
+            [9223372036854775807, -9223372036854775808],
+            None,
+            [],
+            [0, 1],
+        ], type=pa.list_(pa.int64())),
+    })
+    return write_with_options(
+        table, "nested", "list_int64",
+        use_dictionary=False,
+        compression=None,
+        data_page_version="1.0",
+    )
+
+
+def generate_list_f32() -> dict:
+    """List of float32 values with nulls and special values."""
+    table = pa.table({
+        "list_col": pa.array([
+            [1.5, -2.5, 0.0],
+            [float('inf'), float('-inf')],
+            None,
+            [],
+            [3.14],
+        ], type=pa.list_(pa.float32())),
+    })
+    return write_with_options(
+        table, "nested", "list_f32",
+        use_dictionary=False,
+        compression=None,
+        data_page_version="1.0",
+    )
+
+
+def generate_map_string_string() -> dict:
+    """Map from string to string."""
+    table = pa.table({
+        "map_col": pa.array([
+            [("key1", "val1"), ("key2", "val2")],
+            [("hello", "world")],
+            [],
+            None,
+            [("a", ""), ("b", "test"), ("c", "unicode: 🎉")],
+        ], type=pa.map_(pa.string(), pa.string())),
+    })
+    return write_with_options(
+        table, "nested", "map_string_string",
+        use_dictionary=False,
+        compression=None,
+        data_page_version="1.0",
+    )
+
+
+def generate_map_int_int() -> dict:
+    """Map from int32 to int32."""
+    table = pa.table({
+        "map_col": pa.array([
+            [(1, 100), (2, 200)],
+            [(3, 300)],
+            [],
+            None,
+            [(10, 1000), (20, 2000), (30, 3000)],
+        ], type=pa.map_(pa.int32(), pa.int32())),
+    })
+    return write_with_options(
+        table, "nested", "map_int_int",
+        use_dictionary=False,
+        compression=None,
+        data_page_version="1.0",
+    )
+
+
 def generate_list_string() -> dict:
     """List of strings with nulls and empty values."""
     table = pa.table({
@@ -1393,6 +1469,8 @@ def main():
         files.append(generate_list_int())
         files.append(generate_list_nullable())
         files.append(generate_list_of_list())
+        files.append(generate_list_int64())
+        files.append(generate_list_f32())
         files.append(generate_list_string())
         files.append(generate_list_float())
         files.append(generate_list_bool())
@@ -1402,6 +1480,8 @@ def main():
         files.append(generate_struct_with_list())
         files.append(generate_struct_with_temporal())
         files.append(generate_map_string_int())
+        files.append(generate_map_string_string())
+        files.append(generate_map_int_int())
     
     # Generate manifest
     generate_manifest(files)

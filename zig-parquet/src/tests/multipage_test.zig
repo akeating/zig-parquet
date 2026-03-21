@@ -50,14 +50,19 @@ const StructWithStringField = struct {
     },
 };
 
-const MapEntry = struct {
-    key: []const u8,
-    value: i32,
-};
+const ParquetMapEntry = parquet.MapEntry([]const u8, i32);
 
 const MapStruct = struct {
     id: i32,
-    data: []const MapEntry,
+    data: []const ParquetMapEntry,
+};
+
+const StructWithListStruct = struct {
+    id: i32,
+    inner: struct {
+        label: []const u8,
+        tags: []const i32,
+    },
 };
 
 const Point = struct {
@@ -832,4 +837,132 @@ test "multi-page: large dataset (10K rows)" {
         // Should be done
         try std.testing.expectEqual(@as(?LargeStruct, null), try reader.next());
     }
+}
+
+// =============================================================================
+// Multi-page Map Tests
+// =============================================================================
+
+test "multi-page: map column" {
+    const allocator = std.testing.allocator;
+
+    const row_count = 50;
+
+    var rw = try parquet.writeToBufferRows(MapStruct, allocator, .{
+        .compression = .uncompressed,
+        .use_dictionary = false,
+        .max_page_size = 100,
+    });
+    defer rw.deinit();
+
+    var all_entries: std.ArrayListUnmanaged([]ParquetMapEntry) = .empty;
+    defer {
+        for (all_entries.items) |entries| {
+            for (entries) |e| allocator.free(e.key);
+            allocator.free(entries);
+        }
+        all_entries.deinit(allocator);
+    }
+
+    for (0..row_count) |i| {
+        const entry_count = (i % 4) + 1;
+        var entries = try allocator.alloc(ParquetMapEntry, entry_count);
+        for (0..entry_count) |j| {
+            const key = try std.fmt.allocPrint(allocator, "k{d}_{d}", .{ i, j });
+            entries[j] = .{ .key = key, .value = @intCast(i * 10 + j) };
+        }
+        try all_entries.append(allocator, entries);
+        try rw.writeRow(.{ .id = @intCast(i), .data = entries });
+    }
+    try rw.close();
+
+    const buffer = try rw.toOwnedSlice();
+    defer allocator.free(buffer);
+
+    var reader = try parquet.openBufferRowReader(MapStruct, allocator, buffer, .{});
+    defer reader.deinit();
+
+    try std.testing.expectEqual(@as(usize, row_count), reader.rowCount());
+
+    var count: usize = 0;
+    while (try reader.next()) |row| {
+        defer reader.freeRow(&row);
+        try std.testing.expectEqual(@as(i32, @intCast(count)), row.id);
+        const expected_count = (count % 4) + 1;
+        try std.testing.expectEqual(expected_count, row.data.len);
+        for (row.data, 0..) |entry, j| {
+            const expected_key = try std.fmt.allocPrint(allocator, "k{d}_{d}", .{ count, j });
+            defer allocator.free(expected_key);
+            try std.testing.expectEqualStrings(expected_key, entry.key);
+            try std.testing.expectEqual(@as(i32, @intCast(count * 10 + j)), entry.value.?);
+        }
+        count += 1;
+    }
+    try std.testing.expectEqual(row_count, count);
+}
+
+// =============================================================================
+// Multi-page Struct with List Tests
+// =============================================================================
+
+test "multi-page: struct with list field" {
+    const allocator = std.testing.allocator;
+
+    const row_count = 50;
+
+    var rw = try parquet.writeToBufferRows(StructWithListStruct, allocator, .{
+        .compression = .uncompressed,
+        .use_dictionary = false,
+        .max_page_size = 100,
+    });
+    defer rw.deinit();
+
+    var all_tags: std.ArrayListUnmanaged([]i32) = .empty;
+    var all_labels: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (all_tags.items) |t| allocator.free(t);
+        all_tags.deinit(allocator);
+        for (all_labels.items) |l| allocator.free(l);
+        all_labels.deinit(allocator);
+    }
+
+    for (0..row_count) |i| {
+        const tag_count = (i % 3) + 1;
+        var tags = try allocator.alloc(i32, tag_count);
+        for (0..tag_count) |j| {
+            tags[j] = @intCast(i * 100 + j);
+        }
+        try all_tags.append(allocator, tags);
+        const label = try std.fmt.allocPrint(allocator, "label_{d}", .{i});
+        try all_labels.append(allocator, label);
+        try rw.writeRow(.{
+            .id = @intCast(i),
+            .inner = .{ .label = label, .tags = tags },
+        });
+    }
+    try rw.close();
+
+    const buffer = try rw.toOwnedSlice();
+    defer allocator.free(buffer);
+
+    var reader = try parquet.openBufferRowReader(StructWithListStruct, allocator, buffer, .{});
+    defer reader.deinit();
+
+    try std.testing.expectEqual(@as(usize, row_count), reader.rowCount());
+
+    var count: usize = 0;
+    while (try reader.next()) |row| {
+        defer reader.freeRow(&row);
+        try std.testing.expectEqual(@as(i32, @intCast(count)), row.id);
+        const expected_label = try std.fmt.allocPrint(allocator, "label_{d}", .{count});
+        defer allocator.free(expected_label);
+        try std.testing.expectEqualStrings(expected_label, row.inner.label);
+        const expected_tags = (count % 3) + 1;
+        try std.testing.expectEqual(expected_tags, row.inner.tags.len);
+        for (row.inner.tags, 0..) |tag, j| {
+            try std.testing.expectEqual(@as(i32, @intCast(count * 100 + j)), tag);
+        }
+        count += 1;
+    }
+    try std.testing.expectEqual(row_count, count);
 }

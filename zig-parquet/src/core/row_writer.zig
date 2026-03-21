@@ -402,7 +402,7 @@ fn flattenNestedSliceBuffer(
     }
 
     // Call nested list encoder
-    return list_encoder.flattenNestedList(InnerStorageType, allocator, converted, max_def_level, 2);
+    return list_encoder.flattenNestedList(InnerStorageType, allocator, converted, max_def_level, 2, inner_slice_info.element_optional);
 }
 
 /// Helper to get the innermost storage type for nested lists

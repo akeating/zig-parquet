@@ -1607,6 +1607,48 @@
         }
       ]
     },
+    "nested/list_int64.parquet": {
+      "path": "nested/list_int64.parquet",
+      "sha256": "10af0115ba168b179132830aac4e109fbe477bdc3ed3d990f13872a84461b050",
+      "size_bytes": 651,
+      "num_rows": 5,
+      "num_row_groups": 1,
+      "num_columns": 1,
+      "created_by": "parquet-cpp-arrow version 23.0.1",
+      "schema": "list_col: list<item: int64>\n  child 0, item: int64",
+      "columns": [
+        {
+          "name": "list_col.list.element",
+          "physical_type": "INT64",
+          "compression": "UNCOMPRESSED",
+          "encodings": [
+            "RLE",
+            "PLAIN"
+          ]
+        }
+      ]
+    },
+    "nested/list_f32.parquet": {
+      "path": "nested/list_f32.parquet",
+      "sha256": "48c52ea6439de705cafa5e3bc8bd0864e97e59f19fdeec7f210e8094fa780446",
+      "size_bytes": 570,
+      "num_rows": 5,
+      "num_row_groups": 1,
+      "num_columns": 1,
+      "created_by": "parquet-cpp-arrow version 23.0.1",
+      "schema": "list_col: list<item: float>\n  child 0, item: float",
+      "columns": [
+        {
+          "name": "list_col.list.element",
+          "physical_type": "FLOAT",
+          "compression": "UNCOMPRESSED",
+          "encodings": [
+            "RLE",
+            "PLAIN"
+          ]
+        }
+      ]
+    },
     "nested/list_string.parquet": {
       "path": "nested/list_string.parquet",
       "sha256": "e4300e82a15bdeb45e95ea9d3c04e9560cffe94d246813365e6aeb524488591c",
@@ -1860,6 +1902,66 @@
         {
           "name": "map_col.key_value.key",
           "physical_type": "BYTE_ARRAY",
+          "compression": "UNCOMPRESSED",
+          "encodings": [
+            "RLE",
+            "PLAIN"
+          ]
+        },
+        {
+          "name": "map_col.key_value.value",
+          "physical_type": "INT32",
+          "compression": "UNCOMPRESSED",
+          "encodings": [
+            "RLE",
+            "PLAIN"
+          ]
+        }
+      ]
+    },
+    "nested/map_string_string.parquet": {
+      "path": "nested/map_string_string.parquet",
+      "sha256": "acc5d85b701bd6e9b72f3af08224ad46c6f55bb6a3413007531f45ec10198dfb",
+      "size_bytes": 889,
+      "num_rows": 5,
+      "num_row_groups": 1,
+      "num_columns": 2,
+      "created_by": "parquet-cpp-arrow version 23.0.1",
+      "schema": "map_col: map<string, string>\n  child 0, entries: struct<key: string not null, value: string> not null\n      child 0, key: string not null\n      child 1, value: string",
+      "columns": [
+        {
+          "name": "map_col.key_value.key",
+          "physical_type": "BYTE_ARRAY",
+          "compression": "UNCOMPRESSED",
+          "encodings": [
+            "RLE",
+            "PLAIN"
+          ]
+        },
+        {
+          "name": "map_col.key_value.value",
+          "physical_type": "BYTE_ARRAY",
+          "compression": "UNCOMPRESSED",
+          "encodings": [
+            "RLE",
+            "PLAIN"
+          ]
+        }
+      ]
+    },
+    "nested/map_int_int.parquet": {
+      "path": "nested/map_int_int.parquet",
+      "sha256": "9a0282ec1e12bb0ef542428526df848f07e6059e7ef1990e48f8bec1c46bf852",
+      "size_bytes": 917,
+      "num_rows": 5,
+      "num_row_groups": 1,
+      "num_columns": 2,
+      "created_by": "parquet-cpp-arrow version 23.0.1",
+      "schema": "map_col: map<int32, int32>\n  child 0, entries: struct<key: int32 not null, value: int32> not null\n      child 0, key: int32 not null\n      child 1, value: int32",
+      "columns": [
+        {
+          "name": "map_col.key_value.key",
+          "physical_type": "INT32",
           "compression": "UNCOMPRESSED",
           "encodings": [
             "RLE",

@@ -1465,10 +1465,322 @@ test "Test F: RowWriterHandle struct roundtrip via Zig" {
 
     var dyn = try parquet.openBufferDynamic(allocator, written, .{});
     defer dyn.deinit();
-    const rows = try dyn.readAllRows(0);
+    const dyn_rows = try dyn.readAllRows(0);
     defer {
-        for (rows) |r| r.deinit();
-        allocator.free(rows);
+        for (dyn_rows) |r| r.deinit();
+        allocator.free(dyn_rows);
     }
-    try std.testing.expectEqual(@as(usize, 2), rows.len);
+    try std.testing.expectEqual(@as(usize, 2), dyn_rows.len);
+}
+
+// ============================================================================
+// C ABI reader tests for nested types written by Zig API
+// ============================================================================
+
+test "C ABI reader: nested list (list<list<int32>>)" {
+    const allocator = std.testing.allocator;
+
+    const Row = struct {
+        matrix: []const []const i32,
+    };
+
+    const r1a = [_]i32{ 1, 2 };
+    const r1b = [_]i32{3};
+    const m1 = [_][]const i32{ &r1a, &r1b };
+    const r2a = [_]i32{ 10, 20, 30 };
+    const m2 = [_][]const i32{&r2a};
+
+    const rows = [_]Row{
+        .{ .matrix = &m1 },
+        .{ .matrix = &m2 },
+    };
+
+    var rw = try parquet.writeToBufferRows(Row, allocator, .{});
+    defer rw.deinit();
+    for (&rows) |*row| try rw.writeRow(row.*);
+    try rw.close();
+
+    const buffer = try rw.toOwnedSlice();
+    defer allocator.free(buffer);
+
+    var r_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_reader.zp_row_reader_open_memory(buffer.ptr, buffer.len, &r_handle));
+    defer c_row_reader.zp_row_reader_close(r_handle);
+
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_reader.zp_row_reader_read_row_group(r_handle, 0));
+
+    // Row 1: [[1,2],[3]]
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_reader.zp_row_reader_next(r_handle));
+    const v0 = c_row_reader.zp_row_reader_get_value(r_handle, 0);
+    try std.testing.expect(v0 != null);
+    try std.testing.expectEqual(c_err.ZP_TYPE_LIST, c_row_reader.zp_value_get_type(v0));
+    try std.testing.expectEqual(@as(c_int, 2), c_row_reader.zp_value_get_list_len(v0));
+
+    const inner0 = c_row_reader.zp_value_get_list_element(v0, 0);
+    try std.testing.expectEqual(c_err.ZP_TYPE_LIST, c_row_reader.zp_value_get_type(inner0));
+    try std.testing.expectEqual(@as(c_int, 2), c_row_reader.zp_value_get_list_len(inner0));
+    try std.testing.expectEqual(@as(i32, 1), c_row_reader.zp_value_get_int32(c_row_reader.zp_value_get_list_element(inner0, 0)));
+    try std.testing.expectEqual(@as(i32, 2), c_row_reader.zp_value_get_int32(c_row_reader.zp_value_get_list_element(inner0, 1)));
+
+    const inner1 = c_row_reader.zp_value_get_list_element(v0, 1);
+    try std.testing.expectEqual(@as(c_int, 1), c_row_reader.zp_value_get_list_len(inner1));
+    try std.testing.expectEqual(@as(i32, 3), c_row_reader.zp_value_get_int32(c_row_reader.zp_value_get_list_element(inner1, 0)));
+
+    // Row 2: [[10,20,30]]
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_reader.zp_row_reader_next(r_handle));
+    const v1 = c_row_reader.zp_row_reader_get_value(r_handle, 0);
+    try std.testing.expectEqual(@as(c_int, 1), c_row_reader.zp_value_get_list_len(v1));
+
+    const inner2 = c_row_reader.zp_value_get_list_element(v1, 0);
+    try std.testing.expectEqual(@as(c_int, 3), c_row_reader.zp_value_get_list_len(inner2));
+    try std.testing.expectEqual(@as(i32, 10), c_row_reader.zp_value_get_int32(c_row_reader.zp_value_get_list_element(inner2, 0)));
+    try std.testing.expectEqual(@as(i32, 30), c_row_reader.zp_value_get_int32(c_row_reader.zp_value_get_list_element(inner2, 2)));
+}
+
+test "C ABI reader: list of struct" {
+    const allocator = std.testing.allocator;
+
+    const Item = struct {
+        name: []const u8,
+        qty: i32,
+    };
+
+    const Row = struct {
+        items: []const Item,
+    };
+
+    const items_a = [_]Item{ .{ .name = "apple", .qty = 3 }, .{ .name = "banana", .qty = 5 } };
+    const items_b = [_]Item{.{ .name = "cherry", .qty = 1 }};
+
+    const c_abi_rows = [_]Row{
+        .{ .items = &items_a },
+        .{ .items = &items_b },
+    };
+
+    var rw = try parquet.writeToBufferRows(Row, allocator, .{});
+    defer rw.deinit();
+    for (&c_abi_rows) |*row| try rw.writeRow(row.*);
+    try rw.close();
+
+    const buffer = try rw.toOwnedSlice();
+    defer allocator.free(buffer);
+
+    var r_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_reader.zp_row_reader_open_memory(buffer.ptr, buffer.len, &r_handle));
+    defer c_row_reader.zp_row_reader_close(r_handle);
+
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_reader.zp_row_reader_read_row_group(r_handle, 0));
+
+    // Row 1: [{name:"apple", qty:3}, {name:"banana", qty:5}]
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_reader.zp_row_reader_next(r_handle));
+    const v0 = c_row_reader.zp_row_reader_get_value(r_handle, 0);
+    try std.testing.expect(v0 != null);
+    try std.testing.expectEqual(c_err.ZP_TYPE_LIST, c_row_reader.zp_value_get_type(v0));
+    try std.testing.expectEqual(@as(c_int, 2), c_row_reader.zp_value_get_list_len(v0));
+
+    const s0 = c_row_reader.zp_value_get_list_element(v0, 0);
+    try std.testing.expectEqual(c_err.ZP_TYPE_STRUCT, c_row_reader.zp_value_get_type(s0));
+    const name_val0 = c_row_reader.zp_value_get_struct_field_value(s0, 0);
+    var name_len: usize = 0;
+    var name_ptr: [*]const u8 = undefined;
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_reader.zp_value_get_bytes(name_val0, &name_ptr, &name_len));
+    try std.testing.expectEqualStrings("apple", name_ptr[0..name_len]);
+    const qty_val0 = c_row_reader.zp_value_get_struct_field_value(s0, 1);
+    try std.testing.expectEqual(@as(i32, 3), c_row_reader.zp_value_get_int32(qty_val0));
+
+    const s1 = c_row_reader.zp_value_get_list_element(v0, 1);
+    const name_val1 = c_row_reader.zp_value_get_struct_field_value(s1, 0);
+    var name1_len: usize = 0;
+    var name1_ptr: [*]const u8 = undefined;
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_reader.zp_value_get_bytes(name_val1, &name1_ptr, &name1_len));
+    try std.testing.expectEqualStrings("banana", name1_ptr[0..name1_len]);
+    const qty_val1 = c_row_reader.zp_value_get_struct_field_value(s1, 1);
+    try std.testing.expectEqual(@as(i32, 5), c_row_reader.zp_value_get_int32(qty_val1));
+
+    // Row 2: [{name:"cherry", qty:1}]
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_reader.zp_row_reader_next(r_handle));
+    const v1 = c_row_reader.zp_row_reader_get_value(r_handle, 0);
+    try std.testing.expectEqual(@as(c_int, 1), c_row_reader.zp_value_get_list_len(v1));
+
+    const s2 = c_row_reader.zp_value_get_list_element(v1, 0);
+    const name_val2 = c_row_reader.zp_value_get_struct_field_value(s2, 0);
+    var name2_len: usize = 0;
+    var name2_ptr: [*]const u8 = undefined;
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_reader.zp_value_get_bytes(name_val2, &name2_ptr, &name2_len));
+    try std.testing.expectEqualStrings("cherry", name2_ptr[0..name2_len]);
+    const qty_val2 = c_row_reader.zp_value_get_struct_field_value(s2, 1);
+    try std.testing.expectEqual(@as(i32, 1), c_row_reader.zp_value_get_int32(qty_val2));
+}
+
+// ============================================================================
+// C ABI writer round-trip tests for nested types
+// ============================================================================
+
+test "C ABI writer: nested list (list<list<int32>>) roundtrip" {
+    const allocator = std.testing.allocator;
+
+    var w_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_writer.zp_row_writer_open_memory(&w_handle));
+
+    const int32_schema = c_row_writer.zp_schema_primitive(w_handle, c_err.ZP_TYPE_INT32);
+    const inner_list = c_row_writer.zp_schema_list(w_handle, int32_schema);
+    const outer_list = c_row_writer.zp_schema_list(w_handle, inner_list);
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_writer.zp_row_writer_add_column_nested(w_handle, "matrix", outer_list));
+
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_writer.zp_row_writer_begin(w_handle));
+
+    // Row 1: [[1,2],[3]]
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_writer.zp_row_writer_begin_list(w_handle, 0)); // outer list
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_writer.zp_row_writer_begin_list(w_handle, 0)); // inner list [1,2]
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_writer.zp_row_writer_append_int32(w_handle, 0, 1));
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_writer.zp_row_writer_append_int32(w_handle, 0, 2));
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_writer.zp_row_writer_end_list(w_handle, 0)); // end inner
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_writer.zp_row_writer_begin_list(w_handle, 0)); // inner list [3]
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_writer.zp_row_writer_append_int32(w_handle, 0, 3));
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_writer.zp_row_writer_end_list(w_handle, 0)); // end inner
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_writer.zp_row_writer_end_list(w_handle, 0)); // end outer
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_writer.zp_row_writer_add_row(w_handle));
+
+    // Row 2: [[10,20,30]]
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_writer.zp_row_writer_begin_list(w_handle, 0));
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_writer.zp_row_writer_begin_list(w_handle, 0));
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_writer.zp_row_writer_append_int32(w_handle, 0, 10));
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_writer.zp_row_writer_append_int32(w_handle, 0, 20));
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_writer.zp_row_writer_append_int32(w_handle, 0, 30));
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_writer.zp_row_writer_end_list(w_handle, 0));
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_writer.zp_row_writer_end_list(w_handle, 0));
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_writer.zp_row_writer_add_row(w_handle));
+
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_writer.zp_row_writer_flush(w_handle));
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_writer.zp_row_writer_close(w_handle));
+
+    var out_data: [*]const u8 = undefined;
+    var out_len: usize = 0;
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_writer.zp_row_writer_get_buffer(w_handle, &out_data, &out_len));
+
+    const written = try allocator.dupe(u8, out_data[0..out_len]);
+    defer allocator.free(written);
+    c_row_writer.zp_row_writer_free(w_handle);
+
+    // Read back with C ABI reader
+    var r_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_reader.zp_row_reader_open_memory(written.ptr, written.len, &r_handle));
+    defer c_row_reader.zp_row_reader_close(r_handle);
+
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_reader.zp_row_reader_read_row_group(r_handle, 0));
+
+    // Row 1: [[1,2],[3]]
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_reader.zp_row_reader_next(r_handle));
+    const rv0 = c_row_reader.zp_row_reader_get_value(r_handle, 0);
+    try std.testing.expectEqual(@as(c_int, 2), c_row_reader.zp_value_get_list_len(rv0));
+
+    const ri0 = c_row_reader.zp_value_get_list_element(rv0, 0);
+    try std.testing.expectEqual(@as(c_int, 2), c_row_reader.zp_value_get_list_len(ri0));
+    try std.testing.expectEqual(@as(i32, 1), c_row_reader.zp_value_get_int32(c_row_reader.zp_value_get_list_element(ri0, 0)));
+    try std.testing.expectEqual(@as(i32, 2), c_row_reader.zp_value_get_int32(c_row_reader.zp_value_get_list_element(ri0, 1)));
+
+    const ri1 = c_row_reader.zp_value_get_list_element(rv0, 1);
+    try std.testing.expectEqual(@as(c_int, 1), c_row_reader.zp_value_get_list_len(ri1));
+    try std.testing.expectEqual(@as(i32, 3), c_row_reader.zp_value_get_int32(c_row_reader.zp_value_get_list_element(ri1, 0)));
+
+    // Row 2: [[10,20,30]]
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_reader.zp_row_reader_next(r_handle));
+    const rv1 = c_row_reader.zp_row_reader_get_value(r_handle, 0);
+    try std.testing.expectEqual(@as(c_int, 1), c_row_reader.zp_value_get_list_len(rv1));
+
+    const ri2 = c_row_reader.zp_value_get_list_element(rv1, 0);
+    try std.testing.expectEqual(@as(c_int, 3), c_row_reader.zp_value_get_list_len(ri2));
+    try std.testing.expectEqual(@as(i32, 10), c_row_reader.zp_value_get_int32(c_row_reader.zp_value_get_list_element(ri2, 0)));
+    try std.testing.expectEqual(@as(i32, 30), c_row_reader.zp_value_get_int32(c_row_reader.zp_value_get_list_element(ri2, 2)));
+}
+
+test "C ABI writer: list<struct> roundtrip" {
+    const allocator = std.testing.allocator;
+
+    var w_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_writer.zp_row_writer_open_memory(&w_handle));
+
+    const name_schema = c_row_writer.zp_schema_primitive(w_handle, c_err.ZP_TYPE_BYTES);
+    const qty_schema = c_row_writer.zp_schema_primitive(w_handle, c_err.ZP_TYPE_INT32);
+
+    const field_names = [_]?[*:0]const u8{ "name", "qty" };
+    const field_schemas = [_]?*const anyopaque{ @ptrCast(name_schema), @ptrCast(qty_schema) };
+    const struct_schema = c_row_writer.zp_schema_struct(w_handle, &field_names, &field_schemas, 2);
+    const list_schema = c_row_writer.zp_schema_list(w_handle, struct_schema);
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_writer.zp_row_writer_add_column_nested(w_handle, "items", list_schema));
+
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_writer.zp_row_writer_begin(w_handle));
+
+    // Row 1: [{name:"apple",qty:3},{name:"banana",qty:5}]
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_writer.zp_row_writer_begin_list(w_handle, 0));
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_writer.zp_row_writer_begin_struct(w_handle, 0));
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_writer.zp_row_writer_set_field_bytes(w_handle, 0, 0, "apple", 5));
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_writer.zp_row_writer_set_field_int32(w_handle, 0, 1, 3));
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_writer.zp_row_writer_end_struct(w_handle, 0));
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_writer.zp_row_writer_begin_struct(w_handle, 0));
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_writer.zp_row_writer_set_field_bytes(w_handle, 0, 0, "banana", 6));
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_writer.zp_row_writer_set_field_int32(w_handle, 0, 1, 5));
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_writer.zp_row_writer_end_struct(w_handle, 0));
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_writer.zp_row_writer_end_list(w_handle, 0));
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_writer.zp_row_writer_add_row(w_handle));
+
+    // Row 2: [{name:"cherry",qty:1}]
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_writer.zp_row_writer_begin_list(w_handle, 0));
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_writer.zp_row_writer_begin_struct(w_handle, 0));
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_writer.zp_row_writer_set_field_bytes(w_handle, 0, 0, "cherry", 6));
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_writer.zp_row_writer_set_field_int32(w_handle, 0, 1, 1));
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_writer.zp_row_writer_end_struct(w_handle, 0));
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_writer.zp_row_writer_end_list(w_handle, 0));
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_writer.zp_row_writer_add_row(w_handle));
+
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_writer.zp_row_writer_flush(w_handle));
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_writer.zp_row_writer_close(w_handle));
+
+    var out_data: [*]const u8 = undefined;
+    var out_len: usize = 0;
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_writer.zp_row_writer_get_buffer(w_handle, &out_data, &out_len));
+
+    const written = try allocator.dupe(u8, out_data[0..out_len]);
+    defer allocator.free(written);
+    c_row_writer.zp_row_writer_free(w_handle);
+
+    // Read back with C ABI reader
+    var r_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_reader.zp_row_reader_open_memory(written.ptr, written.len, &r_handle));
+    defer c_row_reader.zp_row_reader_close(r_handle);
+
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_reader.zp_row_reader_read_row_group(r_handle, 0));
+
+    // Row 1
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_reader.zp_row_reader_next(r_handle));
+    const lv0 = c_row_reader.zp_row_reader_get_value(r_handle, 0);
+    try std.testing.expectEqual(@as(c_int, 2), c_row_reader.zp_value_get_list_len(lv0));
+
+    const sv0 = c_row_reader.zp_value_get_list_element(lv0, 0);
+    try std.testing.expectEqual(c_err.ZP_TYPE_STRUCT, c_row_reader.zp_value_get_type(sv0));
+    const nv0 = c_row_reader.zp_value_get_struct_field_value(sv0, 0);
+    var nl0: usize = 0;
+    var np0: [*]const u8 = undefined;
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_reader.zp_value_get_bytes(nv0, &np0, &nl0));
+    try std.testing.expectEqualStrings("apple", np0[0..nl0]);
+    try std.testing.expectEqual(@as(i32, 3), c_row_reader.zp_value_get_int32(c_row_reader.zp_value_get_struct_field_value(sv0, 1)));
+
+    const sv1 = c_row_reader.zp_value_get_list_element(lv0, 1);
+    const nv1 = c_row_reader.zp_value_get_struct_field_value(sv1, 0);
+    var nl1: usize = 0;
+    var np1: [*]const u8 = undefined;
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_reader.zp_value_get_bytes(nv1, &np1, &nl1));
+    try std.testing.expectEqualStrings("banana", np1[0..nl1]);
+    try std.testing.expectEqual(@as(i32, 5), c_row_reader.zp_value_get_int32(c_row_reader.zp_value_get_struct_field_value(sv1, 1)));
+
+    // Row 2
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_reader.zp_row_reader_next(r_handle));
+    const lv1 = c_row_reader.zp_row_reader_get_value(r_handle, 0);
+    try std.testing.expectEqual(@as(c_int, 1), c_row_reader.zp_value_get_list_len(lv1));
+    const sv2 = c_row_reader.zp_value_get_list_element(lv1, 0);
+    var nl2: usize = 0;
+    var np2: [*]const u8 = undefined;
+    try std.testing.expectEqual(c_err.ZP_OK, c_row_reader.zp_value_get_bytes(c_row_reader.zp_value_get_struct_field_value(sv2, 0), &np2, &nl2));
+    try std.testing.expectEqualStrings("cherry", np2[0..nl2]);
+    try std.testing.expectEqual(@as(i32, 1), c_row_reader.zp_value_get_int32(c_row_reader.zp_value_get_struct_field_value(sv2, 1)));
 }
