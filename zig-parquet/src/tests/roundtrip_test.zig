@@ -3787,3 +3787,20 @@ test "addColumnNested rejects duplicate column names" {
     const result = writer.addColumnNested("data", struct_node, .{});
     try std.testing.expectError(error.DuplicateColumnName, result);
 }
+
+test "setBytes validates fixed-length byte array length" {
+    const allocator = std.testing.allocator;
+
+    var writer = try parquet.createBufferDynamic(allocator);
+    defer writer.deinit();
+
+    try writer.addColumn("uid", TypeInfo.uuid, .{});
+    try writer.begin();
+
+    // UUID expects exactly 16 bytes
+    try std.testing.expectError(error.InvalidFixedLength, writer.setBytes(0, "too short"));
+    try std.testing.expectError(error.InvalidFixedLength, writer.setBytes(0, "this is way too long for a uuid field"));
+
+    // Correct length should succeed
+    try writer.setBytes(0, "0123456789abcdef");
+}

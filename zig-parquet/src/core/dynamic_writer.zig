@@ -542,6 +542,12 @@ pub const DynamicWriter = struct {
         if (col >= self.num_columns) return error.InvalidArgument;
         const ct = self.column_types[col];
         if (ct != .bytes and ct != .fixed_bytes) return error.InvalidArgument;
+        if (ct == .fixed_bytes) {
+            if (self.column_type_lengths[col]) |expected_len| {
+                const expected: usize = safe.castTo(usize, expected_len) catch return error.InvalidFixedLength;
+                if (data.len != expected) return error.InvalidFixedLength;
+            }
+        }
         const copy = self.bytes_arena.allocator().dupe(u8, data) catch return error.OutOfMemory;
         self.current_row[col] = .{ .bytes_val = copy };
         self.row_set[col] = true;

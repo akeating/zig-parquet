@@ -337,9 +337,6 @@ Files containing unsupported features return explicit errors rather than silentl
 
 ## Known Limitations
 
-**Writer:**
-- `setBytes` does not validate length for `FIXED_LEN_BYTE_ARRAY` columns
-
 **Reader:**
 - No column projection (all columns are read)
 - No predicate pushdown or row group filtering
