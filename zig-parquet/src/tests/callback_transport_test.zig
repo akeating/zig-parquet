@@ -200,16 +200,10 @@ test "callback round-trip: Writer -> Reader" {
     }
 }
 
-test "callback round-trip: RowWriter -> RowReader" {
+test "callback round-trip: DynamicWriter -> DynamicReader" {
     const allocator = std.testing.allocator;
 
-    const TestRow = struct {
-        id: i32,
-        value: i64,
-        name: []const u8,
-    };
-
-    // Write via callbacks
+    // Write via callbacks using DynamicWriter
     var sink = MemorySink.init(allocator);
     defer sink.deinit();
 
@@ -219,18 +213,29 @@ test "callback round-trip: RowWriter -> RowReader" {
         .close_fn = MemorySink.close,
     };
 
-    var writer = try parquet.RowWriter(TestRow).initWithTarget(allocator, cb_writer.target(), .{});
+    var writer = parquet.DynamicWriter.init(allocator, cb_writer.target());
     defer writer.deinit();
 
-    const rows = [_]TestRow{
+    try writer.addColumn("id", parquet.TypeInfo.int32, .{});
+    try writer.addColumn("value", parquet.TypeInfo.int64, .{});
+    try writer.addColumn("name", parquet.TypeInfo.string, .{});
+    try writer.begin();
+
+    const test_data = [_]struct { id: i32, value: i64, name: []const u8 }{
         .{ .id = 1, .value = 100, .name = "alice" },
         .{ .id = 2, .value = 200, .name = "bob" },
         .{ .id = 3, .value = 300, .name = "charlie" },
     };
-    try writer.writeRows(&rows);
+
+    for (test_data) |row| {
+        try writer.setInt32(0, row.id);
+        try writer.setInt64(1, row.value);
+        try writer.setBytes(2, row.name);
+        try writer.addRow();
+    }
     try writer.close();
 
-    // Read back via callbacks
+    // Read back via callbacks using DynamicReader
     const written = sink.getWritten();
     var source = MemorySource{ .data = written };
     var cb_reader = CallbackReader{
@@ -239,23 +244,24 @@ test "callback round-trip: RowWriter -> RowReader" {
         .size_fn = MemorySource.size,
     };
 
-    var reader = try parquet.RowReader(TestRow).initFromSeekable(allocator, cb_reader.reader(), .{});
+    var reader = try parquet.DynamicReader.initFromSeekable(allocator, cb_reader.reader(), .{});
     defer reader.deinit();
 
-    var row_count: usize = 0;
-    while (try reader.next()) |row| {
-        var row_copy = row;
-        defer reader.freeRow(&row_copy);
-        try std.testing.expectEqual(rows[row_count].id, row.id);
-        try std.testing.expectEqual(rows[row_count].value, row.value);
-        try std.testing.expectEqualStrings(rows[row_count].name, row.name);
-        row_count += 1;
+    const rows = try reader.readAllRows(0);
+    defer {
+        for (rows) |row| row.deinit();
+        allocator.free(rows);
     }
 
-    try std.testing.expectEqual(@as(usize, 3), row_count);
+    try std.testing.expectEqual(@as(usize, 3), rows.len);
+    for (test_data, 0..) |expected, i| {
+        try std.testing.expectEqual(expected.id, rows[i].getColumn(0).?.asInt32().?);
+        try std.testing.expectEqual(expected.value, rows[i].getColumn(1).?.asInt64().?);
+        try std.testing.expectEqualStrings(expected.name, rows[i].getColumn(2).?.asBytes().?);
+    }
 }
 
-test "callback round-trip: DynamicReader" {
+test "callback round-trip: DynamicReader with optional columns" {
     const allocator = std.testing.allocator;
 
     // Write via callbacks

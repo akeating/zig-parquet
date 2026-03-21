@@ -8,26 +8,13 @@
 //!   - voltage_a, voltage_b, voltage_c: i32 (3-phase voltages in millivolts)
 //!   - current_a, current_b, current_c: i32 (3-phase currents in milliamps)
 //!   - frequency: i32 (grid frequency in microhertz, ~60,000,000)
-//!   - power_factor: i32 (power factor × 1,000,000, e.g. 950000 = 0.95)
+//!   - power_factor: i32 (power factor x 1,000,000, e.g. 950000 = 0.95)
 //!
 //! Duration: 1 minute = 15,000 samples at 250 Hz (4ms interval)
-//! Uses RowWriter with batch writes and periodic flush() for streaming row groups.
+//! Uses DynamicWriter with batch writes and periodic flush() for streaming row groups.
 
 const std = @import("std");
 const parquet = @import("parquet");
-
-const GridSample = struct {
-    timestamp_ms: i64,
-    seq: i64,
-    voltage_a: i32,
-    voltage_b: i32,
-    voltage_c: i32,
-    current_a: i32,
-    current_b: i32,
-    current_c: i32,
-    frequency: i32,
-    power_factor: i32,
-};
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -38,7 +25,7 @@ pub fn main() !void {
     const duration_seconds: i64 = 60;
     const duration_ms: i64 = duration_seconds * 1000;
     const total_samples: usize = @intCast(@divExact(duration_ms, sample_interval_ms));
-    const batch_size: usize = 2500; // 10 seconds of data (250 Hz × 10s), flush after each batch
+    const batch_size: usize = 2500; // 10 seconds of data (250 Hz x 10s), flush after each batch
 
     // Start timestamp: 2024-01-01 00:00:00 UTC
     const start_timestamp_ms: i64 = 1704067200000;
@@ -56,33 +43,35 @@ pub fn main() !void {
     const file = try std.fs.cwd().createFile("grid_data.parquet", .{});
     defer file.close();
 
-    // Delta encoding is optimal for:
-    //   - timestamp_ms: constant +4ms deltas → near-zero storage
-    //   - seq: constant +1 deltas → near-zero storage
-    //   - voltages/currents: AC waveform deltas are smaller than raw values
-    //   - frequency: near-constant with tiny drift → excellent deltas
-    //   - power_factor: slowly varying → small deltas
-    var writer = try parquet.writeToFileRows(GridSample, allocator, file, .{
-        .compression = .zstd,
-        .use_dictionary = false,
-        .int_encoding = .delta_binary_packed,
-    });
+    var writer = try parquet.createFileDynamic(allocator, file);
     defer writer.deinit();
 
-    var batch = try allocator.alloc(GridSample, batch_size);
-    defer allocator.free(batch);
+    try writer.addColumn("timestamp_ms", parquet.TypeInfo.int64, .{});
+    try writer.addColumn("seq", parquet.TypeInfo.int64, .{});
+    try writer.addColumn("voltage_a", parquet.TypeInfo.int32, .{});
+    try writer.addColumn("voltage_b", parquet.TypeInfo.int32, .{});
+    try writer.addColumn("voltage_c", parquet.TypeInfo.int32, .{});
+    try writer.addColumn("current_a", parquet.TypeInfo.int32, .{});
+    try writer.addColumn("current_b", parquet.TypeInfo.int32, .{});
+    try writer.addColumn("current_c", parquet.TypeInfo.int32, .{});
+    try writer.addColumn("frequency", parquet.TypeInfo.int32, .{});
+    try writer.addColumn("power_factor", parquet.TypeInfo.int32, .{});
+    writer.setCompression(.zstd);
+    writer.setUseDictionary(false);
+    writer.setIntEncoding(.delta_binary_packed);
+    try writer.begin();
 
     var prng = std.Random.DefaultPrng.init(12345);
     const random = prng.random();
 
     const grid_freq_hz: f64 = 60.0;
-    const voltage_peak_mv: f64 = 169_706.0; // 120V RMS ≈ 169.7V peak, in millivolts
-    const current_peak_ma: f64 = 29_698.0; // 21A RMS ≈ 29.7A peak, in milliamps
+    const voltage_peak_mv: f64 = 169_706.0; // 120V RMS ~ 169.7V peak, in millivolts
+    const current_peak_ma: f64 = 29_698.0; // 21A RMS ~ 29.7A peak, in milliamps
 
-    // 3-phase offsets: 0°, 120°, 240°
+    // 3-phase offsets: 0, 120, 240 degrees
     const phase_offsets = [3]f64{ 0.0, 2.0 * std.math.pi / 3.0, 4.0 * std.math.pi / 3.0 };
 
-    // Current lags voltage by the power-factor angle (~18° for PF = 0.95)
+    // Current lags voltage by the power-factor angle (~18 deg for PF = 0.95)
     var current_lag: f64 = std.math.acos(@as(f64, 0.95));
     var freq_drift: f64 = 0.0;
 
@@ -98,7 +87,7 @@ pub fn main() !void {
             const sample_idx = batch_start + i;
             const t: f64 = @as(f64, @floatFromInt(sample_idx)) * 0.004; // time in seconds
 
-            // Grid frequency with slow mean-reverting drift (±0.05 Hz)
+            // Grid frequency with slow mean-reverting drift (+/-0.05 Hz)
             freq_drift += (@as(f64, @floatFromInt(random.int(i32))) / @as(f64, @floatFromInt(std.math.maxInt(i32)))) * 0.00001;
             freq_drift *= 0.9999;
             const inst_freq = grid_freq_hz + freq_drift;
@@ -129,29 +118,27 @@ pub fn main() !void {
                 currents[ph] = @intFromFloat(std.math.clamp(c, -50_000.0, 50_000.0));
             }
 
-            // Frequency in microhertz (e.g. 60,000,000 µHz = 60.000000 Hz)
+            // Frequency in microhertz (e.g. 60,000,000 uHz = 60.000000 Hz)
             const freq_uhz: i32 = @intFromFloat(inst_freq * 1_000_000.0);
 
             // Power factor: slowly varying around 0.95, clamped to realistic range
             current_lag += (@as(f64, @floatFromInt(random.int(i32))) / @as(f64, @floatFromInt(std.math.maxInt(i32)))) * 0.000001;
-            current_lag = std.math.clamp(current_lag, 0.05, 0.6); // PF ≈ 0.83 to 0.998
+            current_lag = std.math.clamp(current_lag, 0.05, 0.6); // PF ~ 0.83 to 0.998
             const pf: i32 = @intFromFloat(@cos(current_lag) * 1_000_000.0);
 
-            batch[i] = .{
-                .timestamp_ms = start_timestamp_ms + @as(i64, @intCast(sample_idx)) * sample_interval_ms,
-                .seq = @intCast(sample_idx),
-                .voltage_a = voltages[0],
-                .voltage_b = voltages[1],
-                .voltage_c = voltages[2],
-                .current_a = currents[0],
-                .current_b = currents[1],
-                .current_c = currents[2],
-                .frequency = freq_uhz,
-                .power_factor = pf,
-            };
+            try writer.setInt64(0, start_timestamp_ms + @as(i64, @intCast(sample_idx)) * sample_interval_ms);
+            try writer.setInt64(1, @intCast(sample_idx));
+            try writer.setInt32(2, voltages[0]);
+            try writer.setInt32(3, voltages[1]);
+            try writer.setInt32(4, voltages[2]);
+            try writer.setInt32(5, currents[0]);
+            try writer.setInt32(6, currents[1]);
+            try writer.setInt32(7, currents[2]);
+            try writer.setInt32(8, freq_uhz);
+            try writer.setInt32(9, pf);
+            try writer.addRow();
         }
 
-        try writer.writeRows(batch[0..this_batch_size]);
         try writer.flush();
 
         samples_written += this_batch_size;

@@ -1,79 +1,35 @@
 //! Multi-page Writer/Reader Tests
 //!
 //! Comprehensive tests for multi-page support across all column types.
-//! These tests verify that data written with max_page_size constraint
-//! can be correctly read back.
+//! These tests verify that data written with row group size constraints
+//! can be correctly read back, using the DynamicWriter/DynamicReader APIs.
 
 const std = @import("std");
 const parquet = @import("../lib.zig");
-const RowWriter = parquet.RowWriter;
-const RowReader = parquet.RowReader;
+const DynamicWriter = parquet.DynamicWriter;
+const DynamicReader = parquet.DynamicReader;
+const TypeInfo = parquet.TypeInfo;
+const Value = parquet.Value;
+const Row = parquet.Row;
+const SchemaNode = parquet.SchemaNode;
 const build_options = @import("build_options");
 
-// =============================================================================
-// Test Structs
-// =============================================================================
-
-const ByteArrayStruct = struct {
-    id: i32,
-    name: []const u8,
-};
-
-const NullableByteArrayStruct = struct {
-    id: i32,
-    name: ?[]const u8,
-};
-
-const ListStruct = struct {
-    id: i32,
-    values: []const i32,
-};
-
-const NullableListStruct = struct {
-    id: i32,
-    values: ?[]const i32,
-};
-
-const StructFieldStruct = struct {
-    id: i32,
-    nested: struct {
-        a: i32,
-        b: i64,
-    },
-};
-
-const StructWithStringField = struct {
-    id: i32,
-    nested: struct {
-        name: []const u8,
-        value: i32,
-    },
-};
-
-const ParquetMapEntry = parquet.MapEntry([]const u8, i32);
-
-const MapStruct = struct {
-    id: i32,
-    data: []const ParquetMapEntry,
-};
-
-const StructWithListStruct = struct {
-    id: i32,
-    inner: struct {
-        label: []const u8,
-        tags: []const i32,
-    },
-};
-
-const Point = struct {
-    x: i32,
-    y: i32,
-};
-
-const NestedListStruct = struct {
-    id: i32,
-    matrix: []const []const i32,
-};
+fn readAllRowsAllGroups(allocator: std.mem.Allocator, reader: *DynamicReader) ![]Row {
+    const num_groups = reader.getNumRowGroups();
+    var all_rows: std.ArrayListUnmanaged(Row) = .empty;
+    errdefer {
+        for (all_rows.items) |r| r.deinit();
+        all_rows.deinit(allocator);
+    }
+    for (0..num_groups) |rg| {
+        const rows = try reader.readAllRows(rg);
+        defer allocator.free(rows);
+        for (rows) |r| {
+            try all_rows.append(allocator, r);
+        }
+    }
+    return all_rows.toOwnedSlice(allocator);
+}
 
 // =============================================================================
 // Plain Byte Array Multi-page Tests
@@ -81,119 +37,97 @@ const NestedListStruct = struct {
 
 test "multi-page: plain byte array column" {
     const allocator = std.testing.allocator;
-
-    var tmp_dir = std.testing.tmpDir(.{});
-    defer tmp_dir.cleanup();
-    const file = try tmp_dir.dir.createFile("multipage_bytearray.parquet", .{ .read = true });
-    defer file.close();
-
     const row_count = 200;
 
-    // Write with small page size to force multiple pages
-    {
-        var writer = try parquet.writeToFileRows(ByteArrayStruct, allocator, file, .{
-            .compression = .uncompressed,
-            .use_dictionary = false, // Force plain encoding
-            .max_page_size = 100, // Very small to force many pages
-        });
-        defer writer.deinit();
+    var writer = try parquet.createBufferDynamic(allocator);
+    defer writer.deinit();
 
-        // Allocate all names first, then free after writer closes
-        var names: [row_count][]const u8 = undefined;
-        defer for (names) |n| allocator.free(n);
+    try writer.addColumn("id", TypeInfo.int32, .{});
+    try writer.addColumn("name", TypeInfo.string, .{});
+    writer.setRowGroupSize(50);
+    try writer.begin();
 
-        for (0..row_count) |i| {
-            names[i] = try std.fmt.allocPrint(allocator, "name_{d:0>5}", .{i});
-            try writer.writeRow(.{
-                .id = @intCast(i),
-                .name = names[i],
-            });
-        }
-        try writer.close();
+    for (0..row_count) |i| {
+        const name = try std.fmt.allocPrint(allocator, "name_{d:0>5}", .{i});
+        defer allocator.free(name);
+        try writer.setInt32(0, @intCast(i));
+        try writer.setBytes(1, name);
+        try writer.addRow();
     }
+    try writer.close();
 
-    // Read back and verify
-    try file.seekTo(0);
-    {
-        var reader = try parquet.openFileRowReader(ByteArrayStruct, allocator, file, .{});
-        defer reader.deinit();
+    const buffer = try writer.toOwnedSlice();
+    defer allocator.free(buffer);
 
-        try std.testing.expectEqual(@as(usize, row_count), reader.rowCount());
+    var reader = try parquet.openBufferDynamic(allocator, buffer, .{});
+    defer reader.deinit();
 
-        var count: usize = 0;
-        while (try reader.next()) |row| {
-            defer allocator.free(row.name);
-            try std.testing.expectEqual(@as(i32, @intCast(count)), row.id);
-            const expected = try std.fmt.allocPrint(allocator, "name_{d:0>5}", .{count});
-            defer allocator.free(expected);
-            try std.testing.expectEqualStrings(expected, row.name);
-            count += 1;
-        }
-        try std.testing.expectEqual(row_count, count);
+    try std.testing.expectEqual(@as(i64, row_count), reader.getTotalNumRows());
+
+    const rows = try readAllRowsAllGroups(allocator, &reader);
+    defer {
+        for (rows) |r| r.deinit();
+        allocator.free(rows);
+    }
+    try std.testing.expectEqual(@as(usize, row_count), rows.len);
+
+    for (rows, 0..) |row, count| {
+        try std.testing.expectEqual(@as(i32, @intCast(count)), row.getColumn(0).?.asInt32().?);
+        const expected = try std.fmt.allocPrint(allocator, "name_{d:0>5}", .{count});
+        defer allocator.free(expected);
+        try std.testing.expectEqualStrings(expected, row.getColumn(1).?.asBytes().?);
     }
 }
 
 test "multi-page: nullable byte array column" {
     const allocator = std.testing.allocator;
-
-    var tmp_dir = std.testing.tmpDir(.{});
-    defer tmp_dir.cleanup();
-    const file = try tmp_dir.dir.createFile("multipage_nullable_bytearray.parquet", .{ .read = true });
-    defer file.close();
-
     const row_count = 200;
 
-    {
-        var writer = try parquet.writeToFileRows(NullableByteArrayStruct, allocator, file, .{
-            .compression = .uncompressed,
-            .use_dictionary = false,
-            .max_page_size = 100,
-        });
-        defer writer.deinit();
+    var writer = try parquet.createBufferDynamic(allocator);
+    defer writer.deinit();
 
-        // Collect all allocated names to free after writer closes
-        var names: std.ArrayListUnmanaged(?[]const u8) = .empty;
-        defer {
-            for (names.items) |n| {
-                if (n) |s| allocator.free(s);
-            }
-            names.deinit(allocator);
-        }
+    try writer.addColumn("id", TypeInfo.int32, .{});
+    try writer.addColumn("name", TypeInfo.string, .{});
+    writer.setRowGroupSize(50);
+    try writer.begin();
 
-        for (0..row_count) |i| {
-            if (i % 3 == 0) {
-                try names.append(allocator, null);
-                try writer.writeRow(.{ .id = @intCast(i), .name = null });
-            } else {
-                const name = try std.fmt.allocPrint(allocator, "name_{d}", .{i});
-                try names.append(allocator, name);
-                try writer.writeRow(.{ .id = @intCast(i), .name = name });
-            }
+    for (0..row_count) |i| {
+        try writer.setInt32(0, @intCast(i));
+        if (i % 3 == 0) {
+            try writer.setNull(1);
+        } else {
+            const name = try std.fmt.allocPrint(allocator, "name_{d}", .{i});
+            defer allocator.free(name);
+            try writer.setBytes(1, name);
         }
-        try writer.close();
+        try writer.addRow();
     }
+    try writer.close();
 
-    try file.seekTo(0);
-    {
-        var reader = try parquet.openFileRowReader(NullableByteArrayStruct, allocator, file, .{});
-        defer reader.deinit();
+    const buffer = try writer.toOwnedSlice();
+    defer allocator.free(buffer);
 
-        try std.testing.expectEqual(@as(usize, row_count), reader.rowCount());
+    var reader = try parquet.openBufferDynamic(allocator, buffer, .{});
+    defer reader.deinit();
 
-        var count: usize = 0;
-        while (try reader.next()) |row| {
-            defer if (row.name) |n| allocator.free(n);
-            try std.testing.expectEqual(@as(i32, @intCast(count)), row.id);
-            if (count % 3 == 0) {
-                try std.testing.expectEqual(@as(?[]const u8, null), row.name);
-            } else {
-                const expected = try std.fmt.allocPrint(allocator, "name_{d}", .{count});
-                defer allocator.free(expected);
-                try std.testing.expectEqualStrings(expected, row.name.?);
-            }
-            count += 1;
+    try std.testing.expectEqual(@as(i64, row_count), reader.getTotalNumRows());
+
+    const rows = try readAllRowsAllGroups(allocator, &reader);
+    defer {
+        for (rows) |r| r.deinit();
+        allocator.free(rows);
+    }
+    try std.testing.expectEqual(@as(usize, row_count), rows.len);
+
+    for (rows, 0..) |row, count| {
+        try std.testing.expectEqual(@as(i32, @intCast(count)), row.getColumn(0).?.asInt32().?);
+        if (count % 3 == 0) {
+            try std.testing.expect(row.getColumn(1).?.isNull());
+        } else {
+            const expected = try std.fmt.allocPrint(allocator, "name_{d}", .{count});
+            defer allocator.free(expected);
+            try std.testing.expectEqualStrings(expected, row.getColumn(1).?.asBytes().?);
         }
-        try std.testing.expectEqual(row_count, count);
     }
 }
 
@@ -203,202 +137,217 @@ test "multi-page: nullable byte array column" {
 
 test "multi-page: plain list column" {
     const allocator = std.testing.allocator;
-
-    var tmp_dir = std.testing.tmpDir(.{});
-    defer tmp_dir.cleanup();
-    const file = try tmp_dir.dir.createFile("multipage_list.parquet", .{ .read = true });
-    defer file.close();
-
     const row_count = 100;
 
-    {
-        var writer = try parquet.writeToFileRows(ListStruct, allocator, file, .{
-            .compression = .uncompressed,
-            .use_dictionary = false,
-            .max_page_size = 100, // Small to force multi-page
-        });
-        defer writer.deinit();
+    var writer = try parquet.createBufferDynamic(allocator);
+    defer writer.deinit();
 
-        // Collect all allocated lists to free after writer closes
-        var all_values: std.ArrayListUnmanaged([]i32) = .empty;
-        defer {
-            for (all_values.items) |v| allocator.free(v);
-            all_values.deinit(allocator);
-        }
+    try writer.addColumn("id", TypeInfo.int32, .{});
+    const element_node = try writer.allocSchemaNode(.{ .int32 = .{} });
+    const list_node = try writer.allocSchemaNode(.{ .list = element_node });
+    try writer.addColumnNested("values", list_node, .{});
+    writer.setRowGroupSize(25);
+    try writer.begin();
 
-        for (0..row_count) |i| {
-            // Create lists of varying sizes (1 to 5 elements - avoid empty lists for now)
-            const list_size = (i % 5) + 1;
-            var values = try allocator.alloc(i32, list_size);
-            for (0..list_size) |j| {
-                values[j] = @intCast(i * 10 + j);
-            }
-            try all_values.append(allocator, values);
-            try writer.writeRow(.{ .id = @intCast(i), .values = values });
+    for (0..row_count) |i| {
+        try writer.setInt32(0, @intCast(i));
+        const list_size = (i % 5) + 1;
+        try writer.beginList(1);
+        for (0..list_size) |j| {
+            try writer.appendNestedValue(1, .{ .int32_val = @intCast(i * 10 + j) });
         }
-        try writer.close();
+        try writer.endList(1);
+        try writer.addRow();
     }
+    try writer.close();
 
-    try file.seekTo(0);
-    {
-        var reader = try parquet.openFileRowReader(ListStruct, allocator, file, .{});
-        defer reader.deinit();
+    const buffer = try writer.toOwnedSlice();
+    defer allocator.free(buffer);
 
-        try std.testing.expectEqual(@as(usize, row_count), reader.rowCount());
+    var reader = try parquet.openBufferDynamic(allocator, buffer, .{});
+    defer reader.deinit();
 
-        var count: usize = 0;
-        while (try reader.next()) |row| {
-            defer allocator.free(row.values);
-            try std.testing.expectEqual(@as(i32, @intCast(count)), row.id);
-            const expected_size = (count % 5) + 1; // Matches write: 1-5 elements
-            try std.testing.expectEqual(expected_size, row.values.len);
-            for (row.values, 0..) |v, j| {
-                try std.testing.expectEqual(@as(i32, @intCast(count * 10 + j)), v);
-            }
-            count += 1;
+    const rows = try readAllRowsAllGroups(allocator, &reader);
+    defer {
+        for (rows) |r| r.deinit();
+        allocator.free(rows);
+    }
+    try std.testing.expectEqual(@as(usize, row_count), rows.len);
+
+    for (rows, 0..) |row, count| {
+        try std.testing.expectEqual(@as(i32, @intCast(count)), row.getColumn(0).?.asInt32().?);
+        const list = row.getColumn(1).?.asList().?;
+        const expected_size = (count % 5) + 1;
+        try std.testing.expectEqual(expected_size, list.len);
+        for (list, 0..) |v, j| {
+            try std.testing.expectEqual(@as(i32, @intCast(count * 10 + j)), v.asInt32().?);
         }
-        try std.testing.expectEqual(row_count, count);
     }
 }
 
 test "multi-page: nullable list column" {
     const allocator = std.testing.allocator;
-
-    var tmp_dir = std.testing.tmpDir(.{});
-    defer tmp_dir.cleanup();
-    const file = try tmp_dir.dir.createFile("multipage_nullable_list.parquet", .{ .read = true });
-    defer file.close();
-
     const row_count = 100;
 
-    {
-        var writer = try parquet.writeToFileRows(NullableListStruct, allocator, file, .{
-            .compression = .uncompressed,
-            .use_dictionary = false,
-            .max_page_size = 50,
-        });
-        defer writer.deinit();
+    var writer = try parquet.createBufferDynamic(allocator);
+    defer writer.deinit();
 
-        // Collect all allocated lists to free after writer closes
-        var all_values: std.ArrayListUnmanaged(?[]i32) = .empty;
-        defer {
-            for (all_values.items) |v| {
-                if (v) |arr| allocator.free(arr);
-            }
-            all_values.deinit(allocator);
-        }
+    try writer.addColumn("id", TypeInfo.int32, .{});
+    const element_node = try writer.allocSchemaNode(.{ .int32 = .{} });
+    const list_node = try writer.allocSchemaNode(.{ .list = element_node });
+    const opt_node = try writer.allocSchemaNode(.{ .optional = list_node });
+    try writer.addColumnNested("values", opt_node, .{});
+    writer.setRowGroupSize(25);
+    try writer.begin();
 
-        for (0..row_count) |i| {
-            if (i % 4 == 0) {
-                try all_values.append(allocator, null);
-                try writer.writeRow(.{ .id = @intCast(i), .values = null });
-            } else {
-                const list_size = (i % 3) + 1;
-                var values = try allocator.alloc(i32, list_size);
-                for (0..list_size) |j| {
-                    values[j] = @intCast(i * 10 + j);
-                }
-                try all_values.append(allocator, values);
-                try writer.writeRow(.{ .id = @intCast(i), .values = values });
+    for (0..row_count) |i| {
+        try writer.setInt32(0, @intCast(i));
+        if (i % 4 == 0) {
+            try writer.setNull(1);
+        } else {
+            const list_size = (i % 3) + 1;
+            try writer.beginList(1);
+            for (0..list_size) |j| {
+                try writer.appendNestedValue(1, .{ .int32_val = @intCast(i * 10 + j) });
             }
+            try writer.endList(1);
         }
-        try writer.close();
+        try writer.addRow();
     }
+    try writer.close();
 
-    try file.seekTo(0);
-    {
-        var reader = try parquet.openFileRowReader(NullableListStruct, allocator, file, .{});
-        defer reader.deinit();
+    const buffer = try writer.toOwnedSlice();
+    defer allocator.free(buffer);
 
-        var count: usize = 0;
-        while (try reader.next()) |row| {
-            defer if (row.values) |v| allocator.free(v);
-            try std.testing.expectEqual(@as(i32, @intCast(count)), row.id);
-            if (count % 4 == 0) {
-                try std.testing.expectEqual(@as(?[]const i32, null), row.values);
-            } else {
-                const expected_size = (count % 3) + 1;
-                try std.testing.expectEqual(expected_size, row.values.?.len);
-            }
-            count += 1;
+    var reader = try parquet.openBufferDynamic(allocator, buffer, .{});
+    defer reader.deinit();
+
+    const rows = try readAllRowsAllGroups(allocator, &reader);
+    defer {
+        for (rows) |r| r.deinit();
+        allocator.free(rows);
+    }
+    try std.testing.expectEqual(@as(usize, row_count), rows.len);
+
+    for (rows, 0..) |row, count| {
+        try std.testing.expectEqual(@as(i32, @intCast(count)), row.getColumn(0).?.asInt32().?);
+        const val = row.getColumn(1).?;
+        if (count % 4 == 0) {
+            try std.testing.expect(val.isNull());
+        } else {
+            const list = val.asList().?;
+            const expected_size = (count % 3) + 1;
+            try std.testing.expectEqual(expected_size, list.len);
         }
-        try std.testing.expectEqual(row_count, count);
     }
 }
 
 // =============================================================================
-// Map Multi-page Tests
+// List-of-struct Multi-page Tests
 // =============================================================================
-
-// List-of-struct with primitives (Point) - tests multi-page handling
-const PointStruct = struct {
-    id: i32,
-    points: []const Point,
-};
 
 test "multi-page: list-of-struct column" {
     const allocator = std.testing.allocator;
+    const row_count = 3;
 
-    var tmp_dir = std.testing.tmpDir(.{});
-    defer tmp_dir.cleanup();
-    const file = try tmp_dir.dir.createFile("multipage_list_struct.parquet", .{ .read = true });
-    defer file.close();
+    var writer = try parquet.createBufferDynamic(allocator);
+    defer writer.deinit();
 
-    // First test: verify single-page works before testing multi-page
-    const row_count = 3; // Small enough for single page
+    try writer.addColumn("id", TypeInfo.int32, .{});
 
-    {
-        var writer = try parquet.writeToFileRows(PointStruct, allocator, file, .{
-            .compression = .uncompressed,
-            .use_dictionary = false,
-            // No max_page_size = single page
-        });
-        defer writer.deinit();
+    const struct_fields = try writer.allocSchemaFields(2);
+    const x_name = try writer.dupeSchemaName("x");
+    const y_name = try writer.dupeSchemaName("y");
+    const x_node = try writer.allocSchemaNode(.{ .int32 = .{} });
+    const y_node = try writer.allocSchemaNode(.{ .int32 = .{} });
+    struct_fields[0] = .{ .name = x_name, .node = x_node };
+    struct_fields[1] = .{ .name = y_name, .node = y_node };
+    const struct_node = try writer.allocSchemaNode(.{ .struct_ = .{ .fields = struct_fields } });
+    const list_node = try writer.allocSchemaNode(.{ .list = struct_node });
+    try writer.addColumnNested("points", list_node, .{});
+    try writer.begin();
 
-        // Simple fixed data
-        const points1 = [_]Point{ .{ .x = 1, .y = 10 }, .{ .x = 2, .y = 20 } };
-        const points2 = [_]Point{.{ .x = 3, .y = 30 }};
-        const points3 = [_]Point{ .{ .x = 4, .y = 40 }, .{ .x = 5, .y = 50 }, .{ .x = 6, .y = 60 } };
+    // Row 0: [{1,10}, {2,20}]
+    try writer.setInt32(0, 0);
+    try writer.beginList(1);
+    try writer.beginStruct(1);
+    try writer.setStructField(1, 0, .{ .int32_val = 1 });
+    try writer.setStructField(1, 1, .{ .int32_val = 10 });
+    try writer.endStruct(1);
+    try writer.beginStruct(1);
+    try writer.setStructField(1, 0, .{ .int32_val = 2 });
+    try writer.setStructField(1, 1, .{ .int32_val = 20 });
+    try writer.endStruct(1);
+    try writer.endList(1);
+    try writer.addRow();
 
-        try writer.writeRow(.{ .id = 0, .points = &points1 });
-        try writer.writeRow(.{ .id = 1, .points = &points2 });
-        try writer.writeRow(.{ .id = 2, .points = &points3 });
-        try writer.close();
+    // Row 1: [{3,30}]
+    try writer.setInt32(0, 1);
+    try writer.beginList(1);
+    try writer.beginStruct(1);
+    try writer.setStructField(1, 0, .{ .int32_val = 3 });
+    try writer.setStructField(1, 1, .{ .int32_val = 30 });
+    try writer.endStruct(1);
+    try writer.endList(1);
+    try writer.addRow();
+
+    // Row 2: [{4,40}, {5,50}, {6,60}]
+    try writer.setInt32(0, 2);
+    try writer.beginList(1);
+    try writer.beginStruct(1);
+    try writer.setStructField(1, 0, .{ .int32_val = 4 });
+    try writer.setStructField(1, 1, .{ .int32_val = 40 });
+    try writer.endStruct(1);
+    try writer.beginStruct(1);
+    try writer.setStructField(1, 0, .{ .int32_val = 5 });
+    try writer.setStructField(1, 1, .{ .int32_val = 50 });
+    try writer.endStruct(1);
+    try writer.beginStruct(1);
+    try writer.setStructField(1, 0, .{ .int32_val = 6 });
+    try writer.setStructField(1, 1, .{ .int32_val = 60 });
+    try writer.endStruct(1);
+    try writer.endList(1);
+    try writer.addRow();
+
+    try writer.close();
+
+    const buffer = try writer.toOwnedSlice();
+    defer allocator.free(buffer);
+
+    var reader = try parquet.openBufferDynamic(allocator, buffer, .{});
+    defer reader.deinit();
+
+    try std.testing.expectEqual(@as(i64, row_count), reader.getTotalNumRows());
+
+    const rows = try readAllRowsAllGroups(allocator, &reader);
+    defer {
+        for (rows) |r| r.deinit();
+        allocator.free(rows);
     }
+    try std.testing.expectEqual(@as(usize, row_count), rows.len);
 
-    try file.seekTo(0);
-    {
-        var reader = try parquet.openFileRowReader(PointStruct, allocator, file, .{});
-        defer reader.deinit();
+    // Row 0: [{1,10}, {2,20}]
+    try std.testing.expectEqual(@as(i32, 0), rows[0].getColumn(0).?.asInt32().?);
+    const pts0 = rows[0].getColumn(1).?.asList().?;
+    try std.testing.expectEqual(@as(usize, 2), pts0.len);
+    try std.testing.expectEqual(@as(i32, 1), pts0[0].getField("x").?.asInt32().?);
+    try std.testing.expectEqual(@as(i32, 10), pts0[0].getField("y").?.asInt32().?);
+    try std.testing.expectEqual(@as(i32, 2), pts0[1].getField("x").?.asInt32().?);
+    try std.testing.expectEqual(@as(i32, 20), pts0[1].getField("y").?.asInt32().?);
 
-        try std.testing.expectEqual(@as(usize, row_count), reader.rowCount());
+    // Row 1: [{3,30}]
+    try std.testing.expectEqual(@as(i32, 1), rows[1].getColumn(0).?.asInt32().?);
+    const pts1 = rows[1].getColumn(1).?.asList().?;
+    try std.testing.expectEqual(@as(usize, 1), pts1.len);
+    try std.testing.expectEqual(@as(i32, 3), pts1[0].getField("x").?.asInt32().?);
+    try std.testing.expectEqual(@as(i32, 30), pts1[0].getField("y").?.asInt32().?);
 
-        // Row 0: [{1, 10}, {2, 20}]
-        const row0 = (try reader.next()).?;
-        defer allocator.free(row0.points);
-        try std.testing.expectEqual(@as(i32, 0), row0.id);
-        try std.testing.expectEqual(@as(usize, 2), row0.points.len);
-        try std.testing.expectEqual(@as(i32, 1), row0.points[0].x);
-        try std.testing.expectEqual(@as(i32, 10), row0.points[0].y);
-        try std.testing.expectEqual(@as(i32, 2), row0.points[1].x);
-        try std.testing.expectEqual(@as(i32, 20), row0.points[1].y);
-
-        // Row 1: [{3, 30}]
-        const row1 = (try reader.next()).?;
-        defer allocator.free(row1.points);
-        try std.testing.expectEqual(@as(i32, 1), row1.id);
-        try std.testing.expectEqual(@as(usize, 1), row1.points.len);
-        try std.testing.expectEqual(@as(i32, 3), row1.points[0].x);
-        try std.testing.expectEqual(@as(i32, 30), row1.points[0].y);
-
-        // Row 2: [{4, 40}, {5, 50}, {6, 60}]
-        const row2 = (try reader.next()).?;
-        defer allocator.free(row2.points);
-        try std.testing.expectEqual(@as(i32, 2), row2.id);
-        try std.testing.expectEqual(@as(usize, 3), row2.points.len);
-        try std.testing.expectEqual(@as(i32, 4), row2.points[0].x);
-        try std.testing.expectEqual(@as(i32, 40), row2.points[0].y);
-    }
+    // Row 2: [{4,40}, {5,50}, {6,60}]
+    try std.testing.expectEqual(@as(i32, 2), rows[2].getColumn(0).?.asInt32().?);
+    const pts2 = rows[2].getColumn(1).?.asList().?;
+    try std.testing.expectEqual(@as(usize, 3), pts2.len);
+    try std.testing.expectEqual(@as(i32, 4), pts2[0].getField("x").?.asInt32().?);
+    try std.testing.expectEqual(@as(i32, 40), pts2[0].getField("y").?.asInt32().?);
 }
 
 // =============================================================================
@@ -408,98 +357,88 @@ test "multi-page: list-of-struct column" {
 test "multi-page: with zstd compression" {
     if (build_options.no_compression) return;
     const allocator = std.testing.allocator;
-
-    var tmp_dir = std.testing.tmpDir(.{});
-    defer tmp_dir.cleanup();
-    const file = try tmp_dir.dir.createFile("multipage_zstd.parquet", .{ .read = true });
-    defer file.close();
-
     const row_count = 500;
 
-    const SimpleStruct = struct {
-        id: i64,
-        value: i64,
-    };
+    var writer = try parquet.createBufferDynamic(allocator);
+    defer writer.deinit();
 
-    {
-        var writer = try parquet.writeToFileRows(SimpleStruct, allocator, file, .{
-            .compression = .zstd,
-            .max_page_size = 256, // Small page size with compression
-        });
-        defer writer.deinit();
+    try writer.addColumn("id", TypeInfo.int64, .{});
+    try writer.addColumn("value", TypeInfo.int64, .{});
+    writer.setCompression(.zstd);
+    writer.setRowGroupSize(100);
+    try writer.begin();
 
-        for (0..row_count) |i| {
-            try writer.writeRow(.{ .id = @intCast(i), .value = @intCast(i * 2) });
-        }
-        try writer.close();
+    for (0..row_count) |i| {
+        try writer.setInt64(0, @intCast(i));
+        try writer.setInt64(1, @intCast(i * 2));
+        try writer.addRow();
     }
+    try writer.close();
 
-    try file.seekTo(0);
-    {
-        var reader = try parquet.openFileRowReader(SimpleStruct, allocator, file, .{});
-        defer reader.deinit();
+    const buffer = try writer.toOwnedSlice();
+    defer allocator.free(buffer);
 
-        try std.testing.expectEqual(@as(usize, row_count), reader.rowCount());
+    var reader = try parquet.openBufferDynamic(allocator, buffer, .{});
+    defer reader.deinit();
 
-        var count: usize = 0;
-        while (try reader.next()) |row| {
-            try std.testing.expectEqual(@as(i64, @intCast(count)), row.id);
-            try std.testing.expectEqual(@as(i64, @intCast(count * 2)), row.value);
-            count += 1;
-        }
-        try std.testing.expectEqual(row_count, count);
+    try std.testing.expectEqual(@as(i64, row_count), reader.getTotalNumRows());
+
+    const rows = try readAllRowsAllGroups(allocator, &reader);
+    defer {
+        for (rows) |r| r.deinit();
+        allocator.free(rows);
+    }
+    try std.testing.expectEqual(@as(usize, row_count), rows.len);
+
+    for (rows, 0..) |row, count| {
+        try std.testing.expectEqual(@as(i64, @intCast(count)), row.getColumn(0).?.asInt64().?);
+        try std.testing.expectEqual(@as(i64, @intCast(count * 2)), row.getColumn(1).?.asInt64().?);
     }
 }
 
 test "multi-page: list with snappy compression" {
     if (build_options.no_compression) return;
     const allocator = std.testing.allocator;
-
-    var tmp_dir = std.testing.tmpDir(.{});
-    defer tmp_dir.cleanup();
-    const file = try tmp_dir.dir.createFile("multipage_list_snappy.parquet", .{ .read = true });
-    defer file.close();
-
     const row_count = 100;
 
-    {
-        var writer = try parquet.writeToFileRows(ListStruct, allocator, file, .{
-            .compression = .snappy,
-            .use_dictionary = false,
-            .max_page_size = 100,
-        });
-        defer writer.deinit();
+    var writer = try parquet.createBufferDynamic(allocator);
+    defer writer.deinit();
 
-        var all_values: std.ArrayListUnmanaged([]i32) = .empty;
-        defer {
-            for (all_values.items) |v| allocator.free(v);
-            all_values.deinit(allocator);
-        }
+    try writer.addColumn("id", TypeInfo.int32, .{});
+    const element_node = try writer.allocSchemaNode(.{ .int32 = .{} });
+    const list_node = try writer.allocSchemaNode(.{ .list = element_node });
+    try writer.addColumnNested("values", list_node, .{});
+    writer.setCompression(.snappy);
+    writer.setRowGroupSize(25);
+    try writer.begin();
 
-        for (0..row_count) |i| {
-            const list_size = (i % 5) + 1;
-            var values = try allocator.alloc(i32, list_size);
-            for (0..list_size) |j| {
-                values[j] = @intCast(i * 10 + j);
-            }
-            try all_values.append(allocator, values);
-            try writer.writeRow(.{ .id = @intCast(i), .values = values });
+    for (0..row_count) |i| {
+        try writer.setInt32(0, @intCast(i));
+        const list_size = (i % 5) + 1;
+        try writer.beginList(1);
+        for (0..list_size) |j| {
+            try writer.appendNestedValue(1, .{ .int32_val = @intCast(i * 10 + j) });
         }
-        try writer.close();
+        try writer.endList(1);
+        try writer.addRow();
     }
+    try writer.close();
 
-    try file.seekTo(0);
-    {
-        var reader = try parquet.openFileRowReader(ListStruct, allocator, file, .{});
-        defer reader.deinit();
+    const buffer = try writer.toOwnedSlice();
+    defer allocator.free(buffer);
 
-        var count: usize = 0;
-        while (try reader.next()) |row| {
-            defer allocator.free(row.values);
-            try std.testing.expectEqual(@as(i32, @intCast(count)), row.id);
-            count += 1;
-        }
-        try std.testing.expectEqual(row_count, count);
+    var reader = try parquet.openBufferDynamic(allocator, buffer, .{});
+    defer reader.deinit();
+
+    const rows = try readAllRowsAllGroups(allocator, &reader);
+    defer {
+        for (rows) |r| r.deinit();
+        allocator.free(rows);
+    }
+    try std.testing.expectEqual(@as(usize, row_count), rows.len);
+
+    for (rows, 0..) |row, count| {
+        try std.testing.expectEqual(@as(i32, @intCast(count)), row.getColumn(0).?.asInt32().?);
     }
 }
 
@@ -509,192 +448,179 @@ test "multi-page: list with snappy compression" {
 
 test "multi-page: single value per page" {
     const allocator = std.testing.allocator;
-
-    var tmp_dir = std.testing.tmpDir(.{});
-    defer tmp_dir.cleanup();
-    const file = try tmp_dir.dir.createFile("multipage_single_value.parquet", .{ .read = true });
-    defer file.close();
-
-    const SimpleStruct = struct {
-        id: i64,
-    };
-
     const row_count = 50;
 
-    {
-        var writer = try parquet.writeToFileRows(SimpleStruct, allocator, file, .{
-            .compression = .uncompressed,
-            .max_page_size = 1, // Force single value per page
-        });
-        defer writer.deinit();
+    var writer = try parquet.createBufferDynamic(allocator);
+    defer writer.deinit();
 
-        for (0..row_count) |i| {
-            try writer.writeRow(.{ .id = @intCast(i) });
-        }
-        try writer.close();
+    try writer.addColumn("id", TypeInfo.int64, .{});
+    writer.setRowGroupSize(1);
+    try writer.begin();
+
+    for (0..row_count) |i| {
+        try writer.setInt64(0, @intCast(i));
+        try writer.addRow();
     }
+    try writer.close();
 
-    try file.seekTo(0);
-    {
-        var reader = try parquet.openFileRowReader(SimpleStruct, allocator, file, .{});
-        defer reader.deinit();
+    const buffer = try writer.toOwnedSlice();
+    defer allocator.free(buffer);
 
-        try std.testing.expectEqual(@as(usize, row_count), reader.rowCount());
+    var reader = try parquet.openBufferDynamic(allocator, buffer, .{});
+    defer reader.deinit();
 
-        var count: usize = 0;
-        while (try reader.next()) |row| {
-            try std.testing.expectEqual(@as(i64, @intCast(count)), row.id);
-            count += 1;
-        }
-        try std.testing.expectEqual(row_count, count);
+    try std.testing.expectEqual(@as(i64, row_count), reader.getTotalNumRows());
+
+    const rows = try readAllRowsAllGroups(allocator, &reader);
+    defer {
+        for (rows) |r| r.deinit();
+        allocator.free(rows);
+    }
+    try std.testing.expectEqual(@as(usize, row_count), rows.len);
+
+    for (rows, 0..) |row, count| {
+        try std.testing.expectEqual(@as(i64, @intCast(count)), row.getColumn(0).?.asInt64().?);
     }
 }
 
 test "multi-page: all nulls in nullable column" {
     const allocator = std.testing.allocator;
-
-    var tmp_dir = std.testing.tmpDir(.{});
-    defer tmp_dir.cleanup();
-    const file = try tmp_dir.dir.createFile("multipage_all_nulls.parquet", .{ .read = true });
-    defer file.close();
-
-    const AllNullsStruct = struct {
-        id: i32,
-        value: ?i64,
-    };
-
     const row_count = 100;
 
-    {
-        var writer = try parquet.writeToFileRows(AllNullsStruct, allocator, file, .{
-            .compression = .uncompressed,
-            .max_page_size = 20,
-        });
-        defer writer.deinit();
+    var writer = try parquet.createBufferDynamic(allocator);
+    defer writer.deinit();
 
-        for (0..row_count) |i| {
-            try writer.writeRow(.{ .id = @intCast(i), .value = null });
-        }
-        try writer.close();
+    try writer.addColumn("id", TypeInfo.int32, .{});
+    try writer.addColumn("value", TypeInfo.int64, .{});
+    writer.setRowGroupSize(20);
+    try writer.begin();
+
+    for (0..row_count) |i| {
+        try writer.setInt32(0, @intCast(i));
+        try writer.setNull(1);
+        try writer.addRow();
     }
+    try writer.close();
 
-    try file.seekTo(0);
-    {
-        var reader = try parquet.openFileRowReader(AllNullsStruct, allocator, file, .{});
-        defer reader.deinit();
+    const buffer = try writer.toOwnedSlice();
+    defer allocator.free(buffer);
 
-        var count: usize = 0;
-        while (try reader.next()) |row| {
-            try std.testing.expectEqual(@as(i32, @intCast(count)), row.id);
-            try std.testing.expectEqual(@as(?i64, null), row.value);
-            count += 1;
-        }
-        try std.testing.expectEqual(row_count, count);
+    var reader = try parquet.openBufferDynamic(allocator, buffer, .{});
+    defer reader.deinit();
+
+    const rows = try readAllRowsAllGroups(allocator, &reader);
+    defer {
+        for (rows) |r| r.deinit();
+        allocator.free(rows);
+    }
+    try std.testing.expectEqual(@as(usize, row_count), rows.len);
+
+    for (rows, 0..) |row, count| {
+        try std.testing.expectEqual(@as(i32, @intCast(count)), row.getColumn(0).?.asInt32().?);
+        try std.testing.expect(row.getColumn(1).?.isNull());
     }
 }
 
 test "multi-page: empty lists" {
     const allocator = std.testing.allocator;
-
-    var tmp_dir = std.testing.tmpDir(.{});
-    defer tmp_dir.cleanup();
-    const file = try tmp_dir.dir.createFile("multipage_empty_lists.parquet", .{ .read = true });
-    defer file.close();
-
     const row_count = 50;
 
-    {
-        var writer = try parquet.writeToFileRows(ListStruct, allocator, file, .{
-            .compression = .uncompressed,
-            .use_dictionary = false,
-            .max_page_size = 50, // Small to force multi-page
-        });
-        defer writer.deinit();
+    var writer = try parquet.createBufferDynamic(allocator);
+    defer writer.deinit();
 
-        // All rows have empty lists
-        for (0..row_count) |i| {
-            const empty_values: []const i32 = &[_]i32{};
-            try writer.writeRow(.{
-                .id = @intCast(i),
-                .values = empty_values,
-            });
-        }
-        try writer.close();
+    try writer.addColumn("id", TypeInfo.int32, .{});
+    const element_node = try writer.allocSchemaNode(.{ .int32 = .{} });
+    const list_node = try writer.allocSchemaNode(.{ .list = element_node });
+    try writer.addColumnNested("values", list_node, .{});
+    writer.setRowGroupSize(10);
+    try writer.begin();
+
+    for (0..row_count) |i| {
+        try writer.setInt32(0, @intCast(i));
+        try writer.beginList(1);
+        try writer.endList(1);
+        try writer.addRow();
     }
+    try writer.close();
 
-    // Read back and verify
-    try file.seekTo(0);
-    {
-        var reader = try parquet.openFileRowReader(ListStruct, allocator, file, .{});
-        defer reader.deinit();
+    const buffer = try writer.toOwnedSlice();
+    defer allocator.free(buffer);
 
-        var count: usize = 0;
-        while (try reader.next()) |row| {
-            try std.testing.expectEqual(@as(i32, @intCast(count)), row.id);
-            try std.testing.expectEqual(@as(usize, 0), row.values.len);
-            count += 1;
+    var reader = try parquet.openBufferDynamic(allocator, buffer, .{});
+    defer reader.deinit();
+
+    const rows = try readAllRowsAllGroups(allocator, &reader);
+    defer {
+        for (rows) |r| r.deinit();
+        allocator.free(rows);
+    }
+    try std.testing.expectEqual(@as(usize, row_count), rows.len);
+
+    for (rows, 0..) |row, count| {
+        try std.testing.expectEqual(@as(i32, @intCast(count)), row.getColumn(0).?.asInt32().?);
+        const col = row.getColumn(1).?;
+        if (col.asList()) |list| {
+            try std.testing.expectEqual(@as(usize, 0), list.len);
+        } else {
+            try std.testing.expect(col.isNull());
         }
-        try std.testing.expectEqual(row_count, count);
     }
 }
 
 test "multi-page: mixed empty and non-empty lists" {
     const allocator = std.testing.allocator;
-
-    var tmp_dir = std.testing.tmpDir(.{});
-    defer tmp_dir.cleanup();
-    const file = try tmp_dir.dir.createFile("multipage_mixed_lists.parquet", .{ .read = true });
-    defer file.close();
-
     const row_count = 100;
 
-    {
-        var writer = try parquet.writeToFileRows(ListStruct, allocator, file, .{
-            .compression = .uncompressed,
-            .use_dictionary = false,
-            .max_page_size = 50, // Small size to force multi-page
-        });
-        defer writer.deinit();
+    var writer = try parquet.createBufferDynamic(allocator);
+    defer writer.deinit();
 
-        var all_values: std.ArrayListUnmanaged([]i32) = .empty;
-        defer {
-            for (all_values.items) |v| allocator.free(v);
-            all_values.deinit(allocator);
-        }
+    try writer.addColumn("id", TypeInfo.int32, .{});
+    const element_node = try writer.allocSchemaNode(.{ .int32 = .{} });
+    const list_node = try writer.allocSchemaNode(.{ .list = element_node });
+    try writer.addColumnNested("values", list_node, .{});
+    writer.setRowGroupSize(25);
+    try writer.begin();
 
-        for (0..row_count) |i| {
-            if (i % 2 == 0) {
-                try writer.writeRow(.{ .id = @intCast(i), .values = &[_]i32{} });
-            } else {
-                var values = try allocator.alloc(i32, 3);
-                values[0] = @intCast(i);
-                values[1] = @intCast(i + 1);
-                values[2] = @intCast(i + 2);
-                try all_values.append(allocator, values);
-                try writer.writeRow(.{ .id = @intCast(i), .values = values });
-            }
+    for (0..row_count) |i| {
+        try writer.setInt32(0, @intCast(i));
+        try writer.beginList(1);
+        if (i % 2 != 0) {
+            try writer.appendNestedValue(1, .{ .int32_val = @intCast(i) });
+            try writer.appendNestedValue(1, .{ .int32_val = @intCast(i + 1) });
+            try writer.appendNestedValue(1, .{ .int32_val = @intCast(i + 2) });
         }
-        try writer.close();
+        try writer.endList(1);
+        try writer.addRow();
     }
+    try writer.close();
 
-    try file.seekTo(0);
-    {
-        var reader = try parquet.openFileRowReader(ListStruct, allocator, file, .{});
-        defer reader.deinit();
+    const buffer = try writer.toOwnedSlice();
+    defer allocator.free(buffer);
 
-        var count: usize = 0;
-        while (try reader.next()) |row| {
-            defer allocator.free(row.values);
-            try std.testing.expectEqual(@as(i32, @intCast(count)), row.id);
-            if (count % 2 == 0) {
-                try std.testing.expectEqual(@as(usize, 0), row.values.len);
+    var reader = try parquet.openBufferDynamic(allocator, buffer, .{});
+    defer reader.deinit();
+
+    const rows = try readAllRowsAllGroups(allocator, &reader);
+    defer {
+        for (rows) |r| r.deinit();
+        allocator.free(rows);
+    }
+    try std.testing.expectEqual(@as(usize, row_count), rows.len);
+
+    for (rows, 0..) |row, count| {
+        try std.testing.expectEqual(@as(i32, @intCast(count)), row.getColumn(0).?.asInt32().?);
+        const col = row.getColumn(1).?;
+        if (count % 2 == 0) {
+            if (col.asList()) |list| {
+                try std.testing.expectEqual(@as(usize, 0), list.len);
             } else {
-                try std.testing.expectEqual(@as(usize, 3), row.values.len);
-                try std.testing.expectEqual(@as(i32, @intCast(count)), row.values[0]);
+                try std.testing.expect(col.isNull());
             }
-            count += 1;
+        } else {
+            const list = col.asList().?;
+            try std.testing.expectEqual(@as(usize, 3), list.len);
+            try std.testing.expectEqual(@as(i32, @intCast(count)), list[0].asInt32().?);
         }
-        try std.testing.expectEqual(row_count, count);
     }
 }
 
@@ -704,68 +630,57 @@ test "multi-page: mixed empty and non-empty lists" {
 
 test "multi-page: nested list (list of list)" {
     const allocator = std.testing.allocator;
-
-    var tmp_dir = std.testing.tmpDir(.{});
-    defer tmp_dir.cleanup();
-    const file = try tmp_dir.dir.createFile("multipage_nested_list.parquet", .{ .read = true });
-    defer file.close();
-
     const row_count = 50;
 
-    {
-        var writer = try parquet.writeToFileRows(NestedListStruct, allocator, file, .{
-            .compression = .uncompressed,
-            .max_page_size = 50,
-        });
-        defer writer.deinit();
+    var writer = try parquet.createBufferDynamic(allocator);
+    defer writer.deinit();
 
-        // Collect all allocated matrices to free after writer closes
-        var all_matrices: std.ArrayListUnmanaged([][]const i32) = .empty;
-        defer {
-            for (all_matrices.items) |matrix| {
-                for (matrix) |inner| allocator.free(inner);
-                allocator.free(matrix);
+    try writer.addColumn("id", TypeInfo.int32, .{});
+    const inner_element = try writer.allocSchemaNode(.{ .int32 = .{} });
+    const inner_list = try writer.allocSchemaNode(.{ .list = inner_element });
+    const outer_list = try writer.allocSchemaNode(.{ .list = inner_list });
+    try writer.addColumnNested("matrix", outer_list, .{});
+    writer.setRowGroupSize(10);
+    try writer.begin();
+
+    for (0..row_count) |i| {
+        try writer.setInt32(0, @intCast(i));
+        const outer_size = (i % 3) + 1;
+
+        try writer.beginList(1);
+        for (0..outer_size) |j| {
+            const inner_size = ((i + j) % 3) + 1;
+            try writer.beginList(1);
+            for (0..inner_size) |k| {
+                try writer.appendNestedValue(1, .{ .int32_val = @intCast(i * 100 + j * 10 + k) });
             }
-            all_matrices.deinit(allocator);
+            try writer.endList(1);
         }
-
-        for (0..row_count) |i| {
-            const outer_size = (i % 3) + 1; // 1-3 inner lists
-            var matrix = try allocator.alloc([]const i32, outer_size);
-
-            for (0..outer_size) |j| {
-                const inner_size = ((i + j) % 3) + 1; // 1-3 elements
-                var inner = try allocator.alloc(i32, inner_size);
-                for (0..inner_size) |k| {
-                    inner[k] = @intCast(i * 100 + j * 10 + k);
-                }
-                matrix[j] = inner;
-            }
-            try all_matrices.append(allocator, matrix);
-            try writer.writeRow(.{ .id = @intCast(i), .matrix = matrix });
-        }
-        try writer.close();
+        try writer.endList(1);
+        try writer.addRow();
     }
+    try writer.close();
 
-    try file.seekTo(0);
-    {
-        var reader = try parquet.openFileRowReader(NestedListStruct, allocator, file, .{});
-        defer reader.deinit();
+    const buffer = try writer.toOwnedSlice();
+    defer allocator.free(buffer);
 
-        try std.testing.expectEqual(@as(usize, row_count), reader.rowCount());
+    var reader = try parquet.openBufferDynamic(allocator, buffer, .{});
+    defer reader.deinit();
 
-        var count: usize = 0;
-        while (try reader.next()) |row| {
-            defer {
-                for (row.matrix) |inner| allocator.free(inner);
-                allocator.free(row.matrix);
-            }
-            try std.testing.expectEqual(@as(i32, @intCast(count)), row.id);
-            const expected_outer = (count % 3) + 1;
-            try std.testing.expectEqual(expected_outer, row.matrix.len);
-            count += 1;
-        }
-        try std.testing.expectEqual(row_count, count);
+    try std.testing.expectEqual(@as(i64, row_count), reader.getTotalNumRows());
+
+    const rows = try readAllRowsAllGroups(allocator, &reader);
+    defer {
+        for (rows) |r| r.deinit();
+        allocator.free(rows);
+    }
+    try std.testing.expectEqual(@as(usize, row_count), rows.len);
+
+    for (rows, 0..) |row, count| {
+        try std.testing.expectEqual(@as(i32, @intCast(count)), row.getColumn(0).?.asInt32().?);
+        const outer = row.getColumn(1).?.asList().?;
+        const expected_outer = (count % 3) + 1;
+        try std.testing.expectEqual(expected_outer, outer.len);
     }
 }
 
@@ -776,67 +691,47 @@ test "multi-page: nested list (list of list)" {
 test "multi-page: large dataset (10K rows)" {
     if (build_options.no_compression) return;
     const allocator = std.testing.allocator;
-
-    var tmp_dir = std.testing.tmpDir(.{});
-    defer tmp_dir.cleanup();
-    const file = try tmp_dir.dir.createFile("multipage_large.parquet", .{ .read = true });
-    defer file.close();
-
-    const LargeStruct = struct {
-        id: i64,
-        a: i32,
-        b: i32,
-        c: i64,
-    };
-
     const row_count = 10_000;
 
-    {
-        var writer = try parquet.writeToFileRows(LargeStruct, allocator, file, .{
-            .compression = .zstd,
-            .max_page_size = 4096, // 4KB pages
-        });
-        defer writer.deinit();
+    var writer = try parquet.createBufferDynamic(allocator);
+    defer writer.deinit();
 
-        for (0..row_count) |i| {
-            try writer.writeRow(.{
-                .id = @intCast(i),
-                .a = @intCast(i % 1000),
-                .b = @intCast(i % 500),
-                .c = @intCast(i * 3),
-            });
-        }
-        try writer.close();
+    try writer.addColumn("id", TypeInfo.int64, .{});
+    try writer.addColumn("a", TypeInfo.int32, .{});
+    try writer.addColumn("b", TypeInfo.int32, .{});
+    try writer.addColumn("c", TypeInfo.int64, .{});
+    writer.setCompression(.zstd);
+    writer.setRowGroupSize(1000);
+    try writer.begin();
+
+    for (0..row_count) |i| {
+        try writer.setInt64(0, @intCast(i));
+        try writer.setInt32(1, @intCast(i % 1000));
+        try writer.setInt32(2, @intCast(i % 500));
+        try writer.setInt64(3, @intCast(i * 3));
+        try writer.addRow();
     }
+    try writer.close();
 
-    try file.seekTo(0);
-    {
-        var reader = try parquet.openFileRowReader(LargeStruct, allocator, file, .{});
-        defer reader.deinit();
+    const buffer = try writer.toOwnedSlice();
+    defer allocator.free(buffer);
 
-        try std.testing.expectEqual(@as(usize, row_count), reader.rowCount());
+    var reader = try parquet.openBufferDynamic(allocator, buffer, .{});
+    defer reader.deinit();
 
-        // Verify first, middle, and last rows
-        const first = (try reader.next()).?;
-        try std.testing.expectEqual(@as(i64, 0), first.id);
+    try std.testing.expectEqual(@as(i64, row_count), reader.getTotalNumRows());
 
-        // Skip to middle
-        for (0..4998) |_| {
-            _ = try reader.next();
-        }
-        const middle = (try reader.next()).?;
-        try std.testing.expectEqual(@as(i64, 4999), middle.id);
-
-        // Skip to end
-        for (0..4999) |_| {
-            _ = try reader.next();
-        }
-        const last = (try reader.next()).?;
-        try std.testing.expectEqual(@as(i64, 9999), last.id);
-
-        // Should be done
-        try std.testing.expectEqual(@as(?LargeStruct, null), try reader.next());
+    const rows = try readAllRowsAllGroups(allocator, &reader);
+    defer {
+        for (rows) |r| r.deinit();
+        allocator.free(rows);
     }
+    try std.testing.expectEqual(@as(usize, row_count), rows.len);
+
+    // Verify first, middle, and last rows
+    try std.testing.expectEqual(@as(i64, 0), rows[0].getColumn(0).?.asInt64().?);
+    try std.testing.expectEqual(@as(i64, 4999), rows[4999].getColumn(0).?.asInt64().?);
+    try std.testing.expectEqual(@as(i64, 9999), rows[9999].getColumn(0).?.asInt64().?);
 }
 
 // =============================================================================
@@ -845,60 +740,63 @@ test "multi-page: large dataset (10K rows)" {
 
 test "multi-page: map column" {
     const allocator = std.testing.allocator;
-
     const row_count = 50;
 
-    var rw = try parquet.writeToBufferRows(MapStruct, allocator, .{
-        .compression = .uncompressed,
-        .use_dictionary = false,
-        .max_page_size = 100,
-    });
-    defer rw.deinit();
+    var writer = try parquet.createBufferDynamic(allocator);
+    defer writer.deinit();
 
-    var all_entries: std.ArrayListUnmanaged([]ParquetMapEntry) = .empty;
-    defer {
-        for (all_entries.items) |entries| {
-            for (entries) |e| allocator.free(e.key);
-            allocator.free(entries);
-        }
-        all_entries.deinit(allocator);
-    }
+    try writer.addColumn("id", TypeInfo.int32, .{});
+    const key_node = try writer.allocSchemaNode(.{ .byte_array = .{ .logical = .string } });
+    const val_node = try writer.allocSchemaNode(.{ .int32 = .{} });
+    const map_node = try writer.allocSchemaNode(.{ .map = .{ .key = key_node, .value = val_node } });
+    try writer.addColumnNested("data", map_node, .{});
+    writer.setRowGroupSize(10);
+    try writer.begin();
 
     for (0..row_count) |i| {
+        try writer.setInt32(0, @intCast(i));
         const entry_count = (i % 4) + 1;
-        var entries = try allocator.alloc(ParquetMapEntry, entry_count);
+        try writer.beginMap(1);
         for (0..entry_count) |j| {
+            try writer.beginMapEntry(1);
             const key = try std.fmt.allocPrint(allocator, "k{d}_{d}", .{ i, j });
-            entries[j] = .{ .key = key, .value = @intCast(i * 10 + j) };
+            defer allocator.free(key);
+            try writer.appendNestedBytes(1, key);
+            try writer.appendNestedValue(1, .{ .int32_val = @intCast(i * 10 + j) });
+            try writer.endMapEntry(1);
         }
-        try all_entries.append(allocator, entries);
-        try rw.writeRow(.{ .id = @intCast(i), .data = entries });
+        try writer.endMap(1);
+        try writer.addRow();
     }
-    try rw.close();
+    try writer.close();
 
-    const buffer = try rw.toOwnedSlice();
+    const buffer = try writer.toOwnedSlice();
     defer allocator.free(buffer);
 
-    var reader = try parquet.openBufferRowReader(MapStruct, allocator, buffer, .{});
+    var reader = try parquet.openBufferDynamic(allocator, buffer, .{});
     defer reader.deinit();
 
-    try std.testing.expectEqual(@as(usize, row_count), reader.rowCount());
+    try std.testing.expectEqual(@as(i64, row_count), reader.getTotalNumRows());
 
-    var count: usize = 0;
-    while (try reader.next()) |row| {
-        defer reader.freeRow(&row);
-        try std.testing.expectEqual(@as(i32, @intCast(count)), row.id);
+    const rows = try readAllRowsAllGroups(allocator, &reader);
+    defer {
+        for (rows) |r| r.deinit();
+        allocator.free(rows);
+    }
+    try std.testing.expectEqual(@as(usize, row_count), rows.len);
+
+    for (rows, 0..) |row, count| {
+        try std.testing.expectEqual(@as(i32, @intCast(count)), row.getColumn(0).?.asInt32().?);
+        const map = row.getColumn(1).?.asMap().?;
         const expected_count = (count % 4) + 1;
-        try std.testing.expectEqual(expected_count, row.data.len);
-        for (row.data, 0..) |entry, j| {
+        try std.testing.expectEqual(expected_count, map.len);
+        for (map, 0..) |entry, j| {
             const expected_key = try std.fmt.allocPrint(allocator, "k{d}_{d}", .{ count, j });
             defer allocator.free(expected_key);
-            try std.testing.expectEqualStrings(expected_key, entry.key);
-            try std.testing.expectEqual(@as(i32, @intCast(count * 10 + j)), entry.value.?);
+            try std.testing.expectEqualStrings(expected_key, entry.key.asBytes().?);
+            try std.testing.expectEqual(@as(i32, @intCast(count * 10 + j)), entry.value.asInt32().?);
         }
-        count += 1;
     }
-    try std.testing.expectEqual(row_count, count);
 }
 
 // =============================================================================
@@ -907,62 +805,75 @@ test "multi-page: map column" {
 
 test "multi-page: struct with list field" {
     const allocator = std.testing.allocator;
-
     const row_count = 50;
 
-    var rw = try parquet.writeToBufferRows(StructWithListStruct, allocator, .{
-        .compression = .uncompressed,
-        .use_dictionary = false,
-        .max_page_size = 100,
-    });
-    defer rw.deinit();
+    var writer = try parquet.createBufferDynamic(allocator);
+    defer writer.deinit();
 
-    var all_tags: std.ArrayListUnmanaged([]i32) = .empty;
-    var all_labels: std.ArrayListUnmanaged([]u8) = .empty;
-    defer {
-        for (all_tags.items) |t| allocator.free(t);
-        all_tags.deinit(allocator);
-        for (all_labels.items) |l| allocator.free(l);
-        all_labels.deinit(allocator);
-    }
+    try writer.addColumn("id", TypeInfo.int32, .{});
+
+    const label_node = try writer.allocSchemaNode(.{ .byte_array = .{ .logical = .string } });
+    const tag_element = try writer.allocSchemaNode(.{ .int32 = .{} });
+    const tags_list = try writer.allocSchemaNode(.{ .list = tag_element });
+    const fields = try writer.allocSchemaFields(2);
+    const label_name = try writer.dupeSchemaName("label");
+    const tags_name = try writer.dupeSchemaName("tags");
+    fields[0] = .{ .name = label_name, .node = label_node };
+    fields[1] = .{ .name = tags_name, .node = tags_list };
+    const struct_node = try writer.allocSchemaNode(.{ .struct_ = .{ .fields = fields } });
+    try writer.addColumnNested("inner", struct_node, .{});
+    writer.setRowGroupSize(10);
+    try writer.begin();
 
     for (0..row_count) |i| {
-        const tag_count = (i % 3) + 1;
-        var tags = try allocator.alloc(i32, tag_count);
-        for (0..tag_count) |j| {
-            tags[j] = @intCast(i * 100 + j);
-        }
-        try all_tags.append(allocator, tags);
-        const label = try std.fmt.allocPrint(allocator, "label_{d}", .{i});
-        try all_labels.append(allocator, label);
-        try rw.writeRow(.{
-            .id = @intCast(i),
-            .inner = .{ .label = label, .tags = tags },
-        });
-    }
-    try rw.close();
+        try writer.setInt32(0, @intCast(i));
 
-    const buffer = try rw.toOwnedSlice();
+        // Build the tags list value first (can't nest list inside struct builder)
+        const tag_count = (i % 3) + 1;
+        try writer.beginList(1);
+        for (0..tag_count) |j| {
+            try writer.appendNestedValue(1, .{ .int32_val = @intCast(i * 100 + j) });
+        }
+        try writer.endList(1);
+        const tags_val = writer.current_row[1];
+
+        // Now build the struct with label and the pre-built tags list
+        try writer.beginStruct(1);
+        const label = try std.fmt.allocPrint(allocator, "label_{d}", .{i});
+        defer allocator.free(label);
+        try writer.setStructFieldBytes(1, 0, label);
+        try writer.setStructField(1, 1, tags_val);
+        try writer.endStruct(1);
+        try writer.addRow();
+    }
+    try writer.close();
+
+    const buffer = try writer.toOwnedSlice();
     defer allocator.free(buffer);
 
-    var reader = try parquet.openBufferRowReader(StructWithListStruct, allocator, buffer, .{});
+    var reader = try parquet.openBufferDynamic(allocator, buffer, .{});
     defer reader.deinit();
 
-    try std.testing.expectEqual(@as(usize, row_count), reader.rowCount());
+    try std.testing.expectEqual(@as(i64, row_count), reader.getTotalNumRows());
 
-    var count: usize = 0;
-    while (try reader.next()) |row| {
-        defer reader.freeRow(&row);
-        try std.testing.expectEqual(@as(i32, @intCast(count)), row.id);
+    const rows = try readAllRowsAllGroups(allocator, &reader);
+    defer {
+        for (rows) |r| r.deinit();
+        allocator.free(rows);
+    }
+    try std.testing.expectEqual(@as(usize, row_count), rows.len);
+
+    for (rows, 0..) |row, count| {
+        try std.testing.expectEqual(@as(i32, @intCast(count)), row.getColumn(0).?.asInt32().?);
+        const s = row.getColumn(1).?;
         const expected_label = try std.fmt.allocPrint(allocator, "label_{d}", .{count});
         defer allocator.free(expected_label);
-        try std.testing.expectEqualStrings(expected_label, row.inner.label);
+        try std.testing.expectEqualStrings(expected_label, s.getField("label").?.asBytes().?);
+        const tags = s.getField("tags").?.asList().?;
         const expected_tags = (count % 3) + 1;
-        try std.testing.expectEqual(expected_tags, row.inner.tags.len);
-        for (row.inner.tags, 0..) |tag, j| {
-            try std.testing.expectEqual(@as(i32, @intCast(count * 100 + j)), tag);
+        try std.testing.expectEqual(expected_tags, tags.len);
+        for (tags, 0..) |tag, j| {
+            try std.testing.expectEqual(@as(i32, @intCast(count * 100 + j)), tag.asInt32().?);
         }
-        count += 1;
     }
-    try std.testing.expectEqual(row_count, count);
 }

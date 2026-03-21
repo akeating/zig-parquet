@@ -917,6 +917,7 @@ pub const Writer = struct {
                 levels.max_rep,
                 self.current_offset,
                 col_def.codec,
+                .{},
             ) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.WriteError => return error.WriteError,

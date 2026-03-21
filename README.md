@@ -15,8 +15,8 @@ A native Parquet library built for portability, embeddability, and low deploymen
 - **Nested Types** - Lists, structs, maps, and arbitrary nesting depth
 - **Compression** - zstd, gzip, snappy, lz4, brotli (via C/C++ libraries)
 - **Logical Types** - Timestamps, dates, decimals, UUIDs, JSON, BSON, enums, geometry, geography
-- **Comptime Row API** - Type-safe `RowWriter(T)` / `RowReader(T)` with schema inference
-- **Dynamic Reader** - Schema-agnostic reading without comptime types
+- **Dynamic Row API** - Runtime `DynamicWriter` / `DynamicReader` for all types and arbitrary nesting depth
+- **Schema-Agnostic Reading** - Read any Parquet file without knowing the schema at compile time
 - **Column Statistics** - Min/max/null_count in column metadata
 - **Page-Level CRC Checksums** - Written by default, validated on read
 - **Key-Value Metadata** - Read and write arbitrary file-level metadata
@@ -86,18 +86,11 @@ exe.linkLibrary(parquet.artifact("parquet"));
 
 ### Row-Based API (Recommended)
 
-The easiest way to work with Parquet files - define a struct and let the library handle schema inference:
+Define your schema at runtime, write rows with typed setters, and read back dynamically:
 
 ```zig
 const std = @import("std");
 const parquet = @import("parquet");
-
-const SensorReading = struct {
-    sensor_id: i32,
-    timestamp: parquet.Timestamp,
-    temperature: f64,
-    location: ?[]const u8,  // nullable string
-};
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -109,17 +102,21 @@ pub fn main() !void {
         const file = try std.fs.cwd().createFile("sensors.parquet", .{});
         defer file.close();
 
-        var writer = try parquet.writeToFileRows(SensorReading, allocator, file, .{
-            .compression = .zstd,
-        });
+        var writer = try parquet.createFileDynamic(allocator, file);
         defer writer.deinit();
 
-        try writer.writeRow(.{
-            .sensor_id = 1,
-            .timestamp = parquet.Timestamp.fromMicros(1704067200000000),
-            .temperature = 23.5,
-            .location = "Building A",
-        });
+        try writer.addColumn("sensor_id", parquet.TypeInfo.int32, .{});
+        try writer.addColumn("timestamp", parquet.TypeInfo.timestamp_micros, .{});
+        try writer.addColumn("temperature", parquet.TypeInfo.double_, .{});
+        try writer.addColumn("location", parquet.TypeInfo.string, .{});
+        writer.setCompression(.zstd);
+        try writer.begin();
+
+        try writer.setInt32(0, 1);
+        try writer.setInt64(1, 1704067200000000);
+        try writer.setDouble(2, 23.5);
+        try writer.setBytes(3, "Building A");
+        try writer.addRow();
 
         try writer.close();
     }
@@ -129,12 +126,19 @@ pub fn main() !void {
         const file = try std.fs.cwd().openFile("sensors.parquet", .{});
         defer file.close();
 
-        var reader = try parquet.openFileRowReader(SensorReading, allocator, file, .{});
+        var reader = try parquet.openFileDynamic(allocator, file, .{});
         defer reader.deinit();
 
-        while (try reader.next()) |row| {
-            defer reader.freeRow(&row);
-            std.debug.print("Sensor {}: {}°C\n", .{ row.sensor_id, row.temperature });
+        const rows = try reader.readAllRows(0);
+        defer {
+            for (rows) |row| row.deinit();
+            allocator.free(rows);
+        }
+
+        for (rows) |row| {
+            const id = if (row.getColumn(0)) |v| v.asInt32() orelse 0 else 0;
+            const temp = if (row.getColumn(2)) |v| v.asDouble() orelse 0 else 0;
+            std.debug.print("Sensor {}: {d}°C\n", .{ id, temp });
         }
     }
 }
@@ -192,43 +196,41 @@ for (ids) |id| {
 
 ### Logical Types
 
-| Logical Type | Usage |
-|--------------|-------|
-| STRING | `[]const u8` with string annotation |
-| DATE | `parquet.Date` (days since epoch) |
-| TIMESTAMP | `parquet.Timestamp` (micros since epoch) |
-| TIME | `parquet.Time` (micros since midnight) |
-| UUID | `parquet.Uuid` (16-byte array) |
-| INTERVAL | `parquet.Interval` (months/days/millis) |
-| GEOMETRY | `[]const u8` (WKB) with geometry annotation |
-| GEOGRAPHY | `[]const u8` (WKB) with geography annotation |
-| DECIMAL | Configurable precision/scale |
-| JSON | String with JSON annotation |
-| BSON | Binary with BSON annotation |
-| ENUM | String with enum annotation |
+| Logical Type | TypeInfo Constant | Physical Storage |
+|--------------|-------------------|------------------|
+| STRING | `TypeInfo.string` | BYTE_ARRAY |
+| DATE | `TypeInfo.date` | INT32 (days since epoch) |
+| TIMESTAMP | `TypeInfo.timestamp_micros` | INT64 |
+| TIME | `TypeInfo.time_micros` | INT64 |
+| UUID | `TypeInfo.uuid` | FIXED_LEN_BYTE_ARRAY(16) |
+| INTERVAL | `TypeInfo.interval` | FIXED_LEN_BYTE_ARRAY(12) |
+| GEOMETRY | `TypeInfo.geometry` | BYTE_ARRAY (WKB) |
+| GEOGRAPHY | `TypeInfo.geography` | BYTE_ARRAY (WKB) |
+| DECIMAL | `TypeInfo.forDecimal(p, s)` | INT32/INT64/FIXED |
+| JSON | `TypeInfo.json` | BYTE_ARRAY |
+| BSON | `TypeInfo.bson` | BYTE_ARRAY |
+| ENUM | `TypeInfo.enum_` | BYTE_ARRAY |
 
 ### Nested Types
 
+Build arbitrary nested schemas at runtime using `SchemaNode`:
+
 ```zig
-const Order = struct {
-    order_id: i64,
-    items: []const Item,           // LIST
-    shipping: Address,             // STRUCT
-    metadata: ?[]const u8,         // Nullable
-};
-
-const Item = struct {
-    product_id: i32,
-    quantity: i32,
-    price: f64,
-};
-
-const Address = struct {
-    street: []const u8,
-    city: []const u8,
-    zip: []const u8,
-};
+// list<struct<product_id: i32, quantity: i32, price: f64>>
+const pid = try writer.allocSchemaNode(.{ .int32 = .{} });
+const qty = try writer.allocSchemaNode(.{ .int32 = .{} });
+const price = try writer.allocSchemaNode(.{ .double = .{} });
+var fields = try writer.allocSchemaFields(3);
+fields[0] = .{ .name = try writer.dupeSchemaName("product_id"), .node = pid };
+fields[1] = .{ .name = try writer.dupeSchemaName("quantity"), .node = qty };
+fields[2] = .{ .name = try writer.dupeSchemaName("price"), .node = price };
+const item = try writer.allocSchemaNode(.{ .struct_ = .{ .fields = fields } });
+const items = try writer.allocSchemaNode(.{ .list = item });
+try writer.addColumnNested("items", items, .{});
 ```
+
+Supports lists, structs, maps, and arbitrary nesting depth (e.g., `list<map<string, list<struct<...>>>>`).
+See `examples/basic/03_nested_types.zig` for a complete example.
 
 ## Compression
 
@@ -242,12 +244,36 @@ All major Parquet compression codecs are supported:
 | lz4 | lz4 1.10.0 | Very fast |
 | brotli | brotli 1.2.0 | High ratio |
 
-Set per-column or use `RowWriterOptions`:
+Set compression on the writer:
 
 ```zig
-var writer = try parquet.writeToFileRows(T, allocator, file, .{
+var writer = try parquet.createFileDynamic(allocator, file);
+writer.setCompression(.zstd);
+```
+
+### Per-Column and Per-Leaf Options
+
+Set options per column at definition time, or per leaf path for nested types:
+
+```zig
+// Per-column options via addColumn
+try writer.addColumn("timestamp", parquet.TypeInfo.int64, .{
+    .encoding = .delta_binary_packed,
     .compression = .zstd,
 });
+
+// Per-leaf options for nested columns via setPathProperties
+try writer.addColumnNested("address", struct_node, .{});
+try writer.setPathProperties("address.city", .{ .compression = .zstd });
+try writer.setPathProperties("address.zip", .{ .use_dictionary = false });
+```
+
+Global defaults apply to any column/leaf without an explicit override:
+
+```zig
+writer.setUseDictionary(false);        // disable dictionary encoding globally
+writer.setIntEncoding(.delta_binary_packed);  // default for int columns
+writer.setMaxPageSize(1_048_576);      // 1MB page size limit
 ```
 
 ## Spec Coverage
@@ -257,7 +283,7 @@ var writer = try parquet.writeToFileRows(T, allocator, file, .{
 | **Physical Types** | | |
 | BOOLEAN, INT32, INT64, FLOAT, DOUBLE | ✅ | All primitive types |
 | BYTE_ARRAY, FIXED_LEN_BYTE_ARRAY | ✅ | Variable and fixed-length binary |
-| INT96 | ✅ | Legacy timestamp support (read/write); exposed as i64 nanos in C/WASM APIs |
+| INT96 | ✅ | Legacy timestamp support; read always, write via column API only (not DynamicWriter) |
 | **Encodings** | | |
 | PLAIN | ✅ | All physical types |
 | RLE / BIT_PACKED | ✅ | Levels, dictionary indices, booleans |
@@ -308,6 +334,17 @@ var writer = try parquet.writeToFileRows(T, allocator, file, .{
 Legend: ✅ Supported | ⏳ Planned | 🔍 Under review | ❌ Unsupported
 
 Files containing unsupported features return explicit errors rather than silently producing incorrect results.
+
+## Known Limitations
+
+**Writer:**
+- `setBytes` does not validate length for `FIXED_LEN_BYTE_ARRAY` columns
+
+**Reader:**
+- No column projection (all columns are read)
+- No predicate pushdown or row group filtering
+- No streaming/iterator API (all rows materialized at once)
+- INT96 dictionary encoding is not handled
 
 ## WASM Support
 

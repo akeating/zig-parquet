@@ -41,22 +41,19 @@ const is_wasm = builtin.cpu.arch == .wasm32 or builtin.cpu.arch == .wasm64;
 //   Reading:
 //     parquet.openFile(allocator, file)                        -> Reader
 //     parquet.openBuffer(allocator, data)                      -> Reader
-//     parquet.openFileRowReader(T, allocator, file, opts)      -> RowReader(T)
-//     parquet.openBufferRowReader(T, allocator, data, opts)    -> RowReader(T)
 //     parquet.openFileDynamic(allocator, file, opts)           -> DynamicReader
 //     parquet.openBufferDynamic(allocator, data, opts)         -> DynamicReader
 //
 //   Writing:
 //     parquet.writeToFile(allocator, file, columns)            -> Writer
 //     parquet.writeToBuffer(allocator, columns)                -> Writer
-//     parquet.writeToFileRows(T, allocator, file, opts)        -> RowWriter(T)
-//     parquet.writeToBufferRows(T, allocator, opts)            -> RowWriter(T)
+//     parquet.createFileDynamic(allocator, file)               -> DynamicWriter
+//     parquet.createBufferDynamic(allocator)                   -> DynamicWriter
 //
 // Advanced — transport-neutral constructors on core types:
 //     Reader.initFromSeekable(allocator, seekable)
 //     Writer.initWithTarget(allocator, target, columns)
-//     RowReader(T).initFromSeekable(allocator, seekable, opts)
-//     RowWriter(T).initWithTarget(allocator, target, opts)
+//     DynamicWriter.init(allocator, target)
 //     DynamicReader.initFromSeekable(allocator, seekable, opts)
 //
 // Internals — low-level codec/encoding/format access:
@@ -97,10 +94,7 @@ const reader_mod = @import("core/reader.zig");
 pub const Reader = reader_mod.Reader;
 pub const ListColumn = reader_mod.ListColumn;
 pub const MapColumn = reader_mod.MapColumn;
-/// Column-level reader MapEntry (uses Optional(V) for values).
-/// For RowWriter/RowReader map fields, use the top-level MapEntry instead.
 pub const ColumnMapEntry = reader_mod.MapEntry;
-/// Map entry type for RowWriter/RowReader struct fields.
 pub const MapEntry = types.MapEntry;
 
 // Writer (core type)
@@ -117,17 +111,19 @@ pub const WriteTargetWriter = write_target_mod.WriteTargetWriter;
 
 // Format types (Thrift-decoded Parquet structures)
 pub const format = @import("core/format.zig");
+pub const Encoding = format.Encoding;
+pub const CompressionCodec = format.CompressionCodec;
 
-// Row Writer / Row Reader (high-level row-oriented APIs)
-const reader_module = @import("core/reader_mod.zig");
+// Dynamic Writer (runtime row-oriented writing)
 const writer_module = @import("core/writer_mod.zig");
-pub const RowWriter = writer_module.RowWriter;
-pub const RowWriterOptions = writer_module.RowWriterOptions;
-pub const RowReader = reader_module.RowReader;
-pub const RowReaderOptions = reader_module.RowReaderOptions;
-pub const RowReaderError = reader_module.RowReaderError;
+pub const DynamicWriter = writer_module.DynamicWriter;
+pub const DynamicWriterError = writer_module.DynamicWriterError;
+pub const TypeInfo = writer_module.TypeInfo;
+pub const ColumnType = writer_module.ColumnType;
+pub const ColumnProperties = writer_module.ColumnProperties;
 
 // Dynamic Reader (schema-agnostic row reading)
+const reader_module = @import("core/reader_mod.zig");
 pub const DynamicReader = reader_module.DynamicReader;
 pub const DynamicReaderError = reader_module.DynamicReaderError;
 pub const DynamicReaderOptions = reader_module.DynamicReaderOptions;
@@ -156,26 +152,14 @@ pub const openFile = api_reader.openFile;
 pub const openBuffer = api_reader.openBuffer;
 pub const openFileDynamic = api_reader.openFileDynamic;
 pub const openBufferDynamic = api_reader.openBufferDynamic;
-pub const openFileRowReader = api_reader.openFileRowReader;
-pub const openBufferRowReader = api_reader.openBufferRowReader;
 pub const writeToFile = api_writer.writeToFile;
 pub const writeToBuffer = api_writer.writeToBuffer;
-pub const writeToFileRows = api_writer.writeToFileRows;
-pub const writeToBufferRows = api_writer.writeToBufferRows;
+pub const createFileDynamic = api_writer.createFileDynamic;
+pub const createBufferDynamic = api_writer.createBufferDynamic;
 
-// Logical type wrappers for RowWriter/RowReader
-pub const Timestamp = writer_module.row_writer.Timestamp;
-pub const TimestampMicros = writer_module.row_writer.TimestampMicros;
-pub const TimestampInt96 = writer_module.row_writer.TimestampInt96;
-pub const Int96 = writer_module.row_writer.Int96;
-pub const Date = writer_module.row_writer.Date;
-pub const Uuid = writer_module.row_writer.Uuid;
-pub const Interval = writer_module.row_writer.Interval;
 pub const Decimal = types.Decimal;
 pub const DecimalValue = types.DecimalValue;
-pub const Time = writer_module.row_writer.Time;
-pub const TimeMicros = writer_module.row_writer.TimeMicros;
-pub const TimeUnit = writer_module.row_writer.TimeUnit;
+pub const Int96 = types.Int96;
 
 // ============================================================================
 // Internals — Low-level modules for advanced usage

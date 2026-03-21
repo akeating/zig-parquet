@@ -258,6 +258,109 @@ pub fn writeDataPageWithLevels(
     };
 }
 
+/// Like writeDataPageWithLevels but uses a specified value encoding instead of PLAIN.
+pub fn writeDataPageWithLevelsAndEncoding(
+    allocator: std.mem.Allocator,
+    comptime T: type,
+    values: []const T,
+    def_levels: []const u32,
+    rep_levels: []const u32,
+    max_def_level: u8,
+    max_rep_level: u8,
+    encoding: format.Encoding,
+) PageWriteError!DataPageResult {
+    const encoded_values = try encodeValuesWithEncoding(allocator, T, values, encoding);
+    defer allocator.free(encoded_values);
+
+    var rep_level_data: ?[]u8 = null;
+    if (max_rep_level > 0) {
+        rep_level_data = try rle_encoder.encodeLevelsWithLength(allocator, rep_levels, max_rep_level);
+    }
+    defer if (rep_level_data) |d| allocator.free(d);
+
+    var def_level_data: ?[]u8 = null;
+    if (max_def_level > 0) {
+        def_level_data = try rle_encoder.encodeLevelsWithLength(allocator, def_levels, max_def_level);
+    }
+    defer if (def_level_data) |d| allocator.free(d);
+
+    const rep_size = if (rep_level_data) |d| d.len else 0;
+    const def_size = if (def_level_data) |d| d.len else 0;
+    const total_size = rep_size + def_size + encoded_values.len;
+    const result = try allocator.alloc(u8, total_size);
+
+    var offset: usize = 0;
+
+    if (rep_level_data) |d| {
+        @memcpy(result[offset..][0..d.len], d);
+        offset += d.len;
+    }
+
+    if (def_level_data) |d| {
+        @memcpy(result[offset..][0..d.len], d);
+        offset += d.len;
+    }
+
+    @memcpy(result[offset..], encoded_values);
+
+    return .{
+        .data = result,
+        .num_values = def_levels.len,
+        .num_non_null = values.len,
+    };
+}
+
+/// Like writeDataPageWithLevelsByteArray but uses a specified value encoding instead of PLAIN.
+pub fn writeDataPageWithLevelsByteArrayWithEncoding(
+    allocator: std.mem.Allocator,
+    values: []const []const u8,
+    def_levels: []const u32,
+    rep_levels: []const u32,
+    max_def_level: u8,
+    max_rep_level: u8,
+    encoding: format.Encoding,
+) PageWriteError!DataPageResult {
+    const encoded_values = try encodeByteArraysWithEncoding(allocator, values, encoding);
+    defer allocator.free(encoded_values);
+
+    var rep_level_data: ?[]u8 = null;
+    if (max_rep_level > 0) {
+        rep_level_data = try rle_encoder.encodeLevelsWithLength(allocator, rep_levels, max_rep_level);
+    }
+    defer if (rep_level_data) |d| allocator.free(d);
+
+    var def_level_data: ?[]u8 = null;
+    if (max_def_level > 0) {
+        def_level_data = try rle_encoder.encodeLevelsWithLength(allocator, def_levels, max_def_level);
+    }
+    defer if (def_level_data) |d| allocator.free(d);
+
+    const rep_size = if (rep_level_data) |d| d.len else 0;
+    const def_size = if (def_level_data) |d| d.len else 0;
+    const total_size = rep_size + def_size + encoded_values.len;
+    const result = try allocator.alloc(u8, total_size);
+
+    var offset: usize = 0;
+
+    if (rep_level_data) |d| {
+        @memcpy(result[offset..][0..d.len], d);
+        offset += d.len;
+    }
+
+    if (def_level_data) |d| {
+        @memcpy(result[offset..][0..d.len], d);
+        offset += d.len;
+    }
+
+    @memcpy(result[offset..], encoded_values);
+
+    return .{
+        .data = result,
+        .num_values = def_levels.len,
+        .num_non_null = values.len,
+    };
+}
+
 /// Write a data page for byte array values with definition and repetition levels.
 /// This is used for nested types (structs, lists) with string/binary fields.
 pub fn writeDataPageWithLevelsByteArray(

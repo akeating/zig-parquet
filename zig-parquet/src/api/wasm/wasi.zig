@@ -33,6 +33,7 @@ const WriterHandle = handles.WriterHandle;
 const RowReaderHandle = handles.RowReaderHandle;
 const RowWriterHandle = handles.RowWriterHandle;
 const TypeInfo = handles.TypeInfo;
+const typeInfoFromZpType = handles.typeInfoFromZpType;
 const Value = handles.Value;
 const SchemaNode = handles.SchemaNode;
 const SeekableReader = seekable_reader_mod.SeekableReader;
@@ -1399,7 +1400,7 @@ export fn zp_row_writer_open_callbacks(
 export fn zp_row_writer_add_column(handle_ptr: ?*anyopaque, name: ?[*:0]const u8, col_type: i32) i32 {
     const handle = castHandle(RowWriterHandle, handle_ptr) orelse return err.ZP_ERROR_INVALID_ARGUMENT;
     const n = name orelse return err.ZP_ERROR_INVALID_ARGUMENT;
-    const info = TypeInfo.fromZpType(col_type) orelse {
+    const info = typeInfoFromZpType(col_type) orelse {
         handle.err_ctx.setError(err.ZP_ERROR_INVALID_ARGUMENT, "unknown column type");
         return handle.err_ctx.code;
     };
@@ -1477,7 +1478,7 @@ export fn zp_row_writer_add_column_geography(handle_ptr: ?*anyopaque, name: ?[*:
 
 export fn zp_row_writer_set_compression(handle_ptr: ?*anyopaque, codec: i32) i32 {
     const handle = castHandle(RowWriterHandle, handle_ptr) orelse return err.ZP_ERROR_INVALID_ARGUMENT;
-    if (handle.began) {
+    if (handle.writer.began) {
         handle.err_ctx.setError(err.ZP_ERROR_INVALID_STATE, "cannot set compression after begin");
         return handle.err_ctx.code;
     }
@@ -1485,13 +1486,13 @@ export fn zp_row_writer_set_compression(handle_ptr: ?*anyopaque, codec: i32) i32
         handle.err_ctx.setError(err.ZP_ERROR_INVALID_ARGUMENT, "unknown compression codec");
         return handle.err_ctx.code;
     };
-    handle.default_codec = cc;
+    handle.writer.setCompression(cc);
     return ZP_OK;
 }
 
 export fn zp_row_writer_set_column_codec(handle_ptr: ?*anyopaque, col_index: i32, codec: i32) i32 {
     const handle = castHandle(RowWriterHandle, handle_ptr) orelse return err.ZP_ERROR_INVALID_ARGUMENT;
-    if (handle.began) {
+    if (handle.writer.began) {
         handle.err_ctx.setError(err.ZP_ERROR_INVALID_STATE, "cannot set column codec after begin");
         return handle.err_ctx.code;
     }
@@ -1503,15 +1504,14 @@ export fn zp_row_writer_set_column_codec(handle_ptr: ?*anyopaque, col_index: i32
         handle.err_ctx.setError(err.ZP_ERROR_INVALID_ARGUMENT, "column index out of range");
         return handle.err_ctx.code;
     };
-    if (idx >= handle.pending_columns.items.len) {
-        handle.err_ctx.setError(err.ZP_ERROR_INVALID_ARGUMENT, "column index out of range");
-        return handle.err_ctx.code;
-    }
     const cc = format.CompressionCodec.fromInt(codec) catch {
         handle.err_ctx.setError(err.ZP_ERROR_INVALID_ARGUMENT, "unknown compression codec");
         return handle.err_ctx.code;
     };
-    handle.pending_columns.items[idx].codec = cc;
+    handle.writer.setColumnCompression(idx, cc) catch |e| {
+        handle.err_ctx.setErrorFmt(err.mapError(e), "setColumnCodec failed: {s}", .{err.errorMessage(e)});
+        return handle.err_ctx.code;
+    };
     return ZP_OK;
 }
 
@@ -1521,10 +1521,11 @@ export fn zp_row_writer_set_row_group_size(handle_ptr: ?*anyopaque, max_rows: i6
         handle.err_ctx.setError(err.ZP_ERROR_INVALID_ARGUMENT, "row group size must be positive");
         return handle.err_ctx.code;
     }
-    handle.row_group_row_limit = safe.castTo(usize, max_rows) catch {
+    const limit = safe.castTo(usize, max_rows) catch {
         handle.err_ctx.setError(err.ZP_ERROR_INVALID_ARGUMENT, "row group size out of range");
         return handle.err_ctx.code;
     };
+    handle.writer.setRowGroupSize(limit);
     return ZP_OK;
 }
 
@@ -1545,7 +1546,7 @@ export fn zp_row_writer_set_kv_metadata(handle_ptr: ?*anyopaque, key: ?[*]const 
 
 export fn zp_schema_primitive(handle_ptr: ?*anyopaque, zp_type: i32) ?*const anyopaque {
     const handle = castHandle(RowWriterHandle, handle_ptr) orelse return null;
-    const info = TypeInfo.fromZpType(zp_type) orelse return null;
+    const info = typeInfoFromZpType(zp_type) orelse return null;
     const node = schemaNodeFromTypeInfo(handle, info) catch return null;
     return @ptrCast(node);
 }

@@ -543,33 +543,22 @@ test "dictionary cardinality fallback" {
 
     const file_path = "dictionary_cardinality_fallback.parquet";
 
-        // Write
+    // Write using DynamicWriter with high-cardinality data
     {
         const file = try tmp_dir.dir.createFile(file_path, .{});
         defer file.close();
 
-        // 1. Setup options with a strict cardinality threshold
-        const options = parquet.RowWriterOptions{
-            .dictionary_cardinality_threshold = 0.5, // 50% unique values
-        };
-
-        const Record = struct {
-            id: i64,
-        };
-
-        // 3. Initialize RowWriter
-        var writer = try parquet.writeToFileRows(Record, allocator, file, options);
+        var writer = try parquet.createFileDynamic(allocator, file);
         defer writer.deinit();
 
-        // 4. Generate high-cardinality data
-        // We write > 1024 values to trigger the threshold check
-        var records: [2000]Record = undefined;
-        for (&records, 0..) |*rec, i| {
-            rec.id = @as(i64, @intCast(i)); // All unique values -> 100% cardinality
+        try writer.addColumn("id", parquet.TypeInfo.int64, .{});
+        try writer.begin();
+
+        for (0..2000) |i| {
+            try writer.setInt64(0, @as(i64, @intCast(i)));
+            try writer.addRow();
         }
 
-        // 5. Write the batch
-        try writer.writeRows(&records);
         try writer.close();
     }
 
@@ -584,24 +573,6 @@ test "dictionary cardinality fallback" {
         // Verify metadata
         try std.testing.expectEqual(@as(i64, 2000), reader.metadata.num_rows);
 
-        // Verify the column actually fell back to plain encoding
-        // We can inspect the encodings of the first column chunk
-        const cc = reader.metadata.row_groups[0].columns[0];
-        const meta = cc.meta_data orelse return error.MissingMetaData;
-
-        // If it fell back to PLAIN, the dictionary page encoding shouldn't be the primary one.
-        // Usually, if dictionary is aborted early, the encodings array might just have PLAIN, RLE.
-        // It should NOT have PLAIN_DICTIONARY or RLE_DICTIONARY as the primary data page encoding.
-        var has_dict = false;
-        for (meta.encodings) |enc| {
-            if (enc == .plain_dictionary or enc == .rle_dictionary) {
-                has_dict = true;
-            }
-        }
-        
-        // It might still have PLAIN_DICTIONARY from the partially constructed dictionary page
-        // but let's just make sure the values are readable and correct.
-        
         const col = try reader.readColumn(0, i64);
         defer allocator.free(col);
 

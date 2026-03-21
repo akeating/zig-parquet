@@ -9,8 +9,7 @@ const format = parquet.format;
 const Reader = parquet.Reader;
 const Writer = parquet.Writer;
 const Optional = parquet.Optional;
-const RowWriter = @import("../core/row_writer.zig").RowWriter;
-const RowReader = @import("../core/row_reader.zig").RowReader;
+const Interval = parquet.types.Interval;
 
 const output_dir = "../test-files-arrow/interop";
 
@@ -118,12 +117,8 @@ test "PyArrow interop: read INT96 timestamp" {
     };
     defer file.close();
 
-    const Int96Row = struct {
-        ts_col: ?parquet.TimestampInt96,
-    };
-
-    var row_reader = try parquet.openFileRowReader(Int96Row, allocator, file, .{});
-    defer row_reader.deinit();
+    var reader = try parquet.openFileDynamic(allocator, file, .{});
+    defer reader.deinit();
 
     const expected_nanos = [_]?i64{
         1705314600000000000, // 2024-01-15 10:30:00 UTC
@@ -133,14 +128,21 @@ test "PyArrow interop: read INT96 timestamp" {
         1720117845123456000, // 2024-07-04 18:30:45.123456 UTC
     };
 
-    for (expected_nanos) |expected| {
-        var row = (try row_reader.next()) orelse return error.ExpectedRow;
-        defer row_reader.freeRow(&row);
+    const rows = try reader.readAllRows(0);
+    defer {
+        for (rows) |row| row.deinit();
+        allocator.free(rows);
+    }
+
+    try std.testing.expectEqual(@as(usize, 5), rows.len);
+
+    for (expected_nanos, 0..) |expected, i| {
+        const val = rows[i].getColumn(0).?;
         if (expected) |exp| {
-            try std.testing.expect(row.ts_col != null);
-            try std.testing.expectEqual(exp, row.ts_col.?.value);
+            try std.testing.expect(!val.isNull());
+            try std.testing.expectEqual(exp, val.asInt64().?);
         } else {
-            try std.testing.expect(row.ts_col == null);
+            try std.testing.expect(val.isNull());
         }
     }
 }
@@ -210,29 +212,29 @@ test "PyArrow interop: write UUID" {
 
     try ensureOutputDir();
 
-    const UuidRow = struct {
-        id: ?parquet.Uuid,
-    };
-
-    const uuid1 = parquet.Uuid{ .bytes = .{ 0x12, 0x34, 0x56, 0x78, 0x12, 0x34, 0x56, 0x78, 0x12, 0x34, 0x56, 0x78, 0x12, 0x34, 0x56, 0x78 } };
-    const uuid2 = parquet.Uuid{ .bytes = .{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 } };
-    const uuid3 = parquet.Uuid{ .bytes = .{ 0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6, 0x78, 0x90, 0xab, 0xcd, 0xef, 0x12, 0x34, 0x56, 0x78, 0x90 } };
-
-    const rows = [_]UuidRow{
-        .{ .id = uuid1 },
-        .{ .id = uuid2 },
-        .{ .id = null },
-        .{ .id = uuid3 },
-    };
+    const uuid1 = [_]u8{ 0x12, 0x34, 0x56, 0x78, 0x12, 0x34, 0x56, 0x78, 0x12, 0x34, 0x56, 0x78, 0x12, 0x34, 0x56, 0x78 };
+    const uuid2 = [_]u8{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+    const uuid3 = [_]u8{ 0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6, 0x78, 0x90, 0xab, 0xcd, 0xef, 0x12, 0x34, 0x56, 0x78, 0x90 };
 
     var file = try std.fs.cwd().createFile(output_dir ++ "/uuid.parquet", .{});
     defer file.close();
 
-    var rw = try parquet.writeToFileRows(UuidRow, allocator, file, .{});
-    defer rw.deinit();
+    var dw = try parquet.createFileDynamic(allocator, file);
+    defer dw.deinit();
 
-    try rw.writeRows(&rows);
-    try rw.close();
+    try dw.addColumn("id", parquet.TypeInfo.uuid, .{});
+    try dw.begin();
+
+    try dw.setBytes(0, &uuid1);
+    try dw.addRow();
+    try dw.setBytes(0, &uuid2);
+    try dw.addRow();
+    try dw.setNull(0);
+    try dw.addRow();
+    try dw.setBytes(0, &uuid3);
+    try dw.addRow();
+
+    try dw.close();
 }
 
 test "PyArrow interop: write Interval" {
@@ -240,25 +242,29 @@ test "PyArrow interop: write Interval" {
 
     try ensureOutputDir();
 
-    const IntervalRow = struct {
-        duration: ?parquet.Interval,
-    };
-
-    const rows = [_]IntervalRow{
-        .{ .duration = parquet.Interval.fromComponents(1, 15, 3600000) },
-        .{ .duration = parquet.Interval.fromComponents(0, 0, 0) },
-        .{ .duration = null },
-        .{ .duration = parquet.Interval.fromComponents(12, 365, 86400000) },
-    };
-
     var file = try std.fs.cwd().createFile(output_dir ++ "/interval.parquet", .{});
     defer file.close();
 
-    var rw = try parquet.writeToFileRows(IntervalRow, allocator, file, .{});
-    defer rw.deinit();
+    var dw = try parquet.createFileDynamic(allocator, file);
+    defer dw.deinit();
 
-    try rw.writeRows(&rows);
-    try rw.close();
+    try dw.addColumn("duration", parquet.TypeInfo.interval, .{});
+    try dw.begin();
+
+    const iv1 = Interval.fromComponents(1, 15, 3600000);
+    const iv2 = Interval.fromComponents(0, 0, 0);
+    const iv3 = Interval.fromComponents(12, 365, 86400000);
+
+    try dw.setBytes(0, &iv1.toBytes());
+    try dw.addRow();
+    try dw.setBytes(0, &iv2.toBytes());
+    try dw.addRow();
+    try dw.setNull(0);
+    try dw.addRow();
+    try dw.setBytes(0, &iv3.toBytes());
+    try dw.addRow();
+
+    try dw.close();
 }
 
 test "PyArrow interop: write TimestampInt96" {
@@ -266,25 +272,88 @@ test "PyArrow interop: write TimestampInt96" {
 
     try ensureOutputDir();
 
-    const Int96Row = struct {
-        ts: ?parquet.TimestampInt96,
-    };
-
-    const rows = [_]Int96Row{
-        .{ .ts = parquet.TimestampInt96.fromNanos(1705314600000000000) }, // 2024-01-15 10:30:00 UTC
-        .{ .ts = parquet.TimestampInt96.fromNanos(0) }, // epoch
-        .{ .ts = null },
-        .{ .ts = parquet.TimestampInt96.fromNanos(961070400000000000) }, // 2000-06-15 12:00:00 UTC
-    };
-
     var file = try std.fs.cwd().createFile(output_dir ++ "/int96_timestamp.parquet", .{});
     defer file.close();
 
-    var rw = try parquet.writeToFileRows(Int96Row, allocator, file, .{});
-    defer rw.deinit();
+    // INT96 is a special physical type not exposed through the high-level Writer.
+    // Use column_writer directly for the data, then assemble the footer manually.
+    const column_writer = parquet.internals.writer.column_writer;
 
-    try rw.writeRows(&rows);
-    try rw.close();
+    const FileTarget = parquet.io.FileTarget;
+    var ft = FileTarget.init(file);
+    const write_target = ft.target();
+    var target_writer = parquet.WriteTargetWriter.init(write_target);
+    const writer = target_writer.writer();
+
+    // Write PAR1 magic
+    try writer.writeAll(format.PARQUET_MAGIC);
+
+    const nano_vals = [_]Optional(i64){
+        .{ .value = 1705314600000000000 }, // 2024-01-15 10:30:00 UTC
+        .{ .value = 0 }, // epoch
+        .null_value,
+        .{ .value = 961070400000000000 }, // 2000-06-15 12:00:00 UTC
+    };
+
+    const result = try column_writer.writeColumnChunkInt96OptionalWithPathArray(
+        allocator, writer, &.{"ts"}, &nano_vals, true, 4, .uncompressed, true,
+    );
+    try target_writer.flush();
+
+    // Write footer
+    const thrift = parquet.internals.thrift;
+    const schema = [_]format.SchemaElement{
+        .{ .type_ = null, .type_length = null, .repetition_type = null, .name = "schema", .num_children = 1, .converted_type = null, .scale = null, .precision = null, .field_id = null, .logical_type = null },
+        .{ .type_ = .int96, .type_length = null, .repetition_type = .optional, .name = "ts", .num_children = null, .converted_type = null, .scale = null, .precision = null, .field_id = null, .logical_type = null },
+    };
+
+    const col_chunk = format.ColumnChunk{
+        .file_path = null,
+        .file_offset = result.file_offset,
+        .meta_data = result.metadata,
+    };
+
+    const row_group = format.RowGroup{
+        .columns = @constCast(&[_]format.ColumnChunk{col_chunk}),
+        .total_byte_size = result.metadata.total_compressed_size,
+        .num_rows = 4,
+        .sorting_columns = null,
+        .file_offset = 4,
+        .total_compressed_size = result.metadata.total_compressed_size,
+        .ordinal = 0,
+    };
+
+    const file_metadata = format.FileMetaData{
+        .version = 1,
+        .schema = @constCast(&schema),
+        .num_rows = 4,
+        .row_groups = @constCast(&[_]format.RowGroup{row_group}),
+        .key_value_metadata = null,
+        .created_by = "zig-parquet",
+    };
+
+    var thrift_writer = thrift.CompactWriter.init(allocator);
+    defer thrift_writer.deinit();
+    try file_metadata.serialize(&thrift_writer);
+    const footer_bytes = thrift_writer.getWritten();
+
+    try writer.writeAll(footer_bytes);
+    var len_buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &len_buf, @intCast(footer_bytes.len), .little);
+    try writer.writeAll(&len_buf);
+    try writer.writeAll(format.PARQUET_MAGIC);
+    try target_writer.flush();
+
+    // Clean up the column chunk metadata
+    allocator.free(result.metadata.encodings);
+    for (result.metadata.path_in_schema) |p| allocator.free(p);
+    allocator.free(result.metadata.path_in_schema);
+    if (result.metadata.statistics) |stats| {
+        if (stats.max) |m| allocator.free(m);
+        if (stats.min) |m| allocator.free(m);
+        if (stats.max_value) |m| allocator.free(m);
+        if (stats.min_value) |m| allocator.free(m);
+    }
 }
 
 test "PyArrow interop: write Geometry" {
@@ -657,28 +726,65 @@ test "PyArrow interop: write nested" {
 
     try ensureOutputDir();
 
-    const Point = struct {
-        x: i32,
-        y: i32,
-    };
-    const NestedRow = struct {
-        int_list: ?[]const i32,
-        point: Point,
-    };
-
     var file = try std.fs.cwd().createFile(output_dir ++ "/nested.parquet", .{});
     defer file.close();
 
-    var rw = try parquet.writeToFileRows(NestedRow, allocator, file, .{});
-    defer rw.deinit();
+    var dw = try parquet.createFileDynamic(allocator, file);
+    defer dw.deinit();
 
-    const rows = [_]NestedRow{
-        .{ .int_list = &[_]i32{ 1, 2, 3 }, .point = .{ .x = 10, .y = 11 } },
-        .{ .int_list = &[_]i32{ 4, 5 }, .point = .{ .x = 20, .y = 21 } },
-        .{ .int_list = null, .point = .{ .x = 0, .y = 0 } },
-        .{ .int_list = &[_]i32{}, .point = .{ .x = 30, .y = 31 } },
-    };
+    // int_list: optional list of int32
+    const list_node = try dw.allocSchemaNode(.{ .optional =
+        try dw.allocSchemaNode(.{ .list = try dw.allocSchemaNode(.{ .int32 = .{} }) }) });
+    try dw.addColumnNested("int_list", list_node, .{});
 
-    try rw.writeRows(&rows);
-    try rw.close();
+    // point: struct { x: i32, y: i32 }
+    const fields = try dw.allocSchemaFields(2);
+    fields[0] = .{ .name = try dw.dupeSchemaName("x"), .node = try dw.allocSchemaNode(.{ .int32 = .{} }) };
+    fields[1] = .{ .name = try dw.dupeSchemaName("y"), .node = try dw.allocSchemaNode(.{ .int32 = .{} }) };
+    const struct_node = try dw.allocSchemaNode(.{ .struct_ = .{ .fields = fields } });
+    try dw.addColumnNested("point", struct_node, .{});
+
+    try dw.begin();
+
+    // Row 0: int_list=[1,2,3], point={x:10, y:11}
+    try dw.beginList(0);
+    try dw.appendNestedValue(0, .{ .int32_val = 1 });
+    try dw.appendNestedValue(0, .{ .int32_val = 2 });
+    try dw.appendNestedValue(0, .{ .int32_val = 3 });
+    try dw.endList(0);
+    try dw.beginStruct(1);
+    try dw.setStructField(1, 0, .{ .int32_val = 10 });
+    try dw.setStructField(1, 1, .{ .int32_val = 11 });
+    try dw.endStruct(1);
+    try dw.addRow();
+
+    // Row 1: int_list=[4,5], point={x:20, y:21}
+    try dw.beginList(0);
+    try dw.appendNestedValue(0, .{ .int32_val = 4 });
+    try dw.appendNestedValue(0, .{ .int32_val = 5 });
+    try dw.endList(0);
+    try dw.beginStruct(1);
+    try dw.setStructField(1, 0, .{ .int32_val = 20 });
+    try dw.setStructField(1, 1, .{ .int32_val = 21 });
+    try dw.endStruct(1);
+    try dw.addRow();
+
+    // Row 2: int_list=null, point={x:0, y:0}
+    try dw.setNull(0);
+    try dw.beginStruct(1);
+    try dw.setStructField(1, 0, .{ .int32_val = 0 });
+    try dw.setStructField(1, 1, .{ .int32_val = 0 });
+    try dw.endStruct(1);
+    try dw.addRow();
+
+    // Row 3: int_list=[] (empty list), point={x:30, y:31}
+    try dw.beginList(0);
+    try dw.endList(0);
+    try dw.beginStruct(1);
+    try dw.setStructField(1, 0, .{ .int32_val = 30 });
+    try dw.setStructField(1, 1, .{ .int32_val = 31 });
+    try dw.endStruct(1);
+    try dw.addRow();
+
+    try dw.close();
 }

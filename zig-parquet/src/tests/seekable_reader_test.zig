@@ -369,7 +369,7 @@ test "DynamicReader.initFromBuffer reads real Parquet file" {
     try std.testing.expect(rows.len > 0);
 }
 
-test "RowReader.initFromBuffer reads real Parquet file" {
+test "DynamicReader.initFromBuffer reads real Parquet file with row iteration" {
     const allocator = std.testing.allocator;
 
     // Read the Parquet file into memory
@@ -381,30 +381,17 @@ test "RowReader.initFromBuffer reads real Parquet file" {
     );
     defer allocator.free(file_data);
 
-    // Define a struct matching the schema
-    const TestRow = struct {
-        bool_col: ?bool,
-        int32_col: ?i32,
-        int64_col: ?i64,
-        float_col: ?f32,
-        double_col: ?f64,
-        string_col: ?[]const u8,
-        binary_col: ?[]const u8,
-        fixed_binary_col: ?[]const u8,
-    };
-
-    var reader = try parquet.openBufferRowReader(TestRow, allocator, file_data, .{});
+    var reader = try parquet.openBufferDynamic(allocator, file_data, .{});
     defer reader.deinit();
 
     // Read rows
-    var row_count: usize = 0;
-    while (try reader.next()) |row| {
-        var row_copy = row;
-        defer reader.freeRow(&row_copy);
-        row_count += 1;
+    const rows = try reader.readAllRows(0);
+    defer {
+        for (rows) |row| row.deinit();
+        allocator.free(rows);
     }
 
-    try std.testing.expect(row_count > 0);
+    try std.testing.expect(rows.len > 0);
 }
 
 test "Reader.initFromBuffer with compressed file" {
@@ -507,24 +494,28 @@ test "Writer round-trip buffer" {
     }
 }
 
-test "RowWriter.initToBuffer basic write" {
+test "DynamicWriter.initToBuffer basic write" {
     const allocator = std.testing.allocator;
 
-    const TestRow = struct {
-        id: i32,
-        value: i64,
-    };
-
-    // Create a RowWriter that writes to a buffer
-    var writer = try parquet.writeToBufferRows(TestRow, allocator, .{});
+    var writer = try parquet.createBufferDynamic(allocator);
     defer writer.deinit();
 
-    // Write some rows
-    try writer.writeRow(.{ .id = 1, .value = 100 });
-    try writer.writeRow(.{ .id = 2, .value = 200 });
-    try writer.writeRow(.{ .id = 3, .value = 300 });
+    try writer.addColumn("id", parquet.TypeInfo.int32, .{});
+    try writer.addColumn("value", parquet.TypeInfo.int64, .{});
+    try writer.begin();
 
-    // Close and get the buffer
+    try writer.setInt32(0, 1);
+    try writer.setInt64(1, 100);
+    try writer.addRow();
+
+    try writer.setInt32(0, 2);
+    try writer.setInt64(1, 200);
+    try writer.addRow();
+
+    try writer.setInt32(0, 3);
+    try writer.setInt64(1, 300);
+    try writer.addRow();
+
     try writer.close();
     const buffer = try writer.toOwnedSlice();
     defer allocator.free(buffer);
@@ -535,46 +526,48 @@ test "RowWriter.initToBuffer basic write" {
     try std.testing.expectEqualStrings("PAR1", buffer[buffer.len - 4 ..]);
 }
 
-test "RowWriter round-trip buffer" {
+test "DynamicWriter round-trip buffer" {
     const allocator = std.testing.allocator;
 
-    const TestRow = struct {
-        id: i32,
-        value: i64,
-        name: []const u8,
-    };
-
-    // Create a RowWriter that writes to a buffer
-    var writer = try parquet.writeToBufferRows(TestRow, allocator, .{});
+    var writer = try parquet.createBufferDynamic(allocator);
     defer writer.deinit();
 
-    // Write some rows
-    const rows = [_]TestRow{
+    try writer.addColumn("id", parquet.TypeInfo.int32, .{});
+    try writer.addColumn("value", parquet.TypeInfo.int64, .{});
+    try writer.addColumn("name", parquet.TypeInfo.string, .{});
+    try writer.begin();
+
+    const test_data = [_]struct { id: i32, value: i64, name: []const u8 }{
         .{ .id = 1, .value = 100, .name = "alice" },
         .{ .id = 2, .value = 200, .name = "bob" },
         .{ .id = 3, .value = 300, .name = "charlie" },
     };
-    try writer.writeRows(&rows);
 
-    // Close and get the buffer
+    for (test_data) |row| {
+        try writer.setInt32(0, row.id);
+        try writer.setInt64(1, row.value);
+        try writer.setBytes(2, row.name);
+        try writer.addRow();
+    }
+
     try writer.close();
     const buffer = try writer.toOwnedSlice();
     defer allocator.free(buffer);
 
-    var reader = try parquet.openBufferRowReader(TestRow, allocator, buffer, .{});
+    var reader = try parquet.openBufferDynamic(allocator, buffer, .{});
     defer reader.deinit();
 
-    // Read and verify rows
-    var row_count: usize = 0;
-    while (try reader.next()) |row| {
-        var row_copy = row;
-        defer reader.freeRow(&row_copy);
-
-        try std.testing.expectEqual(rows[row_count].id, row.id);
-        try std.testing.expectEqual(rows[row_count].value, row.value);
-        try std.testing.expectEqualStrings(rows[row_count].name, row.name);
-        row_count += 1;
+    const rows = try reader.readAllRows(0);
+    defer {
+        for (rows) |row| row.deinit();
+        allocator.free(rows);
     }
 
-    try std.testing.expectEqual(@as(usize, 3), row_count);
+    try std.testing.expectEqual(@as(usize, 3), rows.len);
+
+    for (test_data, 0..) |expected, i| {
+        try std.testing.expectEqual(expected.id, rows[i].getColumn(0).?.asInt32().?);
+        try std.testing.expectEqual(expected.value, rows[i].getColumn(1).?.asInt64().?);
+        try std.testing.expectEqualStrings(expected.name, rows[i].getColumn(2).?.asBytes().?);
+    }
 }

@@ -1407,3 +1407,62 @@ Four correctness and hardening fixes for nested type support.
 - [x] Add `max_nesting_depth = 64` constant
 - [x] `flattenRecursive` and `assembleRecursive` now accept a `depth` parameter and return `error.NestingTooDeep` when exceeded
 - [x] Prevents stack overflow on pathologically deep schemas
+
+---
+
+## Phase 16: API Simplification ✅
+
+Replaced comptime `RowWriter(T)` / `RowReader(T)` with runtime `DynamicWriter` / `DynamicReader`. The comptime row API could not handle deeply nested types (`list<list<T>>`, `struct<list>`, `list<map>`, etc.) due to Zig comptime limitations. The runtime API supports all types and arbitrary nesting depth with zero limitations.
+
+### P0 — Create DynamicWriter Core ✅
+
+Extracted `DynamicWriter` from C ABI `RowWriterHandle` into `zig-parquet/src/core/dynamic_writer.zig`:
+
+- [x] Accept user-provided `Allocator` (not hardcoded `page_allocator`)
+- [x] Accept `WriteTarget` directly (transport-neutral)
+- [x] Zig-idiomatic method signatures: `setBytes(col, slice)` not `setBytes(col, ptr, len)`
+- [x] `TypeInfo` named constants (`TypeInfo.string`, `TypeInfo.int32`, etc.) and builders (`TypeInfo.forDecimal`)
+- [x] All nested builders: `beginList/endList`, `beginStruct/endStruct`, `beginMap/endMap`
+- [x] Convenience constructors: `createFileDynamic`, `createBufferDynamic`
+
+### P1 — Wire Up and Delete ✅
+
+- [x] Refactored C ABI `RowWriterHandle` to delegate to `DynamicWriter`
+- [x] Refactored WASM API `RowWriterHandle` to delegate to `DynamicWriter`
+- [x] Updated `lib.zig` exports: removed `RowWriter`, `RowReader`, logical type wrappers; added `DynamicWriter`, `TypeInfo`, `ColumnType`
+- [x] Deleted `row_writer.zig` (2,076 lines), `row_reader.zig` (1,685 lines), `struct_utils.zig` (736 lines)
+- [x] Deleted `row_writer_test.zig` (2,013 lines), `row_reader_test.zig` (3,800 lines)
+
+### P2 — Update Consumers ✅
+
+- [x] Rewrote 8 test files to use `DynamicWriter` / `DynamicReader`
+- [x] Rewrote 7 examples to use `DynamicWriter` / `DynamicReader`
+- [x] Updated README.md Quick Start, features list, nested types section
+- [x] Updated ROADMAP.md with Phase 16
+
+**Net result:** ~10,300 lines of comptime code removed, ~400 lines of `DynamicWriter` added. All 597 tests pass.
+
+### P3 — Per-Column and Per-Leaf Properties ✅
+
+Added `ColumnProperties` struct and `setPathProperties` for fine-grained control over individual leaf columns within nested structures:
+
+- [x] `ColumnProperties` struct with `compression`, `encoding`, `use_dictionary`, `dictionary_size_limit`, `max_page_size`
+- [x] `addColumn` / `addColumnNested` accept `ColumnProperties` as third argument
+- [x] `setPathProperties(path, props)` for per-leaf overrides using dot-joined paths (e.g., `"address.city"`)
+- [x] `resolveOpts` merges global → column → path properties (most specific wins)
+- [x] `ColumnProperties` exported from `lib.zig` alongside `Encoding` and `CompressionCodec`
+- [x] C ABI and WASM API updated to pass defaults
+
+### P4 — Nested Encoding Options ✅
+
+Extended `writeColumnChunkFromValues` to accept and apply all encoding options for nested leaf columns. Previously, nested leaves were hardcoded to PLAIN encoding regardless of configuration.
+
+- [x] Added `writeDataPageWithLevelsAndEncoding` and `writeDataPageWithLevelsByteArrayWithEncoding` to `page_writer.zig`
+- [x] Added `NestedEncodingOpts` struct to `column_writer.zig`
+- [x] Extended `writeColumnChunkFromValues` and typed helpers to branch on encoding options
+- [x] Dictionary-with-levels for typed and byte array nested columns (builds dictionary, writes dict page + RLE-encoded data pages with multi-level def/rep)
+- [x] Encoding override and int/float encoding for nested typed columns
+- [x] Encoding override for nested byte array and fixed byte array columns
+- [x] Updated `writeColumnChunkWithPath` to record correct encoding in metadata (was hardcoded to `.plain`)
+- [x] Wired `flushNestedColumn` to pass resolved `EncodingOpts` through to `NestedEncodingOpts`
+- [x] Tests verifying dictionary, delta, and encoding metadata for nested leaves

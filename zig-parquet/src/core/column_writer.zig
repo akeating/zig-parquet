@@ -834,6 +834,18 @@ pub fn detectValueType(values: []const Value) ValuePhysicalType {
     return .unknown;
 }
 
+/// Encoding options for nested (Value-based) column writing.
+pub const NestedEncodingOpts = struct {
+    use_dictionary: bool = false,
+    encoding: ?format.Encoding = null,
+    int_encoding: format.Encoding = .plain,
+    float_encoding: format.Encoding = .plain,
+    max_page_size: ?usize = null,
+    dictionary_size_limit: ?usize = 1_048_576,
+    dictionary_cardinality_threshold: ?f32 = null,
+    write_page_checksum: bool = true,
+};
+
 /// Write a column chunk from Value data with definition and repetition levels.
 /// This is the core function for writing nested type data.
 pub fn writeColumnChunkFromValues(
@@ -847,18 +859,54 @@ pub fn writeColumnChunkFromValues(
     max_rep_level: u8,
     start_offset: i64,
     codec: format.CompressionCodec,
+    opts: NestedEncodingOpts,
 ) ColumnWriteError!ColumnChunkResult {
     const value_type = detectValueType(values);
 
     return switch (value_type) {
-        .int32 => writeColumnChunkFromValuesTyped(i32, allocator, output, path_in_schema, values, def_levels, rep_levels, max_def_level, max_rep_level, start_offset, codec),
-        .int64 => writeColumnChunkFromValuesTyped(i64, allocator, output, path_in_schema, values, def_levels, rep_levels, max_def_level, max_rep_level, start_offset, codec),
-        .float => writeColumnChunkFromValuesTyped(f32, allocator, output, path_in_schema, values, def_levels, rep_levels, max_def_level, max_rep_level, start_offset, codec),
-        .double => writeColumnChunkFromValuesTyped(f64, allocator, output, path_in_schema, values, def_levels, rep_levels, max_def_level, max_rep_level, start_offset, codec),
-        .byte_array => writeColumnChunkFromValuesBytes(allocator, output, path_in_schema, values, def_levels, rep_levels, max_def_level, max_rep_level, start_offset, codec),
-        .fixed_byte_array => writeColumnChunkFromValuesFixedBytes(allocator, output, path_in_schema, values, def_levels, rep_levels, max_def_level, max_rep_level, start_offset, codec),
-        .boolean => writeColumnChunkFromValuesBool(allocator, output, path_in_schema, values, def_levels, rep_levels, max_def_level, max_rep_level, start_offset, codec),
-        .unknown => error.WriteError,
+        .int32 => writeColumnChunkFromValuesTyped(i32, allocator, output, path_in_schema, values, def_levels, rep_levels, max_def_level, max_rep_level, start_offset, codec, opts),
+        .int64 => writeColumnChunkFromValuesTyped(i64, allocator, output, path_in_schema, values, def_levels, rep_levels, max_def_level, max_rep_level, start_offset, codec, opts),
+        .float => writeColumnChunkFromValuesTyped(f32, allocator, output, path_in_schema, values, def_levels, rep_levels, max_def_level, max_rep_level, start_offset, codec, opts),
+        .double => writeColumnChunkFromValuesTyped(f64, allocator, output, path_in_schema, values, def_levels, rep_levels, max_def_level, max_rep_level, start_offset, codec, opts),
+        .byte_array => writeColumnChunkFromValuesBytes(allocator, output, path_in_schema, values, def_levels, rep_levels, max_def_level, max_rep_level, start_offset, codec, opts),
+        .fixed_byte_array => writeColumnChunkFromValuesFixedBytes(allocator, output, path_in_schema, values, def_levels, rep_levels, max_def_level, max_rep_level, start_offset, codec, opts),
+        .boolean => writeColumnChunkFromValuesBool(allocator, output, path_in_schema, values, def_levels, rep_levels, max_def_level, max_rep_level, start_offset, codec, opts),
+        .unknown => writeColumnChunkFromValuesTyped(i32, allocator, output, path_in_schema, values, def_levels, rep_levels, max_def_level, max_rep_level, start_offset, codec, opts),
+    };
+}
+
+fn countNullsFromLevelDiff(total_entries: usize, non_null_count: usize) i64 {
+    if (total_entries >= non_null_count) {
+        return @as(i64, @intCast(total_entries - non_null_count));
+    }
+    return 0;
+}
+
+fn extractTypedValues(comptime T: type, allocator: std.mem.Allocator, values: []const Value) !std.ArrayList(T) {
+    var typed_values: std.ArrayList(T) = .empty;
+    for (values) |v| {
+        const val: ?T = switch (v) {
+            .int32_val => |x| if (T == i32) @as(T, x) else null,
+            .int64_val => |x| if (T == i64) @as(T, x) else null,
+            .float_val => |x| if (T == f32) @as(T, x) else null,
+            .double_val => |x| if (T == f64) @as(T, x) else null,
+            .null_val => null,
+            else => null,
+        };
+        if (val) |value| {
+            typed_values.append(allocator, value) catch return error.OutOfMemory;
+        }
+    }
+    return typed_values;
+}
+
+fn physicalTypeOf(comptime T: type) format.PhysicalType {
+    return switch (T) {
+        i32 => .int32,
+        i64 => .int64,
+        f32 => .float,
+        f64 => .double,
+        else => unreachable,
     };
 }
 
@@ -874,34 +922,36 @@ fn writeColumnChunkFromValuesTyped(
     max_rep_level: u8,
     start_offset: i64,
     codec: format.CompressionCodec,
+    opts: NestedEncodingOpts,
 ) ColumnWriteError!ColumnChunkResult {
-    // Extract typed values (skip nulls - they're encoded in def levels)
-    var typed_values: std.ArrayList(T) = .empty;
+    var typed_values = extractTypedValues(T, allocator, values) catch return error.OutOfMemory;
     defer typed_values.deinit(allocator);
 
-    for (values) |v| {
-        const val: ?T = switch (v) {
-            .int32_val => |x| if (T == i32) @as(T, x) else null,
-            .int64_val => |x| if (T == i64) @as(T, x) else null,
-            .float_val => |x| if (T == f32) @as(T, x) else null,
-            .double_val => |x| if (T == f64) @as(T, x) else null,
-            .null_val => null,
-            else => null,
-        };
-        if (val) |value| {
-            typed_values.append(allocator, value) catch return error.OutOfMemory;
-        }
+    const physical_type = physicalTypeOf(T);
+
+    // Determine encoding: explicit override > type-specific > plain
+    const effective_encoding: ?format.Encoding = if (opts.encoding) |enc|
+        enc
+    else if (!opts.use_dictionary) switch (T) {
+        i32, i64 => opts.int_encoding,
+        f32, f64 => opts.float_encoding,
+        else => format.Encoding.plain,
+    } else null;
+
+    // Dictionary path
+    if (effective_encoding == null and opts.use_dictionary) {
+        return writeColumnChunkFromValuesTypedDict(
+            T, allocator, output, path_in_schema,
+            typed_values.items, def_levels, rep_levels,
+            max_def_level, max_rep_level, start_offset, codec, opts,
+        );
     }
 
-    // Write the data page with levels
-    var page_result = page_writer.writeDataPageWithLevels(
-        allocator,
-        T,
-        typed_values.items,
-        def_levels,
-        rep_levels,
-        max_def_level,
-        max_rep_level,
+    const enc = effective_encoding orelse .plain;
+
+    var page_result = page_writer.writeDataPageWithLevelsAndEncoding(
+        allocator, T, typed_values.items,
+        def_levels, rep_levels, max_def_level, max_rep_level, enc,
     ) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.InvalidFixedLength => return error.InvalidFixedLength,
@@ -910,26 +960,29 @@ fn writeColumnChunkFromValuesTyped(
     };
     defer page_result.deinit(allocator);
 
-    // Get the physical type
-    const physical_type: format.PhysicalType = switch (T) {
-        i32 => .int32,
-        i64 => .int64,
-        f32 => .float,
-        f64 => .double,
-        else => unreachable,
-    };
-
-    return writeColumnChunkWithPath(
-        allocator,
-        output,
-        path_in_schema,
-        physical_type,
-        page_result.data,
-        page_result.num_values,
-        start_offset,
-        codec,
-        true, // Default: write page checksums
+    var result = try writeColumnChunkWithPath(
+        allocator, output, path_in_schema, physical_type,
+        page_result.data, page_result.num_values,
+        start_offset, codec, enc, opts.write_page_checksum,
     );
+    var stats_builder = statistics.StatisticsBuilder(T){};
+    stats_builder.update(typed_values.items);
+    stats_builder.addNulls(countNullsFromLevelDiff(def_levels.len, typed_values.items.len));
+    result.metadata.statistics = stats_builder.build(allocator) catch null;
+    return result;
+}
+
+fn extractByteValues(allocator: std.mem.Allocator, values: []const Value) !std.ArrayList([]const u8) {
+    var byte_values: std.ArrayList([]const u8) = .empty;
+    for (values) |v| {
+        switch (v) {
+            .bytes_val => |b| byte_values.append(allocator, b) catch return error.OutOfMemory,
+            .fixed_bytes_val => |b| byte_values.append(allocator, b) catch return error.OutOfMemory,
+            .null_val => {},
+            else => {},
+        }
+    }
+    return byte_values;
 }
 
 fn writeColumnChunkFromValuesBytes(
@@ -943,28 +996,25 @@ fn writeColumnChunkFromValuesBytes(
     max_rep_level: u8,
     start_offset: i64,
     codec: format.CompressionCodec,
+    opts: NestedEncodingOpts,
 ) ColumnWriteError!ColumnChunkResult {
-    // Extract byte arrays (skip nulls)
-    var byte_values: std.ArrayList([]const u8) = .empty;
+    var byte_values = extractByteValues(allocator, values) catch return error.OutOfMemory;
     defer byte_values.deinit(allocator);
 
-    for (values) |v| {
-        switch (v) {
-            .bytes_val => |b| byte_values.append(allocator, b) catch return error.OutOfMemory,
-            .fixed_bytes_val => |b| byte_values.append(allocator, b) catch return error.OutOfMemory,
-            .null_val => {},
-            else => {},
-        }
+    // Dictionary path
+    if (opts.encoding == null and opts.use_dictionary) {
+        return writeColumnChunkFromValuesBytesDict(
+            allocator, output, path_in_schema,
+            byte_values.items, def_levels, rep_levels,
+            max_def_level, max_rep_level, start_offset, codec, opts,
+        );
     }
 
-    // Write the data page with levels
-    var page_result = page_writer.writeDataPageWithLevelsByteArray(
-        allocator,
-        byte_values.items,
-        def_levels,
-        rep_levels,
-        max_def_level,
-        max_rep_level,
+    const enc = opts.encoding orelse .plain;
+
+    var page_result = page_writer.writeDataPageWithLevelsByteArrayWithEncoding(
+        allocator, byte_values.items,
+        def_levels, rep_levels, max_def_level, max_rep_level, enc,
     ) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.InvalidFixedLength => return error.InvalidFixedLength,
@@ -973,17 +1023,17 @@ fn writeColumnChunkFromValuesBytes(
     };
     defer page_result.deinit(allocator);
 
-    return writeColumnChunkWithPath(
-        allocator,
-        output,
-        path_in_schema,
-        .byte_array,
-        page_result.data,
-        page_result.num_values,
-        start_offset,
-        codec,
-        true, // Default: write page checksums
+    var result = try writeColumnChunkWithPath(
+        allocator, output, path_in_schema, .byte_array,
+        page_result.data, page_result.num_values,
+        start_offset, codec, enc, opts.write_page_checksum,
     );
+    var byte_stats = statistics.ByteArrayStatisticsBuilder.init(allocator);
+    defer byte_stats.deinit();
+    byte_stats.update(byte_values.items) catch {};
+    byte_stats.addNulls(countNullsFromLevelDiff(def_levels.len, byte_values.items.len));
+    result.metadata.statistics = byte_stats.build();
+    return result;
 }
 
 fn writeColumnChunkFromValuesFixedBytes(
@@ -997,6 +1047,7 @@ fn writeColumnChunkFromValuesFixedBytes(
     max_rep_level: u8,
     start_offset: i64,
     codec: format.CompressionCodec,
+    opts: NestedEncodingOpts,
 ) ColumnWriteError!ColumnChunkResult {
     var byte_values: std.ArrayList([]const u8) = .empty;
     defer byte_values.deinit(allocator);
@@ -1019,14 +1070,11 @@ fn writeColumnChunkFromValuesFixedBytes(
 
     if (fixed_len == 0) return error.InvalidFixedLength;
 
-    var page_result = page_writer.writeDataPageWithLevelsFixedByteArray(
-        allocator,
-        byte_values.items,
-        fixed_len,
-        def_levels,
-        rep_levels,
-        max_def_level,
-        max_rep_level,
+    const enc = opts.encoding orelse .plain;
+
+    var page_result = page_writer.writeDataPageWithLevelsFixedByteArrayWithEncoding(
+        allocator, byte_values.items, fixed_len,
+        def_levels, rep_levels, max_def_level, max_rep_level, enc,
     ) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.InvalidFixedLength => return error.InvalidFixedLength,
@@ -1035,17 +1083,17 @@ fn writeColumnChunkFromValuesFixedBytes(
     };
     defer page_result.deinit(allocator);
 
-    return writeColumnChunkWithPath(
-        allocator,
-        output,
-        path_in_schema,
-        .fixed_len_byte_array,
-        page_result.data,
-        page_result.num_values,
-        start_offset,
-        codec,
-        true,
+    var result = try writeColumnChunkWithPath(
+        allocator, output, path_in_schema, .fixed_len_byte_array,
+        page_result.data, page_result.num_values,
+        start_offset, codec, enc, opts.write_page_checksum,
     );
+    var fixed_stats = statistics.ByteArrayStatisticsBuilder.init(allocator);
+    defer fixed_stats.deinit();
+    fixed_stats.update(byte_values.items) catch {};
+    fixed_stats.addNulls(countNullsFromLevelDiff(def_levels.len, byte_values.items.len));
+    result.metadata.statistics = fixed_stats.build();
+    return result;
 }
 
 fn writeColumnChunkFromValuesBool(
@@ -1059,8 +1107,8 @@ fn writeColumnChunkFromValuesBool(
     max_rep_level: u8,
     start_offset: i64,
     codec: format.CompressionCodec,
+    opts: NestedEncodingOpts,
 ) ColumnWriteError!ColumnChunkResult {
-    // Extract boolean values (skip nulls - they're encoded in def levels)
     var bool_values: std.ArrayList(bool) = .empty;
     defer bool_values.deinit(allocator);
 
@@ -1072,15 +1120,9 @@ fn writeColumnChunkFromValuesBool(
         }
     }
 
-    // Write the data page with levels
     var page_result = page_writer.writeDataPageWithLevels(
-        allocator,
-        bool,
-        bool_values.items,
-        def_levels,
-        rep_levels,
-        max_def_level,
-        max_rep_level,
+        allocator, bool, bool_values.items,
+        def_levels, rep_levels, max_def_level, max_rep_level,
     ) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.InvalidFixedLength => return error.InvalidFixedLength,
@@ -1089,20 +1131,19 @@ fn writeColumnChunkFromValuesBool(
     };
     defer page_result.deinit(allocator);
 
-    return writeColumnChunkWithPath(
-        allocator,
-        output,
-        path_in_schema,
-        .boolean,
-        page_result.data,
-        page_result.num_values,
-        start_offset,
-        codec,
-        true, // Default: write page checksums
+    var result = try writeColumnChunkWithPath(
+        allocator, output, path_in_schema, .boolean,
+        page_result.data, page_result.num_values,
+        start_offset, codec, .plain, opts.write_page_checksum,
     );
+    var bool_stats = statistics.StatisticsBuilder(bool){};
+    bool_stats.update(bool_values.items);
+    bool_stats.addNulls(countNullsFromLevelDiff(def_levels.len, bool_values.items.len));
+    result.metadata.statistics = bool_stats.build(allocator) catch null;
+    return result;
 }
 
-/// Write a column chunk with a custom path_in_schema
+/// Write a column chunk with a custom path_in_schema and specified value encoding.
 fn writeColumnChunkWithPath(
     allocator: std.mem.Allocator,
     output: *std.Io.Writer,
@@ -1112,9 +1153,9 @@ fn writeColumnChunkWithPath(
     num_values: usize,
     start_offset: i64,
     codec: format.CompressionCodec,
+    value_encoding: format.Encoding,
     write_page_checksum: bool,
 ) ColumnWriteError!ColumnChunkResult {
-    // Compress page data if needed
     const compressed_data: []const u8 = if (codec == .uncompressed)
         page_data
     else blk: {
@@ -1126,7 +1167,6 @@ fn writeColumnChunkWithPath(
     };
     defer if (codec != .uncompressed) allocator.free(compressed_data);
 
-    // Create page header
     const page_header = format.PageHeader{
         .type_ = .data_page,
         .uncompressed_page_size = try safe.castTo(i32, page_data.len),
@@ -1134,7 +1174,7 @@ fn writeColumnChunkWithPath(
         .crc = if (write_page_checksum) computePageCrc(compressed_data) else null,
         .data_page_header = .{
             .num_values = try safe.castTo(i32, num_values),
-            .encoding = .plain,
+            .encoding = value_encoding,
             .definition_level_encoding = .rle,
             .repetition_level_encoding = .rle,
             .statistics = null,
@@ -1142,30 +1182,26 @@ fn writeColumnChunkWithPath(
         .dictionary_page_header = null,
     };
 
-    // Serialize page header
     var thrift_writer = thrift.CompactWriter.init(allocator);
     defer thrift_writer.deinit();
 
     page_header.serialize(&thrift_writer) catch return error.OutOfMemory;
     const header_bytes = thrift_writer.getWritten();
 
-    // Write header and compressed data
     output.writeAll(header_bytes) catch return error.WriteError;
     output.writeAll(compressed_data) catch return error.WriteError;
 
     const total_compressed_bytes = header_bytes.len + compressed_data.len;
     const total_uncompressed_bytes = header_bytes.len + page_data.len;
 
-    // Duplicate path_in_schema for metadata
     const path = allocator.alloc([]const u8, path_in_schema.len) catch return error.OutOfMemory;
     for (path_in_schema, 0..) |segment, i| {
         path[i] = allocator.dupe(u8, segment) catch return error.OutOfMemory;
     }
 
-    // Build encodings list
     const encodings = allocator.alloc(format.Encoding, 2) catch return error.OutOfMemory;
-    encodings[0] = .rle; // Levels
-    encodings[1] = .plain; // Values
+    encodings[0] = .rle;
+    encodings[1] = value_encoding;
 
     return .{
         .metadata = .{
@@ -1183,6 +1219,562 @@ fn writeColumnChunkWithPath(
         .file_offset = start_offset,
         .total_bytes = total_compressed_bytes,
     };
+}
+
+/// Dictionary encoding for typed nested columns with explicit def/rep levels.
+/// Falls back to plain encoding if dictionary thresholds are exceeded.
+fn writeColumnChunkFromValuesTypedDict(
+    comptime T: type,
+    allocator: std.mem.Allocator,
+    output: *std.Io.Writer,
+    path_in_schema: []const []const u8,
+    typed_values: []const T,
+    def_levels: []const u32,
+    rep_levels: []const u32,
+    max_def_level: u8,
+    max_rep_level: u8,
+    start_offset: i64,
+    codec: format.CompressionCodec,
+    opts: NestedEncodingOpts,
+) ColumnWriteError!ColumnChunkResult {
+    if (typed_values.len == 0) {
+        var page_result = page_writer.writeDataPageWithLevels(
+            allocator, T, typed_values, def_levels, rep_levels, max_def_level, max_rep_level,
+        ) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidFixedLength => return error.InvalidFixedLength,
+            error.IntegerOverflow => return error.IntegerOverflow,
+            error.ValueTooLarge => return error.ValueTooLarge,
+        };
+        defer page_result.deinit(allocator);
+        return writeColumnChunkWithPath(
+            allocator, output, path_in_schema, physicalTypeOf(T),
+            page_result.data, page_result.num_values,
+            start_offset, codec, .plain, opts.write_page_checksum,
+        );
+    }
+
+    var unique_map = std.HashMap(T, u32, DictHashContext(T), std.hash_map.default_max_load_percentage).init(allocator);
+    defer unique_map.deinit();
+    var dict_values: std.ArrayListUnmanaged(T) = .empty;
+    defer dict_values.deinit(allocator);
+
+    var indices = allocator.alloc(u32, typed_values.len) catch return error.OutOfMemory;
+    defer allocator.free(indices);
+
+    for (typed_values, 0..) |val, idx| {
+        if (unique_map.get(val)) |dict_idx| {
+            indices[idx] = dict_idx;
+        } else {
+            const new_idx: u32 = try safe.castTo(u32, dict_values.items.len);
+            unique_map.put(val, new_idx) catch return error.OutOfMemory;
+            dict_values.append(allocator, val) catch return error.OutOfMemory;
+            indices[idx] = new_idx;
+        }
+
+        if (opts.dictionary_cardinality_threshold) |threshold| {
+            if (idx >= 1024) {
+                const ratio = @as(f32, @floatFromInt(dict_values.items.len)) / @as(f32, @floatFromInt(idx));
+                if (ratio > threshold) {
+                    return writeColumnChunkFromValuesTypedPlainFallback(
+                        T, allocator, output, path_in_schema, typed_values,
+                        def_levels, rep_levels, max_def_level, max_rep_level,
+                        start_offset, codec, opts,
+                    );
+                }
+            }
+        }
+    }
+
+    const dict_size = dict_values.items.len;
+    const bytes_per_value = @sizeOf(T);
+    const dict_byte_count = dict_size * bytes_per_value;
+
+    if (opts.dictionary_size_limit) |limit| {
+        if (dict_byte_count > limit) {
+            return writeColumnChunkFromValuesTypedPlainFallback(
+                T, allocator, output, path_in_schema, typed_values,
+                def_levels, rep_levels, max_def_level, max_rep_level,
+                start_offset, codec, opts,
+            );
+        }
+    }
+
+    // Write dictionary page
+    const dict_data = allocator.alloc(u8, dict_byte_count) catch return error.OutOfMemory;
+    defer allocator.free(dict_data);
+
+    for (dict_values.items, 0..) |v, i| {
+        if (T == i32) {
+            std.mem.writeInt(i32, dict_data[i * 4 ..][0..4], v, .little);
+        } else if (T == i64) {
+            std.mem.writeInt(i64, dict_data[i * 8 ..][0..8], v, .little);
+        } else if (T == f32) {
+            std.mem.writeInt(u32, dict_data[i * 4 ..][0..4], @bitCast(v), .little);
+        } else if (T == f64) {
+            std.mem.writeInt(u64, dict_data[i * 8 ..][0..8], @bitCast(v), .little);
+        }
+    }
+
+    const dict_compressed: []const u8 = if (codec == .uncompressed)
+        dict_data
+    else blk: {
+        break :blk compress.compress(allocator, dict_data, codec) catch |err| switch (err) {
+            error.UnsupportedCompression => return error.UnsupportedCompression,
+            error.CompressionError => return error.CompressionError,
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+    };
+    defer if (codec != .uncompressed) allocator.free(dict_compressed);
+
+    const dict_page_header = format.PageHeader{
+        .type_ = .dictionary_page,
+        .uncompressed_page_size = try safe.castTo(i32, dict_data.len),
+        .compressed_page_size = try safe.castTo(i32, dict_compressed.len),
+        .crc = if (opts.write_page_checksum) computePageCrc(dict_compressed) else null,
+        .data_page_header = null,
+        .dictionary_page_header = .{
+            .num_values = try safe.castTo(i32, dict_size),
+            .encoding = .plain,
+            .is_sorted = false,
+        },
+    };
+
+    var dict_thrift = thrift.CompactWriter.init(allocator);
+    defer dict_thrift.deinit();
+    dict_page_header.serialize(&dict_thrift) catch return error.OutOfMemory;
+    const dict_header_bytes = dict_thrift.getWritten();
+
+    output.writeAll(dict_header_bytes) catch return error.WriteError;
+    output.writeAll(dict_compressed) catch return error.WriteError;
+
+    var total_bytes_written: usize = dict_header_bytes.len + dict_compressed.len;
+    const dict_page_offset = start_offset;
+    const data_page_offset = start_offset + try safe.castTo(i64, total_bytes_written);
+
+    const bit_width: u5 = if (dict_size <= 1) 0 else try safe.castTo(u5, std.math.log2_int(usize, dict_size - 1) + 1);
+
+    // Write data page: rep_levels + def_levels + bit_width + rle_indices
+    var rep_level_data: ?[]u8 = null;
+    if (max_rep_level > 0) {
+        rep_level_data = rle_encoder.encodeLevelsWithLength(allocator, rep_levels, max_rep_level) catch return error.OutOfMemory;
+    }
+    defer if (rep_level_data) |d| allocator.free(d);
+
+    var def_level_data: ?[]u8 = null;
+    if (max_def_level > 0) {
+        def_level_data = rle_encoder.encodeLevelsWithLength(allocator, def_levels, max_def_level) catch return error.OutOfMemory;
+    }
+    defer if (def_level_data) |d| allocator.free(d);
+
+    // Only encode indices for slots where def_level == max_def_level (non-null values)
+    const rle_data = rle_encoder.encode(allocator, indices, bit_width) catch return error.OutOfMemory;
+    defer allocator.free(rle_data);
+
+    const rep_size = if (rep_level_data) |d| d.len else 0;
+    const def_size = if (def_level_data) |d| d.len else 0;
+    const page_data_len = rep_size + def_size + 1 + rle_data.len;
+    const data_page_uncompressed = allocator.alloc(u8, page_data_len) catch return error.OutOfMemory;
+    defer allocator.free(data_page_uncompressed);
+
+    var offset: usize = 0;
+    if (rep_level_data) |d| {
+        @memcpy(data_page_uncompressed[offset..][0..d.len], d);
+        offset += d.len;
+    }
+    if (def_level_data) |d| {
+        @memcpy(data_page_uncompressed[offset..][0..d.len], d);
+        offset += d.len;
+    }
+    data_page_uncompressed[offset] = bit_width;
+    offset += 1;
+    @memcpy(data_page_uncompressed[offset..], rle_data);
+
+    const data_compressed: []const u8 = if (codec == .uncompressed)
+        data_page_uncompressed
+    else cblk: {
+        break :cblk compress.compress(allocator, data_page_uncompressed, codec) catch |err| switch (err) {
+            error.UnsupportedCompression => return error.UnsupportedCompression,
+            error.CompressionError => return error.CompressionError,
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+    };
+    defer if (codec != .uncompressed) allocator.free(data_compressed);
+
+    const data_page_header = format.PageHeader{
+        .type_ = .data_page,
+        .uncompressed_page_size = try safe.castTo(i32, data_page_uncompressed.len),
+        .compressed_page_size = try safe.castTo(i32, data_compressed.len),
+        .crc = if (opts.write_page_checksum) computePageCrc(data_compressed) else null,
+        .data_page_header = .{
+            .num_values = try safe.castTo(i32, def_levels.len),
+            .encoding = .rle_dictionary,
+            .definition_level_encoding = .rle,
+            .repetition_level_encoding = .rle,
+            .statistics = null,
+        },
+        .dictionary_page_header = null,
+    };
+
+    var data_thrift = thrift.CompactWriter.init(allocator);
+    defer data_thrift.deinit();
+    data_page_header.serialize(&data_thrift) catch return error.OutOfMemory;
+    const data_header_bytes = data_thrift.getWritten();
+
+    output.writeAll(data_header_bytes) catch return error.WriteError;
+    output.writeAll(data_compressed) catch return error.WriteError;
+
+    const page_bytes = std.math.add(usize, data_header_bytes.len, data_compressed.len) catch return error.IntegerOverflow;
+    total_bytes_written = std.math.add(usize, total_bytes_written, page_bytes) catch return error.IntegerOverflow;
+
+    const path = allocator.alloc([]const u8, path_in_schema.len) catch return error.OutOfMemory;
+    for (path_in_schema, 0..) |segment, i| {
+        path[i] = allocator.dupe(u8, segment) catch return error.OutOfMemory;
+    }
+
+    const encodings = allocator.alloc(format.Encoding, 3) catch return error.OutOfMemory;
+    encodings[0] = .plain;
+    encodings[1] = .rle;
+    encodings[2] = .rle_dictionary;
+
+    var stats_builder = statistics.StatisticsBuilder(T){};
+    stats_builder.update(typed_values);
+    stats_builder.addNulls(countNullsFromLevelDiff(def_levels.len, typed_values.len));
+    const stats = stats_builder.build(allocator) catch null;
+
+    return .{
+        .metadata = .{
+            .type_ = physicalTypeOf(T),
+            .encodings = encodings,
+            .path_in_schema = path,
+            .codec = codec,
+            .num_values = try safe.castTo(i64, def_levels.len),
+            .total_uncompressed_size = try safe.castTo(i64, total_bytes_written),
+            .total_compressed_size = try safe.castTo(i64, total_bytes_written),
+            .data_page_offset = data_page_offset,
+            .index_page_offset = null,
+            .dictionary_page_offset = dict_page_offset,
+            .statistics = stats,
+        },
+        .file_offset = start_offset,
+        .total_bytes = total_bytes_written,
+    };
+}
+
+/// Plain encoding fallback used when dictionary thresholds are exceeded.
+fn writeColumnChunkFromValuesTypedPlainFallback(
+    comptime T: type,
+    allocator: std.mem.Allocator,
+    output: *std.Io.Writer,
+    path_in_schema: []const []const u8,
+    typed_values: []const T,
+    def_levels: []const u32,
+    rep_levels: []const u32,
+    max_def_level: u8,
+    max_rep_level: u8,
+    start_offset: i64,
+    codec: format.CompressionCodec,
+    opts: NestedEncodingOpts,
+) ColumnWriteError!ColumnChunkResult {
+    const enc: format.Encoding = switch (T) {
+        i32, i64 => opts.int_encoding,
+        f32, f64 => opts.float_encoding,
+        else => .plain,
+    };
+
+    var page_result = page_writer.writeDataPageWithLevelsAndEncoding(
+        allocator, T, typed_values,
+        def_levels, rep_levels, max_def_level, max_rep_level, enc,
+    ) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidFixedLength => return error.InvalidFixedLength,
+        error.IntegerOverflow => return error.IntegerOverflow,
+        error.ValueTooLarge => return error.ValueTooLarge,
+    };
+    defer page_result.deinit(allocator);
+
+    var result = try writeColumnChunkWithPath(
+        allocator, output, path_in_schema, physicalTypeOf(T),
+        page_result.data, page_result.num_values,
+        start_offset, codec, enc, opts.write_page_checksum,
+    );
+    var stats_builder = statistics.StatisticsBuilder(T){};
+    stats_builder.update(typed_values);
+    stats_builder.addNulls(countNullsFromLevelDiff(def_levels.len, typed_values.len));
+    result.metadata.statistics = stats_builder.build(allocator) catch null;
+    return result;
+}
+
+/// Dictionary encoding for byte array nested columns with explicit def/rep levels.
+fn writeColumnChunkFromValuesBytesDict(
+    allocator: std.mem.Allocator,
+    output: *std.Io.Writer,
+    path_in_schema: []const []const u8,
+    byte_values: []const []const u8,
+    def_levels: []const u32,
+    rep_levels: []const u32,
+    max_def_level: u8,
+    max_rep_level: u8,
+    start_offset: i64,
+    codec: format.CompressionCodec,
+    opts: NestedEncodingOpts,
+) ColumnWriteError!ColumnChunkResult {
+    if (byte_values.len == 0) {
+        var page_result = page_writer.writeDataPageWithLevelsByteArray(
+            allocator, byte_values, def_levels, rep_levels, max_def_level, max_rep_level,
+        ) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidFixedLength => return error.InvalidFixedLength,
+            error.IntegerOverflow => return error.IntegerOverflow,
+            error.ValueTooLarge => return error.ValueTooLarge,
+        };
+        defer page_result.deinit(allocator);
+        return writeColumnChunkWithPath(
+            allocator, output, path_in_schema, .byte_array,
+            page_result.data, page_result.num_values,
+            start_offset, codec, .plain, opts.write_page_checksum,
+        );
+    }
+
+    var unique_map = std.StringHashMap(u32).init(allocator);
+    defer unique_map.deinit();
+    var dict_entries: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer dict_entries.deinit(allocator);
+
+    var indices = allocator.alloc(u32, byte_values.len) catch return error.OutOfMemory;
+    defer allocator.free(indices);
+
+    var dict_byte_count: usize = 0;
+    for (byte_values, 0..) |val, idx| {
+        if (val.len > std.math.maxInt(i32)) return error.ValueTooLarge;
+        if (unique_map.get(val)) |dict_idx| {
+            indices[idx] = dict_idx;
+        } else {
+            const new_idx: u32 = try safe.castTo(u32, dict_entries.items.len);
+            unique_map.put(val, new_idx) catch return error.OutOfMemory;
+            dict_entries.append(allocator, val) catch return error.OutOfMemory;
+            dict_byte_count += 4 + val.len;
+            indices[idx] = new_idx;
+        }
+
+        if (opts.dictionary_cardinality_threshold) |threshold| {
+            if (idx >= 1024) {
+                const ratio = @as(f32, @floatFromInt(dict_entries.items.len)) / @as(f32, @floatFromInt(idx));
+                if (ratio > threshold) {
+                    return writeColumnChunkFromValuesBytesPlainFallback(
+                        allocator, output, path_in_schema, byte_values,
+                        def_levels, rep_levels, max_def_level, max_rep_level,
+                        start_offset, codec, opts,
+                    );
+                }
+            }
+        }
+    }
+
+    const dict_size = dict_entries.items.len;
+
+    if (opts.dictionary_size_limit) |limit| {
+        if (dict_byte_count > limit) {
+            return writeColumnChunkFromValuesBytesPlainFallback(
+                allocator, output, path_in_schema, byte_values,
+                def_levels, rep_levels, max_def_level, max_rep_level,
+                start_offset, codec, opts,
+            );
+        }
+    }
+
+    // Write dictionary page (length-prefixed byte arrays)
+    const dict_data = allocator.alloc(u8, dict_byte_count) catch return error.OutOfMemory;
+    defer allocator.free(dict_data);
+
+    var dict_offset: usize = 0;
+    for (dict_entries.items) |v| {
+        std.mem.writeInt(u32, dict_data[dict_offset..][0..4], try safe.castTo(u32, v.len), .little);
+        dict_offset += 4;
+        @memcpy(dict_data[dict_offset..][0..v.len], v);
+        dict_offset += v.len;
+    }
+
+    const dict_compressed: []const u8 = if (codec == .uncompressed)
+        dict_data
+    else blk: {
+        break :blk compress.compress(allocator, dict_data, codec) catch |err| switch (err) {
+            error.UnsupportedCompression => return error.UnsupportedCompression,
+            error.CompressionError => return error.CompressionError,
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+    };
+    defer if (codec != .uncompressed) allocator.free(dict_compressed);
+
+    const dict_page_header = format.PageHeader{
+        .type_ = .dictionary_page,
+        .uncompressed_page_size = try safe.castTo(i32, dict_data.len),
+        .compressed_page_size = try safe.castTo(i32, dict_compressed.len),
+        .crc = if (opts.write_page_checksum) computePageCrc(dict_compressed) else null,
+        .data_page_header = null,
+        .dictionary_page_header = .{
+            .num_values = try safe.castTo(i32, dict_size),
+            .encoding = .plain,
+            .is_sorted = false,
+        },
+    };
+
+    var dict_thrift = thrift.CompactWriter.init(allocator);
+    defer dict_thrift.deinit();
+    dict_page_header.serialize(&dict_thrift) catch return error.OutOfMemory;
+    const dict_header_bytes = dict_thrift.getWritten();
+
+    output.writeAll(dict_header_bytes) catch return error.WriteError;
+    output.writeAll(dict_compressed) catch return error.WriteError;
+
+    var total_bytes_written: usize = dict_header_bytes.len + dict_compressed.len;
+    const dict_page_offset = start_offset;
+    const data_page_offset = start_offset + try safe.castTo(i64, total_bytes_written);
+
+    const bit_width: u5 = if (dict_size <= 1) 0 else try safe.castTo(u5, std.math.log2_int(usize, dict_size - 1) + 1);
+
+    // Write data page: rep_levels + def_levels + bit_width + rle_indices
+    var rep_level_data: ?[]u8 = null;
+    if (max_rep_level > 0) {
+        rep_level_data = rle_encoder.encodeLevelsWithLength(allocator, rep_levels, max_rep_level) catch return error.OutOfMemory;
+    }
+    defer if (rep_level_data) |d| allocator.free(d);
+
+    var def_level_data: ?[]u8 = null;
+    if (max_def_level > 0) {
+        def_level_data = rle_encoder.encodeLevelsWithLength(allocator, def_levels, max_def_level) catch return error.OutOfMemory;
+    }
+    defer if (def_level_data) |d| allocator.free(d);
+
+    const rle_data = rle_encoder.encode(allocator, indices, bit_width) catch return error.OutOfMemory;
+    defer allocator.free(rle_data);
+
+    const rep_size = if (rep_level_data) |d| d.len else 0;
+    const def_size = if (def_level_data) |d| d.len else 0;
+    const page_data_len = rep_size + def_size + 1 + rle_data.len;
+    const data_page_uncompressed = allocator.alloc(u8, page_data_len) catch return error.OutOfMemory;
+    defer allocator.free(data_page_uncompressed);
+
+    var doffset: usize = 0;
+    if (rep_level_data) |d| {
+        @memcpy(data_page_uncompressed[doffset..][0..d.len], d);
+        doffset += d.len;
+    }
+    if (def_level_data) |d| {
+        @memcpy(data_page_uncompressed[doffset..][0..d.len], d);
+        doffset += d.len;
+    }
+    data_page_uncompressed[doffset] = bit_width;
+    doffset += 1;
+    @memcpy(data_page_uncompressed[doffset..], rle_data);
+
+    const data_compressed: []const u8 = if (codec == .uncompressed)
+        data_page_uncompressed
+    else cblk: {
+        break :cblk compress.compress(allocator, data_page_uncompressed, codec) catch |err| switch (err) {
+            error.UnsupportedCompression => return error.UnsupportedCompression,
+            error.CompressionError => return error.CompressionError,
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+    };
+    defer if (codec != .uncompressed) allocator.free(data_compressed);
+
+    const data_page_header = format.PageHeader{
+        .type_ = .data_page,
+        .uncompressed_page_size = try safe.castTo(i32, data_page_uncompressed.len),
+        .compressed_page_size = try safe.castTo(i32, data_compressed.len),
+        .crc = if (opts.write_page_checksum) computePageCrc(data_compressed) else null,
+        .data_page_header = .{
+            .num_values = try safe.castTo(i32, def_levels.len),
+            .encoding = .rle_dictionary,
+            .definition_level_encoding = .rle,
+            .repetition_level_encoding = .rle,
+            .statistics = null,
+        },
+        .dictionary_page_header = null,
+    };
+
+    var data_thrift = thrift.CompactWriter.init(allocator);
+    defer data_thrift.deinit();
+    data_page_header.serialize(&data_thrift) catch return error.OutOfMemory;
+    const data_header_bytes = data_thrift.getWritten();
+
+    output.writeAll(data_header_bytes) catch return error.WriteError;
+    output.writeAll(data_compressed) catch return error.WriteError;
+
+    const page_bytes = std.math.add(usize, data_header_bytes.len, data_compressed.len) catch return error.IntegerOverflow;
+    total_bytes_written = std.math.add(usize, total_bytes_written, page_bytes) catch return error.IntegerOverflow;
+
+    const path = allocator.alloc([]const u8, path_in_schema.len) catch return error.OutOfMemory;
+    for (path_in_schema, 0..) |segment, i| {
+        path[i] = allocator.dupe(u8, segment) catch return error.OutOfMemory;
+    }
+
+    const encodings = allocator.alloc(format.Encoding, 3) catch return error.OutOfMemory;
+    encodings[0] = .plain;
+    encodings[1] = .rle;
+    encodings[2] = .rle_dictionary;
+
+    var byte_stats = statistics.ByteArrayStatisticsBuilder.init(allocator);
+    defer byte_stats.deinit();
+    byte_stats.update(byte_values) catch {};
+    byte_stats.addNulls(countNullsFromLevelDiff(def_levels.len, byte_values.len));
+    const stats = byte_stats.build();
+
+    return .{
+        .metadata = .{
+            .type_ = .byte_array,
+            .encodings = encodings,
+            .path_in_schema = path,
+            .codec = codec,
+            .num_values = try safe.castTo(i64, def_levels.len),
+            .total_uncompressed_size = try safe.castTo(i64, total_bytes_written),
+            .total_compressed_size = try safe.castTo(i64, total_bytes_written),
+            .data_page_offset = data_page_offset,
+            .index_page_offset = null,
+            .dictionary_page_offset = dict_page_offset,
+            .statistics = stats,
+        },
+        .file_offset = start_offset,
+        .total_bytes = total_bytes_written,
+    };
+}
+
+/// Plain encoding fallback for byte array nested columns.
+fn writeColumnChunkFromValuesBytesPlainFallback(
+    allocator: std.mem.Allocator,
+    output: *std.Io.Writer,
+    path_in_schema: []const []const u8,
+    byte_values: []const []const u8,
+    def_levels: []const u32,
+    rep_levels: []const u32,
+    max_def_level: u8,
+    max_rep_level: u8,
+    start_offset: i64,
+    codec: format.CompressionCodec,
+    opts: NestedEncodingOpts,
+) ColumnWriteError!ColumnChunkResult {
+    var page_result = page_writer.writeDataPageWithLevelsByteArray(
+        allocator, byte_values, def_levels, rep_levels, max_def_level, max_rep_level,
+    ) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidFixedLength => return error.InvalidFixedLength,
+        error.IntegerOverflow => return error.IntegerOverflow,
+        error.ValueTooLarge => return error.ValueTooLarge,
+    };
+    defer page_result.deinit(allocator);
+
+    var result = try writeColumnChunkWithPath(
+        allocator, output, path_in_schema, .byte_array,
+        page_result.data, page_result.num_values,
+        start_offset, codec, .plain, opts.write_page_checksum,
+    );
+    var byte_stats = statistics.ByteArrayStatisticsBuilder.init(allocator);
+    defer byte_stats.deinit();
+    byte_stats.update(byte_values) catch {};
+    byte_stats.addNulls(countNullsFromLevelDiff(def_levels.len, byte_values.len));
+    result.metadata.statistics = byte_stats.build();
+    return result;
 }
 
 // Tests

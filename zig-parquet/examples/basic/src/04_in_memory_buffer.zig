@@ -1,11 +1,6 @@
 const std = @import("std");
 const parquet = @import("parquet");
 
-const Metric = struct {
-    timestamp: i64,
-    value: f32,
-};
-
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -14,11 +9,20 @@ pub fn main() !void {
     std.debug.print("Writing to an in-memory buffer...\n", .{});
 
     // 1. Write to buffer instead of file
-    var writer = try parquet.writeToBufferRows(Metric, allocator, .{});
+    var writer = try parquet.createBufferDynamic(allocator);
     defer writer.deinit();
 
-    try writer.writeRow(.{ .timestamp = 1000, .value = 42.5 });
-    try writer.writeRow(.{ .timestamp = 2000, .value = 43.1 });
+    try writer.addColumn("timestamp", parquet.TypeInfo.int64, .{});
+    try writer.addColumn("value", parquet.TypeInfo.float_, .{});
+    try writer.begin();
+
+    try writer.setInt64(0, 1000);
+    try writer.setFloat(1, 42.5);
+    try writer.addRow();
+
+    try writer.setInt64(0, 2000);
+    try writer.setFloat(1, 43.1);
+    try writer.addRow();
 
     try writer.close();
 
@@ -28,16 +32,22 @@ pub fn main() !void {
     std.debug.print("Created a Parquet buffer of {d} bytes.\n", .{buffer.len});
     std.debug.print("Reading directly from buffer...\n", .{});
 
-    // 2. Read from buffer instead of file
-    var reader = try parquet.openBufferRowReader(Metric, allocator, buffer, .{});
+    // 2. Read from buffer
+    var reader = try parquet.openBufferDynamic(allocator, buffer, .{});
     defer reader.deinit();
+
+    const rows = try reader.readAllRows(0);
+    defer {
+        for (rows) |row| row.deinit();
+        allocator.free(rows);
+    }
 
     var sum: f32 = 0;
     var count: usize = 0;
 
-    while (try reader.next()) |metric| {
-        defer reader.freeRow(&metric);
-        sum += metric.value;
+    for (rows) |row| {
+        const val = if (row.getColumn(1)) |v| v.asFloat() orelse 0 else 0;
+        sum += val;
         count += 1;
     }
 

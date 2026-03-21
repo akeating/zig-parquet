@@ -1,12 +1,6 @@
 const std = @import("std");
 const parquet = @import("parquet");
 
-const User = struct {
-    id: i32,
-    name: []const u8,
-    active: bool,
-};
-
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -22,18 +16,28 @@ pub fn main() !void {
         const file = try std.fs.cwd().createFile(output_path, .{});
         defer file.close();
 
-        var writer = try parquet.writeToFileRows(User, allocator, file, .{
-            .compression = .zstd,
-        });
+        var writer = try parquet.createFileDynamic(allocator, file);
         defer writer.deinit();
 
-        const users = [_]User{
+        try writer.addColumn("id", parquet.TypeInfo.int32, .{});
+        try writer.addColumn("name", parquet.TypeInfo.string, .{});
+        try writer.addColumn("active", parquet.TypeInfo.bool_, .{});
+        writer.setCompression(.zstd);
+        try writer.begin();
+
+        const users = [_]struct { id: i32, name: []const u8, active: bool }{
             .{ .id = 1, .name = "Alice", .active = true },
             .{ .id = 2, .name = "Bob", .active = false },
             .{ .id = 3, .name = "Charlie", .active = true },
         };
 
-        try writer.writeRows(&users);
+        for (users) |user| {
+            try writer.setInt32(0, user.id);
+            try writer.setBytes(1, user.name);
+            try writer.setBool(2, user.active);
+            try writer.addRow();
+        }
+
         try writer.close();
     }
 
@@ -44,12 +48,20 @@ pub fn main() !void {
         const file = try std.fs.cwd().openFile(output_path, .{});
         defer file.close();
 
-        var reader = try parquet.openFileRowReader(User, allocator, file, .{});
+        var reader = try parquet.openFileDynamic(allocator, file, .{});
         defer reader.deinit();
 
-        while (try reader.next()) |user| {
-            defer reader.freeRow(&user);
-            std.debug.print("User {d}: {s} (active: {any})\n", .{ user.id, user.name, user.active });
+        const rows = try reader.readAllRows(0);
+        defer {
+            for (rows) |row| row.deinit();
+            allocator.free(rows);
+        }
+
+        for (rows) |row| {
+            const id = if (row.getColumn(0)) |v| v.asInt32() orelse 0 else 0;
+            const name = if (row.getColumn(1)) |v| v.asBytes() orelse "(null)" else "(null)";
+            const active = if (row.getColumn(2)) |v| v.asBool() orelse false else false;
+            std.debug.print("User {d}: {s} (active: {any})\n", .{ id, name, active });
         }
     }
 

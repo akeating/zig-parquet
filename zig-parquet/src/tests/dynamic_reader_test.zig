@@ -1,12 +1,13 @@
 //! Tests for DynamicReader
 //!
-//! Verifies schema-agnostic reading by writing with RowWriter(T)
+//! Verifies schema-agnostic reading by writing with DynamicWriter
 //! and reading back with DynamicReader.
 
 const std = @import("std");
 const parquet = @import("../lib.zig");
 const DynamicReader = parquet.DynamicReader;
-const RowWriter = parquet.RowWriter;
+const DynamicWriter = parquet.DynamicWriter;
+const TypeInfo = parquet.TypeInfo;
 const Value = parquet.Value;
 const Row = parquet.Row;
 const build_options = @import("build_options");
@@ -18,28 +19,45 @@ const build_options = @import("build_options");
 test "DynamicReader: basic primitives roundtrip" {
     const allocator = std.testing.allocator;
 
-    const TestRecord = struct {
-        id: i32,
-        value: i64,
-        score: f64,
-        ratio: f32,
-        active: bool,
-    };
-
     const tmp_path = "test_dynamic_primitives.parquet";
     defer std.fs.cwd().deleteFile(tmp_path) catch {};
 
-    // Write test data
+    // Write test data using DynamicWriter
     {
         const file = try std.fs.cwd().createFile(tmp_path, .{});
         defer file.close();
 
-        var writer = try parquet.writeToFileRows(TestRecord, allocator, file, .{});
+        var writer = try parquet.createFileDynamic(allocator, file);
         defer writer.deinit();
 
-        try writer.writeRow(.{ .id = 1, .value = 100, .score = 1.5, .ratio = 0.5, .active = true });
-        try writer.writeRow(.{ .id = 2, .value = 200, .score = 2.5, .ratio = 1.5, .active = false });
-        try writer.writeRow(.{ .id = 3, .value = 300, .score = 3.5, .ratio = 2.5, .active = true });
+        try writer.addColumn("id", TypeInfo.int32, .{});
+        try writer.addColumn("value", TypeInfo.int64, .{});
+        try writer.addColumn("score", TypeInfo.double_, .{});
+        try writer.addColumn("ratio", TypeInfo.float_, .{});
+        try writer.addColumn("active", TypeInfo.bool_, .{});
+        try writer.begin();
+
+        try writer.setInt32(0, 1);
+        try writer.setInt64(1, 100);
+        try writer.setDouble(2, 1.5);
+        try writer.setFloat(3, 0.5);
+        try writer.setBool(4, true);
+        try writer.addRow();
+
+        try writer.setInt32(0, 2);
+        try writer.setInt64(1, 200);
+        try writer.setDouble(2, 2.5);
+        try writer.setFloat(3, 1.5);
+        try writer.setBool(4, false);
+        try writer.addRow();
+
+        try writer.setInt32(0, 3);
+        try writer.setInt64(1, 300);
+        try writer.setDouble(2, 3.5);
+        try writer.setFloat(3, 2.5);
+        try writer.setBool(4, true);
+        try writer.addRow();
+
         try writer.close();
     }
 
@@ -89,11 +107,6 @@ test "DynamicReader: basic primitives roundtrip" {
 test "DynamicReader: string columns roundtrip" {
     const allocator = std.testing.allocator;
 
-    const StringRecord = struct {
-        id: i32,
-        name: []const u8,
-    };
-
     const tmp_path = "test_dynamic_strings.parquet";
     defer std.fs.cwd().deleteFile(tmp_path) catch {};
 
@@ -101,12 +114,25 @@ test "DynamicReader: string columns roundtrip" {
         const file = try std.fs.cwd().createFile(tmp_path, .{});
         defer file.close();
 
-        var writer = try parquet.writeToFileRows(StringRecord, allocator, file, .{});
+        var writer = try parquet.createFileDynamic(allocator, file);
         defer writer.deinit();
 
-        try writer.writeRow(.{ .id = 1, .name = "Alice" });
-        try writer.writeRow(.{ .id = 2, .name = "Bob" });
-        try writer.writeRow(.{ .id = 3, .name = "Charlie" });
+        try writer.addColumn("id", TypeInfo.int32, .{});
+        try writer.addColumn("name", TypeInfo.string, .{});
+        try writer.begin();
+
+        try writer.setInt32(0, 1);
+        try writer.setBytes(1, "Alice");
+        try writer.addRow();
+
+        try writer.setInt32(0, 2);
+        try writer.setBytes(1, "Bob");
+        try writer.addRow();
+
+        try writer.setInt32(0, 3);
+        try writer.setBytes(1, "Charlie");
+        try writer.addRow();
+
         try writer.close();
     }
 
@@ -137,12 +163,6 @@ test "DynamicReader: string columns roundtrip" {
 test "DynamicReader: optional fields roundtrip" {
     const allocator = std.testing.allocator;
 
-    const OptionalRecord = struct {
-        id: i32,
-        maybe_value: ?i64,
-        maybe_score: ?f64,
-    };
-
     const tmp_path = "test_dynamic_optionals.parquet";
     defer std.fs.cwd().deleteFile(tmp_path) catch {};
 
@@ -150,13 +170,38 @@ test "DynamicReader: optional fields roundtrip" {
         const file = try std.fs.cwd().createFile(tmp_path, .{});
         defer file.close();
 
-        var writer = try parquet.writeToFileRows(OptionalRecord, allocator, file, .{});
+        var writer = try parquet.createFileDynamic(allocator, file);
         defer writer.deinit();
 
-        try writer.writeRow(.{ .id = 1, .maybe_value = 100, .maybe_score = 1.5 });
-        try writer.writeRow(.{ .id = 2, .maybe_value = null, .maybe_score = 2.5 });
-        try writer.writeRow(.{ .id = 3, .maybe_value = 300, .maybe_score = null });
-        try writer.writeRow(.{ .id = 4, .maybe_value = null, .maybe_score = null });
+        try writer.addColumn("id", TypeInfo.int32, .{});
+        try writer.addColumn("maybe_value", TypeInfo.int64, .{});
+        try writer.addColumn("maybe_score", TypeInfo.double_, .{});
+        try writer.begin();
+
+        // Row 0: all present
+        try writer.setInt32(0, 1);
+        try writer.setInt64(1, 100);
+        try writer.setDouble(2, 1.5);
+        try writer.addRow();
+
+        // Row 1: first null
+        try writer.setInt32(0, 2);
+        try writer.setNull(1);
+        try writer.setDouble(2, 2.5);
+        try writer.addRow();
+
+        // Row 2: second null
+        try writer.setInt32(0, 3);
+        try writer.setInt64(1, 300);
+        try writer.setNull(2);
+        try writer.addRow();
+
+        // Row 3: both null
+        try writer.setInt32(0, 4);
+        try writer.setNull(1);
+        try writer.setNull(2);
+        try writer.addRow();
+
         try writer.close();
     }
 
@@ -198,11 +243,6 @@ test "DynamicReader: optional fields roundtrip" {
 test "DynamicReader: multiple row groups" {
     const allocator = std.testing.allocator;
 
-    const SimpleRecord = struct {
-        id: i32,
-        value: i64,
-    };
-
     const tmp_path = "test_dynamic_multirowgroup.parquet";
     defer std.fs.cwd().deleteFile(tmp_path) catch {};
 
@@ -210,17 +250,29 @@ test "DynamicReader: multiple row groups" {
         const file = try std.fs.cwd().createFile(tmp_path, .{});
         defer file.close();
 
-        var writer = try parquet.writeToFileRows(SimpleRecord, allocator, file, .{});
+        var writer = try parquet.createFileDynamic(allocator, file);
         defer writer.deinit();
 
-        // First row group
-        try writer.writeRow(.{ .id = 1, .value = 100 });
-        try writer.writeRow(.{ .id = 2, .value = 200 });
-        try writer.flush();
+        try writer.addColumn("id", TypeInfo.int32, .{});
+        try writer.addColumn("value", TypeInfo.int64, .{});
+        writer.setRowGroupSize(2);
+        try writer.begin();
 
-        // Second row group
-        try writer.writeRow(.{ .id = 3, .value = 300 });
-        try writer.writeRow(.{ .id = 4, .value = 400 });
+        try writer.setInt32(0, 1);
+        try writer.setInt64(1, 100);
+        try writer.addRow();
+        try writer.setInt32(0, 2);
+        try writer.setInt64(1, 200);
+        try writer.addRow();
+        // auto-flush after 2 rows
+
+        try writer.setInt32(0, 3);
+        try writer.setInt64(1, 300);
+        try writer.addRow();
+        try writer.setInt32(0, 4);
+        try writer.setInt64(1, 400);
+        try writer.addRow();
+
         try writer.close();
     }
 
@@ -264,12 +316,6 @@ test "DynamicReader: compressed data roundtrip" {
     if (build_options.no_compression) return;
     const allocator = std.testing.allocator;
 
-    const CompressedRecord = struct {
-        id: i32,
-        name: []const u8,
-        value: i64,
-    };
-
     const tmp_path = "test_dynamic_compressed.parquet";
     defer std.fs.cwd().deleteFile(tmp_path) catch {};
 
@@ -277,13 +323,25 @@ test "DynamicReader: compressed data roundtrip" {
         const file = try std.fs.cwd().createFile(tmp_path, .{});
         defer file.close();
 
-        var writer = try parquet.writeToFileRows(CompressedRecord, allocator, file, .{
-            .compression = .zstd,
-        });
+        var writer = try parquet.createFileDynamic(allocator, file);
         defer writer.deinit();
 
-        try writer.writeRow(.{ .id = 1, .name = "First", .value = 100 });
-        try writer.writeRow(.{ .id = 2, .name = "Second", .value = 200 });
+        try writer.addColumn("id", TypeInfo.int32, .{});
+        try writer.addColumn("name", TypeInfo.string, .{});
+        try writer.addColumn("value", TypeInfo.int64, .{});
+        writer.setCompression(.zstd);
+        try writer.begin();
+
+        try writer.setInt32(0, 1);
+        try writer.setBytes(1, "First");
+        try writer.setInt64(2, 100);
+        try writer.addRow();
+
+        try writer.setInt32(0, 2);
+        try writer.setBytes(1, "Second");
+        try writer.setInt64(2, 200);
+        try writer.addRow();
+
         try writer.close();
     }
 
@@ -312,11 +370,6 @@ test "DynamicReader: compressed data roundtrip" {
 test "DynamicReader: dictionary encoded data roundtrip" {
     const allocator = std.testing.allocator;
 
-    const DictRecord = struct {
-        id: i32,
-        category: []const u8,
-    };
-
     const tmp_path = "test_dynamic_dict.parquet";
     defer std.fs.cwd().deleteFile(tmp_path) catch {};
 
@@ -324,17 +377,30 @@ test "DynamicReader: dictionary encoded data roundtrip" {
         const file = try std.fs.cwd().createFile(tmp_path, .{});
         defer file.close();
 
-        var writer = try parquet.writeToFileRows(DictRecord, allocator, file, .{
-            .use_dictionary = true,
-        });
+        var writer = try parquet.createFileDynamic(allocator, file);
         defer writer.deinit();
 
+        try writer.addColumn("id", TypeInfo.int32, .{});
+        try writer.addColumn("category", TypeInfo.string, .{});
+        try writer.begin();
+
         // Repeated values to test dictionary efficiency
-        try writer.writeRow(.{ .id = 1, .category = "A" });
-        try writer.writeRow(.{ .id = 2, .category = "B" });
-        try writer.writeRow(.{ .id = 3, .category = "A" });
-        try writer.writeRow(.{ .id = 4, .category = "B" });
-        try writer.writeRow(.{ .id = 5, .category = "A" });
+        try writer.setInt32(0, 1);
+        try writer.setBytes(1, "A");
+        try writer.addRow();
+        try writer.setInt32(0, 2);
+        try writer.setBytes(1, "B");
+        try writer.addRow();
+        try writer.setInt32(0, 3);
+        try writer.setBytes(1, "A");
+        try writer.addRow();
+        try writer.setInt32(0, 4);
+        try writer.setBytes(1, "B");
+        try writer.addRow();
+        try writer.setInt32(0, 5);
+        try writer.setBytes(1, "A");
+        try writer.addRow();
+
         try writer.close();
     }
 

@@ -2,7 +2,7 @@
 //!
 //! Tests for INTERVAL type support:
 //! - Round-trip write/read with Writer/Reader API
-//! - Round-trip write/read with RowWriter/RowReader API
+//! - Round-trip write/read with DynamicWriter/DynamicReader API
 //! - Nullable interval columns
 //! - Statistics are NOT written (per Parquet spec, sort order is undefined)
 
@@ -12,8 +12,7 @@ const format = parquet.format;
 const types = parquet.types;
 const Interval = types.Interval;
 const Optional = types.Optional;
-const RowWriter = @import("../core/row_writer.zig").RowWriter;
-const RowReader = @import("../core/row_reader.zig").RowReader;
+const TypeInfo = parquet.TypeInfo;
 
 test "Interval struct basic operations" {
     // Test fromComponents
@@ -103,7 +102,7 @@ test "round-trip INTERVAL with Writer/Reader API" {
         defer {
             for (values) |v| {
                 switch (v) {
-                    .value => |bytes| allocator.free(bytes),
+                    .value => |b| allocator.free(b),
                     .null_value => {},
                 }
             }
@@ -120,7 +119,7 @@ test "round-trip INTERVAL with Writer/Reader API" {
     }
 }
 
-test "round-trip INTERVAL with RowWriter/RowReader API" {
+test "round-trip INTERVAL with DynamicWriter/DynamicReader API" {
     const allocator = std.testing.allocator;
 
     var tmp_dir = std.testing.tmpDir(.{});
@@ -128,52 +127,69 @@ test "round-trip INTERVAL with RowWriter/RowReader API" {
 
     const file_path = "roundtrip_interval_row.parquet";
 
-    const Record = struct {
-        duration: Interval,
-    };
-
-    // Write using RowWriter
+    // Write using DynamicWriter
     {
         const file = try tmp_dir.dir.createFile(file_path, .{});
         defer file.close();
 
-        var writer = try parquet.writeToFileRows(Record, allocator, file, .{});
+        var writer = try parquet.createFileDynamic(allocator, file);
         defer writer.deinit();
 
-        try writer.writeRow(.{ .duration = Interval.fromComponents(1, 15, 3600000) });
-        try writer.writeRow(.{ .duration = Interval.fromDays(30) });
-        try writer.writeRow(.{ .duration = Interval.fromHours(24) });
+        try writer.addColumn("duration", TypeInfo.interval, .{});
+        try writer.begin();
+
+        const iv1 = Interval.fromComponents(1, 15, 3600000);
+        try writer.setBytes(0, &iv1.toBytes());
+        try writer.addRow();
+
+        const iv2 = Interval.fromDays(30);
+        try writer.setBytes(0, &iv2.toBytes());
+        try writer.addRow();
+
+        const iv3 = Interval.fromHours(24);
+        try writer.setBytes(0, &iv3.toBytes());
+        try writer.addRow();
 
         try writer.close();
     }
 
-    // Read using RowReader
+    // Read using DynamicReader
     {
         const file = try tmp_dir.dir.openFile(file_path, .{});
         defer file.close();
 
-        var reader = try parquet.openFileRowReader(Record, allocator, file, .{});
+        var reader = try parquet.openFileDynamic(allocator, file, .{});
         defer reader.deinit();
 
-        var count: usize = 0;
-        while (try reader.next()) |row| {
-            if (count == 0) {
-                try std.testing.expectEqual(@as(u32, 1), row.duration.months);
-                try std.testing.expectEqual(@as(u32, 15), row.duration.days);
-                try std.testing.expectEqual(@as(u32, 3600000), row.duration.millis);
-            } else if (count == 1) {
-                try std.testing.expectEqual(@as(u32, 0), row.duration.months);
-                try std.testing.expectEqual(@as(u32, 30), row.duration.days);
-            } else if (count == 2) {
-                try std.testing.expectEqual(@as(u32, 86400000), row.duration.millis);
-            }
-            count += 1;
+        const rows = try reader.readAllRows(0);
+        defer {
+            for (rows) |row| row.deinit();
+            allocator.free(rows);
         }
-        try std.testing.expectEqual(@as(usize, 3), count);
+
+        try std.testing.expectEqual(@as(usize, 3), rows.len);
+
+        // Row 0: 1 month, 15 days, 1 hour
+        const bytes0 = rows[0].getColumn(0).?.asBytes().?;
+        const iv0 = Interval.fromBytes(bytes0[0..12].*);
+        try std.testing.expectEqual(@as(u32, 1), iv0.months);
+        try std.testing.expectEqual(@as(u32, 15), iv0.days);
+        try std.testing.expectEqual(@as(u32, 3600000), iv0.millis);
+
+        // Row 1: 30 days
+        const bytes1 = rows[1].getColumn(0).?.asBytes().?;
+        const iv1 = Interval.fromBytes(bytes1[0..12].*);
+        try std.testing.expectEqual(@as(u32, 0), iv1.months);
+        try std.testing.expectEqual(@as(u32, 30), iv1.days);
+
+        // Row 2: 24 hours
+        const bytes2 = rows[2].getColumn(0).?.asBytes().?;
+        const iv2 = Interval.fromBytes(bytes2[0..12].*);
+        try std.testing.expectEqual(@as(u32, 86400000), iv2.millis);
     }
 }
 
-test "round-trip nullable INTERVAL with RowWriter/RowReader API" {
+test "round-trip nullable INTERVAL with DynamicWriter/DynamicReader API" {
     const allocator = std.testing.allocator;
 
     var tmp_dir = std.testing.tmpDir(.{});
@@ -181,47 +197,63 @@ test "round-trip nullable INTERVAL with RowWriter/RowReader API" {
 
     const file_path = "roundtrip_interval_nullable.parquet";
 
-    const Record = struct {
-        duration: ?Interval,
-    };
-
-    // Write using RowWriter
+    // Write using DynamicWriter
     {
         const file = try tmp_dir.dir.createFile(file_path, .{});
         defer file.close();
 
-        var writer = try parquet.writeToFileRows(Record, allocator, file, .{});
+        var writer = try parquet.createFileDynamic(allocator, file);
         defer writer.deinit();
 
-        try writer.writeRow(.{ .duration = Interval.fromMonths(6) });
-        try writer.writeRow(.{ .duration = null });
-        try writer.writeRow(.{ .duration = Interval.fromSeconds(90) });
+        try writer.addColumn("duration", TypeInfo.interval, .{});
+        try writer.begin();
+
+        const iv1 = Interval.fromMonths(6);
+        try writer.setBytes(0, &iv1.toBytes());
+        try writer.addRow();
+
+        try writer.setNull(0);
+        try writer.addRow();
+
+        const iv2 = Interval.fromSeconds(90);
+        try writer.setBytes(0, &iv2.toBytes());
+        try writer.addRow();
 
         try writer.close();
     }
 
-    // Read using RowReader
+    // Read using DynamicReader
     {
         const file = try tmp_dir.dir.openFile(file_path, .{});
         defer file.close();
 
-        var reader = try parquet.openFileRowReader(Record, allocator, file, .{});
+        var reader = try parquet.openFileDynamic(allocator, file, .{});
         defer reader.deinit();
 
-        var count: usize = 0;
-        while (try reader.next()) |row| {
-            if (count == 0) {
-                try std.testing.expect(row.duration != null);
-                try std.testing.expectEqual(@as(u32, 6), row.duration.?.months);
-            } else if (count == 1) {
-                try std.testing.expect(row.duration == null);
-            } else if (count == 2) {
-                try std.testing.expect(row.duration != null);
-                try std.testing.expectEqual(@as(u32, 90000), row.duration.?.millis);
-            }
-            count += 1;
+        const rows = try reader.readAllRows(0);
+        defer {
+            for (rows) |row| row.deinit();
+            allocator.free(rows);
         }
-        try std.testing.expectEqual(@as(usize, 3), count);
+
+        try std.testing.expectEqual(@as(usize, 3), rows.len);
+
+        // Row 0: 6 months
+        const val0 = rows[0].getColumn(0).?;
+        try std.testing.expect(!val0.isNull());
+        const bytes0 = val0.asBytes().?;
+        const iv0 = Interval.fromBytes(bytes0[0..12].*);
+        try std.testing.expectEqual(@as(u32, 6), iv0.months);
+
+        // Row 1: null
+        try std.testing.expect(rows[1].getColumn(0).?.isNull());
+
+        // Row 2: 90 seconds
+        const val2 = rows[2].getColumn(0).?;
+        try std.testing.expect(!val2.isNull());
+        const bytes2 = val2.asBytes().?;
+        const iv2 = Interval.fromBytes(bytes2[0..12].*);
+        try std.testing.expectEqual(@as(u32, 90000), iv2.millis);
     }
 }
 

@@ -11,60 +11,6 @@
 const std = @import("std");
 const parquet = @import("parquet");
 const DynamicReader = parquet.DynamicReader;
-const Timestamp = parquet.TimestampMicros;
-const Date = parquet.Date;
-const Time = parquet.TimeMicros;
-const Uuid = parquet.Uuid;
-const Interval = parquet.Interval;
-
-/// Comprehensive struct with all supported data types
-const LargeRecord = struct {
-    // Integer types (signed)
-    id: i64,
-    small_int: i32,
-    medium_val: i16,
-    tiny_val: i8,
-
-    // Integer types (unsigned)
-    unsigned_huge: u64,
-    unsigned_large: u32,
-    unsigned_medium: u16,
-    unsigned_small: u8,
-
-    // Floating point
-    score: f64,
-    ratio: f32,
-
-    // Boolean
-    active: bool,
-
-    // Strings
-    name: []const u8,
-    description: []const u8,
-
-    // Optional types
-    maybe_count: ?i32,
-    maybe_score: ?f64,
-    maybe_name: ?[]const u8,
-
-    // Nested struct
-    metadata: Metadata,
-
-    // Lists
-    tags: []const []const u8,
-
-    // Logical types
-    created_at: Timestamp,
-    birth_date: Date,
-    event_time: Time,
-    uuid: Uuid,
-    duration: Interval,
-};
-
-const Metadata = struct {
-    version: i32,
-    source: []const u8,
-};
 
 // Pre-generated names and descriptions for variety
 const names = [_][]const u8{
@@ -97,10 +43,8 @@ pub fn main() !void {
     const output_path = "test_large_file.parquet";
     defer std.fs.cwd().deleteFile(output_path) catch {};
 
-    // Target rows - use a moderate count for testing
-    // Increase to 100_000+ for real stress testing
     const target_rows: usize = 10_000;
-    const flush_interval: usize = 2_500; // Create multiple row groups
+    const flush_interval: usize = 2_500;
 
     std.debug.print("\n=== Generating large Parquet file ===\n", .{});
     std.debug.print("Target: {} rows, flush every {} rows\n", .{ target_rows, flush_interval });
@@ -110,12 +54,61 @@ pub fn main() !void {
         const file = try std.fs.cwd().createFile(output_path, .{});
         defer file.close();
 
-        var writer = try parquet.writeToFileRows(LargeRecord, allocator, file, .{
-            .compression = .zstd,
-            .use_dictionary = true,
-            .max_page_size = 1024 * 1024, // 1MB pages
-        });
+        var writer = try parquet.createFileDynamic(allocator, file);
         defer writer.deinit();
+
+        // Col 0-3: signed integers
+        try writer.addColumn("id", parquet.TypeInfo.int64, .{});
+        try writer.addColumn("small_int", parquet.TypeInfo.int32, .{});
+        try writer.addColumn("medium_val", parquet.TypeInfo.int16, .{});
+        try writer.addColumn("tiny_val", parquet.TypeInfo.int8, .{});
+
+        // Col 4-7: unsigned integers
+        try writer.addColumn("unsigned_huge", parquet.TypeInfo.uint64, .{});
+        try writer.addColumn("unsigned_large", parquet.TypeInfo.uint32, .{});
+        try writer.addColumn("unsigned_medium", parquet.TypeInfo.uint16, .{});
+        try writer.addColumn("unsigned_small", parquet.TypeInfo.uint8, .{});
+
+        // Col 8-9: floats
+        try writer.addColumn("score", parquet.TypeInfo.double_, .{});
+        try writer.addColumn("ratio", parquet.TypeInfo.float_, .{});
+
+        // Col 10: boolean
+        try writer.addColumn("active", parquet.TypeInfo.bool_, .{});
+
+        // Col 11-12: strings
+        try writer.addColumn("name", parquet.TypeInfo.string, .{});
+        try writer.addColumn("description", parquet.TypeInfo.string, .{});
+
+        // Col 13-15: optional types
+        try writer.addColumn("maybe_count", parquet.TypeInfo.int32, .{});
+        try writer.addColumn("maybe_score", parquet.TypeInfo.double_, .{});
+        try writer.addColumn("maybe_name", parquet.TypeInfo.string, .{});
+
+        // Col 16: nested struct (metadata: { version: i32, source: string })
+        const ver_leaf = try writer.allocSchemaNode(.{ .int32 = .{} });
+        const src_leaf = try writer.allocSchemaNode(.{ .byte_array = .{ .logical = .string } });
+        var meta_fields = try writer.allocSchemaFields(2);
+        meta_fields[0] = .{ .name = try writer.dupeSchemaName("version"), .node = ver_leaf };
+        meta_fields[1] = .{ .name = try writer.dupeSchemaName("source"), .node = src_leaf };
+        const meta_node = try writer.allocSchemaNode(.{ .struct_ = .{ .fields = meta_fields } });
+        try writer.addColumnNested("metadata", meta_node, .{});
+
+        // Col 17: list<string> (tags)
+        const tag_leaf = try writer.allocSchemaNode(.{ .byte_array = .{ .logical = .string } });
+        const tags_node = try writer.allocSchemaNode(.{ .list = tag_leaf });
+        try writer.addColumnNested("tags", tags_node, .{});
+
+        // Col 18-22: logical types
+        try writer.addColumn("created_at", parquet.TypeInfo.timestamp_micros, .{});
+        try writer.addColumn("birth_date", parquet.TypeInfo.date, .{});
+        try writer.addColumn("event_time", parquet.TypeInfo.time_micros, .{});
+        try writer.addColumn("uuid", parquet.TypeInfo.uuid, .{});
+        try writer.addColumn("duration", parquet.TypeInfo.interval, .{});
+
+        writer.setCompression(.zstd);
+        writer.setRowGroupSize(flush_interval);
+        try writer.begin();
 
         var prng = std.Random.DefaultPrng.init(42);
         const rand = prng.random();
@@ -127,68 +120,83 @@ pub fn main() !void {
             const desc_idx = (rows_written / 7) % descriptions.len;
             const source_idx = (rows_written / 13) % sources.len;
 
-            // Nullable fields: null every 5th/7th/11th row
-            const maybe_count: ?i32 = if (rows_written % 5 == 0) null else @intCast(rows_written % 1000);
-            const maybe_score: ?f64 = if (rows_written % 7 == 0) null else @as(f64, @floatFromInt(rows_written % 100)) / 10.0;
-            const maybe_name: ?[]const u8 = if (rows_written % 11 == 0) null else names[name_idx];
+            // Col 0-3: signed integers
+            try writer.setInt64(0, @intCast(rows_written));
+            try writer.setInt32(1, @intCast(rows_written % 10000));
+            try writer.setInt32(2, @intCast(rows_written % 30000));
+            try writer.setInt32(3, @intCast(rows_written % 127));
 
-            // Generate UUID bytes
+            // Col 4-7: unsigned integers (stored as int32/int64 with logical type)
+            try writer.setInt64(4, @intCast(rows_written * 1000000));
+            try writer.setInt32(5, @intCast(rows_written % 1000000));
+            try writer.setInt32(6, @intCast(rows_written % 65000));
+            try writer.setInt32(7, @intCast(rows_written % 255));
+
+            // Col 8-9: floats
+            try writer.setDouble(8, @as(f64, @floatFromInt(rows_written)) * 0.001);
+            try writer.setFloat(9, @as(f32, @floatFromInt(rows_written % 1000)) / 100.0);
+
+            // Col 10: boolean
+            try writer.setBool(10, rows_written % 2 == 0);
+
+            // Col 11-12: strings
+            try writer.setBytes(11, names[name_idx]);
+            try writer.setBytes(12, descriptions[desc_idx]);
+
+            // Col 13-15: nullable (null every 5th/7th/11th row)
+            if (rows_written % 5 == 0) {
+                try writer.setNull(13);
+            } else {
+                try writer.setInt32(13, @intCast(rows_written % 1000));
+            }
+            if (rows_written % 7 == 0) {
+                try writer.setNull(14);
+            } else {
+                try writer.setDouble(14, @as(f64, @floatFromInt(rows_written % 100)) / 10.0);
+            }
+            if (rows_written % 11 == 0) {
+                try writer.setNull(15);
+            } else {
+                try writer.setBytes(15, names[name_idx]);
+            }
+
+            // Col 16: metadata struct
+            try writer.beginStruct(16);
+            try writer.setStructField(16, 0, .{ .int32_val = @intCast((rows_written / 1000) % 10 + 1) });
+            try writer.setStructFieldBytes(16, 1, sources[source_idx]);
+            try writer.endStruct(16);
+
+            // Col 17: tags list
+            const tag_count = rows_written % 4;
+            try writer.beginList(17);
+            if (tag_count >= 1) try writer.appendNestedBytes(17, "alpha");
+            if (tag_count >= 2) try writer.appendNestedBytes(17, "beta");
+            if (tag_count >= 3) try writer.appendNestedBytes(17, "gamma");
+            try writer.endList(17);
+
+            // Col 18: created_at (timestamp micros)
+            try writer.setInt64(18, @intCast(1700000000000000 + rows_written * 1000));
+
+            // Col 19: birth_date (date = days since epoch)
+            try writer.setInt32(19, @intCast(10000 + (rows_written % 20000)));
+
+            // Col 20: event_time (time micros)
+            try writer.setInt64(20, @intCast((rows_written % 86400) * 1000000));
+
+            // Col 21: uuid (16-byte fixed)
             var uuid_bytes: [16]u8 = undefined;
             rand.bytes(&uuid_bytes);
+            try writer.setBytes(21, &uuid_bytes);
 
-            // Tags list - vary the number of tags
-            const tag_count = rows_written % 4;
-            const tags: []const []const u8 = switch (tag_count) {
-                0 => &[_][]const u8{},
-                1 => &[_][]const u8{"alpha"},
-                2 => &[_][]const u8{ "alpha", "beta" },
-                else => &[_][]const u8{ "alpha", "beta", "gamma" },
-            };
+            // Col 22: interval (12-byte fixed: months/days/millis as little-endian i32s)
+            var interval_bytes: [12]u8 = undefined;
+            std.mem.writeInt(i32, interval_bytes[0..4], @intCast(rows_written % 12), .little);
+            std.mem.writeInt(i32, interval_bytes[4..8], @intCast(rows_written % 30), .little);
+            std.mem.writeInt(i32, interval_bytes[8..12], @intCast(rows_written % 1000), .little);
+            try writer.setBytes(22, &interval_bytes);
 
-            const row = LargeRecord{
-                .id = @intCast(rows_written),
-                .small_int = @intCast(rows_written % 10000),
-                .medium_val = @intCast(rows_written % 30000),
-                .tiny_val = @intCast(rows_written % 127),
-
-                .unsigned_huge = @intCast(rows_written * 1000000),
-                .unsigned_large = @intCast(rows_written % 1000000),
-                .unsigned_medium = @intCast(rows_written % 65000),
-                .unsigned_small = @intCast(rows_written % 255),
-
-                .score = @as(f64, @floatFromInt(rows_written)) * 0.001,
-                .ratio = @as(f32, @floatFromInt(rows_written % 1000)) / 100.0,
-
-                .active = rows_written % 2 == 0,
-
-                .name = names[name_idx],
-                .description = descriptions[desc_idx],
-
-                .maybe_count = maybe_count,
-                .maybe_score = maybe_score,
-                .maybe_name = maybe_name,
-
-                .metadata = .{
-                    .version = @intCast((rows_written / 1000) % 10 + 1),
-                    .source = sources[source_idx],
-                },
-
-                .tags = tags,
-
-                .created_at = .{ .value = @intCast(1700000000000000 + rows_written * 1000) },
-                .birth_date = .{ .days = @intCast(10000 + (rows_written % 20000)) },
-                .event_time = .{ .value = @intCast((rows_written % 86400) * 1000000) }, // Time of day (micros since midnight)
-                .uuid = .{ .bytes = uuid_bytes },
-                .duration = .{ .months = @intCast(rows_written % 12), .days = @intCast(rows_written % 30), .millis = @intCast(rows_written % 1000) },
-            };
-
-            try writer.writeRow(row);
+            try writer.addRow();
             rows_written += 1;
-
-            // Flush periodically to create multiple row groups
-            if (rows_written % flush_interval == 0) {
-                try writer.flush();
-            }
         }
 
         try writer.close();
@@ -231,7 +239,6 @@ pub fn main() !void {
 
             total_read += rows.len;
 
-            // Verify each row has the expected number of columns
             for (rows) |row| {
                 if (row.columnCount() != num_columns) {
                     std.debug.print("ERROR: Row has {} columns, expected {}\n", .{ row.columnCount(), num_columns });

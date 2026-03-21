@@ -564,206 +564,58 @@ pub const RowReaderHandle = struct {
 
 // ============================================================================
 // Row Writer Handle (cursor-based, non-Arrow, multi-row-group)
+// Thin wrapper around DynamicWriter for C ABI usage.
 // ============================================================================
 
 const err = @import("error.zig");
-const types = @import("../../core/types.zig");
-const column_writer = @import("../../core/column_writer.zig");
-const thrift = @import("../../core/thrift/mod.zig");
-const nested_mod = @import("../../core/nested.zig");
+const dynamic_writer_mod = @import("../../core/dynamic_writer.zig");
 const schema_mod = @import("../../core/schema.zig");
-const WriteTargetWriter = write_target.WriteTargetWriter;
 const SchemaNode = schema_mod.SchemaNode;
 
-const RowGroupMeta = struct {
-    columns: []format.ColumnChunk,
-    num_rows: i64,
-    total_byte_size: i64,
-    file_offset: i64,
-};
+pub const DynamicWriter = dynamic_writer_mod.DynamicWriter;
+pub const ColumnType = dynamic_writer_mod.ColumnType;
+pub const TypeInfo = dynamic_writer_mod.TypeInfo;
 
-pub const ColumnType = enum {
-    bool_,
-    int32,
-    int64,
-    float_,
-    double_,
-    bytes,
-    fixed_bytes,
-    nested,
-
-    pub fn toPhysicalType(self: ColumnType) ?format.PhysicalType {
-        return switch (self) {
-            .bool_ => .boolean,
-            .int32 => .int32,
-            .int64 => .int64,
-            .float_ => .float,
-            .double_ => .double,
-            .bytes => .byte_array,
-            .fixed_bytes => .fixed_len_byte_array,
-            .nested => null,
-        };
-    }
-};
-
-pub const TypeInfo = struct {
-    physical: ColumnType,
-    logical: ?format.LogicalType,
-    type_length: ?i32,
-
-    pub fn fromZpType(t: c_int) ?TypeInfo {
-        return switch (t) {
-            err.ZP_TYPE_BOOL => .{ .physical = .bool_, .logical = null, .type_length = null },
-            err.ZP_TYPE_INT32 => .{ .physical = .int32, .logical = null, .type_length = null },
-            err.ZP_TYPE_INT64 => .{ .physical = .int64, .logical = null, .type_length = null },
-            err.ZP_TYPE_FLOAT => .{ .physical = .float_, .logical = null, .type_length = null },
-            err.ZP_TYPE_DOUBLE => .{ .physical = .double_, .logical = null, .type_length = null },
-            err.ZP_TYPE_BYTES => .{ .physical = .bytes, .logical = null, .type_length = null },
-
-            err.ZP_TYPE_STRING => .{ .physical = .bytes, .logical = .string, .type_length = null },
-            err.ZP_TYPE_DATE => .{ .physical = .int32, .logical = .date, .type_length = null },
-            err.ZP_TYPE_TIMESTAMP_MILLIS => .{ .physical = .int64, .logical = .{ .timestamp = .{ .is_adjusted_to_utc = true, .unit = .millis } }, .type_length = null },
-            err.ZP_TYPE_TIMESTAMP_MICROS => .{ .physical = .int64, .logical = .{ .timestamp = .{ .is_adjusted_to_utc = true, .unit = .micros } }, .type_length = null },
-            err.ZP_TYPE_TIMESTAMP_NANOS => .{ .physical = .int64, .logical = .{ .timestamp = .{ .is_adjusted_to_utc = true, .unit = .nanos } }, .type_length = null },
-            err.ZP_TYPE_TIME_MILLIS => .{ .physical = .int32, .logical = .{ .time = .{ .is_adjusted_to_utc = false, .unit = .millis } }, .type_length = null },
-            err.ZP_TYPE_TIME_MICROS => .{ .physical = .int64, .logical = .{ .time = .{ .is_adjusted_to_utc = false, .unit = .micros } }, .type_length = null },
-            err.ZP_TYPE_TIME_NANOS => .{ .physical = .int64, .logical = .{ .time = .{ .is_adjusted_to_utc = false, .unit = .nanos } }, .type_length = null },
-            err.ZP_TYPE_INT8 => .{ .physical = .int32, .logical = .{ .int = .{ .bit_width = 8, .is_signed = true } }, .type_length = null },
-            err.ZP_TYPE_INT16 => .{ .physical = .int32, .logical = .{ .int = .{ .bit_width = 16, .is_signed = true } }, .type_length = null },
-            err.ZP_TYPE_UINT8 => .{ .physical = .int32, .logical = .{ .int = .{ .bit_width = 8, .is_signed = false } }, .type_length = null },
-            err.ZP_TYPE_UINT16 => .{ .physical = .int32, .logical = .{ .int = .{ .bit_width = 16, .is_signed = false } }, .type_length = null },
-            err.ZP_TYPE_UINT32 => .{ .physical = .int32, .logical = .{ .int = .{ .bit_width = 32, .is_signed = false } }, .type_length = null },
-            err.ZP_TYPE_UINT64 => .{ .physical = .int64, .logical = .{ .int = .{ .bit_width = 64, .is_signed = false } }, .type_length = null },
-            err.ZP_TYPE_UUID => .{ .physical = .fixed_bytes, .logical = .uuid, .type_length = 16 },
-            err.ZP_TYPE_JSON => .{ .physical = .bytes, .logical = .json, .type_length = null },
-            err.ZP_TYPE_ENUM => .{ .physical = .bytes, .logical = .enum_, .type_length = null },
-            err.ZP_TYPE_FLOAT16 => .{ .physical = .fixed_bytes, .logical = .float16, .type_length = 2 },
-            err.ZP_TYPE_BSON => .{ .physical = .bytes, .logical = .bson, .type_length = null },
-            err.ZP_TYPE_INTERVAL => .{ .physical = .fixed_bytes, .logical = null, .type_length = 12 },
-            err.ZP_TYPE_GEOMETRY => .{ .physical = .bytes, .logical = .{ .geometry = .{} }, .type_length = null },
-            err.ZP_TYPE_GEOGRAPHY => .{ .physical = .bytes, .logical = .{ .geography = .{} }, .type_length = null },
-            else => null,
-        };
-    }
-
-    pub fn forDecimal(precision: i32, scale: i32) TypeInfo {
-        const logical: format.LogicalType = .{ .decimal = .{ .precision = precision, .scale = scale } };
-        if (precision <= 9) {
-            return .{ .physical = .int32, .logical = logical, .type_length = null };
-        } else if (precision <= 18) {
-            return .{ .physical = .int64, .logical = logical, .type_length = null };
-        } else {
-            const byte_len: i32 = @divTrunc(precision + 1, 2);
-            return .{ .physical = .fixed_bytes, .logical = logical, .type_length = byte_len };
-        }
-    }
-};
-
-pub const PendingColumn = struct {
-    name: [:0]u8,
-    col_type: ColumnType,
-    logical_type: ?format.LogicalType = null,
-    type_length: ?i32 = null,
-    codec: ?format.CompressionCodec = null,
-    schema_node: ?*const SchemaNode = null,
-};
-
-/// Per-column builder state for constructing nested values.
-/// Uses a stack to handle arbitrarily deep nesting (list-of-struct-of-list...).
-pub const ValueBuilder = struct {
-    const FrameKind = enum { list, struct_, map, map_entry };
-
-    const Frame = struct {
-        kind: FrameKind,
-        items: std.ArrayListUnmanaged(value_mod.Value) = .empty,
-        map_entries: std.ArrayListUnmanaged(value_mod.Value.MapEntryValue) = .empty,
-        struct_fields: std.ArrayListUnmanaged(value_mod.Value.FieldValue) = .empty,
-        entry_key: ?value_mod.Value = null,
+pub fn typeInfoFromZpType(t: c_int) ?TypeInfo {
+    return switch (t) {
+        err.ZP_TYPE_BOOL => TypeInfo.bool_,
+        err.ZP_TYPE_INT32 => TypeInfo.int32,
+        err.ZP_TYPE_INT64 => TypeInfo.int64,
+        err.ZP_TYPE_FLOAT => TypeInfo.float_,
+        err.ZP_TYPE_DOUBLE => TypeInfo.double_,
+        err.ZP_TYPE_BYTES => TypeInfo.bytes,
+        err.ZP_TYPE_STRING => TypeInfo.string,
+        err.ZP_TYPE_DATE => TypeInfo.date,
+        err.ZP_TYPE_TIMESTAMP_MILLIS => TypeInfo.timestamp_millis,
+        err.ZP_TYPE_TIMESTAMP_MICROS => TypeInfo.timestamp_micros,
+        err.ZP_TYPE_TIMESTAMP_NANOS => TypeInfo.timestamp_nanos,
+        err.ZP_TYPE_TIME_MILLIS => TypeInfo.time_millis,
+        err.ZP_TYPE_TIME_MICROS => TypeInfo.time_micros,
+        err.ZP_TYPE_TIME_NANOS => TypeInfo.time_nanos,
+        err.ZP_TYPE_INT8 => TypeInfo.int8,
+        err.ZP_TYPE_INT16 => TypeInfo.int16,
+        err.ZP_TYPE_UINT8 => TypeInfo.uint8,
+        err.ZP_TYPE_UINT16 => TypeInfo.uint16,
+        err.ZP_TYPE_UINT32 => TypeInfo.uint32,
+        err.ZP_TYPE_UINT64 => TypeInfo.uint64,
+        err.ZP_TYPE_UUID => TypeInfo.uuid,
+        err.ZP_TYPE_JSON => TypeInfo.json,
+        err.ZP_TYPE_ENUM => TypeInfo.enum_,
+        err.ZP_TYPE_FLOAT16 => TypeInfo.float16,
+        err.ZP_TYPE_BSON => TypeInfo.bson,
+        err.ZP_TYPE_INTERVAL => TypeInfo.interval,
+        err.ZP_TYPE_GEOMETRY => TypeInfo.geometry,
+        err.ZP_TYPE_GEOGRAPHY => TypeInfo.geography,
+        else => null,
     };
-
-    stack: std.ArrayListUnmanaged(Frame) = .empty,
-
-    fn push(self: *ValueBuilder, allocator: Allocator, kind: FrameKind) !void {
-        try self.stack.append(allocator, .{ .kind = kind });
-    }
-
-    fn top(self: *ValueBuilder) ?*Frame {
-        if (self.stack.items.len == 0) return null;
-        return &self.stack.items[self.stack.items.len - 1];
-    }
-
-    fn pop(self: *ValueBuilder) ?Frame {
-        if (self.stack.items.len == 0) return null;
-        return self.stack.pop();
-    }
-
-    fn appendValue(self: *ValueBuilder, allocator: Allocator, val: value_mod.Value) !void {
-        const frame = self.top() orelse return error.InvalidState;
-        switch (frame.kind) {
-            .list => try frame.items.append(allocator, val),
-            .map_entry => {
-                if (frame.entry_key == null) {
-                    frame.entry_key = val;
-                } else {
-                    try frame.map_entries.append(allocator, .{
-                        .key = frame.entry_key.?,
-                        .value = val,
-                    });
-                    frame.entry_key = null;
-                }
-            },
-            else => return error.InvalidState,
-        }
-    }
-
-    fn isEmpty(self: *const ValueBuilder) bool {
-        return self.stack.items.len == 0;
-    }
-
-    fn deinit(self: *ValueBuilder, allocator: Allocator) void {
-        for (self.stack.items) |*frame| {
-            frame.items.deinit(allocator);
-            frame.map_entries.deinit(allocator);
-            frame.struct_fields.deinit(allocator);
-        }
-        self.stack.deinit(allocator);
-    }
-};
+}
 
 pub const RowWriterHandle = struct {
     allocator: Allocator,
     backend: WriterBackend,
-    target_writer: WriteTargetWriter = undefined,
-
-    pending_columns: std.ArrayListUnmanaged(PendingColumn) = .empty,
-    default_codec: format.CompressionCodec = .uncompressed,
-    began: bool = false,
-
-    num_columns: usize = 0,
-    column_types: []ColumnType = &.{},
-    column_logical_types: []?format.LogicalType = &.{},
-    column_type_lengths: []?i32 = &.{},
-    column_codecs: []format.CompressionCodec = &.{},
-    column_names_owned: [][:0]u8 = &.{},
-    current_row: []value_mod.Value = &.{},
-    row_set: []bool = &.{},
-    column_buffers: []std.ArrayListUnmanaged(value_mod.Value) = &.{},
-    column_schema_nodes: []?*const SchemaNode = &.{},
-    value_builders: []ValueBuilder = &.{},
-    bytes_arena: std.heap.ArenaAllocator = std.heap.ArenaAllocator.init(backing_allocator),
-    schema_arena: std.heap.ArenaAllocator = std.heap.ArenaAllocator.init(backing_allocator),
-
-    row_groups: std.ArrayListUnmanaged(RowGroupMeta) = .empty,
-    current_offset: i64 = 4, // after PAR1 magic
-
+    writer: DynamicWriter,
     err_ctx: ErrorContext = .{},
     transport_failed: bool = false,
-
-    row_group_row_limit: ?usize = null,
-    rows_in_current_group: usize = 0,
-    kv_metadata: std.ArrayListUnmanaged(format.KeyValue) = .empty,
-
-    // -- Open --
 
     pub fn openMemory() !*RowWriterHandle {
         const allocator = backing_allocator;
@@ -772,7 +624,11 @@ pub const RowWriterHandle = struct {
         bt.* = BufferTarget.init(allocator);
 
         const handle = try allocator.create(RowWriterHandle);
-        handle.* = .{ .allocator = allocator, .backend = .{ .buffer = bt } };
+        handle.* = .{
+            .allocator = allocator,
+            .backend = .{ .buffer = bt },
+            .writer = DynamicWriter.init(allocator, bt.target()),
+        };
         return handle;
     }
 
@@ -787,7 +643,11 @@ pub const RowWriterHandle = struct {
         adapter.* = .{ .user_ctx = ctx, .c_write = write_fn, .c_close = close_fn };
 
         const handle = try allocator.create(RowWriterHandle);
-        handle.* = .{ .allocator = allocator, .backend = .{ .callback = adapter } };
+        handle.* = .{
+            .allocator = allocator,
+            .backend = .{ .callback = adapter },
+            .writer = DynamicWriter.init(allocator, adapter.target()),
+        };
         return handle;
     }
 
@@ -800,784 +660,135 @@ pub const RowWriterHandle = struct {
         ft.* = FileTarget.init(file);
 
         const handle = try allocator.create(RowWriterHandle);
-        handle.* = .{ .allocator = allocator, .backend = .{ .file = ft } };
+        handle.* = .{
+            .allocator = allocator,
+            .backend = .{ .file = ft },
+            .writer = DynamicWriter.init(allocator, ft.target()),
+        };
         return handle;
     }
 
-    fn getTarget(self: *RowWriterHandle) WriteTarget {
-        return switch (self.backend) {
-            .buffer => |bt| bt.target(),
-            .callback => |cb| cb.target(),
-            .file => |ft| ft.target(),
-        };
-    }
-
-    // -- Schema building --
+    // -- Delegated methods --
 
     pub fn addColumn(self: *RowWriterHandle, name: [*:0]const u8, info: TypeInfo) !void {
-        if (self.began) return error.InvalidState;
-        const duped = try self.allocator.dupeZ(u8, std.mem.sliceTo(name, 0));
-        errdefer self.allocator.free(duped);
-        try self.pending_columns.append(self.allocator, .{
-            .name = duped,
-            .col_type = info.physical,
-            .logical_type = info.logical,
-            .type_length = info.type_length,
-        });
+        self.writer.addColumn(std.mem.sliceTo(name, 0), info, .{}) catch |e| return e;
     }
 
     pub fn addColumnNested(self: *RowWriterHandle, name: [*:0]const u8, node: *const SchemaNode) !void {
-        if (self.began) return error.InvalidState;
-        const duped = try self.allocator.dupeZ(u8, std.mem.sliceTo(name, 0));
-        errdefer self.allocator.free(duped);
-        try self.pending_columns.append(self.allocator, .{
-            .name = duped,
-            .col_type = .nested,
-            .schema_node = node,
-        });
+        self.writer.addColumnNested(std.mem.sliceTo(name, 0), node, .{}) catch |e| return e;
     }
 
-    /// Allocate a SchemaNode on the handle's schema arena.
     pub fn allocSchemaNode(self: *RowWriterHandle, node: SchemaNode) !*const SchemaNode {
-        const ptr = try self.schema_arena.allocator().create(SchemaNode);
-        ptr.* = node;
-        return ptr;
+        return self.writer.allocSchemaNode(node) catch |e| return e;
     }
 
-    /// Allocate schema fields on the handle's schema arena.
     pub fn allocSchemaFields(self: *RowWriterHandle, count: usize) ![]SchemaNode.Field {
-        return try self.schema_arena.allocator().alloc(SchemaNode.Field, count);
+        return self.writer.allocSchemaFields(count) catch |e| return e;
     }
 
-    /// Duplicate a string into the schema arena.
     pub fn dupeSchemaName(self: *RowWriterHandle, name: []const u8) ![]const u8 {
-        return try self.schema_arena.allocator().dupe(u8, name);
+        return self.writer.dupeSchemaName(name) catch |e| return e;
     }
 
     pub fn begin(self: *RowWriterHandle) !void {
-        if (self.began) return error.InvalidState;
-        const n = self.pending_columns.items.len;
-        if (n == 0) return error.InvalidState;
-
-        const allocator = self.allocator;
-
-        self.target_writer = WriteTargetWriter.init(self.getTarget());
-
-        // Write PAR1 magic
-        self.target_writer.target.write(format.PARQUET_MAGIC) catch return error.WriteError;
-
-        self.column_types = try allocator.alloc(ColumnType, n);
-        self.column_logical_types = try allocator.alloc(?format.LogicalType, n);
-        self.column_type_lengths = try allocator.alloc(?i32, n);
-        self.column_codecs = try allocator.alloc(format.CompressionCodec, n);
-        self.column_names_owned = try allocator.alloc([:0]u8, n);
-        self.current_row = try allocator.alloc(value_mod.Value, n);
-        self.row_set = try allocator.alloc(bool, n);
-        self.column_buffers = try allocator.alloc(std.ArrayListUnmanaged(value_mod.Value), n);
-        self.column_schema_nodes = try allocator.alloc(?*const SchemaNode, n);
-        self.value_builders = try allocator.alloc(ValueBuilder, n);
-
-        for (0..n) |i| {
-            const pc = self.pending_columns.items[i];
-            self.column_types[i] = pc.col_type;
-            self.column_logical_types[i] = pc.logical_type;
-            self.column_type_lengths[i] = pc.type_length;
-            self.column_codecs[i] = pc.codec orelse self.default_codec;
-            self.column_names_owned[i] = pc.name;
-            self.current_row[i] = .null_val;
-            self.row_set[i] = false;
-            self.column_buffers[i] = .empty;
-            self.column_schema_nodes[i] = pc.schema_node;
-            self.value_builders[i] = .{};
-        }
-
-        self.num_columns = n;
-        self.began = true;
+        self.writer.begin() catch |e| return e;
     }
 
-    // -- Row setters --
-
     pub fn setNull(self: *RowWriterHandle, col: usize) !void {
-        if (!self.began) return error.InvalidState;
-        if (col >= self.num_columns) return error.InvalidArgument;
-        self.current_row[col] = .null_val;
-        self.row_set[col] = true;
+        self.writer.setNull(col) catch |e| return e;
     }
 
     pub fn setBool(self: *RowWriterHandle, col: usize, val: bool) !void {
-        if (!self.began) return error.InvalidState;
-        if (col >= self.num_columns) return error.InvalidArgument;
-        if (self.column_types[col] != .bool_) return error.InvalidArgument;
-        self.current_row[col] = .{ .bool_val = val };
-        self.row_set[col] = true;
+        self.writer.setBool(col, val) catch |e| return e;
     }
 
     pub fn setInt32(self: *RowWriterHandle, col: usize, val: i32) !void {
-        if (!self.began) return error.InvalidState;
-        if (col >= self.num_columns) return error.InvalidArgument;
-        if (self.column_types[col] != .int32) return error.InvalidArgument;
-        self.current_row[col] = .{ .int32_val = val };
-        self.row_set[col] = true;
+        self.writer.setInt32(col, val) catch |e| return e;
     }
 
     pub fn setInt64(self: *RowWriterHandle, col: usize, val: i64) !void {
-        if (!self.began) return error.InvalidState;
-        if (col >= self.num_columns) return error.InvalidArgument;
-        if (self.column_types[col] != .int64) return error.InvalidArgument;
-        self.current_row[col] = .{ .int64_val = val };
-        self.row_set[col] = true;
+        self.writer.setInt64(col, val) catch |e| return e;
     }
 
     pub fn setFloat(self: *RowWriterHandle, col: usize, val: f32) !void {
-        if (!self.began) return error.InvalidState;
-        if (col >= self.num_columns) return error.InvalidArgument;
-        if (self.column_types[col] != .float_) return error.InvalidArgument;
-        self.current_row[col] = .{ .float_val = val };
-        self.row_set[col] = true;
+        self.writer.setFloat(col, val) catch |e| return e;
     }
 
     pub fn setDouble(self: *RowWriterHandle, col: usize, val: f64) !void {
-        if (!self.began) return error.InvalidState;
-        if (col >= self.num_columns) return error.InvalidArgument;
-        if (self.column_types[col] != .double_) return error.InvalidArgument;
-        self.current_row[col] = .{ .double_val = val };
-        self.row_set[col] = true;
+        self.writer.setDouble(col, val) catch |e| return e;
     }
 
     pub fn setBytes(self: *RowWriterHandle, col: usize, data: [*]const u8, len: usize) !void {
-        if (!self.began) return error.InvalidState;
-        if (col >= self.num_columns) return error.InvalidArgument;
-        const ct = self.column_types[col];
-        if (ct != .bytes and ct != .fixed_bytes) return error.InvalidArgument;
-        const copy = try self.bytes_arena.allocator().dupe(u8, data[0..len]);
-        self.current_row[col] = .{ .bytes_val = copy };
-        self.row_set[col] = true;
+        self.writer.setBytes(col, data[0..len]) catch |e| return e;
     }
 
-    // -- Nested value builders --
-
     pub fn beginList(self: *RowWriterHandle, col: usize) !void {
-        if (!self.began) return error.InvalidState;
-        if (col >= self.num_columns) return error.InvalidArgument;
-        if (self.column_types[col] != .nested) return error.InvalidArgument;
-        try self.value_builders[col].push(self.allocator, .list);
+        self.writer.beginList(col) catch |e| return e;
     }
 
     pub fn endList(self: *RowWriterHandle, col: usize) !void {
-        if (!self.began) return error.InvalidState;
-        if (col >= self.num_columns) return error.InvalidArgument;
-        var frame = self.value_builders[col].pop() orelse return error.InvalidState;
-        if (frame.kind != .list) return error.InvalidState;
-        const arena_alloc = self.bytes_arena.allocator();
-        const items = try arena_alloc.dupe(value_mod.Value, frame.items.items);
-        frame.items.deinit(self.allocator);
-        const val = value_mod.Value{ .list_val = items };
-        if (self.value_builders[col].top()) |parent| {
-            switch (parent.kind) {
-                .list => try parent.items.append(self.allocator, val),
-                .struct_ => return error.InvalidState,
-                .map_entry => try self.value_builders[col].appendValue(self.allocator, val),
-                .map => return error.InvalidState,
-            }
-        } else {
-            self.current_row[col] = val;
-            self.row_set[col] = true;
-        }
+        self.writer.endList(col) catch |e| return e;
     }
 
     pub fn beginStruct(self: *RowWriterHandle, col: usize) !void {
-        if (!self.began) return error.InvalidState;
-        if (col >= self.num_columns) return error.InvalidArgument;
-        if (self.column_types[col] != .nested) return error.InvalidArgument;
-        try self.value_builders[col].push(self.allocator, .struct_);
+        self.writer.beginStruct(col) catch |e| return e;
     }
 
     pub fn setStructField(self: *RowWriterHandle, col: usize, field_idx: usize, val: value_mod.Value) !void {
-        if (!self.began) return error.InvalidState;
-        if (col >= self.num_columns) return error.InvalidArgument;
-        const frame = self.value_builders[col].top() orelse return error.InvalidState;
-        if (frame.kind != .struct_) return error.InvalidState;
-        const node = self.column_schema_nodes[col] orelse return error.InvalidState;
-        const fields = getStructFields(node) orelse return error.InvalidState;
-        if (field_idx >= fields.len) return error.InvalidArgument;
-        const arena_alloc = self.bytes_arena.allocator();
-        const name = try arena_alloc.dupe(u8, fields[field_idx].name);
-        try frame.struct_fields.append(self.allocator, .{ .name = name, .value = val });
+        self.writer.setStructField(col, field_idx, val) catch |e| return e;
     }
 
     pub fn setStructFieldBytes(self: *RowWriterHandle, col: usize, field_idx: usize, data: [*]const u8, len: usize) !void {
-        const copy = try self.bytes_arena.allocator().dupe(u8, data[0..len]);
-        try self.setStructField(col, field_idx, .{ .bytes_val = copy });
+        self.writer.setStructFieldBytes(col, field_idx, data[0..len]) catch |e| return e;
     }
 
     pub fn endStruct(self: *RowWriterHandle, col: usize) !void {
-        if (!self.began) return error.InvalidState;
-        if (col >= self.num_columns) return error.InvalidArgument;
-        var frame = self.value_builders[col].pop() orelse return error.InvalidState;
-        if (frame.kind != .struct_) return error.InvalidState;
-        const arena_alloc = self.bytes_arena.allocator();
-        const fields = try arena_alloc.dupe(value_mod.Value.FieldValue, frame.struct_fields.items);
-        frame.struct_fields.deinit(self.allocator);
-        const val = value_mod.Value{ .struct_val = fields };
-        if (self.value_builders[col].top()) |parent| {
-            switch (parent.kind) {
-                .list => try parent.items.append(self.allocator, val),
-                .map_entry => try self.value_builders[col].appendValue(self.allocator, val),
-                else => return error.InvalidState,
-            }
-        } else {
-            self.current_row[col] = val;
-            self.row_set[col] = true;
-        }
+        self.writer.endStruct(col) catch |e| return e;
     }
 
     pub fn beginMap(self: *RowWriterHandle, col: usize) !void {
-        if (!self.began) return error.InvalidState;
-        if (col >= self.num_columns) return error.InvalidArgument;
-        if (self.column_types[col] != .nested) return error.InvalidArgument;
-        try self.value_builders[col].push(self.allocator, .map);
+        self.writer.beginMap(col) catch |e| return e;
     }
 
     pub fn beginMapEntry(self: *RowWriterHandle, col: usize) !void {
-        if (!self.began) return error.InvalidState;
-        if (col >= self.num_columns) return error.InvalidArgument;
-        const frame = self.value_builders[col].top() orelse return error.InvalidState;
-        if (frame.kind != .map) return error.InvalidState;
-        try self.value_builders[col].push(self.allocator, .map_entry);
+        self.writer.beginMapEntry(col) catch |e| return e;
     }
 
     pub fn endMapEntry(self: *RowWriterHandle, col: usize) !void {
-        if (!self.began) return error.InvalidState;
-        if (col >= self.num_columns) return error.InvalidArgument;
-        var frame = self.value_builders[col].pop() orelse return error.InvalidState;
-        if (frame.kind != .map_entry) return error.InvalidState;
-        if (frame.entry_key == null and frame.map_entries.items.len == 0) return error.InvalidState;
-        const parent = self.value_builders[col].top() orelse return error.InvalidState;
-        if (parent.kind != .map) return error.InvalidState;
-        if (frame.map_entries.items.len == 1) {
-            try parent.map_entries.append(self.allocator, frame.map_entries.items[0]);
-        } else if (frame.entry_key != null) {
-            try parent.map_entries.append(self.allocator, .{
-                .key = frame.entry_key.?,
-                .value = .null_val,
-            });
-        }
-        frame.map_entries.deinit(self.allocator);
+        self.writer.endMapEntry(col) catch |e| return e;
     }
 
     pub fn endMap(self: *RowWriterHandle, col: usize) !void {
-        if (!self.began) return error.InvalidState;
-        if (col >= self.num_columns) return error.InvalidArgument;
-        var frame = self.value_builders[col].pop() orelse return error.InvalidState;
-        if (frame.kind != .map) return error.InvalidState;
-        const arena_alloc = self.bytes_arena.allocator();
-        const entries = try arena_alloc.dupe(value_mod.Value.MapEntryValue, frame.map_entries.items);
-        frame.map_entries.deinit(self.allocator);
-        const val = value_mod.Value{ .map_val = entries };
-        if (self.value_builders[col].top()) |parent| {
-            switch (parent.kind) {
-                .list => try parent.items.append(self.allocator, val),
-                .map_entry => try self.value_builders[col].appendValue(self.allocator, val),
-                else => return error.InvalidState,
-            }
-        } else {
-            self.current_row[col] = val;
-            self.row_set[col] = true;
-        }
+        self.writer.endMap(col) catch |e| return e;
     }
 
     pub fn appendNestedValue(self: *RowWriterHandle, col: usize, val: value_mod.Value) !void {
-        if (!self.began) return error.InvalidState;
-        if (col >= self.num_columns) return error.InvalidArgument;
-        try self.value_builders[col].appendValue(self.allocator, val);
+        self.writer.appendNestedValue(col, val) catch |e| return e;
     }
 
     pub fn appendNestedBytes(self: *RowWriterHandle, col: usize, data: [*]const u8, len: usize) !void {
-        const copy = try self.bytes_arena.allocator().dupe(u8, data[0..len]);
-        try self.appendNestedValue(col, .{ .bytes_val = copy });
-    }
-
-    fn getStructFields(node: *const SchemaNode) ?[]const SchemaNode.Field {
-        return switch (node.*) {
-            .optional => |child| getStructFields(child),
-            .list => |element| getStructFields(element),
-            .map => |m| getStructFields(m.value),
-            .struct_ => |s| s.fields,
-            else => null,
-        };
+        self.writer.appendNestedBytes(col, data[0..len]) catch |e| return e;
     }
 
     pub fn addRow(self: *RowWriterHandle) !void {
-        if (!self.began) return error.InvalidState;
-        for (0..self.num_columns) |i| {
-            if (!self.row_set[i]) {
-                self.current_row[i] = .null_val;
-            }
-            try self.column_buffers[i].append(self.allocator, self.current_row[i]);
-            self.current_row[i] = .null_val;
-            self.row_set[i] = false;
-        }
-        self.rows_in_current_group += 1;
-        if (self.row_group_row_limit) |limit| {
-            if (self.rows_in_current_group >= limit) {
-                try self.flush();
-            }
-        }
+        self.writer.addRow() catch |e| return e;
     }
-
-    // -- Flush (writes one row group) --
 
     pub fn flush(self: *RowWriterHandle) !void {
-        if (!self.began) return error.InvalidState;
-        if (self.column_buffers.len == 0) return;
-        const n = self.column_buffers[0].items.len;
-        if (n == 0) return;
-
-        const allocator = self.allocator;
-        const writer = self.target_writer.writer();
-        const row_group_offset = self.current_offset;
-
-        var col_chunks_list: std.ArrayListUnmanaged(format.ColumnChunk) = .empty;
-        errdefer {
-            for (col_chunks_list.items) |cc| {
-                if (cc.meta_data) |meta| {
-                    allocator.free(meta.encodings);
-                    for (meta.path_in_schema) |p| allocator.free(p);
-                    allocator.free(meta.path_in_schema);
-                }
-            }
-            col_chunks_list.deinit(allocator);
-        }
-
-        var total_byte_size: i64 = 0;
-
-        for (0..self.num_columns) |col| {
-            const items = self.column_buffers[col].items;
-            const codec = self.column_codecs[col];
-            const col_name = self.column_names_owned[col];
-
-            if (self.column_types[col] == .nested) {
-                const node = self.column_schema_nodes[col] orelse return error.InvalidState;
-                try self.flushNestedColumn(&col_chunks_list, items, n, node, col_name, codec, &total_byte_size);
-            } else {
-                const path: []const []const u8 = &.{col_name};
-                const result: column_writer.ColumnChunkResult = switch (self.column_types[col]) {
-                    .bool_ => try flushColumnTyped(bool, allocator, writer, path, items, n, self.current_offset, codec),
-                    .int32 => try flushColumnTyped(i32, allocator, writer, path, items, n, self.current_offset, codec),
-                    .int64 => try flushColumnTyped(i64, allocator, writer, path, items, n, self.current_offset, codec),
-                    .float_ => try flushColumnTyped(f32, allocator, writer, path, items, n, self.current_offset, codec),
-                    .double_ => try flushColumnTyped(f64, allocator, writer, path, items, n, self.current_offset, codec),
-                    .bytes, .fixed_bytes => try flushColumnBytes(allocator, writer, path, items, n, self.current_offset, codec),
-                    .nested => unreachable,
-                };
-
-                self.target_writer.flush() catch return error.WriteError;
-
-                try col_chunks_list.append(allocator, .{
-                    .file_path = null,
-                    .file_offset = result.file_offset,
-                    .meta_data = result.metadata,
-                });
-                total_byte_size += result.metadata.total_compressed_size;
-                self.current_offset += safe.castTo(i64, result.total_bytes) catch return error.IntegerOverflow;
-            }
-        }
-
-        const col_chunks = try col_chunks_list.toOwnedSlice(allocator);
-
-        try self.row_groups.append(allocator, .{
-            .columns = col_chunks,
-            .num_rows = safe.castTo(i64, n) catch return error.TooManyValues,
-            .total_byte_size = total_byte_size,
-            .file_offset = row_group_offset,
-        });
-
-        for (0..self.num_columns) |i| {
-            self.column_buffers[i].clearRetainingCapacity();
-        }
-        _ = self.bytes_arena.reset(.retain_capacity);
-        self.rows_in_current_group = 0;
+        self.writer.flush() catch |e| return e;
     }
-
-    fn flushNestedColumn(
-        self: *RowWriterHandle,
-        col_chunks_list: *std.ArrayListUnmanaged(format.ColumnChunk),
-        items: []const value_mod.Value,
-        n: usize,
-        node: *const SchemaNode,
-        col_name: [:0]u8,
-        codec: format.CompressionCodec,
-        total_byte_size: *i64,
-    ) !void {
-        const allocator = self.allocator;
-        const writer = self.target_writer.writer();
-        const leaf_count = node.countLeafColumns();
-
-        var all_columns: std.ArrayListUnmanaged(nested_mod.FlatColumn) = .empty;
-        defer {
-            for (all_columns.items) |*c| c.deinit(allocator);
-            all_columns.deinit(allocator);
-        }
-
-        for (0..leaf_count) |_| {
-            try all_columns.append(allocator, nested_mod.FlatColumn.init());
-        }
-
-        for (0..n) |row_idx| {
-            const row_value = items[row_idx];
-            var row_columns = nested_mod.flattenValue(allocator, node, row_value) catch return error.OutOfMemory;
-            defer row_columns.deinit();
-
-            for (row_columns.columns.items, 0..) |rc, i| {
-                for (rc.values.items) |v| {
-                    all_columns.items[i].values.append(allocator, v) catch return error.OutOfMemory;
-                }
-                for (rc.def_levels.items) |d| {
-                    all_columns.items[i].def_levels.append(allocator, d) catch return error.OutOfMemory;
-                }
-                for (rc.rep_levels.items) |r| {
-                    all_columns.items[i].rep_levels.append(allocator, r) catch return error.OutOfMemory;
-                }
-            }
-        }
-
-        // Build leaf paths
-        var leaf_paths: std.ArrayListUnmanaged([]const []const u8) = .empty;
-        defer {
-            for (leaf_paths.items) |path| {
-                for (path) |seg| allocator.free(seg);
-                allocator.free(path);
-            }
-            leaf_paths.deinit(allocator);
-        }
-
-        var current_path: std.ArrayListUnmanaged([]const u8) = .empty;
-        defer current_path.deinit(allocator);
-        try current_path.append(allocator, col_name);
-        try buildLeafPathsStatic(allocator, &leaf_paths, &current_path, node);
-
-        const leaf_levels = node.computeLeafLevels(allocator) catch return error.OutOfMemory;
-        defer allocator.free(leaf_levels);
-
-        for (all_columns.items, 0..) |*col, leaf_idx| {
-            const path = if (leaf_idx < leaf_paths.items.len) leaf_paths.items[leaf_idx] else &[_][]const u8{col_name};
-            const levels = if (leaf_idx < leaf_levels.len) leaf_levels[leaf_idx] else SchemaNode.Levels{ .max_def = 0, .max_rep = 0 };
-
-            const result = column_writer.writeColumnChunkFromValues(
-                allocator, writer, path,
-                col.values.items, col.def_levels.items, col.rep_levels.items,
-                levels.max_def, levels.max_rep,
-                self.current_offset, codec,
-            ) catch return error.WriteError;
-
-            self.target_writer.flush() catch return error.WriteError;
-
-            try col_chunks_list.append(allocator, .{
-                .file_path = null,
-                .file_offset = result.file_offset,
-                .meta_data = result.metadata,
-            });
-            total_byte_size.* += result.metadata.total_compressed_size;
-            self.current_offset += safe.castTo(i64, result.total_bytes) catch return error.IntegerOverflow;
-        }
-    }
-
-    fn buildLeafPathsStatic(
-        allocator: Allocator,
-        paths: *std.ArrayListUnmanaged([]const []const u8),
-        current_path: *std.ArrayListUnmanaged([]const u8),
-        node: *const SchemaNode,
-    ) !void {
-        switch (node.*) {
-            .optional => |child| try buildLeafPathsStatic(allocator, paths, current_path, child),
-            .list => |element| {
-                try current_path.append(allocator, "list");
-                defer _ = current_path.pop();
-                try current_path.append(allocator, "element");
-                defer _ = current_path.pop();
-                try buildLeafPathsStatic(allocator, paths, current_path, element);
-            },
-            .map => |m| {
-                try current_path.append(allocator, "key_value");
-                try current_path.append(allocator, "key");
-                try buildLeafPathsStatic(allocator, paths, current_path, m.key);
-                _ = current_path.pop();
-                try current_path.append(allocator, "value");
-                try buildLeafPathsStatic(allocator, paths, current_path, m.value);
-                _ = current_path.pop();
-                _ = current_path.pop();
-            },
-            .struct_ => |s| {
-                for (s.fields) |f| {
-                    try current_path.append(allocator, f.name);
-                    try buildLeafPathsStatic(allocator, paths, current_path, f.node);
-                    _ = current_path.pop();
-                }
-            },
-            .boolean, .int32, .int64, .float, .double, .byte_array, .fixed_len_byte_array => {
-                const path = try allocator.alloc([]const u8, current_path.items.len);
-                for (current_path.items, 0..) |seg, i| {
-                    path[i] = try allocator.dupe(u8, seg);
-                }
-                try paths.append(allocator, path);
-            },
-        }
-    }
-
-    fn flushColumnTyped(
-        comptime T: type,
-        allocator: Allocator,
-        writer: *std.Io.Writer,
-        path: []const []const u8,
-        items: []const value_mod.Value,
-        n: usize,
-        offset: i64,
-        codec: format.CompressionCodec,
-    ) !column_writer.ColumnChunkResult {
-        const typed = try allocator.alloc(types.Optional(T), n);
-        defer allocator.free(typed);
-        for (items, 0..) |v, j| {
-            typed[j] = if (v.isNull()) .null_value else .{
-                .value = extractTyped(T, v) orelse return error.InvalidData,
-            };
-        }
-        return column_writer.writeColumnChunkDictOptionalWithPathArray(
-            T, allocator, writer, path, typed,
-            true, offset, codec, null, null, null, true,
-        );
-    }
-
-    fn flushColumnBytes(
-        allocator: Allocator,
-        writer: *std.Io.Writer,
-        path: []const []const u8,
-        items: []const value_mod.Value,
-        n: usize,
-        offset: i64,
-        codec: format.CompressionCodec,
-    ) !column_writer.ColumnChunkResult {
-        const typed = try allocator.alloc(types.Optional([]const u8), n);
-        defer allocator.free(typed);
-        for (items, 0..) |v, j| {
-            typed[j] = if (v.isNull()) .null_value else .{
-                .value = v.asBytes() orelse return error.InvalidData,
-            };
-        }
-        return column_writer.writeColumnChunkByteArrayDictOptionalWithPathArray(
-            allocator, writer, path, typed,
-            true, offset, codec, null, null, null, true,
-        );
-    }
-
-    fn extractTyped(comptime T: type, v: value_mod.Value) ?T {
-        return switch (T) {
-            bool => v.asBool(),
-            i32 => v.asInt32(),
-            i64 => v.asInt64(),
-            f32 => v.asFloat(),
-            f64 => v.asDouble(),
-            []const u8 => v.asBytes(),
-            else => null,
-        };
-    }
-
-    // -- Close (flush remaining + write footer) --
 
     pub fn setKvMetadata(self: *RowWriterHandle, key: []const u8, value: ?[]const u8) !void {
-        const allocator = self.allocator;
-        for (self.kv_metadata.items) |*kv| {
-            if (std.mem.eql(u8, kv.key, key)) {
-                if (kv.value) |old_v| allocator.free(old_v);
-                kv.value = if (value) |v| try allocator.dupe(u8, v) else null;
-                return;
-            }
-        }
-        const owned_key = try allocator.dupe(u8, key);
-        errdefer allocator.free(owned_key);
-        const owned_value = if (value) |v| try allocator.dupe(u8, v) else null;
-        try self.kv_metadata.append(allocator, .{ .key = owned_key, .value = owned_value });
+        self.writer.setKvMetadata(key, value) catch |e| return e;
     }
 
     pub fn writerClose(self: *RowWriterHandle) !void {
-        if (self.column_buffers.len > 0 and self.column_buffers[0].items.len > 0) {
-            try self.flush();
-        }
-        try self.writeFooter();
-        self.target_writer.target.close() catch return error.WriteError;
+        self.writer.close() catch |e| return e;
     }
-
-    fn writeFooter(self: *RowWriterHandle) !void {
-        const allocator = self.allocator;
-        const footer_bytes = try self.buildSerializedFooter();
-        defer allocator.free(footer_bytes);
-
-        const writer = self.target_writer.writer();
-        writer.writeAll(footer_bytes) catch return error.WriteError;
-
-        var len_buf: [4]u8 = undefined;
-        std.mem.writeInt(u32, &len_buf, safe.castTo(u32, footer_bytes.len) catch return error.IntegerOverflow, .little);
-        writer.writeAll(&len_buf) catch return error.WriteError;
-        writer.writeAll(format.PARQUET_MAGIC) catch return error.WriteError;
-
-        self.target_writer.flush() catch return error.WriteError;
-    }
-
-    fn buildSerializedFooter(self: *RowWriterHandle) ![]u8 {
-        const allocator = self.allocator;
-        const n = self.num_columns;
-
-        // Count total schema elements (nested columns expand to multiple)
-        var total_elements: usize = 1; // root
-        for (0..n) |i| {
-            if (self.column_schema_nodes[i]) |node| {
-                total_elements += core_writer.Writer.countSchemaElements(node);
-            } else {
-                total_elements += 1;
-            }
-        }
-
-        const schema = try allocator.alloc(format.SchemaElement, total_elements);
-        defer allocator.free(schema);
-
-        schema[0] = .{
-            .type_ = null,
-            .type_length = null,
-            .repetition_type = null,
-            .name = "schema",
-            .num_children = safe.castTo(i32, n) catch return error.IntegerOverflow,
-            .converted_type = null,
-            .scale = null,
-            .precision = null,
-            .field_id = null,
-            .logical_type = null,
-        };
-
-        var idx: usize = 1;
-        for (0..n) |i| {
-            if (self.column_schema_nodes[i]) |node| {
-                idx = core_writer.Writer.generateSchemaFromNodeStatic(schema, idx, self.column_names_owned[i], node, .required) catch return error.OutOfMemory;
-            } else {
-                const pt = self.column_types[i].toPhysicalType() orelse return error.InvalidState;
-                const lt = self.column_logical_types[i];
-
-                var precision: ?i32 = null;
-                var scale: ?i32 = null;
-                var converted_type: ?i32 = null;
-                if (lt) |l| {
-                    if (l == .decimal) {
-                        precision = l.decimal.precision;
-                        scale = l.decimal.scale;
-                    }
-                } else if (pt == .fixed_len_byte_array and self.column_type_lengths[i] != null and self.column_type_lengths[i].? == 12) {
-                    converted_type = format.ConvertedType.INTERVAL;
-                }
-
-                schema[idx] = .{
-                    .type_ = pt,
-                    .type_length = self.column_type_lengths[i],
-                    .repetition_type = .optional,
-                    .name = self.column_names_owned[i],
-                    .num_children = null,
-                    .converted_type = converted_type,
-                    .scale = scale,
-                    .precision = precision,
-                    .field_id = null,
-                    .logical_type = lt,
-                };
-                idx += 1;
-            }
-        }
-
-        // Build format row groups
-        var total_rows: i64 = 0;
-        for (self.row_groups.items) |rg| {
-            total_rows = std.math.add(i64, total_rows, rg.num_rows) catch return error.IntegerOverflow;
-        }
-
-        const fmt_rgs = try allocator.alloc(format.RowGroup, self.row_groups.items.len);
-        defer allocator.free(fmt_rgs);
-
-        for (self.row_groups.items, 0..) |rg, i| {
-            fmt_rgs[i] = .{
-                .columns = rg.columns,
-                .total_byte_size = rg.total_byte_size,
-                .num_rows = rg.num_rows,
-                .sorting_columns = null,
-                .file_offset = rg.file_offset,
-                .total_compressed_size = rg.total_byte_size,
-                .ordinal = safe.castTo(i16, i) catch 0,
-            };
-        }
-
-        const file_metadata = format.FileMetaData{
-            .version = 1,
-            .schema = schema,
-            .num_rows = total_rows,
-            .row_groups = fmt_rgs,
-            .key_value_metadata = if (self.kv_metadata.items.len > 0) self.kv_metadata.items else null,
-            .created_by = "zig-parquet",
-        };
-
-        var thrift_writer = thrift.CompactWriter.init(allocator);
-        defer thrift_writer.deinit();
-        file_metadata.serialize(&thrift_writer) catch return error.OutOfMemory;
-
-        return allocator.dupe(u8, thrift_writer.getWritten()) catch return error.OutOfMemory;
-    }
-
-    // -- Cleanup --
 
     pub fn deinit(self: *RowWriterHandle) void {
         const allocator = self.allocator;
-
-        for (0..self.num_columns) |i| {
-            self.column_buffers[i].deinit(allocator);
-            self.value_builders[i].deinit(allocator);
-        }
-        if (self.column_buffers.len > 0) allocator.free(self.column_buffers);
-        if (self.value_builders.len > 0) allocator.free(self.value_builders);
-        if (self.column_schema_nodes.len > 0) allocator.free(self.column_schema_nodes);
-        if (self.current_row.len > 0) allocator.free(self.current_row);
-        if (self.row_set.len > 0) allocator.free(self.row_set);
-        if (self.column_types.len > 0) allocator.free(self.column_types);
-        if (self.column_logical_types.len > 0) allocator.free(self.column_logical_types);
-        if (self.column_type_lengths.len > 0) allocator.free(self.column_type_lengths);
-        if (self.column_codecs.len > 0) allocator.free(self.column_codecs);
-
-        self.bytes_arena.deinit();
-        self.schema_arena.deinit();
-
-        // Free row group column chunk metadata
-        for (self.row_groups.items) |rg| {
-            for (rg.columns) |col| {
-                if (col.meta_data) |meta| {
-                    allocator.free(meta.encodings);
-                    for (meta.path_in_schema) |path| allocator.free(path);
-                    allocator.free(meta.path_in_schema);
-                    if (meta.statistics) |stats| {
-                        if (stats.max) |m| allocator.free(m);
-                        if (stats.min) |m| allocator.free(m);
-                        if (stats.max_value) |m| allocator.free(m);
-                        if (stats.min_value) |m| allocator.free(m);
-                    }
-                }
-            }
-            allocator.free(rg.columns);
-        }
-        self.row_groups.deinit(allocator);
-
-        for (self.kv_metadata.items) |kv| {
-            allocator.free(kv.key);
-            if (kv.value) |v| allocator.free(v);
-        }
-        self.kv_metadata.deinit(allocator);
-
-        // Column names are owned by pending_columns; free those
-        for (self.pending_columns.items) |pc| {
-            allocator.free(pc.name);
-        }
-        self.pending_columns.deinit(allocator);
-        if (self.column_names_owned.len > 0) allocator.free(self.column_names_owned);
+        self.writer.deinit();
 
         switch (self.backend) {
             .buffer => |bt| {

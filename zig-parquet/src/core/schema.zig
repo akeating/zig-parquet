@@ -185,13 +185,13 @@ pub const SchemaNode = union(enum) {
                 computeLeafLevelsRecursive(element, current_def + 1, current_rep + 1, result, index);
             },
             .map => |m| {
-                // Map levels account for key_value group only.
-                // Container optionality is handled by the .optional wrapper.
-                //   - key_value group (repeated): +1 def, +1 rep
-                //   - Key (required): +0 def
-                //   - Value (optional): +1 def
+                // Map levels: key_value repeated group adds +1 def, +1 rep.
+                // The Parquet schema always marks map values as OPTIONAL, so add +1 def
+                // for value unless the node already has an .optional wrapper (which adds
+                // its own +1).
                 computeLeafLevelsRecursive(m.key, current_def + 1, current_rep + 1, result, index);
-                computeLeafLevelsRecursive(m.value, current_def + 2, current_rep + 1, result, index);
+                const value_extra_def: u8 = if (m.value.* == .optional) 0 else 1;
+                computeLeafLevelsRecursive(m.value, current_def + 1 + value_extra_def, current_rep + 1, result, index);
             },
             .struct_ => |s| {
                 // Struct fields each get their own path, inheriting current levels

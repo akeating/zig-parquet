@@ -158,13 +158,12 @@ fn flattenRecursive(
             }
         },
         .map => |m| {
-            // Map levels account for key_value group only.
-            // Container optionality is handled by .optional wrapper above.
-            //   key_value group (repeated): +1 def, +1 rep
-            //   Key (required): +0 def
-            //   Value (optional): +1 def
+            // Map levels: key_value repeated group adds +1 def, +1 rep.
+            // Parquet schema always marks map values as OPTIONAL, so add +1 def for value
+            // unless the node already has an .optional wrapper.
             const entries = value.asMap();
             const key_leaves = m.key.countLeafColumns();
+            const value_extra_def: u32 = if (m.value.* == .optional) 0 else 1;
 
             if (entries == null or value.isNull()) {
                 try writeNullToLeaves(m.key, ctx);
@@ -172,13 +171,11 @@ fn flattenRecursive(
                 try writeNullToLeaves(m.value, ctx);
                 ctx.column_index -= key_leaves;
             } else if (entries.?.len == 0) {
-                // Empty map — key_value group not present, no extra def
                 try writeNullToLeaves(m.key, ctx);
                 ctx.column_index += key_leaves;
                 try writeNullToLeaves(m.value, ctx);
                 ctx.column_index -= key_leaves;
             } else {
-                // Non-empty map: +1 for key_value group
                 ctx.current_def += 1;
                 ctx.rep_depth += 1;
                 for (entries.?, 0..) |entry, i| {
@@ -187,9 +184,9 @@ fn flattenRecursive(
                     }
                     try flattenRecursive(m.key, entry.key, ctx, true, depth + 1);
                     ctx.column_index += key_leaves;
-                    ctx.current_def += 1;
+                    ctx.current_def += value_extra_def;
                     try flattenRecursive(m.value, entry.value, ctx, true, depth + 1);
-                    ctx.current_def -= 1;
+                    ctx.current_def -= value_extra_def;
                     ctx.column_index -= key_leaves;
                 }
                 ctx.rep_depth -= 1;

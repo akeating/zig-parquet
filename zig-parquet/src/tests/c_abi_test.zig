@@ -1358,7 +1358,7 @@ test "Test E: RowWriterHandle list<int32> roundtrip via Zig" {
 
     try handle.addColumn("id", .{ .physical = .int32, .logical = null, .type_length = null });
 
-    const schema_arena = handle.schema_arena.allocator();
+    const schema_arena = handle.writer.schema_arena.allocator();
     const element_node = try schema_arena.create(parquet.SchemaNode);
     element_node.* = .{ .int32 = .{ .logical = null } };
     const list_node = try schema_arena.create(parquet.SchemaNode);
@@ -1417,7 +1417,7 @@ test "Test F: RowWriterHandle struct roundtrip via Zig" {
 
     try handle.addColumn("id", .{ .physical = .int32, .logical = null, .type_length = null });
 
-    const schema_arena = handle.schema_arena.allocator();
+    const schema_arena = handle.writer.schema_arena.allocator();
     const x_node = try schema_arena.create(parquet.SchemaNode);
     x_node.* = .{ .int32 = .{ .logical = null } };
     const y_node = try schema_arena.create(parquet.SchemaNode);
@@ -1480,26 +1480,38 @@ test "Test F: RowWriterHandle struct roundtrip via Zig" {
 test "C ABI reader: nested list (list<list<int32>>)" {
     const allocator = std.testing.allocator;
 
-    const Row = struct {
-        matrix: []const []const i32,
-    };
-
-    const r1a = [_]i32{ 1, 2 };
-    const r1b = [_]i32{3};
-    const m1 = [_][]const i32{ &r1a, &r1b };
-    const r2a = [_]i32{ 10, 20, 30 };
-    const m2 = [_][]const i32{&r2a};
-
-    const rows = [_]Row{
-        .{ .matrix = &m1 },
-        .{ .matrix = &m2 },
-    };
-
-    var rw = try parquet.writeToBufferRows(Row, allocator, .{});
+    var rw = try parquet.createBufferDynamic(allocator);
     defer rw.deinit();
-    for (&rows) |*row| try rw.writeRow(row.*);
-    try rw.close();
 
+    const int32_node = try rw.allocSchemaNode(.{ .int32 = .{ .logical = null } });
+    const inner_list = try rw.allocSchemaNode(.{ .list = int32_node });
+    const outer_list = try rw.allocSchemaNode(.{ .list = inner_list });
+    try rw.addColumnNested("matrix", outer_list, .{});
+    try rw.begin();
+
+    // Row 1: [[1,2],[3]]
+    try rw.beginList(0);
+    try rw.beginList(0);
+    try rw.appendNestedValue(0, .{ .int32_val = 1 });
+    try rw.appendNestedValue(0, .{ .int32_val = 2 });
+    try rw.endList(0);
+    try rw.beginList(0);
+    try rw.appendNestedValue(0, .{ .int32_val = 3 });
+    try rw.endList(0);
+    try rw.endList(0);
+    try rw.addRow();
+
+    // Row 2: [[10,20,30]]
+    try rw.beginList(0);
+    try rw.beginList(0);
+    try rw.appendNestedValue(0, .{ .int32_val = 10 });
+    try rw.appendNestedValue(0, .{ .int32_val = 20 });
+    try rw.appendNestedValue(0, .{ .int32_val = 30 });
+    try rw.endList(0);
+    try rw.endList(0);
+    try rw.addRow();
+
+    try rw.close();
     const buffer = try rw.toOwnedSlice();
     defer allocator.free(buffer);
 
@@ -1540,28 +1552,42 @@ test "C ABI reader: nested list (list<list<int32>>)" {
 test "C ABI reader: list of struct" {
     const allocator = std.testing.allocator;
 
-    const Item = struct {
-        name: []const u8,
-        qty: i32,
-    };
-
-    const Row = struct {
-        items: []const Item,
-    };
-
-    const items_a = [_]Item{ .{ .name = "apple", .qty = 3 }, .{ .name = "banana", .qty = 5 } };
-    const items_b = [_]Item{.{ .name = "cherry", .qty = 1 }};
-
-    const c_abi_rows = [_]Row{
-        .{ .items = &items_a },
-        .{ .items = &items_b },
-    };
-
-    var rw = try parquet.writeToBufferRows(Row, allocator, .{});
+    var rw = try parquet.createBufferDynamic(allocator);
     defer rw.deinit();
-    for (&c_abi_rows) |*row| try rw.writeRow(row.*);
-    try rw.close();
 
+    const name_node = try rw.allocSchemaNode(.{ .byte_array = .{ .logical = .string } });
+    const qty_node = try rw.allocSchemaNode(.{ .int32 = .{ .logical = null } });
+    const fields = try rw.allocSchemaFields(2);
+    fields[0] = .{ .name = try rw.dupeSchemaName("name"), .node = name_node };
+    fields[1] = .{ .name = try rw.dupeSchemaName("qty"), .node = qty_node };
+    const struct_node = try rw.allocSchemaNode(.{ .struct_ = .{ .fields = fields } });
+    const list_node = try rw.allocSchemaNode(.{ .list = struct_node });
+    try rw.addColumnNested("items", list_node, .{});
+    try rw.begin();
+
+    // Row 1: [{name:"apple", qty:3}, {name:"banana", qty:5}]
+    try rw.beginList(0);
+    try rw.beginStruct(0);
+    try rw.setStructFieldBytes(0, 0, "apple");
+    try rw.setStructField(0, 1, .{ .int32_val = 3 });
+    try rw.endStruct(0);
+    try rw.beginStruct(0);
+    try rw.setStructFieldBytes(0, 0, "banana");
+    try rw.setStructField(0, 1, .{ .int32_val = 5 });
+    try rw.endStruct(0);
+    try rw.endList(0);
+    try rw.addRow();
+
+    // Row 2: [{name:"cherry", qty:1}]
+    try rw.beginList(0);
+    try rw.beginStruct(0);
+    try rw.setStructFieldBytes(0, 0, "cherry");
+    try rw.setStructField(0, 1, .{ .int32_val = 1 });
+    try rw.endStruct(0);
+    try rw.endList(0);
+    try rw.addRow();
+
+    try rw.close();
     const buffer = try rw.toOwnedSlice();
     defer allocator.free(buffer);
 
@@ -1788,21 +1814,32 @@ test "C ABI writer: list<struct> roundtrip" {
 test "C ABI reader: struct<id:i32, tags:list<i32>>" {
     const allocator = std.testing.allocator;
 
-    const Entry = struct {
-        id: i32,
-        tags: []const i32,
-    };
-
-    const rows = [_]Entry{
-        .{ .id = 1, .tags = &[_]i32{ 10, 20, 30 } },
-        .{ .id = 2, .tags = &[_]i32{40} },
-    };
-
-    var rw = try parquet.writeToBufferRows(Entry, allocator, .{});
+    var rw = try parquet.createBufferDynamic(allocator);
     defer rw.deinit();
-    for (&rows) |*row| try rw.writeRow(row.*);
-    try rw.close();
 
+    try rw.addColumn("id", parquet.TypeInfo.int32, .{});
+    const int32_node = try rw.allocSchemaNode(.{ .int32 = .{ .logical = null } });
+    const list_node = try rw.allocSchemaNode(.{ .list = int32_node });
+    try rw.addColumnNested("tags", list_node, .{});
+    try rw.begin();
+
+    // Row 1: id=1, tags=[10,20,30]
+    try rw.setInt32(0, 1);
+    try rw.beginList(1);
+    try rw.appendNestedValue(1, .{ .int32_val = 10 });
+    try rw.appendNestedValue(1, .{ .int32_val = 20 });
+    try rw.appendNestedValue(1, .{ .int32_val = 30 });
+    try rw.endList(1);
+    try rw.addRow();
+
+    // Row 2: id=2, tags=[40]
+    try rw.setInt32(0, 2);
+    try rw.beginList(1);
+    try rw.appendNestedValue(1, .{ .int32_val = 40 });
+    try rw.endList(1);
+    try rw.addRow();
+
+    try rw.close();
     const buffer = try rw.toOwnedSlice();
     defer allocator.free(buffer);
 

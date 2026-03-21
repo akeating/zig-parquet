@@ -5,7 +5,6 @@
 pub const column_decoder = @import("column_decoder.zig");
 pub const list_decoder = @import("list_decoder.zig");
 pub const map_decoder = @import("map_decoder.zig");
-pub const row_reader = @import("row_reader.zig");
 pub const dynamic_reader = @import("dynamic_reader.zig");
 pub const seekable_reader = @import("seekable_reader.zig");
 pub const parquet_reader = @import("parquet_reader.zig");
@@ -22,9 +21,6 @@ pub const assembleMap = map_decoder.assembleMap;
 pub const freeMapColumn = map_decoder.freeMapColumn;
 pub const MapColumn = map_decoder.MapColumn;
 pub const MapEntry = map_decoder.MapEntry;
-pub const RowReader = row_reader.RowReader;
-pub const RowReaderError = row_reader.RowReaderError;
-pub const RowReaderOptions = row_reader.RowReaderOptions;
 pub const DynamicReader = dynamic_reader.DynamicReader;
 pub const DynamicReaderError = dynamic_reader.DynamicReaderError;
 pub const DynamicReaderOptions = dynamic_reader.DynamicReaderOptions;

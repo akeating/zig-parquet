@@ -18,8 +18,6 @@ test {
     _ = @import("struct_test.zig");
     _ = @import("map_test.zig");
     _ = @import("nested_test.zig");
-    _ = @import("row_writer_test.zig");
-    _ = @import("row_reader_test.zig");
     _ = @import("dynamic_reader_test.zig");
     _ = @import("seekable_reader_test.zig");
     _ = @import("multipage_test.zig");

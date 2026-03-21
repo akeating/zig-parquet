@@ -1,12 +1,6 @@
 const std = @import("std");
 const parquet = @import("parquet");
 
-const Record = struct {
-    id: i32,
-    score: f64,
-    tags: []const []const u8,
-};
-
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -20,10 +14,27 @@ pub fn main() !void {
         const file = try std.fs.cwd().createFile(output_path, .{});
         defer file.close();
 
-        var writer = try parquet.writeToFileRows(Record, allocator, file, .{});
+        var writer = try parquet.createFileDynamic(allocator, file);
         defer writer.deinit();
 
-        try writer.writeRow(.{ .id = 1, .score = 95.5, .tags = &[_][]const u8{ "fast", "reliable" } });
+        try writer.addColumn("id", parquet.TypeInfo.int32, .{});
+        try writer.addColumn("score", parquet.TypeInfo.double_, .{});
+
+        // tags: list<string>
+        const str_node = try writer.allocSchemaNode(.{ .byte_array = .{} });
+        const list_node = try writer.allocSchemaNode(.{ .list = str_node });
+        try writer.addColumnNested("tags", list_node, .{});
+
+        try writer.begin();
+
+        try writer.setInt32(0, 1);
+        try writer.setDouble(1, 95.5);
+        try writer.beginList(2);
+        try writer.appendNestedBytes(2, "fast");
+        try writer.appendNestedBytes(2, "reliable");
+        try writer.endList(2);
+        try writer.addRow();
+
         try writer.close();
     }
 
@@ -55,8 +66,11 @@ pub fn main() !void {
         for (rows, 0..) |row, row_idx| {
             std.debug.print("Row {d}:\n", .{row_idx});
             for (0..row.columnCount()) |col_idx| {
-                const val = row.getColumn(col_idx);
-                std.debug.print("  Col {d}: {any}\n", .{ col_idx, val });
+                if (row.getColumn(col_idx)) |val| {
+                    std.debug.print("  Col {d}: {any}\n", .{ col_idx, val });
+                } else {
+                    std.debug.print("  Col {d}: (missing)\n", .{col_idx});
+                }
             }
         }
     }

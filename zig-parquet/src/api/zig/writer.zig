@@ -7,13 +7,15 @@ const std = @import("std");
 const FileTarget = @import("../../io/file_target.zig").FileTarget;
 const BufferTarget = @import("../../io/buffer_target.zig").BufferTarget;
 const core_writer = @import("../../core/writer.zig");
-const core_row_writer = @import("../../core/row_writer.zig");
+const core_dynamic_writer = @import("../../core/dynamic_writer.zig");
 const write_target = @import("../../core/write_target.zig");
 const parquet_reader = @import("../../core/parquet_reader.zig");
 
 pub const Writer = core_writer.Writer;
 pub const WriterError = core_writer.WriterError;
 pub const ColumnDef = core_writer.ColumnDef;
+pub const DynamicWriter = core_dynamic_writer.DynamicWriter;
+pub const DynamicWriterError = core_dynamic_writer.DynamicWriterError;
 pub const WriteTarget = write_target.WriteTarget;
 pub const BackendCleanup = parquet_reader.BackendCleanup;
 
@@ -58,22 +60,20 @@ pub fn writeToBuffer(
     return writer;
 }
 
-// -- RowWriter convenience constructors --
+// -- DynamicWriter convenience constructors --
 
-/// Create a row-oriented Parquet writer that writes to a file. The schema
-/// is inferred from struct type `T`. Write rows with `writeRow()` or
-/// `writeRows()`, then call `close()` to finalize.
+/// Create a dynamic row-oriented Parquet writer that writes to a file.
+/// Define the schema at runtime with `addColumn()` / `addColumnNested()`,
+/// then call `begin()` to finalize the schema, write rows, and `close()`.
 /// The caller retains ownership of `file`.
-pub fn writeToFileRows(
-    comptime T: type,
+pub fn createFileDynamic(
     allocator: std.mem.Allocator,
     file: std.fs.File,
-    options: core_row_writer.RowWriterOptions,
-) !core_row_writer.RowWriter(T) {
-    const ft = try allocator.create(FileTarget);
+) DynamicWriterError!DynamicWriter {
+    const ft = allocator.create(FileTarget) catch return error.OutOfMemory;
     errdefer allocator.destroy(ft);
     ft.* = FileTarget.init(file);
-    var writer = try core_row_writer.RowWriter(T).initWithTarget(allocator, ft.target(), options);
+    var writer = DynamicWriter.init(allocator, ft.target());
     writer._backend_cleanup = .{
         .ptr = @ptrCast(ft),
         .deinit_fn = &fileTargetCleanup,
@@ -81,18 +81,15 @@ pub fn writeToFileRows(
     return writer;
 }
 
-/// Create a row-oriented Parquet writer that writes to an in-memory buffer.
-/// The schema is inferred from struct type `T`. After calling `close()`,
-/// retrieve the bytes with `toOwnedSlice()`.
-pub fn writeToBufferRows(
-    comptime T: type,
+/// Create a dynamic row-oriented Parquet writer that writes to an in-memory buffer.
+/// After calling `close()`, retrieve the bytes with `toOwnedSlice()`.
+pub fn createBufferDynamic(
     allocator: std.mem.Allocator,
-    options: core_row_writer.RowWriterOptions,
-) !core_row_writer.RowWriter(T) {
-    const bt = try allocator.create(BufferTarget);
+) DynamicWriterError!DynamicWriter {
+    const bt = allocator.create(BufferTarget) catch return error.OutOfMemory;
     errdefer allocator.destroy(bt);
     bt.* = BufferTarget.init(allocator);
-    var writer = try core_row_writer.RowWriter(T).initWithTarget(allocator, bt.target(), options);
+    var writer = DynamicWriter.init(allocator, bt.target());
     writer._backend_cleanup = .{
         .ptr = @ptrCast(bt),
         .deinit_fn = &bufferTargetCleanup,

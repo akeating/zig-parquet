@@ -8,7 +8,6 @@ const FileReader = @import("../../io/file_reader.zig").FileReader;
 const BufferReader = @import("../../io/buffer_reader.zig").BufferReader;
 const core_reader = @import("../../core/reader.zig");
 const core_dynamic = @import("../../core/dynamic_reader.zig");
-const core_row_reader = @import("../../core/row_reader.zig");
 const seekable_reader = @import("../../core/seekable_reader.zig");
 const parquet_reader = @import("../../core/parquet_reader.zig");
 
@@ -75,48 +74,6 @@ pub fn openBufferDynamic(allocator: std.mem.Allocator, data: []const u8, options
     errdefer allocator.destroy(br);
     br.* = BufferReader.init(data);
     var reader = try DynamicReader.initFromSeekable(allocator, br.reader(), options);
-    reader._backend_cleanup = .{
-        .ptr = @ptrCast(br),
-        .deinit_fn = &bufferReaderCleanup,
-    };
-    return reader;
-}
-
-// -- RowReader convenience constructors --
-
-/// Open a Parquet file for row-oriented reading into structs of type `T`.
-/// Returns a `RowReader(T)` with an iterator interface (`next()`, `hasNext()`).
-/// Call `deinit()` when done; the caller retains ownership of `file`.
-pub fn openFileRowReader(
-    comptime T: type,
-    allocator: std.mem.Allocator,
-    file: std.fs.File,
-    options: core_row_reader.RowReaderOptions,
-) core_row_reader.RowReaderError!core_row_reader.RowReader(T) {
-    const fr = allocator.create(FileReader) catch return error.OutOfMemory;
-    errdefer allocator.destroy(fr);
-    fr.* = FileReader.init(file) catch return error.Unseekable;
-    var reader = try core_row_reader.RowReader(T).initFromSeekable(allocator, fr.reader(), options);
-    reader._backend_cleanup = .{
-        .ptr = @ptrCast(fr),
-        .deinit_fn = &fileReaderCleanup,
-    };
-    return reader;
-}
-
-/// Open a Parquet file from an in-memory buffer for row-oriented reading
-/// into structs of type `T`. The caller must ensure `data` outlives the
-/// returned `RowReader`.
-pub fn openBufferRowReader(
-    comptime T: type,
-    allocator: std.mem.Allocator,
-    data: []const u8,
-    options: core_row_reader.RowReaderOptions,
-) core_row_reader.RowReaderError!core_row_reader.RowReader(T) {
-    const br = allocator.create(BufferReader) catch return error.OutOfMemory;
-    errdefer allocator.destroy(br);
-    br.* = BufferReader.init(data);
-    var reader = try core_row_reader.RowReader(T).initFromSeekable(allocator, br.reader(), options);
     reader._backend_cleanup = .{
         .ptr = @ptrCast(br),
         .deinit_fn = &bufferReaderCleanup,

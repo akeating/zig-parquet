@@ -23,6 +23,7 @@ const safe = @import("../../core/safe.zig");
 
 const RowWriterHandle = handles.RowWriterHandle;
 const TypeInfo = handles.TypeInfo;
+const typeInfoFromZpType = handles.typeInfoFromZpType;
 const SchemaNode = @import("../../core/schema.zig").SchemaNode;
 const value_mod = @import("../../core/value.zig");
 const BufferTarget = @import("../../io/buffer_target.zig").BufferTarget;
@@ -82,7 +83,7 @@ pub export fn zp_row_writer_add_column(
 ) callconv(.c) c_int {
     const handle = castHandle(handle_ptr) orelse return err.ZP_ERROR_INVALID_ARGUMENT;
     const n = name orelse return err.ZP_ERROR_INVALID_ARGUMENT;
-    const info = TypeInfo.fromZpType(col_type) orelse {
+    const info = typeInfoFromZpType(col_type) orelse {
         handle.err_ctx.setError(err.ZP_ERROR_INVALID_ARGUMENT, "unknown column type");
         return handle.err_ctx.code;
     };
@@ -180,7 +181,7 @@ pub export fn zp_row_writer_set_compression(
     codec: c_int,
 ) callconv(.c) c_int {
     const handle = castHandle(handle_ptr) orelse return err.ZP_ERROR_INVALID_ARGUMENT;
-    if (handle.began) {
+    if (handle.writer.began) {
         handle.err_ctx.setError(err.ZP_ERROR_INVALID_STATE, "cannot set compression after begin");
         return handle.err_ctx.code;
     }
@@ -188,7 +189,7 @@ pub export fn zp_row_writer_set_compression(
         handle.err_ctx.setError(err.ZP_ERROR_INVALID_ARGUMENT, "unknown compression codec");
         return handle.err_ctx.code;
     };
-    handle.default_codec = cc;
+    handle.writer.setCompression(cc);
     return ZP_OK;
 }
 
@@ -199,7 +200,7 @@ pub export fn zp_row_writer_set_column_codec(
     codec: c_int,
 ) callconv(.c) c_int {
     const handle = castHandle(handle_ptr) orelse return err.ZP_ERROR_INVALID_ARGUMENT;
-    if (handle.began) {
+    if (handle.writer.began) {
         handle.err_ctx.setError(err.ZP_ERROR_INVALID_STATE, "cannot set column codec after begin");
         return handle.err_ctx.code;
     }
@@ -211,15 +212,14 @@ pub export fn zp_row_writer_set_column_codec(
         handle.err_ctx.setError(err.ZP_ERROR_INVALID_ARGUMENT, "column index out of range");
         return handle.err_ctx.code;
     };
-    if (idx >= handle.pending_columns.items.len) {
-        handle.err_ctx.setError(err.ZP_ERROR_INVALID_ARGUMENT, "column index out of range");
-        return handle.err_ctx.code;
-    }
     const cc = format.CompressionCodec.fromInt(codec) catch {
         handle.err_ctx.setError(err.ZP_ERROR_INVALID_ARGUMENT, "unknown compression codec");
         return handle.err_ctx.code;
     };
-    handle.pending_columns.items[idx].codec = cc;
+    handle.writer.setColumnCompression(idx, cc) catch |e| {
+        handle.err_ctx.setErrorFmt(err.mapError(e), "setColumnCodec failed: {s}", .{err.errorMessage(e)});
+        return handle.err_ctx.code;
+    };
     return ZP_OK;
 }
 
@@ -233,10 +233,11 @@ pub export fn zp_row_writer_set_row_group_size(
         handle.err_ctx.setError(err.ZP_ERROR_INVALID_ARGUMENT, "row group size must be positive");
         return handle.err_ctx.code;
     }
-    handle.row_group_row_limit = safe.castTo(usize, max_rows) catch {
+    const limit = safe.castTo(usize, max_rows) catch {
         handle.err_ctx.setError(err.ZP_ERROR_INVALID_ARGUMENT, "row group size out of range");
         return handle.err_ctx.code;
     };
+    handle.writer.setRowGroupSize(limit);
     return ZP_OK;
 }
 
@@ -405,7 +406,7 @@ pub export fn zp_schema_primitive(
     zp_type: c_int,
 ) callconv(.c) ?*const anyopaque {
     const handle = castHandle(handle_ptr) orelse return null;
-    const info = TypeInfo.fromZpType(zp_type) orelse return null;
+    const info = typeInfoFromZpType(zp_type) orelse return null;
     const node = schemaNodeFromTypeInfo(handle, info) catch return null;
     return @ptrCast(node);
 }
