@@ -406,6 +406,7 @@ pub const RowReaderHandle = struct {
     cursor: usize = 0,
     col_names: [][:0]u8 = &.{},
     num_top_columns: usize = 0,
+    auto_rg_index: usize = 0,
     err_ctx: ErrorContext = .{},
 
     pub fn openMemory(data: [*]const u8, len: usize) !*RowReaderHandle {
@@ -541,6 +542,20 @@ pub const RowReaderHandle = struct {
         const idx = self.cursor - 1;
         if (idx >= rows.len) return null;
         return &rows[idx];
+    }
+
+    /// Advance cursor, auto-loading the next row group when needed.
+    /// Returns true if a row is available, false when all row groups are exhausted.
+    pub fn nextAll(self: *RowReaderHandle) !bool {
+        if (self.next()) return true;
+
+        while (self.auto_rg_index < self.reader.metadata.row_groups.len) {
+            const rg = self.auto_rg_index;
+            self.auto_rg_index += 1;
+            try self.readRowGroup(rg);
+            if (self.next()) return true;
+        }
+        return false;
     }
 
     pub fn close(self: *RowReaderHandle) void {

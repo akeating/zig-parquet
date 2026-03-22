@@ -192,6 +192,23 @@ for (0..reader.getNumRowGroups()) |rg| {
 }
 ```
 
+### Row Iterator
+
+Stream through all rows without managing row groups manually. Only one row group's data is held in memory at a time:
+
+```zig
+var reader = try parquet.openFileDynamic(allocator, file, .{});
+defer reader.deinit();
+
+var iter = reader.rowIterator();
+defer iter.deinit();
+
+while (try iter.next()) |row| {
+    const id = if (row.getColumn(0)) |v| v.asInt32() orelse 0 else 0;
+    std.debug.print("id={}\n", .{id});
+}
+```
+
 ### Column-Based API
 
 For more control, use the lower-level column API:
@@ -373,6 +390,7 @@ writer.setMaxPageSize(1_048_576);      // 1MB page size limit
 | **Features** | | |
 | Column projection | ✅ | Read subset of columns; skips I/O for unselected columns |
 | Row group filtering | ✅ | Statistics-based; skip row groups via min/max/null_count |
+| Streaming iteration | ✅ | Row iterator; one row group in memory at a time |
 | Column statistics | ✅ | min/max/null_count |
 | Multi-page columns | ✅ | Large column support |
 | Multi-row-group files | ✅ | |
@@ -384,11 +402,6 @@ writer.setMaxPageSize(1_048_576);      // 1MB page size limit
 Legend: ✅ Supported | ⏳ Planned | 🔍 Under review | ❌ Unsupported
 
 Files containing unsupported features return explicit errors rather than silently producing incorrect results.
-
-## Known Limitations
-
-**Reader:**
-- No streaming/iterator API (all rows materialized at once)
 
 ## WASM Support
 

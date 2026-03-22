@@ -4234,3 +4234,155 @@ test "row group filtering pattern using statistics" {
     try std.testing.expectEqual(@as(?i32, 1), rows[0].getColumn(0).?.asInt32());
     try std.testing.expectEqual(@as(?i32, 100), rows[99].getColumn(0).?.asInt32());
 }
+
+// =============================================================================
+// RowIterator tests
+// =============================================================================
+
+test "rowIterator basic iteration" {
+    const allocator = std.testing.allocator;
+
+    var writer = try parquet.createBufferDynamic(allocator);
+    defer writer.deinit();
+
+    try writer.addColumn("id", parquet.TypeInfo.int32, .{});
+    try writer.addColumn("name", parquet.TypeInfo.string, .{});
+    try writer.begin();
+
+    try writer.setInt32(0, 10);
+    try writer.setBytes(1, "alpha");
+    try writer.addRow();
+    try writer.setInt32(0, 20);
+    try writer.setBytes(1, "beta");
+    try writer.addRow();
+    try writer.setInt32(0, 30);
+    try writer.setBytes(1, "gamma");
+    try writer.addRow();
+
+    try writer.close();
+    const buffer = try writer.toOwnedSlice();
+    defer allocator.free(buffer);
+
+    var reader = try parquet.openBufferDynamic(allocator, buffer, .{});
+    defer reader.deinit();
+
+    var iter = reader.rowIterator();
+    defer iter.deinit();
+
+    const row0 = (try iter.next()).?;
+    try std.testing.expectEqual(@as(?i32, 10), row0.getColumn(0).?.asInt32());
+
+    const row1 = (try iter.next()).?;
+    try std.testing.expectEqual(@as(?i32, 20), row1.getColumn(0).?.asInt32());
+
+    const row2 = (try iter.next()).?;
+    try std.testing.expectEqual(@as(?i32, 30), row2.getColumn(0).?.asInt32());
+
+    try std.testing.expectEqual(@as(?*const DynRow, null), try iter.next());
+}
+
+test "rowIterator multi-row-group seamless traversal" {
+    const allocator = std.testing.allocator;
+
+    var writer = try parquet.createBufferDynamic(allocator);
+    defer writer.deinit();
+
+    try writer.addColumn("val", parquet.TypeInfo.int32, .{});
+    try writer.begin();
+
+    // Row group 0: values 1, 2
+    try writer.setInt32(0, 1);
+    try writer.addRow();
+    try writer.setInt32(0, 2);
+    try writer.addRow();
+    try writer.flush();
+
+    // Row group 1: values 3, 4, 5
+    try writer.setInt32(0, 3);
+    try writer.addRow();
+    try writer.setInt32(0, 4);
+    try writer.addRow();
+    try writer.setInt32(0, 5);
+    try writer.addRow();
+    try writer.flush();
+
+    try writer.close();
+    const buffer = try writer.toOwnedSlice();
+    defer allocator.free(buffer);
+
+    var reader = try parquet.openBufferDynamic(allocator, buffer, .{});
+    defer reader.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), reader.getNumRowGroups());
+
+    var iter = reader.rowIterator();
+    defer iter.deinit();
+
+    var collected: [5]i32 = undefined;
+    var count: usize = 0;
+    while (try iter.next()) |row| {
+        collected[count] = row.getColumn(0).?.asInt32().?;
+        count += 1;
+    }
+
+    try std.testing.expectEqual(@as(usize, 5), count);
+    try std.testing.expectEqual([_]i32{ 1, 2, 3, 4, 5 }, collected);
+}
+
+test "rowIteratorProjected only returns projected columns" {
+    const allocator = std.testing.allocator;
+
+    var writer = try parquet.createBufferDynamic(allocator);
+    defer writer.deinit();
+
+    try writer.addColumn("a", parquet.TypeInfo.int32, .{});
+    try writer.addColumn("b", parquet.TypeInfo.string, .{});
+    try writer.addColumn("c", parquet.TypeInfo.double_, .{});
+    try writer.begin();
+
+    try writer.setInt32(0, 1);
+    try writer.setBytes(1, "hello");
+    try writer.setDouble(2, 3.14);
+    try writer.addRow();
+
+    try writer.close();
+    const buffer = try writer.toOwnedSlice();
+    defer allocator.free(buffer);
+
+    var reader = try parquet.openBufferDynamic(allocator, buffer, .{});
+    defer reader.deinit();
+
+    // Project only columns "b" (index 1) and "c" (index 2)
+    var iter = reader.rowIteratorProjected(&.{ 1, 2 });
+    defer iter.deinit();
+
+    const row = (try iter.next()).?;
+    try std.testing.expectEqual(@as(usize, 2), row.columnCount());
+
+    const b_bytes = row.getColumn(0).?.asBytes().?;
+    try std.testing.expectEqualStrings("hello", b_bytes);
+    try std.testing.expectEqual(@as(?f64, 3.14), row.getColumn(1).?.asDouble());
+
+    try std.testing.expectEqual(@as(?*const DynRow, null), try iter.next());
+}
+
+test "rowIterator on empty file returns null immediately" {
+    const allocator = std.testing.allocator;
+
+    var writer = try parquet.createBufferDynamic(allocator);
+    defer writer.deinit();
+
+    try writer.addColumn("x", parquet.TypeInfo.int32, .{});
+    try writer.begin();
+    try writer.close();
+    const buffer = try writer.toOwnedSlice();
+    defer allocator.free(buffer);
+
+    var reader = try parquet.openBufferDynamic(allocator, buffer, .{});
+    defer reader.deinit();
+
+    var iter = reader.rowIterator();
+    defer iter.deinit();
+
+    try std.testing.expectEqual(@as(?*const DynRow, null), try iter.next());
+}

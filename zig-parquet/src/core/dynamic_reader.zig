@@ -253,6 +253,85 @@ pub const DynamicReader = struct {
         return rg.columns[column_index].meta_data;
     }
 
+    /// Streaming row iterator that advances through row groups automatically.
+    /// Holds at most one row group's worth of rows in memory at a time.
+    pub const RowIterator = struct {
+        reader: *Self,
+        current_rows: ?[]Row,
+        cursor: usize,
+        current_rg: usize,
+        num_rgs: usize,
+        col_indices: ?[]const usize,
+
+        /// Advance to the next row. Returns a pointer to the current row,
+        /// or null when all row groups have been exhausted.
+        /// The returned pointer is valid until the next call to `next()` that
+        /// crosses a row group boundary, or until `deinit()` is called.
+        pub fn next(self: *RowIterator) !?*const Row {
+            while (true) {
+                if (self.current_rows) |rows| {
+                    if (self.cursor < rows.len) {
+                        const row = &rows[self.cursor];
+                        self.cursor += 1;
+                        return row;
+                    }
+                    self.freeCurrentRows();
+                }
+
+                if (self.current_rg >= self.num_rgs) return null;
+
+                const rows = try self.reader.readRowsInternal(self.current_rg, self.col_indices);
+                self.current_rg += 1;
+
+                if (rows.len > 0) {
+                    self.current_rows = rows;
+                    self.cursor = 1;
+                    return &rows[0];
+                }
+                self.reader.allocator.free(rows);
+            }
+        }
+
+        /// Free any currently held rows.
+        pub fn deinit(self: *RowIterator) void {
+            self.freeCurrentRows();
+        }
+
+        fn freeCurrentRows(self: *RowIterator) void {
+            if (self.current_rows) |rows| {
+                for (rows) |row| row.deinit();
+                self.reader.allocator.free(rows);
+                self.current_rows = null;
+            }
+        }
+    };
+
+    /// Create a row iterator that streams through all row groups.
+    /// No I/O occurs until the first call to `next()`.
+    pub fn rowIterator(self: *Self) RowIterator {
+        return .{
+            .reader = self,
+            .current_rows = null,
+            .cursor = 0,
+            .current_rg = 0,
+            .num_rgs = self.metadata.row_groups.len,
+            .col_indices = null,
+        };
+    }
+
+    /// Create a row iterator with column projection.
+    /// Only the specified top-level columns are read and returned.
+    pub fn rowIteratorProjected(self: *Self, col_indices: []const usize) RowIterator {
+        return .{
+            .reader = self,
+            .current_rows = null,
+            .cursor = 0,
+            .current_rg = 0,
+            .num_rgs = self.metadata.row_groups.len,
+            .col_indices = col_indices,
+        };
+    }
+
     /// Read all rows from a row group as dynamic Value types
     pub fn readAllRows(self: *Self, row_group_index: usize) ![]Row {
         return self.readRowsInternal(row_group_index, null);

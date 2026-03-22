@@ -508,6 +508,13 @@ int zp_row_reader_read_row_group_projected(zp_row_reader_t handle,
 int zp_row_reader_next(zp_row_reader_t handle);
 
 /**
+ * Advance to the next row, automatically loading subsequent row groups.
+ * On the first call, begins from row group 0. Returns ZP_OK when a row
+ * is available, ZP_ROW_END when all row groups are exhausted.
+ */
+int zp_row_reader_next_all(zp_row_reader_t handle);
+
+/**
  * Get the value type at a column in the current row.
  * Returns a logical type constant (ZP_TYPE_STRING, ZP_TYPE_DATE, etc.)
  * when the column has a logical type annotation, otherwise returns the

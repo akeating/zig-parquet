@@ -234,6 +234,18 @@ pub export fn zp_row_reader_next(handle_ptr: ?*anyopaque) callconv(.c) c_int {
     return err.ZP_ROW_END;
 }
 
+/// Advance to the next row, automatically loading subsequent row groups.
+/// On the first call (or after opening), begins from row group 0.
+/// Returns ZP_OK if a row is available, ZP_ROW_END when all row groups are exhausted.
+pub export fn zp_row_reader_next_all(handle_ptr: ?*anyopaque) callconv(.c) c_int {
+    const handle = castHandle(handle_ptr) orelse return err.ZP_ERROR_INVALID_ARGUMENT;
+    const has_row = handle.nextAll() catch |e| {
+        handle.err_ctx.setErrorFmt(err.mapError(e), "nextAll failed: {s}", .{err.errorMessage(e)});
+        return handle.err_ctx.code;
+    };
+    return if (has_row) ZP_OK else err.ZP_ROW_END;
+}
+
 // ============================================================================
 // Current row value access
 // ============================================================================
