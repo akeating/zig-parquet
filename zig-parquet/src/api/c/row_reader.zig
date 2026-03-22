@@ -465,6 +465,113 @@ pub export fn zp_row_reader_set_checksum_validation(
 }
 
 // ============================================================================
+// Column Statistics
+// ============================================================================
+
+fn getRowReaderStats(handle: *RowReaderHandle, col_index: c_int, rg_index: c_int) ?format.Statistics {
+    const rg_idx = safe.castTo(usize, rg_index) catch return null;
+    const col_idx = safe.castTo(usize, col_index) catch return null;
+    if (rg_idx >= handle.reader.metadata.row_groups.len) return null;
+    const rg = handle.reader.metadata.row_groups[rg_idx];
+    if (col_idx >= rg.columns.len) return null;
+    const meta = rg.columns[col_idx].meta_data orelse return null;
+    return meta.statistics;
+}
+
+pub export fn zp_row_reader_has_statistics(
+    handle_ptr: ?*anyopaque,
+    col_index: c_int,
+    rg_index: c_int,
+) callconv(.c) c_int {
+    const handle = castHandle(handle_ptr) orelse return 0;
+    return if (getRowReaderStats(handle, col_index, rg_index) != null) 1 else 0;
+}
+
+pub export fn zp_row_reader_get_null_count(
+    handle_ptr: ?*anyopaque,
+    col_index: c_int,
+    rg_index: c_int,
+    count_out: ?*i64,
+) callconv(.c) c_int {
+    const handle = castHandle(handle_ptr) orelse return err.ZP_ERROR_INVALID_ARGUMENT;
+    const out = count_out orelse return err.ZP_ERROR_INVALID_ARGUMENT;
+    const stats = getRowReaderStats(handle, col_index, rg_index) orelse {
+        handle.err_ctx.setError(err.ZP_ERROR_INVALID_ARGUMENT, "no statistics available");
+        return handle.err_ctx.code;
+    };
+    out.* = stats.null_count orelse {
+        handle.err_ctx.setError(err.ZP_ERROR_INVALID_DATA, "null count not available");
+        return handle.err_ctx.code;
+    };
+    return ZP_OK;
+}
+
+pub export fn zp_row_reader_get_distinct_count(
+    handle_ptr: ?*anyopaque,
+    col_index: c_int,
+    rg_index: c_int,
+    count_out: ?*i64,
+) callconv(.c) c_int {
+    const handle = castHandle(handle_ptr) orelse return err.ZP_ERROR_INVALID_ARGUMENT;
+    const out = count_out orelse return err.ZP_ERROR_INVALID_ARGUMENT;
+    const stats = getRowReaderStats(handle, col_index, rg_index) orelse {
+        handle.err_ctx.setError(err.ZP_ERROR_INVALID_ARGUMENT, "no statistics available");
+        return handle.err_ctx.code;
+    };
+    out.* = stats.distinct_count orelse {
+        handle.err_ctx.setError(err.ZP_ERROR_INVALID_DATA, "distinct count not available");
+        return handle.err_ctx.code;
+    };
+    return ZP_OK;
+}
+
+pub export fn zp_row_reader_get_min_value(
+    handle_ptr: ?*anyopaque,
+    col_index: c_int,
+    rg_index: c_int,
+    data_out: ?*[*]const u8,
+    len_out: ?*usize,
+) callconv(.c) c_int {
+    const handle = castHandle(handle_ptr) orelse return err.ZP_ERROR_INVALID_ARGUMENT;
+    const d_out = data_out orelse return err.ZP_ERROR_INVALID_ARGUMENT;
+    const l_out = len_out orelse return err.ZP_ERROR_INVALID_ARGUMENT;
+    const stats = getRowReaderStats(handle, col_index, rg_index) orelse {
+        handle.err_ctx.setError(err.ZP_ERROR_INVALID_ARGUMENT, "no statistics available");
+        return handle.err_ctx.code;
+    };
+    const min = stats.min_value orelse stats.min orelse {
+        handle.err_ctx.setError(err.ZP_ERROR_INVALID_DATA, "min value not available");
+        return handle.err_ctx.code;
+    };
+    d_out.* = min.ptr;
+    l_out.* = min.len;
+    return ZP_OK;
+}
+
+pub export fn zp_row_reader_get_max_value(
+    handle_ptr: ?*anyopaque,
+    col_index: c_int,
+    rg_index: c_int,
+    data_out: ?*[*]const u8,
+    len_out: ?*usize,
+) callconv(.c) c_int {
+    const handle = castHandle(handle_ptr) orelse return err.ZP_ERROR_INVALID_ARGUMENT;
+    const d_out = data_out orelse return err.ZP_ERROR_INVALID_ARGUMENT;
+    const l_out = len_out orelse return err.ZP_ERROR_INVALID_ARGUMENT;
+    const stats = getRowReaderStats(handle, col_index, rg_index) orelse {
+        handle.err_ctx.setError(err.ZP_ERROR_INVALID_ARGUMENT, "no statistics available");
+        return handle.err_ctx.code;
+    };
+    const max = stats.max_value orelse stats.max orelse {
+        handle.err_ctx.setError(err.ZP_ERROR_INVALID_DATA, "max value not available");
+        return handle.err_ctx.code;
+    };
+    d_out.* = max.ptr;
+    l_out.* = max.len;
+    return ZP_OK;
+}
+
+// ============================================================================
 // Error and close
 // ============================================================================
 

@@ -584,6 +584,33 @@ int zp_row_reader_get_kv_metadata_value(zp_row_reader_t handle, int index,
 int zp_row_reader_set_checksum_validation(zp_row_reader_t handle,
                                           int validate, int strict);
 
+/* ---- Row Reader Column Statistics ---- */
+
+/** Check if statistics exist for a column in a row group. Returns 1 or 0. */
+int zp_row_reader_has_statistics(zp_row_reader_t handle, int col_index,
+                                 int rg_index);
+
+/** Get the null count from column statistics. */
+int zp_row_reader_get_null_count(zp_row_reader_t handle, int col_index,
+                                 int rg_index, int64_t* count_out);
+
+/** Get the distinct count from column statistics. */
+int zp_row_reader_get_distinct_count(zp_row_reader_t handle, int col_index,
+                                     int rg_index, int64_t* count_out);
+
+/**
+ * Get the minimum value from column statistics (raw bytes).
+ * Pointer is borrowed from parsed metadata; valid until reader close.
+ */
+int zp_row_reader_get_min_value(zp_row_reader_t handle, int col_index,
+                                int rg_index, const uint8_t** data_out,
+                                size_t* len_out);
+
+/** Get the maximum value from column statistics (raw bytes). */
+int zp_row_reader_get_max_value(zp_row_reader_t handle, int col_index,
+                                int rg_index, const uint8_t** data_out,
+                                size_t* len_out);
+
 /** Most recent error code for this row reader. */
 int zp_row_reader_error_code(zp_row_reader_t handle);
 

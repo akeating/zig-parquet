@@ -166,6 +166,32 @@ for (rows) |row| {
 }
 ```
 
+### Row Group Filtering
+
+Use column statistics to skip row groups that don't match your criteria:
+
+```zig
+var reader = try parquet.openFileDynamic(allocator, file, .{});
+defer reader.deinit();
+
+for (0..reader.getNumRowGroups()) |rg| {
+    const stats = reader.getColumnStatistics(0, rg) orelse continue;
+    const min_bytes = stats.min_value orelse stats.min orelse continue;
+    const max_bytes = stats.max_value orelse stats.max orelse continue;
+    const min = std.mem.readInt(i32, min_bytes[0..4], .little);
+    const max = std.mem.readInt(i32, max_bytes[0..4], .little);
+
+    if (target < min or target > max) continue; // skip this row group
+
+    const rows = try reader.readAllRows(rg);
+    defer {
+        for (rows) |row| row.deinit();
+        allocator.free(rows);
+    }
+    // ... process matching rows ...
+}
+```
+
 ### Column-Based API
 
 For more control, use the lower-level column API:
@@ -346,6 +372,7 @@ writer.setMaxPageSize(1_048_576);      // 1MB page size limit
 | DICTIONARY_PAGE | ✅ | |
 | **Features** | | |
 | Column projection | ✅ | Read subset of columns; skips I/O for unselected columns |
+| Row group filtering | ✅ | Statistics-based; skip row groups via min/max/null_count |
 | Column statistics | ✅ | min/max/null_count |
 | Multi-page columns | ✅ | Large column support |
 | Multi-row-group files | ✅ | |
@@ -361,7 +388,6 @@ Files containing unsupported features return explicit errors rather than silentl
 ## Known Limitations
 
 **Reader:**
-- No predicate pushdown or row group filtering
 - No streaming/iterator API (all rows materialized at once)
 
 ## WASM Support

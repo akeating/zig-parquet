@@ -225,6 +225,34 @@ pub const DynamicReader = struct {
         return std.meta.eql(lt, logical);
     }
 
+    /// Get statistics for a column in a specific row group.
+    /// Returns null if the column or row group doesn't exist, or if no statistics are available.
+    pub fn getColumnStatistics(
+        self: *const Self,
+        column_index: usize,
+        row_group_index: usize,
+    ) ?format.Statistics {
+        if (row_group_index >= self.metadata.row_groups.len) return null;
+        const rg = self.metadata.row_groups[row_group_index];
+        if (column_index >= rg.columns.len) return null;
+        const col = rg.columns[column_index];
+        const meta = col.meta_data orelse return null;
+        return meta.statistics;
+    }
+
+    /// Get column metadata for a specific column in a row group.
+    /// Returns null if the column or row group doesn't exist.
+    pub fn getColumnMetaData(
+        self: *const Self,
+        column_index: usize,
+        row_group_index: usize,
+    ) ?format.ColumnMetaData {
+        if (row_group_index >= self.metadata.row_groups.len) return null;
+        const rg = self.metadata.row_groups[row_group_index];
+        if (column_index >= rg.columns.len) return null;
+        return rg.columns[column_index].meta_data;
+    }
+
     /// Read all rows from a row group as dynamic Value types
     pub fn readAllRows(self: *Self, row_group_index: usize) ![]Row {
         return self.readRowsInternal(row_group_index, null);

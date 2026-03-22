@@ -4056,3 +4056,181 @@ test "readRowsProjected struct-only skips flat columns" {
     try std.testing.expectEqual(@as(?i32, 10), s[0].value.asInt32());
     try std.testing.expectEqual(@as(?i32, 20), s[1].value.asInt32());
 }
+
+// =============================================================================
+// DynamicReader statistics tests
+// =============================================================================
+
+test "getColumnStatistics roundtrip with multi-row-group file" {
+    const allocator = std.testing.allocator;
+
+    var writer = try parquet.createBufferDynamic(allocator);
+    defer writer.deinit();
+
+    try writer.addColumn("value", parquet.TypeInfo.int32, .{});
+    try writer.addColumn("name", parquet.TypeInfo.string, .{});
+    try writer.begin();
+
+    // Row group 0: values 10, 20, null
+    try writer.setInt32(0, 10);
+    try writer.setBytes(1, "alpha");
+    try writer.addRow();
+    try writer.setInt32(0, 20);
+    try writer.setBytes(1, "beta");
+    try writer.addRow();
+    try writer.setNull(0);
+    try writer.setBytes(1, "gamma");
+    try writer.addRow();
+    try writer.flush();
+
+    // Row group 1: values 100, 200
+    try writer.setInt32(0, 100);
+    try writer.setBytes(1, "delta");
+    try writer.addRow();
+    try writer.setInt32(0, 200);
+    try writer.setBytes(1, "epsilon");
+    try writer.addRow();
+    try writer.flush();
+
+    try writer.close();
+    const buffer = try writer.toOwnedSlice();
+    defer allocator.free(buffer);
+
+    var reader = try parquet.openBufferDynamic(allocator, buffer, .{});
+    defer reader.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), reader.getNumRowGroups());
+
+    // RG 0: int32 column should have min=10, max=20, null_count=1
+    const stats0 = reader.getColumnStatistics(0, 0);
+    try std.testing.expect(stats0 != null);
+    const s0 = stats0.?;
+    try std.testing.expectEqual(@as(?i64, 1), s0.null_count);
+    const min0_bytes = s0.min_value orelse s0.min;
+    try std.testing.expect(min0_bytes != null);
+    const min0 = std.mem.readInt(i32, min0_bytes.?[0..4], .little);
+    try std.testing.expectEqual(@as(i32, 10), min0);
+    const max0_bytes = s0.max_value orelse s0.max;
+    try std.testing.expect(max0_bytes != null);
+    const max0 = std.mem.readInt(i32, max0_bytes.?[0..4], .little);
+    try std.testing.expectEqual(@as(i32, 20), max0);
+
+    // RG 1: int32 column should have min=100, max=200, null_count=0
+    const stats1 = reader.getColumnStatistics(0, 1);
+    try std.testing.expect(stats1 != null);
+    const s1 = stats1.?;
+    try std.testing.expectEqual(@as(?i64, 0), s1.null_count);
+    const min1_bytes = s1.min_value orelse s1.min;
+    try std.testing.expect(min1_bytes != null);
+    const min1 = std.mem.readInt(i32, min1_bytes.?[0..4], .little);
+    try std.testing.expectEqual(@as(i32, 100), min1);
+    const max1_bytes = s1.max_value orelse s1.max;
+    try std.testing.expect(max1_bytes != null);
+    const max1 = std.mem.readInt(i32, max1_bytes.?[0..4], .little);
+    try std.testing.expectEqual(@as(i32, 200), max1);
+
+    // getColumnMetaData should also work
+    const meta0 = reader.getColumnMetaData(0, 0);
+    try std.testing.expect(meta0 != null);
+    try std.testing.expectEqual(parquet.format.PhysicalType.int32, meta0.?.type_);
+}
+
+test "getColumnStatistics returns null for out-of-range indices" {
+    const allocator = std.testing.allocator;
+
+    var writer = try parquet.createBufferDynamic(allocator);
+    defer writer.deinit();
+
+    try writer.addColumn("x", parquet.TypeInfo.int32, .{});
+    try writer.begin();
+    try writer.setInt32(0, 42);
+    try writer.addRow();
+    try writer.close();
+    const buffer = try writer.toOwnedSlice();
+    defer allocator.free(buffer);
+
+    var reader = try parquet.openBufferDynamic(allocator, buffer, .{});
+    defer reader.deinit();
+
+    // Valid
+    try std.testing.expect(reader.getColumnStatistics(0, 0) != null);
+
+    // Out-of-range column
+    try std.testing.expectEqual(@as(?parquet.format.Statistics, null), reader.getColumnStatistics(99, 0));
+
+    // Out-of-range row group
+    try std.testing.expectEqual(@as(?parquet.format.Statistics, null), reader.getColumnStatistics(0, 99));
+
+    // Out-of-range both
+    try std.testing.expectEqual(@as(?parquet.format.Statistics, null), reader.getColumnStatistics(99, 99));
+
+    // Same for getColumnMetaData
+    try std.testing.expect(reader.getColumnMetaData(0, 0) != null);
+    try std.testing.expectEqual(@as(?parquet.format.ColumnMetaData, null), reader.getColumnMetaData(99, 0));
+}
+
+test "row group filtering pattern using statistics" {
+    const allocator = std.testing.allocator;
+
+    var writer = try parquet.createBufferDynamic(allocator);
+    defer writer.deinit();
+
+    try writer.addColumn("id", parquet.TypeInfo.int32, .{});
+    try writer.addColumn("label", parquet.TypeInfo.string, .{});
+    try writer.begin();
+
+    // Row group 0: ids 1-100
+    for (1..101) |i| {
+        const val: i32 = @intCast(i);
+        try writer.setInt32(0, val);
+        try writer.setBytes(1, "low");
+        try writer.addRow();
+    }
+    try writer.flush();
+
+    // Row group 1: ids 1000-1099
+    for (0..100) |i| {
+        const val: i32 = @intCast(1000 + i);
+        try writer.setInt32(0, val);
+        try writer.setBytes(1, "high");
+        try writer.addRow();
+    }
+    try writer.flush();
+
+    try writer.close();
+    const buffer = try writer.toOwnedSlice();
+    defer allocator.free(buffer);
+
+    var reader = try parquet.openBufferDynamic(allocator, buffer, .{});
+    defer reader.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), reader.getNumRowGroups());
+
+    // Target: find row groups containing id=50
+    const target: i32 = 50;
+    var matching_rg: ?usize = null;
+
+    for (0..reader.getNumRowGroups()) |rg| {
+        const stats = reader.getColumnStatistics(0, rg) orelse continue;
+        const min_bytes = stats.min_value orelse stats.min orelse continue;
+        const max_bytes = stats.max_value orelse stats.max orelse continue;
+        const min_val = std.mem.readInt(i32, min_bytes[0..4], .little);
+        const max_val = std.mem.readInt(i32, max_bytes[0..4], .little);
+
+        if (target >= min_val and target <= max_val) {
+            matching_rg = rg;
+            break;
+        }
+    }
+
+    // Should match row group 0 (ids 1-100), not row group 1 (ids 1000-1099)
+    try std.testing.expectEqual(@as(?usize, 0), matching_rg);
+
+    // Read only the matching row group
+    const rows = try reader.readAllRows(matching_rg.?);
+    defer deferFreeRows(allocator, rows);
+
+    try std.testing.expectEqual(@as(usize, 100), rows.len);
+    try std.testing.expectEqual(@as(?i32, 1), rows[0].getColumn(0).?.asInt32());
+    try std.testing.expectEqual(@as(?i32, 100), rows[99].getColumn(0).?.asInt32());
+}
