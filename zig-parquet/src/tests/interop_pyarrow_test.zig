@@ -298,7 +298,7 @@ test "PyArrow interop: write TimestampInt96" {
     const result = try column_writer.writeColumnChunkInt96OptionalWithPathArray(
         allocator, writer, &.{"ts"}, &nano_vals, true, 4, .uncompressed, true,
     );
-    try target_writer.flush();
+    try ft.flush();
 
     // Write footer
     const thrift = parquet.internals.thrift;
@@ -342,7 +342,7 @@ test "PyArrow interop: write TimestampInt96" {
     std.mem.writeInt(u32, &len_buf, @intCast(footer_bytes.len), .little);
     try writer.writeAll(&len_buf);
     try writer.writeAll(format.PARQUET_MAGIC);
-    try target_writer.flush();
+    try ft.flush();
 
     // Clean up the column chunk metadata
     allocator.free(result.metadata.encodings);
