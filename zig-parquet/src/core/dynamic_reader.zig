@@ -637,9 +637,11 @@ pub const DynamicReader = struct {
                 if (num_values == 0) continue;
 
                 // Extract level data (uncompressed, at start of page body)
-                const rep_levels_data = compressed_body[0..rep_len];
+                const rep_levels_data = try safe.slice(compressed_body, 0, rep_len);
                 const def_levels_data = try safe.slice(compressed_body, rep_len, def_len);
-                const values_compressed = compressed_body[rep_len + def_len ..];
+                const levels_total = std.math.add(usize, rep_len, def_len) catch return error.EndOfData;
+                if (levels_total > compressed_body.len) return error.EndOfData;
+                const values_compressed = compressed_body[levels_total..];
 
                 // Decompress only the values section if needed
                 // For V2, uncompressed_page_size is the size of the ENTIRE uncompressed page
@@ -650,9 +652,8 @@ pub const DynamicReader = struct {
                 const values_data = if (v2.is_compressed and meta.codec != .uncompressed) blk: {
                     const uncompressed_size = try safePageSize(page_header.uncompressed_page_size);
                     // Levels are uncompressed, so uncompressed values size = total - levels
-                    // Check for underflow
-                    if (uncompressed_size < rep_len + def_len) return error.EndOfData;
-                    const values_uncompressed_size = uncompressed_size - rep_len - def_len;
+                    if (uncompressed_size < levels_total) return error.EndOfData;
+                    const values_uncompressed_size = uncompressed_size - levels_total;
                     // Handle empty values case - skip decompression for empty data pages
                     if (values_uncompressed_size == 0 or values_compressed.len == 0) {
                         break :blk values_compressed; // Return empty slice, no decompression needed
