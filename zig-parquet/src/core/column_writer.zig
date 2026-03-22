@@ -879,7 +879,7 @@ pub fn writeColumnChunkFromValues(
 
 fn countNullsFromLevelDiff(total_entries: usize, non_null_count: usize) i64 {
     if (total_entries >= non_null_count) {
-        return @as(i64, @intCast(total_entries - non_null_count));
+        return safe.castTo(i64, total_entries - non_null_count) catch unreachable; // total_entries >= non_null_count checked above
     }
     return 0;
 }

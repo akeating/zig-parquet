@@ -135,7 +135,7 @@ fn writeBits(bytes: []u8, bit_pos: usize, value: u32, bit_width: u5) !void {
         if (byte_idx >= bytes.len) return;
 
         // bits_in_byte is <= 8, so the shift and mask are well within u16/u8 limits
-        const mask: u8 = safe.castTo(u8, (@as(u16, 1) << bits_in_byte) - 1) catch unreachable;
+        const mask: u8 = safe.castTo(u8, (@as(u16, 1) << bits_in_byte) - 1) catch unreachable; // bits_in_byte <= 8, so (1 << bits_in_byte) - 1 <= 255
         bytes[byte_idx] |= @as(u8, @truncate(v & mask)) << bit_offset;
 
         v >>= safe.castTo(u5, bits_in_byte) catch unreachable; // bits_in_byte is <= 8
@@ -194,7 +194,7 @@ pub fn encodeLevelsWithLength(allocator: std.mem.Allocator, levels: []const u32,
 fn computeBitWidth(max_level: u8) u5 {
     if (max_level == 0) return 0;
     // log2_int(max_level) for max_level=255 is 7. +1 is 8. Safely fits in u5.
-    return safe.castTo(u5, std.math.log2_int(u8, max_level) + 1) catch unreachable;
+    return safe.castTo(u5, std.math.log2_int(u8, max_level) + 1) catch unreachable; // max_level is u8, so log2 + 1 <= 8, fits u5
 }
 
 /// Encode definition levels with a 4-byte length prefix (for V1 data pages)

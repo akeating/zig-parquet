@@ -209,14 +209,12 @@ pub fn Decoder(comptime T: type) type {
             if (bit_width > 64) return error.InvalidHeader;
 
             var bit_pos: usize = 0;
-            // bit_width is <= 64 from earlier checks so it can fit in u6 shift
-            const mask = if (bit_width >= 64) ~@as(u64, 0) else (@as(u64, 1) << (safe.castTo(u6, bit_width) catch unreachable)) - 1;
+            const mask = if (bit_width >= 64) ~@as(u64, 0) else (@as(u64, 1) << (safe.castTo(u6, bit_width) catch unreachable)) - 1; // bit_width <= 64 from check above
 
             for (output) |*out| {
                 // Extract bit_width bits starting at bit_pos
                 const byte_pos = bit_pos / 8;
-                // bit_pos % 8 is strictly 0-7, which safely fits in u6
-                const bit_offset: u6 = safe.castTo(u6, bit_pos % 8) catch unreachable;
+                const bit_offset: u6 = safe.castTo(u6, bit_pos % 8) catch unreachable; // bit_pos % 8 is strictly 0-7, fits u6
 
                 // Read up to 8 bytes (enough for 64 bits)
                 var value: u64 = 0;
@@ -224,8 +222,7 @@ pub fn Decoder(comptime T: type) type {
 
                         const bytes_to_read = @min(bytes_needed, packed_data.len - byte_pos);
                         for (0..@min(bytes_to_read, 8)) |i| {
-                            // i <= 8 from earlier conditions. i * 8 <= 64, well within u6 bounds.
-                            value |= @as(u64, packed_data[byte_pos + i]) << (safe.castTo(u6, i * 8) catch unreachable);
+                            value |= @as(u64, packed_data[byte_pos + i]) << (safe.castTo(u6, i * 8) catch unreachable); // i < 8, so i * 8 <= 56, fits u6
                         }
 
                 // Shift and mask

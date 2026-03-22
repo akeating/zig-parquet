@@ -812,7 +812,7 @@ pub const DynamicWriter = struct {
                         allocator, writer, path, items, n, self.current_offset, codec,
                         self.column_type_lengths[col] orelse return error.InvalidState, opts,
                     ) catch |e| return mapFlushError(e),
-                    .nested => unreachable,
+                    .nested => return error.InvalidState,
                 };
 
                 self.target_writer.flush() catch return error.WriteError;

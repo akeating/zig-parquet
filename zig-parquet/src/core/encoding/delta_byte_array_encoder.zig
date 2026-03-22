@@ -52,10 +52,8 @@ pub fn encode(allocator: std.mem.Allocator, values: []const []const u8) Error![]
     for (values, 0..) |value, i| {
         if (value.len > std.math.maxInt(i32)) return error.ValueTooLarge;
         const prefix_len = commonPrefixLength(prev_value, value);
-    // prefix_len is guaranteed to be <= value.len and prev_value.len via commonPrefixLength.
-    // value.len is also already checked against std.math.maxInt(i32) above.
-    prefix_lengths[i] = safe.castTo(i32, prefix_len) catch unreachable;
-    suffix_lengths[i] = safe.castTo(i32, value.len - prefix_len) catch unreachable;
+    prefix_lengths[i] = safe.castTo(i32, prefix_len) catch unreachable; // prefix_len <= value.len <= maxInt(i32), checked above
+    suffix_lengths[i] = safe.castTo(i32, value.len - prefix_len) catch unreachable; // value.len <= maxInt(i32) checked above, prefix_len <= value.len
 
         // Append suffix
         suffixes.appendSlice(allocator, value[prefix_len..]) catch return error.OutOfMemory;

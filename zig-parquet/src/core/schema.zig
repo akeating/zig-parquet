@@ -312,7 +312,7 @@ pub const SchemaNode = union(enum) {
             // For larger precision, use fixed_len_byte_array
             // Bytes needed = ceil((precision * log2(10)) / 8) ≈ ceil(precision * 0.415)
             // Precision is naturally bounded; this will not exceed u32 limits
-            const bytes_needed: u32 = safe.castTo(u32, @divFloor(precision * 5, 12) + 1) catch unreachable;
+            const bytes_needed: u32 = safe.castTo(u32, @divFloor(precision * 5, 12) + 1) catch unreachable; // precision is bounded; result fits u32
             return .{ .fixed_len_byte_array = .{ .len = bytes_needed, .logical = logical } };
         }
     }

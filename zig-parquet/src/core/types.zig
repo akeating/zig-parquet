@@ -248,8 +248,7 @@ pub const Int96 = struct {
         const day_nanos_i64: i64 = if (day_nanos > @as(u64, max_i64))
             max_i64
         else
-            // This is guaranteed safe because of the check above
-            safe.castTo(i64, day_nanos) catch unreachable;
+            safe.castTo(i64, day_nanos) catch unreachable; // day_nanos <= max_i64 from check above
 
         // Combine with saturating add
         return std.math.add(i64, days_nanos, day_nanos_i64) catch max_i64;
@@ -265,8 +264,7 @@ pub const Int96 = struct {
 
         if (nanos >= 0) {
             days = @divFloor(nanos, nanos_per_day);
-            // The modulo ensures it easily fits within u64 bounds
-            day_nanos = safe.castTo(u64, @mod(nanos, nanos_per_day)) catch unreachable;
+            day_nanos = safe.castTo(u64, @mod(nanos, nanos_per_day)) catch unreachable; // @mod result is non-negative and < nanos_per_day
         } else {
             // For negative values, we need floor division
             days = @divFloor(nanos, nanos_per_day);

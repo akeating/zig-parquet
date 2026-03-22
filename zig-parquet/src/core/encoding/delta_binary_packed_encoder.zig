@@ -111,8 +111,7 @@ fn encodeBlock(buffer: *std.ArrayList(u8), allocator: std.mem.Allocator, deltas:
         // Find max relative delta to determine bit width
         var max_relative: u64 = 0;
         for (mb_deltas) |d| {
-            // By definition d >= min_delta so this won't underflow. Max range 64 bits.
-            const relative: u64 = safe.castTo(u64, d - min_delta) catch unreachable;
+            const relative: u64 = safe.castTo(u64, d - min_delta) catch unreachable; // d >= min_delta by definition, so difference is non-negative
             max_relative = @max(max_relative, relative);
         }
 
@@ -159,8 +158,7 @@ fn packMiniBlock(buffer: *std.ArrayList(u8), allocator: std.mem.Allocator, delta
     var bit_pos: usize = 0;
     for (0..MINI_BLOCK_SIZE) |i| {
         const relative: u64 = if (i < deltas.len)
-            // By definition deltas[i] >= min_delta so (deltas[i] - min_delta) is non-negative, fits in u64
-            safe.castTo(u64, deltas[i] - min_delta) catch unreachable
+            safe.castTo(u64, deltas[i] - min_delta) catch unreachable // deltas[i] >= min_delta by definition
         else
             0; // Padding
 
@@ -186,8 +184,7 @@ fn writeBits(data: []u8, bit_pos: usize, value: u64, bit_width: u8) void {
         const bits_available: u8 = 8 - @as(u8, bit_offset);
         const bits_in_byte: u8 = @min(remaining_bits, bits_available);
 
-        // bits_in_byte <= 8, so mask calculation fits easily in u16/u8
-        const mask: u8 = safe.castTo(u8, (@as(u16, 1) << (safe.castTo(u4, bits_in_byte) catch unreachable)) - 1) catch unreachable;
+        const mask: u8 = safe.castTo(u8, (@as(u16, 1) << (safe.castTo(u4, bits_in_byte) catch unreachable)) - 1) catch unreachable; // bits_in_byte <= 8, fits u4 for shift and u8 for mask
         const byte_val: u8 = safe.castTo(u8, val & mask) catch unreachable; // by mask, it fits in u8
         data[byte_idx] |= byte_val << bit_offset;
 
@@ -200,20 +197,17 @@ fn writeBits(data: []u8, bit_pos: usize, value: u64, bit_width: u8) void {
 /// Compute the minimum number of bits needed to represent a value
 fn bitWidth(value: u64) u8 {
     if (value == 0) return 0;
-    // clz operates on 64 bits, so 64 - clz is safely <= 64.
-    return safe.castTo(u8, 64 - @clz(value)) catch unreachable;
+    return safe.castTo(u8, 64 - @clz(value)) catch unreachable; // value != 0, so 64 - @clz is 1..64, fits u8
 }
 
 /// Write an unsigned varint (ULEB128)
 fn writeUnsignedVarint(buffer: *std.ArrayList(u8), allocator: std.mem.Allocator, value: usize) Error!void {
     var val = value;
     while (val >= 0x80) {
-        // bitwise masking safely truncates to u8 length
-        buffer.append(allocator, safe.castTo(u8, (val & 0x7F) | 0x80) catch unreachable) catch return error.OutOfMemory;
+        buffer.append(allocator, safe.castTo(u8, (val & 0x7F) | 0x80) catch unreachable) catch return error.OutOfMemory; // low 7 bits | 0x80 fits u8
         val >>= 7;
     }
-    // remaining is < 0x80, fits easily in u8
-    buffer.append(allocator, safe.castTo(u8, val) catch unreachable) catch return error.OutOfMemory;
+    buffer.append(allocator, safe.castTo(u8, val) catch unreachable) catch return error.OutOfMemory; // val < 0x80 after loop, fits u8
 }
 
 /// Write a signed varint (zigzag + ULEB128)
@@ -227,12 +221,10 @@ fn writeSignedVarint(buffer: *std.ArrayList(u8), allocator: std.mem.Allocator, v
 fn writeUnsignedVarint64(buffer: *std.ArrayList(u8), allocator: std.mem.Allocator, value: u64) Error!void {
     var val = value;
     while (val >= 0x80) {
-        // bitwise masking safely truncates to u8 length
-        buffer.append(allocator, safe.castTo(u8, (val & 0x7F) | 0x80) catch unreachable) catch return error.OutOfMemory;
+        buffer.append(allocator, safe.castTo(u8, (val & 0x7F) | 0x80) catch unreachable) catch return error.OutOfMemory; // low 7 bits | 0x80 fits u8
         val >>= 7;
     }
-    // remaining is < 0x80, fits easily in u8
-    buffer.append(allocator, safe.castTo(u8, val) catch unreachable) catch return error.OutOfMemory;
+    buffer.append(allocator, safe.castTo(u8, val) catch unreachable) catch return error.OutOfMemory; // val < 0x80 after loop, fits u8
 }
 
 // =============================================================================
@@ -318,8 +310,7 @@ test "delta binary packed encode large sequence" {
     // Create 200 values (more than one block of 128)
     var values: [200]i32 = undefined;
     for (&values, 0..) |*v, i| {
-        // Since i is 0-199, i * 10 is well within the i32 limits
-        v.* = safe.castTo(i32, i * 10) catch unreachable;
+        v.* = safe.castTo(i32, i * 10) catch unreachable; // i < 200, so i * 10 <= 1990, fits i32
     }
 
     const encoded = try encodeInt32(allocator, &values);

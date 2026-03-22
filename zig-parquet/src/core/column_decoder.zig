@@ -1133,13 +1133,13 @@ pub fn decodeColumnDynamicWithValueEncoding(
             return decodeByteStreamSplit(allocator, schema_elem, value_data, num_values, max_def_level, max_rep_level, def_level_encoding, rep_level_encoding);
         },
         .rle => {
-            // RLE encoding for boolean columns
             if (physical_type == .boolean) {
                 return decodeDynamicBoolRLE(allocator, value_data, num_values, max_def_level, max_rep_level, def_level_encoding, rep_level_encoding);
             }
-            // Other types don't use RLE for values (only for levels/dict indices)
+            return error.UnsupportedEncoding;
         },
-        else => {},
+        .plain, .rle_dictionary, .plain_dictionary => {},
+        else => return error.UnsupportedEncoding,
     }
 
     // Standard PLAIN/dictionary encoding path

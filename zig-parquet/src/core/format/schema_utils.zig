@@ -35,7 +35,7 @@ pub fn computeBitWidth(max_level: u8) u5 {
     if (max_level == 0) return 0;
     // Number of bits needed = floor(log2(max_level)) + 1
     // log2_int(max_level) for max_level=255 is 7. +1 is 8. Safely fits in u5.
-    return safe.castTo(u5, std.math.log2_int(u8, max_level) + 1) catch unreachable;
+    return safe.castTo(u5, std.math.log2_int(u8, max_level) + 1) catch unreachable; // max_level is u8, so log2 + 1 <= 8, fits u5
 }
 
 /// Get information about a leaf column by its index.

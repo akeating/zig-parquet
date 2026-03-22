@@ -42,8 +42,8 @@ Build together as one unit (can't test independently):
 ### P1 — Logical Types (Core) ✅
 - [x] STRING (BYTE_ARRAY + UTF8 annotation)
 - [x] DATE (INT32, days since epoch)
-- [x] TIMESTAMP (INT64, millis/micros; nanos read-only)
-- [x] TIME (INT32/INT64, millis/micros; nanos read-only)
+- [x] TIMESTAMP (INT64, millis/micros/nanos)
+- [x] TIME (INT32/INT64, millis/micros/nanos)
 - [x] Schema serialization of LogicalType
 
 ### P2 — Logical Types (Extended) ✅
@@ -258,7 +258,7 @@ Removed column_name-based byte array functions, keeping only path array versions
 Removed ~90 lines from column_writer.zig.
 
 ### P3 — Extract Shared Schema Builder (Skipped)
-Skipped: Writer uses runtime schema building (ColumnDef/SchemaNode) while RowWriter uses comptime schema building (Zig types). The fundamental runtime/comptime difference makes unification more complex than beneficial.
+Skipped: RowWriter was removed in Phase 16, eliminating the original comptime/runtime unification goal. DynamicWriter still imports `Writer.countSchemaElements` and `Writer.generateSchemaFromNodeStatic` — extracting these into a shared module remains a future cleanup opportunity.
 
 ### P4 — Split column_writer.zig by Domain ✅
 Split column_writer.zig (2829→1701 lines) into domain-specific modules.
