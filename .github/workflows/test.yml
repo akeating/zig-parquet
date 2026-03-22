@@ -14,13 +14,15 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.15.2
 
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: false
 
       - name: Generate test files
         working-directory: test-files-arrow
@@ -53,9 +55,11 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: false
 
       - name: Run interop tests
         working-directory: test-files-arrow
@@ -69,13 +73,15 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.15.2
 
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: false
 
       - name: Generate test files
         working-directory: test-files-arrow
