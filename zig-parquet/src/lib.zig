@@ -249,7 +249,9 @@ comptime {
         _ = &c_api.row_reader.zp_row_reader_get_column_count;
         _ = &c_api.row_reader.zp_row_reader_get_column_name;
         _ = &c_api.row_reader.zp_row_reader_read_row_group;
+        _ = &c_api.row_reader.zp_row_reader_read_row_group_projected;
         _ = &c_api.row_reader.zp_row_reader_next;
+        _ = &c_api.row_reader.zp_row_reader_next_all;
         _ = &c_api.row_reader.zp_row_reader_get_type;
         _ = &c_api.row_reader.zp_row_reader_is_null;
         _ = &c_api.row_reader.zp_row_reader_get_int32;
@@ -400,7 +402,9 @@ comptime {
             _ = &wasi.zp_row_reader_get_column_count;
             _ = &wasi.zp_row_reader_get_column_name;
             _ = &wasi.zp_row_reader_read_row_group;
+            _ = &wasi.zp_row_reader_read_row_group_projected;
             _ = &wasi.zp_row_reader_next;
+            _ = &wasi.zp_row_reader_next_all;
             _ = &wasi.zp_row_reader_get_type;
             _ = &wasi.zp_row_reader_is_null;
             _ = &wasi.zp_row_reader_get_int32;
@@ -551,7 +555,9 @@ comptime {
             _ = &freestanding.zp_row_reader_get_column_count;
             _ = &freestanding.zp_row_reader_get_column_name;
             _ = &freestanding.zp_row_reader_read_row_group;
+            _ = &freestanding.zp_row_reader_read_row_group_projected;
             _ = &freestanding.zp_row_reader_next;
+            _ = &freestanding.zp_row_reader_next_all;
             _ = &freestanding.zp_row_reader_get_type;
             _ = &freestanding.zp_row_reader_is_null;
             _ = &freestanding.zp_row_reader_get_int32;

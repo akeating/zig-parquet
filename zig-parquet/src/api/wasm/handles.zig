@@ -332,6 +332,7 @@ pub const RowReaderHandle = struct {
     cursor: usize = 0,
     col_names: [][:0]u8 = &.{},
     num_top_columns: usize = 0,
+    auto_rg_index: usize = 0,
     err_ctx: ErrorContext = .{},
 
     pub fn openMemory(data: [*]const u8, len: usize) !*RowReaderHandle {
@@ -421,6 +422,12 @@ pub const RowReaderHandle = struct {
         self.cursor = 0;
     }
 
+    pub fn readRowGroupProjected(self: *RowReaderHandle, rg_index: usize, col_indices: []const usize) !void {
+        self.freeCurrentRows();
+        self.current_rows = try self.reader.readRowsProjected(rg_index, col_indices);
+        self.cursor = 0;
+    }
+
     pub fn next(self: *RowReaderHandle) bool {
         const rows = self.current_rows orelse return false;
         if (self.cursor >= rows.len) return false;
@@ -434,6 +441,18 @@ pub const RowReaderHandle = struct {
         const idx = self.cursor - 1;
         if (idx >= rows.len) return null;
         return &rows[idx];
+    }
+
+    pub fn nextAll(self: *RowReaderHandle) !bool {
+        if (self.next()) return true;
+
+        while (self.auto_rg_index < self.reader.metadata.row_groups.len) {
+            const rg = self.auto_rg_index;
+            self.auto_rg_index += 1;
+            try self.readRowGroup(rg);
+            if (self.next()) return true;
+        }
+        return false;
     }
 
     pub fn close(self: *RowReaderHandle) void {

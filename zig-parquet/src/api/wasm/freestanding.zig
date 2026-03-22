@@ -915,6 +915,74 @@ export fn zp_row_reader_next(handle_id: i32) i32 {
     return err.ZP_ROW_END;
 }
 
+export fn zp_row_reader_next_all(handle_id: i32) i32 {
+    const handle = getRowReaderHandle(handle_id) orelse return err.ZP_ERROR_INVALID_ARGUMENT;
+    const has_row = handle.nextAll() catch |e| {
+        handle.err_ctx.setErrorFmt(err.mapError(e), "nextAll failed: {s}", .{err.errorMessage(e)});
+        return handle.err_ctx.code;
+    };
+    return if (has_row) ZP_OK else err.ZP_ROW_END;
+}
+
+export fn zp_row_reader_read_row_group_projected(
+    handle_id: i32,
+    rg_index: i32,
+    col_indices: ?[*]const i32,
+    num_cols: i32,
+) i32 {
+    const handle = getRowReaderHandle(handle_id) orelse return err.ZP_ERROR_INVALID_ARGUMENT;
+    handle.err_ctx.setOk();
+
+    if (rg_index < 0) {
+        handle.err_ctx.setError(err.ZP_ERROR_INVALID_ARGUMENT, "negative row group index");
+        return handle.err_ctx.code;
+    }
+    const idx = safe.castTo(usize, rg_index) catch {
+        handle.err_ctx.setError(err.ZP_ERROR_INVALID_ARGUMENT, "row group index out of range");
+        return handle.err_ctx.code;
+    };
+    if (idx >= handle.reader.metadata.row_groups.len) {
+        handle.err_ctx.setErrorFmt(err.ZP_ERROR_INVALID_ARGUMENT, "row group index {d} >= {d}", .{ idx, handle.reader.metadata.row_groups.len });
+        return handle.err_ctx.code;
+    }
+
+    if (col_indices == null) {
+        handle.readRowGroup(idx) catch |e| {
+            handle.err_ctx.setErrorFmt(err.mapError(e), "readRowGroup failed: {s}", .{err.errorMessage(e)});
+            return handle.err_ctx.code;
+        };
+        return ZP_OK;
+    }
+
+    if (num_cols < 0) {
+        handle.err_ctx.setError(err.ZP_ERROR_INVALID_ARGUMENT, "negative num_cols");
+        return handle.err_ctx.code;
+    }
+    const n: usize = safe.castTo(usize, num_cols) catch {
+        handle.err_ctx.setError(err.ZP_ERROR_INVALID_ARGUMENT, "num_cols out of range");
+        return handle.err_ctx.code;
+    };
+
+    var zig_indices = handle.allocator.alloc(usize, n) catch {
+        handle.err_ctx.setError(err.ZP_ERROR_OUT_OF_MEMORY, "alloc failed");
+        return handle.err_ctx.code;
+    };
+    defer handle.allocator.free(zig_indices);
+
+    for (0..n) |i| {
+        zig_indices[i] = safe.castTo(usize, col_indices.?[i]) catch {
+            handle.err_ctx.setError(err.ZP_ERROR_INVALID_ARGUMENT, "negative column index");
+            return handle.err_ctx.code;
+        };
+    }
+
+    handle.readRowGroupProjected(idx, zig_indices) catch |e| {
+        handle.err_ctx.setErrorFmt(err.mapError(e), "readRowGroupProjected failed: {s}", .{err.errorMessage(e)});
+        return handle.err_ctx.code;
+    };
+    return ZP_OK;
+}
+
 export fn zp_row_reader_get_type(handle_id: i32, col_index: i32) i32 {
     const handle = getRowReaderHandle(handle_id) orelse return err.ZP_TYPE_NULL;
     const val = getRowValue(handle_id, col_index) orelse return err.ZP_TYPE_NULL;
