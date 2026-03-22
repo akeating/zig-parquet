@@ -21,8 +21,7 @@ pub fn run(allocator: std.mem.Allocator, file_path: []const u8) !void {
     };
     defer file.close();
 
-    // Create reader
-    var reader = parquet.openFile(allocator, file) catch |err| {
+    var reader = parquet.openFileDynamic(allocator, file, .{}) catch |err| {
         try stderr.print("Error: Cannot read parquet file: {}\n", .{err});
         try stderr.flush();
         std.process.exit(1);

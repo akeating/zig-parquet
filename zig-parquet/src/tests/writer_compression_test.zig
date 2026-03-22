@@ -59,7 +59,7 @@ test "round-trip with zstd compression" {
         const file = try tmp_dir.dir.openFile(file_path, .{});
         defer file.close();
 
-        var reader = try parquet.openFile(allocator, file);
+        var reader = try parquet.openFileDynamic(allocator, file, .{});
         defer reader.deinit();
 
         // Verify metadata
@@ -70,19 +70,21 @@ test "round-trip with zstd compression" {
         const col_chunk = row_group.columns[0];
         try std.testing.expectEqual(parquet.format.CompressionCodec.zstd, col_chunk.meta_data.?.codec);
 
-        // Read column
-        const col = try reader.readColumn(0, i64);
-        defer allocator.free(col);
+        // Read rows
+        const rows = try reader.readAllRows(0);
+        defer {
+            for (rows) |row| row.deinit();
+            allocator.free(rows);
+        }
 
-        try std.testing.expectEqual(@as(usize, 10), col.len);
+        try std.testing.expectEqual(@as(usize, 10), rows.len);
 
         // Verify values
         const expected = [_]i64{ 1, 2, 3, 4, 5, 100, -50, 0, 999999, -123456 };
-        for (col, 0..) |v, i| {
-            switch (v) {
-                .value => |val| try std.testing.expectEqual(expected[i], val),
-                .null_value => return error.UnexpectedNull,
-            }
+        for (rows, 0..) |row, i| {
+            const val = row.getColumn(0).?;
+            if (val.isNull()) return error.UnexpectedNull;
+            try std.testing.expectEqual(expected[i], val.asInt64().?);
         }
     }
 }
@@ -120,7 +122,7 @@ test "round-trip zstd compression with byte arrays" {
         const file = try tmp_dir.dir.openFile(file_path, .{});
         defer file.close();
 
-        var reader = try parquet.openFile(allocator, file);
+        var reader = try parquet.openFileDynamic(allocator, file, .{});
         defer reader.deinit();
 
         try std.testing.expectEqual(@as(i64, 5), reader.metadata.num_rows);
@@ -130,26 +132,20 @@ test "round-trip zstd compression with byte arrays" {
         const col_chunk = row_group.columns[0];
         try std.testing.expectEqual(parquet.format.CompressionCodec.zstd, col_chunk.meta_data.?.codec);
 
-        // Read column
-        const col = try reader.readColumn(0, []const u8);
+        // Read rows
+        const rows = try reader.readAllRows(0);
         defer {
-            for (col) |v| {
-                switch (v) {
-                    .value => |s| allocator.free(s),
-                    .null_value => {},
-                }
-            }
-            allocator.free(col);
+            for (rows) |row| row.deinit();
+            allocator.free(rows);
         }
 
-        try std.testing.expectEqual(@as(usize, 5), col.len);
+        try std.testing.expectEqual(@as(usize, 5), rows.len);
 
         const expected = [_][]const u8{ "hello", "world", "test", "compression", "parquet" };
-        for (col, 0..) |v, i| {
-            switch (v) {
-                .value => |s| try std.testing.expectEqualStrings(expected[i], s),
-                .null_value => return error.UnexpectedNull,
-            }
+        for (rows, 0..) |row, i| {
+            const val = row.getColumn(0).?;
+            if (val.isNull()) return error.UnexpectedNull;
+            try std.testing.expectEqualStrings(expected[i], val.asBytes().?);
         }
     }
 }
@@ -190,7 +186,7 @@ test "round-trip mixed compression (zstd and uncompressed)" {
         const file = try tmp_dir.dir.openFile(file_path, .{});
         defer file.close();
 
-        var reader = try parquet.openFile(allocator, file);
+        var reader = try parquet.openFileDynamic(allocator, file, .{});
         defer reader.deinit();
 
         try std.testing.expectEqual(@as(i64, 3), reader.metadata.num_rows);
@@ -200,23 +196,24 @@ test "round-trip mixed compression (zstd and uncompressed)" {
         try std.testing.expectEqual(parquet.format.CompressionCodec.zstd, row_group.columns[0].meta_data.?.codec);
         try std.testing.expectEqual(parquet.format.CompressionCodec.uncompressed, row_group.columns[1].meta_data.?.codec);
 
-        // Read and verify first column (zstd)
-        const col0 = try reader.readColumn(0, i64);
-        defer allocator.free(col0);
-        try std.testing.expectEqual(@as(usize, 3), col0.len);
-        switch (col0[0]) {
-            .value => |v| try std.testing.expectEqual(@as(i64, 100), v),
-            .null_value => return error.UnexpectedNull,
+        // Read rows (both columns at once)
+        const rows = try reader.readAllRows(0);
+        defer {
+            for (rows) |row| row.deinit();
+            allocator.free(rows);
         }
 
-        // Read and verify second column (uncompressed)
-        const col1 = try reader.readColumn(1, i32);
-        defer allocator.free(col1);
-        try std.testing.expectEqual(@as(usize, 3), col1.len);
-        switch (col1[0]) {
-            .value => |v| try std.testing.expectEqual(@as(i32, 1), v),
-            .null_value => return error.UnexpectedNull,
-        }
+        try std.testing.expectEqual(@as(usize, 3), rows.len);
+
+        // Verify first column (zstd, i64)
+        const val0 = rows[0].getColumn(0).?;
+        if (val0.isNull()) return error.UnexpectedNull;
+        try std.testing.expectEqual(@as(i64, 100), val0.asInt64().?);
+
+        // Verify second column (uncompressed, i32)
+        const val1 = rows[0].getColumn(1).?;
+        if (val1.isNull()) return error.UnexpectedNull;
+        try std.testing.expectEqual(@as(i32, 1), val1.asInt32().?);
     }
 }
 
@@ -251,7 +248,7 @@ test "round-trip with gzip compression" {
         const file = try tmp_dir.dir.openFile(file_path, .{});
         defer file.close();
 
-        var reader = try parquet.openFile(allocator, file);
+        var reader = try parquet.openFileDynamic(allocator, file, .{});
         defer reader.deinit();
 
         // Verify metadata
@@ -262,19 +259,21 @@ test "round-trip with gzip compression" {
         const col_chunk = row_group.columns[0];
         try std.testing.expectEqual(parquet.format.CompressionCodec.gzip, col_chunk.meta_data.?.codec);
 
-        // Read column
-        const col = try reader.readColumn(0, i64);
-        defer allocator.free(col);
+        // Read rows
+        const rows = try reader.readAllRows(0);
+        defer {
+            for (rows) |row| row.deinit();
+            allocator.free(rows);
+        }
 
-        try std.testing.expectEqual(@as(usize, 10), col.len);
+        try std.testing.expectEqual(@as(usize, 10), rows.len);
 
         // Verify values
         const expected = [_]i64{ 1, 2, 3, 4, 5, 100, -50, 0, 999999, -123456 };
-        for (col, 0..) |v, i| {
-            switch (v) {
-                .value => |val| try std.testing.expectEqual(expected[i], val),
-                .null_value => return error.UnexpectedNull,
-            }
+        for (rows, 0..) |row, i| {
+            const val = row.getColumn(0).?;
+            if (val.isNull()) return error.UnexpectedNull;
+            try std.testing.expectEqual(expected[i], val.asInt64().?);
         }
     }
 }
@@ -312,7 +311,7 @@ test "round-trip gzip compression with byte arrays" {
         const file = try tmp_dir.dir.openFile(file_path, .{});
         defer file.close();
 
-        var reader = try parquet.openFile(allocator, file);
+        var reader = try parquet.openFileDynamic(allocator, file, .{});
         defer reader.deinit();
 
         try std.testing.expectEqual(@as(i64, 5), reader.metadata.num_rows);
@@ -322,26 +321,20 @@ test "round-trip gzip compression with byte arrays" {
         const col_chunk = row_group.columns[0];
         try std.testing.expectEqual(parquet.format.CompressionCodec.gzip, col_chunk.meta_data.?.codec);
 
-        // Read column
-        const col = try reader.readColumn(0, []const u8);
+        // Read rows
+        const rows = try reader.readAllRows(0);
         defer {
-            for (col) |v| {
-                switch (v) {
-                    .value => |s| allocator.free(s),
-                    .null_value => {},
-                }
-            }
-            allocator.free(col);
+            for (rows) |row| row.deinit();
+            allocator.free(rows);
         }
 
-        try std.testing.expectEqual(@as(usize, 5), col.len);
+        try std.testing.expectEqual(@as(usize, 5), rows.len);
 
         const expected = [_][]const u8{ "hello", "world", "test", "compression", "parquet" };
-        for (col, 0..) |v, i| {
-            switch (v) {
-                .value => |s| try std.testing.expectEqualStrings(expected[i], s),
-                .null_value => return error.UnexpectedNull,
-            }
+        for (rows, 0..) |row, i| {
+            const val = row.getColumn(0).?;
+            if (val.isNull()) return error.UnexpectedNull;
+            try std.testing.expectEqualStrings(expected[i], val.asBytes().?);
         }
     }
 }
@@ -377,7 +370,7 @@ test "round-trip with snappy compression" {
         const file = try tmp_dir.dir.openFile(file_path, .{});
         defer file.close();
 
-        var reader = try parquet.openFile(allocator, file);
+        var reader = try parquet.openFileDynamic(allocator, file, .{});
         defer reader.deinit();
 
         // Verify metadata
@@ -388,19 +381,21 @@ test "round-trip with snappy compression" {
         const col_chunk = row_group.columns[0];
         try std.testing.expectEqual(parquet.format.CompressionCodec.snappy, col_chunk.meta_data.?.codec);
 
-        // Read column
-        const col = try reader.readColumn(0, i64);
-        defer allocator.free(col);
+        // Read rows
+        const rows = try reader.readAllRows(0);
+        defer {
+            for (rows) |row| row.deinit();
+            allocator.free(rows);
+        }
 
-        try std.testing.expectEqual(@as(usize, 10), col.len);
+        try std.testing.expectEqual(@as(usize, 10), rows.len);
 
         // Verify values
         const expected_i64 = [_]i64{ 1, 2, 3, 4, 5, 100, -50, 0, 999999, -123456 };
-        for (col, 0..) |v, i| {
-            switch (v) {
-                .value => |val| try std.testing.expectEqual(expected_i64[i], val),
-                .null_value => return error.UnexpectedNull,
-            }
+        for (rows, 0..) |row, i| {
+            const val = row.getColumn(0).?;
+            if (val.isNull()) return error.UnexpectedNull;
+            try std.testing.expectEqual(expected_i64[i], val.asInt64().?);
         }
     }
 }
@@ -438,7 +433,7 @@ test "round-trip snappy compression with byte arrays" {
         const file = try tmp_dir.dir.openFile(file_path, .{});
         defer file.close();
 
-        var reader = try parquet.openFile(allocator, file);
+        var reader = try parquet.openFileDynamic(allocator, file, .{});
         defer reader.deinit();
 
         try std.testing.expectEqual(@as(i64, 5), reader.metadata.num_rows);
@@ -448,26 +443,20 @@ test "round-trip snappy compression with byte arrays" {
         const col_chunk = row_group.columns[0];
         try std.testing.expectEqual(parquet.format.CompressionCodec.snappy, col_chunk.meta_data.?.codec);
 
-        // Read column
-        const col = try reader.readColumn(0, []const u8);
+        // Read rows
+        const rows = try reader.readAllRows(0);
         defer {
-            for (col) |v| {
-                switch (v) {
-                    .value => |s| allocator.free(s),
-                    .null_value => {},
-                }
-            }
-            allocator.free(col);
+            for (rows) |row| row.deinit();
+            allocator.free(rows);
         }
 
-        try std.testing.expectEqual(@as(usize, 5), col.len);
+        try std.testing.expectEqual(@as(usize, 5), rows.len);
 
         const expected_strs = [_][]const u8{ "hello", "world", "test", "compression", "parquet" };
-        for (col, 0..) |v, i| {
-            switch (v) {
-                .value => |s| try std.testing.expectEqualStrings(expected_strs[i], s),
-                .null_value => return error.UnexpectedNull,
-            }
+        for (rows, 0..) |row, i| {
+            const val = row.getColumn(0).?;
+            if (val.isNull()) return error.UnexpectedNull;
+            try std.testing.expectEqualStrings(expected_strs[i], val.asBytes().?);
         }
     }
 }
@@ -503,7 +492,7 @@ test "round-trip with lz4_raw compression" {
         const file = try tmp_dir.dir.openFile(file_path, .{});
         defer file.close();
 
-        var reader = try parquet.openFile(allocator, file);
+        var reader = try parquet.openFileDynamic(allocator, file, .{});
         defer reader.deinit();
 
         // Verify metadata
@@ -514,19 +503,21 @@ test "round-trip with lz4_raw compression" {
         const col_chunk = row_group.columns[0];
         try std.testing.expectEqual(parquet.format.CompressionCodec.lz4_raw, col_chunk.meta_data.?.codec);
 
-        // Read column
-        const col = try reader.readColumn(0, i64);
-        defer allocator.free(col);
+        // Read rows
+        const rows = try reader.readAllRows(0);
+        defer {
+            for (rows) |row| row.deinit();
+            allocator.free(rows);
+        }
 
-        try std.testing.expectEqual(@as(usize, 10), col.len);
+        try std.testing.expectEqual(@as(usize, 10), rows.len);
 
         // Verify values
         const expected_i64 = [_]i64{ 1, 2, 3, 4, 5, 100, -50, 0, 999999, -123456 };
-        for (col, 0..) |v, i| {
-            switch (v) {
-                .value => |val| try std.testing.expectEqual(expected_i64[i], val),
-                .null_value => return error.UnexpectedNull,
-            }
+        for (rows, 0..) |row, i| {
+            const val = row.getColumn(0).?;
+            if (val.isNull()) return error.UnexpectedNull;
+            try std.testing.expectEqual(expected_i64[i], val.asInt64().?);
         }
     }
 }
@@ -564,7 +555,7 @@ test "round-trip lz4_raw compression with byte arrays" {
         const file = try tmp_dir.dir.openFile(file_path, .{});
         defer file.close();
 
-        var reader = try parquet.openFile(allocator, file);
+        var reader = try parquet.openFileDynamic(allocator, file, .{});
         defer reader.deinit();
 
         try std.testing.expectEqual(@as(i64, 5), reader.metadata.num_rows);
@@ -574,26 +565,20 @@ test "round-trip lz4_raw compression with byte arrays" {
         const col_chunk = row_group.columns[0];
         try std.testing.expectEqual(parquet.format.CompressionCodec.lz4_raw, col_chunk.meta_data.?.codec);
 
-        // Read column
-        const col = try reader.readColumn(0, []const u8);
+        // Read rows
+        const rows = try reader.readAllRows(0);
         defer {
-            for (col) |v| {
-                switch (v) {
-                    .value => |s| allocator.free(s),
-                    .null_value => {},
-                }
-            }
-            allocator.free(col);
+            for (rows) |row| row.deinit();
+            allocator.free(rows);
         }
 
-        try std.testing.expectEqual(@as(usize, 5), col.len);
+        try std.testing.expectEqual(@as(usize, 5), rows.len);
 
         const expected_lz4_strs = [_][]const u8{ "hello", "world", "test", "compression", "parquet" };
-        for (col, 0..) |v, i| {
-            switch (v) {
-                .value => |s| try std.testing.expectEqualStrings(expected_lz4_strs[i], s),
-                .null_value => return error.UnexpectedNull,
-            }
+        for (rows, 0..) |row, i| {
+            const val = row.getColumn(0).?;
+            if (val.isNull()) return error.UnexpectedNull;
+            try std.testing.expectEqualStrings(expected_lz4_strs[i], val.asBytes().?);
         }
     }
 }
@@ -629,7 +614,7 @@ test "round-trip with brotli compression" {
         const file = try tmp_dir.dir.openFile(file_path, .{});
         defer file.close();
 
-        var reader = try parquet.openFile(allocator, file);
+        var reader = try parquet.openFileDynamic(allocator, file, .{});
         defer reader.deinit();
 
         // Verify metadata
@@ -640,19 +625,21 @@ test "round-trip with brotli compression" {
         const col_chunk = row_group.columns[0];
         try std.testing.expectEqual(parquet.format.CompressionCodec.brotli, col_chunk.meta_data.?.codec);
 
-        // Read column
-        const col = try reader.readColumn(0, i64);
-        defer allocator.free(col);
+        // Read rows
+        const rows = try reader.readAllRows(0);
+        defer {
+            for (rows) |row| row.deinit();
+            allocator.free(rows);
+        }
 
-        try std.testing.expectEqual(@as(usize, 10), col.len);
+        try std.testing.expectEqual(@as(usize, 10), rows.len);
 
         // Verify values
         const expected_i64 = [_]i64{ 1, 2, 3, 4, 5, 100, -50, 0, 999999, -123456 };
-        for (col, 0..) |v, i| {
-            switch (v) {
-                .value => |val| try std.testing.expectEqual(expected_i64[i], val),
-                .null_value => return error.UnexpectedNull,
-            }
+        for (rows, 0..) |row, i| {
+            const val = row.getColumn(0).?;
+            if (val.isNull()) return error.UnexpectedNull;
+            try std.testing.expectEqual(expected_i64[i], val.asInt64().?);
         }
     }
 }
@@ -690,7 +677,7 @@ test "round-trip brotli compression with byte arrays" {
         const file = try tmp_dir.dir.openFile(file_path, .{});
         defer file.close();
 
-        var reader = try parquet.openFile(allocator, file);
+        var reader = try parquet.openFileDynamic(allocator, file, .{});
         defer reader.deinit();
 
         try std.testing.expectEqual(@as(i64, 5), reader.metadata.num_rows);
@@ -700,26 +687,20 @@ test "round-trip brotli compression with byte arrays" {
         const col_chunk = row_group.columns[0];
         try std.testing.expectEqual(parquet.format.CompressionCodec.brotli, col_chunk.meta_data.?.codec);
 
-        // Read column
-        const col = try reader.readColumn(0, []const u8);
+        // Read rows
+        const rows = try reader.readAllRows(0);
         defer {
-            for (col) |v| {
-                switch (v) {
-                    .value => |s| allocator.free(s),
-                    .null_value => {},
-                }
-            }
-            allocator.free(col);
+            for (rows) |row| row.deinit();
+            allocator.free(rows);
         }
 
-        try std.testing.expectEqual(@as(usize, 5), col.len);
+        try std.testing.expectEqual(@as(usize, 5), rows.len);
 
         const expected_brotli_strs = [_][]const u8{ "hello", "world", "test", "compression", "parquet" };
-        for (col, 0..) |v, i| {
-            switch (v) {
-                .value => |s| try std.testing.expectEqualStrings(expected_brotli_strs[i], s),
-                .null_value => return error.UnexpectedNull,
-            }
+        for (rows, 0..) |row, i| {
+            const val = row.getColumn(0).?;
+            if (val.isNull()) return error.UnexpectedNull;
+            try std.testing.expectEqualStrings(expected_brotli_strs[i], val.asBytes().?);
         }
     }
 }

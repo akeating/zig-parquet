@@ -67,7 +67,7 @@ test "round-trip all codecs with i64" {
             const file = try tmp_dir.dir.openFile(file_path, .{});
             defer file.close();
 
-            var reader = try parquet.openFile(allocator, file);
+            var reader = try parquet.openFileDynamic(allocator, file, .{});
             defer reader.deinit();
 
             try std.testing.expectEqual(@as(i64, 10), reader.metadata.num_rows);
@@ -77,17 +77,17 @@ test "round-trip all codecs with i64" {
             try std.testing.expectEqual(codec, col_chunk.meta_data.?.codec);
 
             // Read and compare
-            const col = try reader.readColumn(0, i64);
-            defer allocator.free(col);
+            const rows = try reader.readAllRows(0);
+            defer {
+                for (rows) |row| row.deinit();
+                allocator.free(rows);
+            }
 
             const expected = [_]i64{ 1, 2, 3, 4, 5, -100, 0, 999999, -123456, 42 };
-            try std.testing.expectEqual(@as(usize, 10), col.len);
+            try std.testing.expectEqual(@as(usize, 10), rows.len);
 
-            for (col, 0..) |v, i| {
-                switch (v) {
-                    .value => |val| try std.testing.expectEqual(expected[i], val),
-                    .null_value => return error.UnexpectedNull,
-                }
+            for (rows, 0..) |row, i| {
+                try std.testing.expectEqual(@as(?i64, expected[i]), row.getColumn(0).?.asInt64());
             }
         }
     }
@@ -138,69 +138,22 @@ test "round-trip all codecs with mixed types" {
             const file = try tmp_dir.dir.openFile(file_path, .{});
             defer file.close();
 
-            var reader = try parquet.openFile(allocator, file);
+            var reader = try parquet.openFileDynamic(allocator, file, .{});
             defer reader.deinit();
 
             try std.testing.expectEqual(@as(i64, 5), reader.metadata.num_rows);
 
-            // Verify i32 column
-            {
-                const col = try reader.readColumn(0, i32);
-                defer allocator.free(col);
-
-                for (col, 0..) |v, i| {
-                    switch (v) {
-                        .value => |val| try std.testing.expectEqual(i32_values[i], val),
-                        .null_value => return error.UnexpectedNull,
-                    }
-                }
+            const rows = try reader.readAllRows(0);
+            defer {
+                for (rows) |row| row.deinit();
+                allocator.free(rows);
             }
 
-            // Verify i64 column
-            {
-                const col = try reader.readColumn(1, i64);
-                defer allocator.free(col);
-
-                for (col, 0..) |v, i| {
-                    switch (v) {
-                        .value => |val| try std.testing.expectEqual(i64_values[i], val),
-                        .null_value => return error.UnexpectedNull,
-                    }
-                }
-            }
-
-            // Verify f64 column
-            {
-                const col = try reader.readColumn(2, f64);
-                defer allocator.free(col);
-
-                for (col, 0..) |v, i| {
-                    switch (v) {
-                        .value => |val| try std.testing.expectApproxEqAbs(f64_values[i], val, 0.0001),
-                        .null_value => return error.UnexpectedNull,
-                    }
-                }
-            }
-
-            // Verify string column
-            {
-                const col = try reader.readColumn(3, []const u8);
-                defer {
-                    for (col) |v| {
-                        switch (v) {
-                            .value => |s| allocator.free(s),
-                            .null_value => {},
-                        }
-                    }
-                    allocator.free(col);
-                }
-
-                for (col, 0..) |v, i| {
-                    switch (v) {
-                        .value => |s| try std.testing.expectEqualStrings(str_values[i], s),
-                        .null_value => return error.UnexpectedNull,
-                    }
-                }
+            for (rows, 0..) |row, i| {
+                try std.testing.expectEqual(@as(?i32, i32_values[i]), row.getColumn(0).?.asInt32());
+                try std.testing.expectEqual(@as(?i64, i64_values[i]), row.getColumn(1).?.asInt64());
+                try std.testing.expectApproxEqAbs(f64_values[i], row.getColumn(2).?.asDouble().?, 0.0001);
+                try std.testing.expectEqualStrings(str_values[i], row.getColumn(3).?.asBytes().?);
             }
         }
     }
@@ -237,30 +190,24 @@ test "round-trip with nullable columns" {
         const file = try tmp_dir.dir.openFile(file_path, .{});
         defer file.close();
 
-        var reader = try parquet.openFile(allocator, file);
+        var reader = try parquet.openFileDynamic(allocator, file, .{});
         defer reader.deinit();
 
         try std.testing.expectEqual(@as(i64, 10), reader.metadata.num_rows);
 
-        const col = try reader.readColumn(0, i64);
-        defer allocator.free(col);
+        const rows = try reader.readAllRows(0);
+        defer {
+            for (rows) |row| row.deinit();
+            allocator.free(rows);
+        }
 
         const expected = [_]?i64{ 1, null, 3, null, 5, 6, null, 8, 9, null };
 
-        for (col, 0..) |v, i| {
-            switch (v) {
-                .value => |val| {
-                    if (expected[i]) |exp| {
-                        try std.testing.expectEqual(exp, val);
-                    } else {
-                        return error.ExpectedNull;
-                    }
-                },
-                .null_value => {
-                    if (expected[i] != null) {
-                        return error.UnexpectedNull;
-                    }
-                },
+        for (rows, 0..) |row, i| {
+            if (expected[i]) |exp| {
+                try std.testing.expectEqual(@as(?i64, exp), row.getColumn(0).?.asInt64());
+            } else {
+                try std.testing.expect(row.getColumn(0).?.isNull());
             }
         }
     }
@@ -317,116 +264,25 @@ test "round-trip all physical types" {
         const file = try tmp_dir.dir.openFile(file_path, .{});
         defer file.close();
 
-        var reader = try parquet.openFile(allocator, file);
+        var reader = try parquet.openFileDynamic(allocator, file, .{});
         defer reader.deinit();
 
         try std.testing.expectEqual(@as(i64, 5), reader.metadata.num_rows);
 
-        // Verify bool column
-        {
-            const col = try reader.readColumn(0, bool);
-            defer allocator.free(col);
-
-            for (col, 0..) |v, i| {
-                switch (v) {
-                    .value => |val| try std.testing.expectEqual(bool_values[i], val),
-                    .null_value => return error.UnexpectedNull,
-                }
-            }
+        const rows = try reader.readAllRows(0);
+        defer {
+            for (rows) |row| row.deinit();
+            allocator.free(rows);
         }
 
-        // Verify i32 column
-        {
-            const col = try reader.readColumn(1, i32);
-            defer allocator.free(col);
-
-            for (col, 0..) |v, i| {
-                switch (v) {
-                    .value => |val| try std.testing.expectEqual(i32_values[i], val),
-                    .null_value => return error.UnexpectedNull,
-                }
-            }
-        }
-
-        // Verify i64 column
-        {
-            const col = try reader.readColumn(2, i64);
-            defer allocator.free(col);
-
-            for (col, 0..) |v, i| {
-                switch (v) {
-                    .value => |val| try std.testing.expectEqual(i64_values[i], val),
-                    .null_value => return error.UnexpectedNull,
-                }
-            }
-        }
-
-        // Verify f32 column
-        {
-            const col = try reader.readColumn(3, f32);
-            defer allocator.free(col);
-
-            for (col, 0..) |v, i| {
-                switch (v) {
-                    .value => |val| try std.testing.expectApproxEqAbs(f32_values[i], val, 0.0001),
-                    .null_value => return error.UnexpectedNull,
-                }
-            }
-        }
-
-        // Verify f64 column
-        {
-            const col = try reader.readColumn(4, f64);
-            defer allocator.free(col);
-
-            for (col, 0..) |v, i| {
-                switch (v) {
-                    .value => |val| try std.testing.expectApproxEqAbs(f64_values[i], val, 0.0001),
-                    .null_value => return error.UnexpectedNull,
-                }
-            }
-        }
-
-        // Verify byte_array column
-        {
-            const col = try reader.readColumn(5, []const u8);
-            defer {
-                for (col) |v| {
-                    switch (v) {
-                        .value => |s| allocator.free(s),
-                        .null_value => {},
-                    }
-                }
-                allocator.free(col);
-            }
-
-            for (col, 0..) |v, i| {
-                switch (v) {
-                    .value => |s| try std.testing.expectEqualStrings(str_values[i], s),
-                    .null_value => return error.UnexpectedNull,
-                }
-            }
-        }
-
-        // Verify fixed_len_byte_array column
-        {
-            const col = try reader.readColumn(6, []const u8);
-            defer {
-                for (col) |v| {
-                    switch (v) {
-                        .value => |s| allocator.free(s),
-                        .null_value => {},
-                    }
-                }
-                allocator.free(col);
-            }
-
-            for (col, 0..) |v, i| {
-                switch (v) {
-                    .value => |s| try std.testing.expectEqualStrings(fixed_values[i], s),
-                    .null_value => return error.UnexpectedNull,
-                }
-            }
+        for (rows, 0..) |row, i| {
+            try std.testing.expectEqual(@as(?bool, bool_values[i]), row.getColumn(0).?.asBool());
+            try std.testing.expectEqual(@as(?i32, i32_values[i]), row.getColumn(1).?.asInt32());
+            try std.testing.expectEqual(@as(?i64, i64_values[i]), row.getColumn(2).?.asInt64());
+            try std.testing.expectApproxEqAbs(f32_values[i], row.getColumn(3).?.asFloat().?, 0.0001);
+            try std.testing.expectApproxEqAbs(f64_values[i], row.getColumn(4).?.asDouble().?, 0.0001);
+            try std.testing.expectEqualStrings(str_values[i], row.getColumn(5).?.asBytes().?);
+            try std.testing.expectEqualStrings(fixed_values[i], row.getColumn(6).?.asBytes().?);
         }
     }
 }
@@ -498,7 +354,7 @@ test "round-trip logical types" {
         const file = try tmp_dir.dir.openFile(file_path, .{});
         defer file.close();
 
-        var reader = try parquet.openFile(allocator, file);
+        var reader = try parquet.openFileDynamic(allocator, file, .{});
         defer reader.deinit();
 
         try std.testing.expectEqual(@as(i64, 3), reader.metadata.num_rows);
@@ -566,72 +422,30 @@ test "round-trip logical types" {
             }
         }
 
-        // Verify string data
-        {
-            const col = try reader.readColumn(0, []const u8);
-            defer {
-                for (col) |v| {
-                    switch (v) {
-                        .value => |s| allocator.free(s),
-                        .null_value => {},
-                    }
-                }
-                allocator.free(col);
-            }
+        const rows = try reader.readAllRows(0);
+        defer {
+            for (rows) |row| row.deinit();
+            allocator.free(rows);
+        }
 
-            for (col, 0..) |v, i| {
-                switch (v) {
-                    .value => |s| try std.testing.expectEqualStrings(string_values[i], s),
-                    .null_value => return error.UnexpectedNull,
-                }
-            }
+        // Verify string data
+        for (rows, 0..) |row, i| {
+            try std.testing.expectEqualStrings(string_values[i], row.getColumn(0).?.asBytes().?);
         }
 
         // Verify date data
-        {
-            const col = try reader.readColumn(1, i32);
-            defer allocator.free(col);
-
-            for (col, 0..) |v, i| {
-                switch (v) {
-                    .value => |val| try std.testing.expectEqual(date_values[i], val),
-                    .null_value => return error.UnexpectedNull,
-                }
-            }
+        for (rows, 0..) |row, i| {
+            try std.testing.expectEqual(@as(?i32, date_values[i]), row.getColumn(1).?.asInt32());
         }
 
         // Verify timestamp data
-        {
-            const col = try reader.readColumn(2, i64);
-            defer allocator.free(col);
-
-            for (col, 0..) |v, i| {
-                switch (v) {
-                    .value => |val| try std.testing.expectEqual(timestamp_values[i], val),
-                    .null_value => return error.UnexpectedNull,
-                }
-            }
+        for (rows, 0..) |row, i| {
+            try std.testing.expectEqual(@as(?i64, timestamp_values[i]), row.getColumn(2).?.asInt64());
         }
 
         // Verify uuid data
-        {
-            const col = try reader.readColumn(5, []const u8);
-            defer {
-                for (col) |v| {
-                    switch (v) {
-                        .value => |s| allocator.free(s),
-                        .null_value => {},
-                    }
-                }
-                allocator.free(col);
-            }
-
-            for (col, 0..) |v, i| {
-                switch (v) {
-                    .value => |s| try std.testing.expectEqualStrings(uuid_values[i], s),
-                    .null_value => return error.UnexpectedNull,
-                }
-            }
+        for (rows, 0..) |row, i| {
+            try std.testing.expectEqualStrings(uuid_values[i], row.getColumn(5).?.asBytes().?);
         }
     }
 }
@@ -692,19 +506,19 @@ test "round-trip validates compression actually works" {
         const file = try tmp_dir.dir.openFile(file_path, .{});
         defer file.close();
 
-        var reader = try parquet.openFile(allocator, file);
+        var reader = try parquet.openFileDynamic(allocator, file, .{});
         defer reader.deinit();
 
         try std.testing.expectEqual(@as(i64, 1000), reader.metadata.num_rows);
 
-        const col = try reader.readColumn(0, i64);
-        defer allocator.free(col);
+        const rows = try reader.readAllRows(0);
+        defer {
+            for (rows) |row| row.deinit();
+            allocator.free(rows);
+        }
 
-        for (col) |v| {
-            switch (v) {
-                .value => |val| try std.testing.expectEqual(@as(i64, 42), val),
-                .null_value => return error.UnexpectedNull,
-            }
+        for (rows) |row| {
+            try std.testing.expectEqual(@as(?i64, 42), row.getColumn(0).?.asInt64());
         }
     }
 }
@@ -739,7 +553,7 @@ test "round-trip statistics i32" {
         const file = try tmp_dir.dir.openFile("stats_i32.parquet", .{});
         defer file.close();
 
-        var reader = try parquet.openFile(allocator, file);
+        var reader = try parquet.openFileDynamic(allocator, file, .{});
         defer reader.deinit();
 
         const stats = reader.getColumnStatistics(0, 0);
@@ -777,7 +591,7 @@ test "round-trip statistics i64 with nulls" {
         const file = try tmp_dir.dir.openFile("stats_i64_nulls.parquet", .{});
         defer file.close();
 
-        var reader = try parquet.openFile(allocator, file);
+        var reader = try parquet.openFileDynamic(allocator, file, .{});
         defer reader.deinit();
 
         const stats = reader.getColumnStatistics(0, 0);
@@ -815,7 +629,7 @@ test "round-trip statistics byte array" {
         const file = try tmp_dir.dir.openFile("stats_ba.parquet", .{});
         defer file.close();
 
-        var reader = try parquet.openFile(allocator, file);
+        var reader = try parquet.openFileDynamic(allocator, file, .{});
         defer reader.deinit();
 
         const stats = reader.getColumnStatistics(0, 0);
@@ -852,7 +666,7 @@ test "round-trip statistics double" {
         const file = try tmp_dir.dir.openFile("stats_double.parquet", .{});
         defer file.close();
 
-        var reader = try parquet.openFile(allocator, file);
+        var reader = try parquet.openFileDynamic(allocator, file, .{});
         defer reader.deinit();
 
         const stats = reader.getColumnStatistics(0, 0);
@@ -889,7 +703,7 @@ test "round-trip statistics boolean" {
         const file = try tmp_dir.dir.openFile("stats_bool.parquet", .{});
         defer file.close();
 
-        var reader = try parquet.openFile(allocator, file);
+        var reader = try parquet.openFileDynamic(allocator, file, .{});
         defer reader.deinit();
 
         const stats = reader.getColumnStatistics(0, 0);
@@ -928,7 +742,7 @@ test "round-trip statistics float" {
         const file = try tmp_dir.dir.openFile("stats_float.parquet", .{});
         defer file.close();
 
-        var reader = try parquet.openFile(allocator, file);
+        var reader = try parquet.openFileDynamic(allocator, file, .{});
         defer reader.deinit();
 
         const stats = reader.getColumnStatistics(0, 0);
@@ -968,7 +782,7 @@ test "round-trip statistics fixed byte array" {
         const file = try tmp_dir.dir.openFile("stats_flba.parquet", .{});
         defer file.close();
 
-        var reader = try parquet.openFile(allocator, file);
+        var reader = try parquet.openFileDynamic(allocator, file, .{});
         defer reader.deinit();
 
         const stats = reader.getColumnStatistics(0, 0);
@@ -1005,7 +819,7 @@ test "round-trip statistics edge values i32" {
         const file = try tmp_dir.dir.openFile("stats_i32_edge.parquet", .{});
         defer file.close();
 
-        var reader = try parquet.openFile(allocator, file);
+        var reader = try parquet.openFileDynamic(allocator, file, .{});
         defer reader.deinit();
 
         const stats = reader.getColumnStatistics(0, 0);
@@ -1042,7 +856,7 @@ test "round-trip statistics edge values i64" {
         const file = try tmp_dir.dir.openFile("stats_i64_edge.parquet", .{});
         defer file.close();
 
-        var reader = try parquet.openFile(allocator, file);
+        var reader = try parquet.openFileDynamic(allocator, file, .{});
         defer reader.deinit();
 
         const stats = reader.getColumnStatistics(0, 0);
@@ -1079,7 +893,7 @@ test "round-trip statistics all nulls" {
         const file = try tmp_dir.dir.openFile("stats_nulls.parquet", .{});
         defer file.close();
 
-        var reader = try parquet.openFile(allocator, file);
+        var reader = try parquet.openFileDynamic(allocator, file, .{});
         defer reader.deinit();
 
         const stats = reader.getColumnStatistics(0, 0);
@@ -1451,7 +1265,7 @@ test "round-trip FLBA with byte_stream_split encoding (low-level Writer)" {
         const file = try tmp_dir.dir.openFile("bss_flba.parquet", .{});
         defer file.close();
 
-        var reader = try parquet.openFile(allocator, file);
+        var reader = try parquet.openFileDynamic(allocator, file, .{});
         defer reader.deinit();
 
         try std.testing.expectEqual(@as(i64, 3), reader.metadata.num_rows);
@@ -1467,18 +1281,16 @@ test "round-trip FLBA with byte_stream_split encoding (low-level Writer)" {
         }
         try std.testing.expect(has_bss);
 
-        const col = try reader.readColumn(0, []const u8);
+        const rows = try reader.readAllRows(0);
         defer {
-            for (col) |v| {
-                if (v == .value) allocator.free(v.value);
-            }
-            allocator.free(col);
+            for (rows) |row| row.deinit();
+            allocator.free(rows);
         }
 
-        try std.testing.expectEqual(@as(usize, 3), col.len);
-        try std.testing.expectEqualSlices(u8, &val0, col[0].value);
-        try std.testing.expectEqualSlices(u8, &val1, col[1].value);
-        try std.testing.expectEqualSlices(u8, &val2, col[2].value);
+        try std.testing.expectEqual(@as(usize, 3), rows.len);
+        try std.testing.expectEqualSlices(u8, &val0, rows[0].getColumn(0).?.asBytes().?);
+        try std.testing.expectEqualSlices(u8, &val1, rows[1].getColumn(0).?.asBytes().?);
+        try std.testing.expectEqualSlices(u8, &val2, rows[2].getColumn(0).?.asBytes().?);
     }
 }
 
@@ -2652,7 +2464,7 @@ test "round-trip statistics int32 logical types" {
         const file = try tmp_dir.dir.openFile("stats_int32_logical.parquet", .{});
         defer file.close();
 
-        var reader = try parquet.openFile(allocator, file);
+        var reader = try parquet.openFileDynamic(allocator, file, .{});
         defer reader.deinit();
 
         const Expectation = struct { col: usize, min: i32, max: i32 };
@@ -2723,7 +2535,7 @@ test "round-trip statistics int64 logical types" {
         const file = try tmp_dir.dir.openFile("stats_int64_logical.parquet", .{});
         defer file.close();
 
-        var reader = try parquet.openFile(allocator, file);
+        var reader = try parquet.openFileDynamic(allocator, file, .{});
         defer reader.deinit();
 
         const Expectation = struct { col: usize, min: i64, max: i64 };
@@ -2799,7 +2611,7 @@ test "round-trip statistics fixed byte array logical types" {
         const file = try tmp_dir.dir.openFile("stats_fixed_logical.parquet", .{});
         defer file.close();
 
-        var reader = try parquet.openFile(allocator, file);
+        var reader = try parquet.openFileDynamic(allocator, file, .{});
         defer reader.deinit();
 
         {
@@ -2864,33 +2676,25 @@ test "Writer.initWithTarget round-trip via BufferTarget" {
     try writer.close();
 
     const buffer = bt.written();
-    var reader = try parquet.openBuffer(allocator, buffer);
+    var reader = try parquet.openBufferDynamic(allocator, buffer, .{});
     defer reader.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), reader.metadata.row_groups.len);
     try std.testing.expectEqual(@as(i64, 3), reader.metadata.row_groups[0].num_rows);
 
-    const col0 = try reader.readColumn(0, i64);
-    defer allocator.free(col0);
-    try std.testing.expectEqual(@as(usize, 3), col0.len);
-    try std.testing.expectEqual(@as(i64, 10), col0[0].value);
-    try std.testing.expectEqual(@as(i64, 20), col0[1].value);
-    try std.testing.expectEqual(@as(i64, 30), col0[2].value);
-
-    const col1 = try reader.readColumn(1, []const u8);
+    const rows = try reader.readAllRows(0);
     defer {
-        for (col1) |v| {
-            switch (v) {
-                .value => |s| allocator.free(s),
-                .null_value => {},
-            }
-        }
-        allocator.free(col1);
+        for (rows) |row| row.deinit();
+        allocator.free(rows);
     }
-    try std.testing.expectEqual(@as(usize, 3), col1.len);
-    try std.testing.expectEqualStrings("alice", col1[0].value);
-    try std.testing.expectEqual(parquet.Optional([]const u8).null_value, col1[1]);
-    try std.testing.expectEqualStrings("charlie", col1[2].value);
+    try std.testing.expectEqual(@as(usize, 3), rows.len);
+    try std.testing.expectEqual(@as(?i64, 10), rows[0].getColumn(0).?.asInt64());
+    try std.testing.expectEqual(@as(?i64, 20), rows[1].getColumn(0).?.asInt64());
+    try std.testing.expectEqual(@as(?i64, 30), rows[2].getColumn(0).?.asInt64());
+
+    try std.testing.expectEqualStrings("alice", rows[0].getColumn(1).?.asBytes().?);
+    try std.testing.expect(rows[1].getColumn(1).?.isNull());
+    try std.testing.expectEqualStrings("charlie", rows[2].getColumn(1).?.asBytes().?);
 }
 
 test "DynamicWriter.initWithTarget round-trip via BufferTarget" {

@@ -5,11 +5,10 @@
 const std = @import("std");
 const parquet = @import("../lib.zig");
 
-const Reader = parquet.Reader;
+const Value = parquet.Value;
 const Writer = parquet.Writer;
 const ColumnDef = parquet.ColumnDef;
 const Optional = parquet.Optional;
-// Use writer's MapEntry for writing (and reading types are compatible via assembly)
 const WriterMapEntry = @import("../core/map_encoder.zig").MapEntry;
 
 // =============================================================================
@@ -26,7 +25,7 @@ test "read map_string_int.parquet" {
     };
     defer file.close();
 
-    var reader = try parquet.openFile(allocator, file);
+    var reader = try parquet.openFileDynamic(allocator, file, .{});
     defer reader.deinit();
 
     // File has 5 rows:
@@ -36,45 +35,64 @@ test "read map_string_int.parquet" {
     // Row 3: null
     // Row 4: {"d": 4, "e": 5, "f": 6}
 
-    // Read the map column (key column is at index 0, value is at index 1)
-    const maps = try reader.readMapColumn(0, []const u8, i32);
-    defer reader.freeMapColumn([]const u8, i32, maps);
+    const rows = try reader.readAllRows(0);
+    defer {
+        for (rows) |row| row.deinit();
+        allocator.free(rows);
+    }
 
-    try std.testing.expectEqual(@as(usize, 5), maps.len);
+    try std.testing.expectEqual(@as(usize, 5), rows.len);
 
     // Row 0: {"a": 1, "b": 2}
-    try std.testing.expect(!maps[0].isNull());
-    const row0 = maps[0].value;
-    try std.testing.expectEqual(@as(usize, 2), row0.len);
-    try std.testing.expectEqualStrings("a", row0[0].key);
-    try std.testing.expectEqual(@as(i32, 1), row0[0].value.value);
-    try std.testing.expectEqualStrings("b", row0[1].key);
-    try std.testing.expectEqual(@as(i32, 2), row0[1].value.value);
+    const map0 = rows[0].getColumn(0).?;
+    switch (map0) {
+        .map_val => |entries| {
+            try std.testing.expectEqual(@as(usize, 2), entries.len);
+            try std.testing.expectEqualStrings("a", entries[0].key.asBytes().?);
+            try std.testing.expectEqual(@as(i32, 1), entries[0].value.asInt32().?);
+            try std.testing.expectEqualStrings("b", entries[1].key.asBytes().?);
+            try std.testing.expectEqual(@as(i32, 2), entries[1].value.asInt32().?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
 
     // Row 1: {"c": 3}
-    try std.testing.expect(!maps[1].isNull());
-    const row1 = maps[1].value;
-    try std.testing.expectEqual(@as(usize, 1), row1.len);
-    try std.testing.expectEqualStrings("c", row1[0].key);
-    try std.testing.expectEqual(@as(i32, 3), row1[0].value.value);
+    const map1 = rows[1].getColumn(0).?;
+    switch (map1) {
+        .map_val => |entries| {
+            try std.testing.expectEqual(@as(usize, 1), entries.len);
+            try std.testing.expectEqualStrings("c", entries[0].key.asBytes().?);
+            try std.testing.expectEqual(@as(i32, 3), entries[0].value.asInt32().?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
 
     // Row 2: {} (empty map)
-    try std.testing.expect(!maps[2].isNull());
-    try std.testing.expectEqual(@as(usize, 0), maps[2].value.len);
+    const map2 = rows[2].getColumn(0).?;
+    switch (map2) {
+        .map_val => |entries| {
+            try std.testing.expectEqual(@as(usize, 0), entries.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
 
     // Row 3: null
-    try std.testing.expect(maps[3].isNull());
+    try std.testing.expect(rows[3].getColumn(0).?.isNull());
 
     // Row 4: {"d": 4, "e": 5, "f": 6}
-    try std.testing.expect(!maps[4].isNull());
-    const row4 = maps[4].value;
-    try std.testing.expectEqual(@as(usize, 3), row4.len);
-    try std.testing.expectEqualStrings("d", row4[0].key);
-    try std.testing.expectEqual(@as(i32, 4), row4[0].value.value);
-    try std.testing.expectEqualStrings("e", row4[1].key);
-    try std.testing.expectEqual(@as(i32, 5), row4[1].value.value);
-    try std.testing.expectEqualStrings("f", row4[2].key);
-    try std.testing.expectEqual(@as(i32, 6), row4[2].value.value);
+    const map4 = rows[4].getColumn(0).?;
+    switch (map4) {
+        .map_val => |entries| {
+            try std.testing.expectEqual(@as(usize, 3), entries.len);
+            try std.testing.expectEqualStrings("d", entries[0].key.asBytes().?);
+            try std.testing.expectEqual(@as(i32, 4), entries[0].value.asInt32().?);
+            try std.testing.expectEqualStrings("e", entries[1].key.asBytes().?);
+            try std.testing.expectEqual(@as(i32, 5), entries[1].value.asInt32().?);
+            try std.testing.expectEqualStrings("f", entries[2].key.asBytes().?);
+            try std.testing.expectEqual(@as(i32, 6), entries[2].value.asInt32().?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 // =============================================================================
@@ -123,29 +141,40 @@ test "write and read simple map" {
         const file = try tmp_dir.dir.openFile(file_path, .{});
         defer file.close();
 
-        var reader = try parquet.openFile(allocator, file);
+        var reader = try parquet.openFileDynamic(allocator, file, .{});
         defer reader.deinit();
 
-        const maps = try reader.readMapColumn(0, []const u8, i32);
-        defer reader.freeMapColumn([]const u8, i32, maps);
+        const rows = try reader.readAllRows(0);
+        defer {
+            for (rows) |row| row.deinit();
+            allocator.free(rows);
+        }
 
-        try std.testing.expectEqual(@as(usize, 2), maps.len);
+        try std.testing.expectEqual(@as(usize, 2), rows.len);
 
         // Row 0: {a: 1, b: 2}
-        try std.testing.expect(!maps[0].isNull());
-        const row0 = maps[0].value;
-        try std.testing.expectEqual(@as(usize, 2), row0.len);
-        try std.testing.expectEqualStrings("a", row0[0].key);
-        try std.testing.expectEqual(@as(i32, 1), row0[0].value.value);
-        try std.testing.expectEqualStrings("b", row0[1].key);
-        try std.testing.expectEqual(@as(i32, 2), row0[1].value.value);
+        const map0 = rows[0].getColumn(0).?;
+        switch (map0) {
+            .map_val => |entries| {
+                try std.testing.expectEqual(@as(usize, 2), entries.len);
+                try std.testing.expectEqualStrings("a", entries[0].key.asBytes().?);
+                try std.testing.expectEqual(@as(i32, 1), entries[0].value.asInt32().?);
+                try std.testing.expectEqualStrings("b", entries[1].key.asBytes().?);
+                try std.testing.expectEqual(@as(i32, 2), entries[1].value.asInt32().?);
+            },
+            else => return error.TestUnexpectedResult,
+        }
 
         // Row 1: {c: 3}
-        try std.testing.expect(!maps[1].isNull());
-        const row1 = maps[1].value;
-        try std.testing.expectEqual(@as(usize, 1), row1.len);
-        try std.testing.expectEqualStrings("c", row1[0].key);
-        try std.testing.expectEqual(@as(i32, 3), row1[0].value.value);
+        const map1 = rows[1].getColumn(0).?;
+        switch (map1) {
+            .map_val => |entries| {
+                try std.testing.expectEqual(@as(usize, 1), entries.len);
+                try std.testing.expectEqualStrings("c", entries[0].key.asBytes().?);
+                try std.testing.expectEqual(@as(i32, 3), entries[0].value.asInt32().?);
+            },
+            else => return error.TestUnexpectedResult,
+        }
     }
 }
 
@@ -187,25 +216,33 @@ test "write and read map with null values" {
         const file = try tmp_dir.dir.openFile(file_path, .{});
         defer file.close();
 
-        var reader = try parquet.openFile(allocator, file);
+        var reader = try parquet.openFileDynamic(allocator, file, .{});
         defer reader.deinit();
 
-        const maps = try reader.readMapColumn(0, []const u8, i32);
-        defer reader.freeMapColumn([]const u8, i32, maps);
+        const rows = try reader.readAllRows(0);
+        defer {
+            for (rows) |row| row.deinit();
+            allocator.free(rows);
+        }
 
-        try std.testing.expectEqual(@as(usize, 1), maps.len);
+        try std.testing.expectEqual(@as(usize, 1), rows.len);
 
-        const row0 = maps[0].value;
-        try std.testing.expectEqual(@as(usize, 3), row0.len);
+        const map0 = rows[0].getColumn(0).?;
+        switch (map0) {
+            .map_val => |entries| {
+                try std.testing.expectEqual(@as(usize, 3), entries.len);
 
-        try std.testing.expectEqualStrings("a", row0[0].key);
-        try std.testing.expectEqual(@as(i32, 1), row0[0].value.value);
+                try std.testing.expectEqualStrings("a", entries[0].key.asBytes().?);
+                try std.testing.expectEqual(@as(i32, 1), entries[0].value.asInt32().?);
 
-        try std.testing.expectEqualStrings("b", row0[1].key);
-        try std.testing.expect(row0[1].value.isNull());
+                try std.testing.expectEqualStrings("b", entries[1].key.asBytes().?);
+                try std.testing.expect(entries[1].value.isNull());
 
-        try std.testing.expectEqualStrings("c", row0[2].key);
-        try std.testing.expectEqual(@as(i32, 3), row0[2].value.value);
+                try std.testing.expectEqualStrings("c", entries[2].key.asBytes().?);
+                try std.testing.expectEqual(@as(i32, 3), entries[2].value.asInt32().?);
+            },
+            else => return error.TestUnexpectedResult,
+        }
     }
 }
 
@@ -248,24 +285,37 @@ test "write and read map with null and empty maps" {
         const file = try tmp_dir.dir.openFile(file_path, .{});
         defer file.close();
 
-        var reader = try parquet.openFile(allocator, file);
+        var reader = try parquet.openFileDynamic(allocator, file, .{});
         defer reader.deinit();
 
-        const maps = try reader.readMapColumn(0, []const u8, i32);
-        defer reader.freeMapColumn([]const u8, i32, maps);
+        const rows = try reader.readAllRows(0);
+        defer {
+            for (rows) |row| row.deinit();
+            allocator.free(rows);
+        }
 
-        try std.testing.expectEqual(@as(usize, 3), maps.len);
+        try std.testing.expectEqual(@as(usize, 3), rows.len);
 
         // Row 0: {a: 1}
-        try std.testing.expect(!maps[0].isNull());
-        try std.testing.expectEqual(@as(usize, 1), maps[0].value.len);
+        const map0 = rows[0].getColumn(0).?;
+        switch (map0) {
+            .map_val => |entries| {
+                try std.testing.expectEqual(@as(usize, 1), entries.len);
+            },
+            else => return error.TestUnexpectedResult,
+        }
 
         // Row 1: null
-        try std.testing.expect(maps[1].isNull());
+        try std.testing.expect(rows[1].getColumn(0).?.isNull());
 
         // Row 2: {} (empty map)
-        try std.testing.expect(!maps[2].isNull());
-        try std.testing.expectEqual(@as(usize, 0), maps[2].value.len);
+        const map2 = rows[2].getColumn(0).?;
+        switch (map2) {
+            .map_val => |entries| {
+                try std.testing.expectEqual(@as(usize, 0), entries.len);
+            },
+            else => return error.TestUnexpectedResult,
+        }
     }
 }
 
@@ -333,32 +383,55 @@ test "write and read large map column (multi-page accumulator test)" {
         const file = try tmp_dir.dir.openFile(file_path, .{});
         defer file.close();
 
-        var reader = try parquet.openFile(allocator, file);
+        var reader = try parquet.openFileDynamic(allocator, file, .{});
         defer reader.deinit();
 
-        const read_maps = try reader.readMapColumn(0, []const u8, i32);
-        defer reader.freeMapColumn([]const u8, i32, read_maps);
+        const rows = try reader.readAllRows(0);
+        defer {
+            for (rows) |row| row.deinit();
+            allocator.free(rows);
+        }
 
-        try std.testing.expectEqual(@as(usize, 100), read_maps.len);
+        try std.testing.expectEqual(@as(usize, 100), rows.len);
 
         // Verify a sample of rows
         // Row 0: 0 entries (empty)
-        try std.testing.expect(!read_maps[0].isNull());
-        try std.testing.expectEqual(@as(usize, 0), read_maps[0].value.len);
+        const map0 = rows[0].getColumn(0).?;
+        switch (map0) {
+            .map_val => |entries| {
+                try std.testing.expectEqual(@as(usize, 0), entries.len);
+            },
+            else => return error.TestUnexpectedResult,
+        }
 
         // Row 5: 5 entries
-        try std.testing.expect(!read_maps[5].isNull());
-        try std.testing.expectEqual(@as(usize, 5), read_maps[5].value.len);
+        const map5 = rows[5].getColumn(0).?;
+        switch (map5) {
+            .map_val => |entries| {
+                try std.testing.expectEqual(@as(usize, 5), entries.len);
+            },
+            else => return error.TestUnexpectedResult,
+        }
 
         // Row 10: 10 entries
-        try std.testing.expect(!read_maps[10].isNull());
-        try std.testing.expectEqual(@as(usize, 10), read_maps[10].value.len);
+        const map10 = rows[10].getColumn(0).?;
+        switch (map10) {
+            .map_val => |entries| {
+                try std.testing.expectEqual(@as(usize, 10), entries.len);
+            },
+            else => return error.TestUnexpectedResult,
+        }
 
         // Verify all row entry counts match expected pattern
-        for (read_maps, 0..) |map_opt, row| {
-            const expected_entries = row % 11;
-            try std.testing.expect(!map_opt.isNull());
-            try std.testing.expectEqual(expected_entries, map_opt.value.len);
+        for (rows, 0..) |row, row_idx| {
+            const expected_entries = row_idx % 11;
+            const map = row.getColumn(0).?;
+            switch (map) {
+                .map_val => |entries| {
+                    try std.testing.expectEqual(expected_entries, entries.len);
+                },
+                else => return error.TestUnexpectedResult,
+            }
         }
     }
 
@@ -408,29 +481,42 @@ test "round-trip map string-to-f64" {
         const file = try tmp_dir.dir.openFile(file_path, .{});
         defer file.close();
 
-        var reader = try parquet.openFile(allocator, file);
+        var reader = try parquet.openFileDynamic(allocator, file, .{});
         defer reader.deinit();
 
-        const maps = try reader.readMapColumn(0, []const u8, f64);
-        defer reader.freeMapColumn([]const u8, f64, maps);
+        const rows = try reader.readAllRows(0);
+        defer {
+            for (rows) |row| row.deinit();
+            allocator.free(rows);
+        }
 
-        try std.testing.expectEqual(@as(usize, 3), maps.len);
+        try std.testing.expectEqual(@as(usize, 3), rows.len);
 
-        const row0 = maps[0].value;
-        try std.testing.expectEqual(@as(usize, 2), row0.len);
-        try std.testing.expectEqualStrings("math", row0[0].key);
-        try std.testing.expectEqual(@as(f64, 95.5), row0[0].value.value);
-        try std.testing.expectEqualStrings("science", row0[1].key);
-        try std.testing.expectEqual(@as(f64, 88.25), row0[1].value.value);
+        const map0 = rows[0].getColumn(0).?;
+        switch (map0) {
+            .map_val => |entries| {
+                try std.testing.expectEqual(@as(usize, 2), entries.len);
+                try std.testing.expectEqualStrings("math", entries[0].key.asBytes().?);
+                try std.testing.expectEqual(@as(f64, 95.5), entries[0].value.asDouble().?);
+                try std.testing.expectEqualStrings("science", entries[1].key.asBytes().?);
+                try std.testing.expectEqual(@as(f64, 88.25), entries[1].value.asDouble().?);
+            },
+            else => return error.TestUnexpectedResult,
+        }
 
-        const row1 = maps[1].value;
-        try std.testing.expectEqual(@as(usize, 2), row1.len);
-        try std.testing.expectEqualStrings("english", row1[0].key);
-        try std.testing.expectEqual(@as(f64, 72.0), row1[0].value.value);
-        try std.testing.expectEqualStrings("history", row1[1].key);
-        try std.testing.expect(row1[1].value.isNull());
+        const map1 = rows[1].getColumn(0).?;
+        switch (map1) {
+            .map_val => |entries| {
+                try std.testing.expectEqual(@as(usize, 2), entries.len);
+                try std.testing.expectEqualStrings("english", entries[0].key.asBytes().?);
+                try std.testing.expectEqual(@as(f64, 72.0), entries[0].value.asDouble().?);
+                try std.testing.expectEqualStrings("history", entries[1].key.asBytes().?);
+                try std.testing.expect(entries[1].value.isNull());
+            },
+            else => return error.TestUnexpectedResult,
+        }
 
-        try std.testing.expect(maps[2].isNull());
+        try std.testing.expect(rows[2].getColumn(0).?.isNull());
     }
 }
 
@@ -473,27 +559,40 @@ test "round-trip map string-to-bool" {
         const file = try tmp_dir.dir.openFile(file_path, .{});
         defer file.close();
 
-        var reader = try parquet.openFile(allocator, file);
+        var reader = try parquet.openFileDynamic(allocator, file, .{});
         defer reader.deinit();
 
-        const maps = try reader.readMapColumn(0, []const u8, bool);
-        defer reader.freeMapColumn([]const u8, bool, maps);
+        const rows = try reader.readAllRows(0);
+        defer {
+            for (rows) |row| row.deinit();
+            allocator.free(rows);
+        }
 
-        try std.testing.expectEqual(@as(usize, 2), maps.len);
+        try std.testing.expectEqual(@as(usize, 2), rows.len);
 
-        const row0 = maps[0].value;
-        try std.testing.expectEqual(@as(usize, 2), row0.len);
-        try std.testing.expectEqualStrings("active", row0[0].key);
-        try std.testing.expectEqual(true, row0[0].value.value);
-        try std.testing.expectEqualStrings("verified", row0[1].key);
-        try std.testing.expectEqual(false, row0[1].value.value);
+        const map0 = rows[0].getColumn(0).?;
+        switch (map0) {
+            .map_val => |entries| {
+                try std.testing.expectEqual(@as(usize, 2), entries.len);
+                try std.testing.expectEqualStrings("active", entries[0].key.asBytes().?);
+                try std.testing.expectEqual(true, entries[0].value.asBool().?);
+                try std.testing.expectEqualStrings("verified", entries[1].key.asBytes().?);
+                try std.testing.expectEqual(false, entries[1].value.asBool().?);
+            },
+            else => return error.TestUnexpectedResult,
+        }
 
-        const row1 = maps[1].value;
-        try std.testing.expectEqual(@as(usize, 2), row1.len);
-        try std.testing.expectEqualStrings("admin", row1[0].key);
-        try std.testing.expectEqual(true, row1[0].value.value);
-        try std.testing.expectEqualStrings("deleted", row1[1].key);
-        try std.testing.expect(row1[1].value.isNull());
+        const map1 = rows[1].getColumn(0).?;
+        switch (map1) {
+            .map_val => |entries| {
+                try std.testing.expectEqual(@as(usize, 2), entries.len);
+                try std.testing.expectEqualStrings("admin", entries[0].key.asBytes().?);
+                try std.testing.expectEqual(true, entries[0].value.asBool().?);
+                try std.testing.expectEqualStrings("deleted", entries[1].key.asBytes().?);
+                try std.testing.expect(entries[1].value.isNull());
+            },
+            else => return error.TestUnexpectedResult,
+        }
     }
 }
 
@@ -537,29 +636,42 @@ test "round-trip map i32-to-string" {
         const file = try tmp_dir.dir.openFile(file_path, .{});
         defer file.close();
 
-        var reader = try parquet.openFile(allocator, file);
+        var reader = try parquet.openFileDynamic(allocator, file, .{});
         defer reader.deinit();
 
-        const maps = try reader.readMapColumn(0, i32, []const u8);
-        defer reader.freeMapColumn(i32, []const u8, maps);
+        const rows = try reader.readAllRows(0);
+        defer {
+            for (rows) |row| row.deinit();
+            allocator.free(rows);
+        }
 
-        try std.testing.expectEqual(@as(usize, 3), maps.len);
+        try std.testing.expectEqual(@as(usize, 3), rows.len);
 
-        const row0 = maps[0].value;
-        try std.testing.expectEqual(@as(usize, 2), row0.len);
-        try std.testing.expectEqual(@as(i32, 1), row0[0].key);
-        try std.testing.expectEqualStrings("one", row0[0].value.value);
-        try std.testing.expectEqual(@as(i32, 2), row0[1].key);
-        try std.testing.expectEqualStrings("two", row0[1].value.value);
+        const map0 = rows[0].getColumn(0).?;
+        switch (map0) {
+            .map_val => |entries| {
+                try std.testing.expectEqual(@as(usize, 2), entries.len);
+                try std.testing.expectEqual(@as(i32, 1), entries[0].key.asInt32().?);
+                try std.testing.expectEqualStrings("one", entries[0].value.asBytes().?);
+                try std.testing.expectEqual(@as(i32, 2), entries[1].key.asInt32().?);
+                try std.testing.expectEqualStrings("two", entries[1].value.asBytes().?);
+            },
+            else => return error.TestUnexpectedResult,
+        }
 
-        const row1 = maps[1].value;
-        try std.testing.expectEqual(@as(usize, 2), row1.len);
-        try std.testing.expectEqual(@as(i32, 100), row1[0].key);
-        try std.testing.expectEqualStrings("hundred", row1[0].value.value);
-        try std.testing.expectEqual(@as(i32, 200), row1[1].key);
-        try std.testing.expect(row1[1].value.isNull());
+        const map1 = rows[1].getColumn(0).?;
+        switch (map1) {
+            .map_val => |entries| {
+                try std.testing.expectEqual(@as(usize, 2), entries.len);
+                try std.testing.expectEqual(@as(i32, 100), entries[0].key.asInt32().?);
+                try std.testing.expectEqualStrings("hundred", entries[0].value.asBytes().?);
+                try std.testing.expectEqual(@as(i32, 200), entries[1].key.asInt32().?);
+                try std.testing.expect(entries[1].value.isNull());
+            },
+            else => return error.TestUnexpectedResult,
+        }
 
-        try std.testing.expect(maps[2].isNull());
+        try std.testing.expect(rows[2].getColumn(0).?.isNull());
     }
 }
 
@@ -601,25 +713,38 @@ test "round-trip map string-to-i64" {
         const file = try tmp_dir.dir.openFile(file_path, .{});
         defer file.close();
 
-        var reader = try parquet.openFile(allocator, file);
+        var reader = try parquet.openFileDynamic(allocator, file, .{});
         defer reader.deinit();
 
-        const maps = try reader.readMapColumn(0, []const u8, i64);
-        defer reader.freeMapColumn([]const u8, i64, maps);
+        const rows = try reader.readAllRows(0);
+        defer {
+            for (rows) |row| row.deinit();
+            allocator.free(rows);
+        }
 
-        try std.testing.expectEqual(@as(usize, 2), maps.len);
+        try std.testing.expectEqual(@as(usize, 2), rows.len);
 
-        const row0 = maps[0].value;
-        try std.testing.expectEqual(@as(usize, 2), row0.len);
-        try std.testing.expectEqualStrings("created", row0[0].key);
-        try std.testing.expectEqual(@as(i64, 1700000000000), row0[0].value.value);
-        try std.testing.expectEqualStrings("updated", row0[1].key);
-        try std.testing.expectEqual(@as(i64, 1700001000000), row0[1].value.value);
+        const map0 = rows[0].getColumn(0).?;
+        switch (map0) {
+            .map_val => |entries| {
+                try std.testing.expectEqual(@as(usize, 2), entries.len);
+                try std.testing.expectEqualStrings("created", entries[0].key.asBytes().?);
+                try std.testing.expectEqual(@as(i64, 1700000000000), entries[0].value.asInt64().?);
+                try std.testing.expectEqualStrings("updated", entries[1].key.asBytes().?);
+                try std.testing.expectEqual(@as(i64, 1700001000000), entries[1].value.asInt64().?);
+            },
+            else => return error.TestUnexpectedResult,
+        }
 
-        const row1 = maps[1].value;
-        try std.testing.expectEqual(@as(usize, 1), row1.len);
-        try std.testing.expectEqualStrings("deleted", row1[0].key);
-        try std.testing.expect(row1[0].value.isNull());
+        const map1 = rows[1].getColumn(0).?;
+        switch (map1) {
+            .map_val => |entries| {
+                try std.testing.expectEqual(@as(usize, 1), entries.len);
+                try std.testing.expectEqualStrings("deleted", entries[0].key.asBytes().?);
+                try std.testing.expect(entries[0].value.isNull());
+            },
+            else => return error.TestUnexpectedResult,
+        }
     }
 }
 
@@ -658,21 +783,29 @@ test "round-trip map string-to-f32" {
         const file = try tmp_dir.dir.openFile(file_path, .{});
         defer file.close();
 
-        var reader = try parquet.openFile(allocator, file);
+        var reader = try parquet.openFileDynamic(allocator, file, .{});
         defer reader.deinit();
 
-        const maps = try reader.readMapColumn(0, []const u8, f32);
-        defer reader.freeMapColumn([]const u8, f32, maps);
+        const rows = try reader.readAllRows(0);
+        defer {
+            for (rows) |row| row.deinit();
+            allocator.free(rows);
+        }
 
-        try std.testing.expectEqual(@as(usize, 2), maps.len);
+        try std.testing.expectEqual(@as(usize, 2), rows.len);
 
-        const row0 = maps[0].value;
-        try std.testing.expectEqual(@as(usize, 2), row0.len);
-        try std.testing.expectEqualStrings("alpha", row0[0].key);
-        try std.testing.expectEqual(@as(f32, 0.5), row0[0].value.value);
-        try std.testing.expectEqualStrings("beta", row0[1].key);
-        try std.testing.expectEqual(@as(f32, 1.25), row0[1].value.value);
+        const map0 = rows[0].getColumn(0).?;
+        switch (map0) {
+            .map_val => |entries| {
+                try std.testing.expectEqual(@as(usize, 2), entries.len);
+                try std.testing.expectEqualStrings("alpha", entries[0].key.asBytes().?);
+                try std.testing.expectEqual(@as(f32, 0.5), entries[0].value.asFloat().?);
+                try std.testing.expectEqualStrings("beta", entries[1].key.asBytes().?);
+                try std.testing.expectEqual(@as(f32, 1.25), entries[1].value.asFloat().?);
+            },
+            else => return error.TestUnexpectedResult,
+        }
 
-        try std.testing.expect(maps[1].isNull());
+        try std.testing.expect(rows[1].getColumn(0).?.isNull());
     }
 }

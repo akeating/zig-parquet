@@ -49,7 +49,7 @@ test "round-trip BSON logical type" {
         const file = try tmp_dir.dir.openFile(file_path, .{});
         defer file.close();
 
-        var reader = try parquet.openFile(allocator, file);
+        var reader = try parquet.openFileDynamic(allocator, file, .{});
         defer reader.deinit();
 
         const schema = reader.getSchema();
@@ -108,7 +108,7 @@ test "BSON schema generation via SchemaNode" {
         const file = try tmp_dir.dir.openFile(file_path, .{});
         defer file.close();
 
-        var reader = try parquet.openFile(allocator, file);
+        var reader = try parquet.openFileDynamic(allocator, file, .{});
         defer reader.deinit();
 
         const schema = reader.getSchema();

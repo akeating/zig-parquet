@@ -3,6 +3,7 @@
 const std = @import("std");
 const parquet = @import("parquet");
 const helpers = @import("../helpers.zig");
+const cat = @import("cat.zig");
 
 pub fn run(allocator: std.mem.Allocator, file_path: []const u8) !void {
     var stdout_buf: [8192]u8 = undefined;
@@ -20,14 +21,14 @@ pub fn run(allocator: std.mem.Allocator, file_path: []const u8) !void {
     };
     defer file.close();
 
-    var reader = parquet.openFile(allocator, file) catch |err| {
+    var reader = parquet.openFileDynamic(allocator, file, .{}) catch |err| {
         try stderr.print("Error: Cannot read parquet file: {}\n", .{err});
         try stderr.flush();
         std.process.exit(1);
     };
     defer reader.deinit();
 
-    const col_names = reader.getColumnNames(allocator) catch &.{};
+    const col_names = cat.getTopLevelColumnNames(allocator, reader.getSchema()) catch &.{};
     defer allocator.free(col_names);
 
     for (reader.metadata.row_groups, 0..) |rg, rg_idx| {

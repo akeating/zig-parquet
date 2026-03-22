@@ -4,8 +4,6 @@
 
 const std = @import("std");
 const parquet = @import("../lib.zig");
-const Reader = parquet.Reader;
-const Optional = parquet.Optional;
 
 test "read single_value.parquet" {
     const allocator = std.testing.allocator;
@@ -16,18 +14,21 @@ test "read single_value.parquet" {
     };
     defer file.close();
 
-    var reader = try parquet.openFile(allocator, file);
+    var reader = try parquet.openFileDynamic(allocator, file, .{});
     defer reader.deinit();
 
     // Verify metadata - single row
     try std.testing.expectEqual(@as(i64, 1), reader.metadata.num_rows);
 
     // Read the single value (42)
-    const values = try reader.readColumn(0, i32);
-    defer allocator.free(values);
+    const rows = try reader.readAllRows(0);
+    defer {
+        for (rows) |row| row.deinit();
+        allocator.free(rows);
+    }
 
-    try std.testing.expectEqual(@as(usize, 1), values.len);
-    try std.testing.expectEqual(@as(i32, 42), values[0].value);
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    try std.testing.expectEqual(@as(i32, 42), rows[0].getColumn(0).?.asInt32().?);
 }
 
 test "read empty_table.parquet" {
@@ -39,7 +40,7 @@ test "read empty_table.parquet" {
     };
     defer file.close();
 
-    var reader = try parquet.openFile(allocator, file);
+    var reader = try parquet.openFileDynamic(allocator, file, .{});
     defer reader.deinit();
 
     // Verify metadata - zero rows (may still have 1 empty row group)
@@ -47,7 +48,7 @@ test "read empty_table.parquet" {
     // Empty tables can have 1 row group with 0 rows
     try std.testing.expect(reader.getNumRowGroups() <= 1);
     if (reader.getNumRowGroups() == 1) {
-        try std.testing.expectEqual(@as(i64, 0), reader.getRowGroupNumRows(0).?);
+        try std.testing.expectEqual(@as(i64, 0), reader.getRowGroupNumRows(0));
     }
 }
 
@@ -60,60 +61,34 @@ test "read large_strings.parquet" {
     };
     defer file.close();
 
-    var reader = try parquet.openFile(allocator, file);
+    var reader = try parquet.openFileDynamic(allocator, file, .{});
     defer reader.deinit();
 
     // Verify metadata
     try std.testing.expectEqual(@as(i64, 10), reader.metadata.num_rows);
 
-    // Read small column - "x" repeated
-    const small = try reader.readColumn(0, []const u8);
+    const rows = try reader.readAllRows(0);
     defer {
-        for (small) |v| {
-            switch (v) {
-                .value => |s| allocator.free(s),
-                .null_value => {},
-            }
-        }
-        allocator.free(small);
+        for (rows) |row| row.deinit();
+        allocator.free(rows);
     }
 
-    try std.testing.expectEqual(@as(usize, 10), small.len);
-    try std.testing.expectEqualStrings("x", small[0].value);
+    try std.testing.expectEqual(@as(usize, 10), rows.len);
 
-    // Read medium column - "y" * 1000
-    const medium = try reader.readColumn(1, []const u8);
-    defer {
-        for (medium) |v| {
-            switch (v) {
-                .value => |s| allocator.free(s),
-                .null_value => {},
-            }
-        }
-        allocator.free(medium);
-    }
+    // Read small column (col 0) - "x" repeated
+    try std.testing.expectEqualStrings("x", rows[0].getColumn(0).?.asBytes().?);
 
-    try std.testing.expectEqual(@as(usize, 10), medium.len);
-    try std.testing.expectEqual(@as(usize, 1000), medium[0].value.len);
-    try std.testing.expectEqual(@as(u8, 'y'), medium[0].value[0]);
-    try std.testing.expectEqual(@as(u8, 'y'), medium[0].value[999]);
+    // Read medium column (col 1) - "y" * 1000
+    const medium_val = rows[0].getColumn(1).?.asBytes().?;
+    try std.testing.expectEqual(@as(usize, 1000), medium_val.len);
+    try std.testing.expectEqual(@as(u8, 'y'), medium_val[0]);
+    try std.testing.expectEqual(@as(u8, 'y'), medium_val[999]);
 
-    // Read large column - "z" * 100000
-    const large = try reader.readColumn(2, []const u8);
-    defer {
-        for (large) |v| {
-            switch (v) {
-                .value => |s| allocator.free(s),
-                .null_value => {},
-            }
-        }
-        allocator.free(large);
-    }
-
-    try std.testing.expectEqual(@as(usize, 10), large.len);
-    try std.testing.expectEqual(@as(usize, 100000), large[0].value.len);
-    try std.testing.expectEqual(@as(u8, 'z'), large[0].value[0]);
-    try std.testing.expectEqual(@as(u8, 'z'), large[0].value[99999]);
+    // Read large column (col 2) - "z" * 100000
+    const large_val = rows[0].getColumn(2).?.asBytes().?;
+    try std.testing.expectEqual(@as(usize, 100000), large_val.len);
+    try std.testing.expectEqual(@as(u8, 'z'), large_val[0]);
+    try std.testing.expectEqual(@as(u8, 'z'), large_val[99999]);
 }
 
 test "read nulls_and_empties.parquet" {
@@ -125,89 +100,49 @@ test "read nulls_and_empties.parquet" {
     };
     defer file.close();
 
-    var reader = try parquet.openFile(allocator, file);
+    var reader = try parquet.openFileDynamic(allocator, file, .{});
     defer reader.deinit();
 
     // Verify metadata
     try std.testing.expectEqual(@as(i64, 100), reader.metadata.num_rows);
 
-    // Read all_null column - all 100 values should be null
-    const all_null = try reader.readColumn(0, []const u8);
+    const rows = try reader.readAllRows(0);
     defer {
-        for (all_null) |v| {
-            switch (v) {
-                .value => |s| allocator.free(s),
-                .null_value => {},
-            }
-        }
-        allocator.free(all_null);
+        for (rows) |row| row.deinit();
+        allocator.free(rows);
     }
 
-    try std.testing.expectEqual(@as(usize, 100), all_null.len);
-    for (all_null) |v| {
-        try std.testing.expectEqual(Optional([]const u8){ .null_value = {} }, v);
+    try std.testing.expectEqual(@as(usize, 100), rows.len);
+
+    // Check all_null column (col 0) - all 100 values should be null
+    for (rows) |row| {
+        try std.testing.expect(row.getColumn(0).?.isNull());
     }
 
-    // Read all_empty column - all 100 values should be empty strings
-    const all_empty = try reader.readColumn(1, []const u8);
-    defer {
-        for (all_empty) |v| {
-            switch (v) {
-                .value => |s| allocator.free(s),
-                .null_value => {},
-            }
-        }
-        allocator.free(all_empty);
+    // Check all_empty column (col 1) - all 100 values should be empty strings
+    for (rows) |row| {
+        try std.testing.expectEqualStrings("", row.getColumn(1).?.asBytes().?);
     }
 
-    try std.testing.expectEqual(@as(usize, 100), all_empty.len);
-    for (all_empty) |v| {
-        try std.testing.expectEqualStrings("", v.value);
-    }
-
-    // Read mixed column - [None, "", "x", None, ""] * 20
-    const mixed = try reader.readColumn(2, []const u8);
-    defer {
-        for (mixed) |v| {
-            switch (v) {
-                .value => |s| allocator.free(s),
-                .null_value => {},
-            }
-        }
-        allocator.free(mixed);
-    }
-
-    try std.testing.expectEqual(@as(usize, 100), mixed.len);
+    // Check mixed column (col 2) - [None, "", "x", None, ""] * 20
     // Check first cycle
-    try std.testing.expectEqual(Optional([]const u8){ .null_value = {} }, mixed[0]);
-    try std.testing.expectEqualStrings("", mixed[1].value);
-    try std.testing.expectEqualStrings("x", mixed[2].value);
-    try std.testing.expectEqual(Optional([]const u8){ .null_value = {} }, mixed[3]);
-    try std.testing.expectEqualStrings("", mixed[4].value);
+    try std.testing.expect(rows[0].getColumn(2).?.isNull());
+    try std.testing.expectEqualStrings("", rows[1].getColumn(2).?.asBytes().?);
+    try std.testing.expectEqualStrings("x", rows[2].getColumn(2).?.asBytes().?);
+    try std.testing.expect(rows[3].getColumn(2).?.isNull());
+    try std.testing.expectEqualStrings("", rows[4].getColumn(2).?.asBytes().?);
     // Check last cycle
-    try std.testing.expectEqual(Optional([]const u8){ .null_value = {} }, mixed[95]);
-    try std.testing.expectEqualStrings("", mixed[96].value);
-    try std.testing.expectEqualStrings("x", mixed[97].value);
-    try std.testing.expectEqual(Optional([]const u8){ .null_value = {} }, mixed[98]);
-    try std.testing.expectEqualStrings("", mixed[99].value);
+    try std.testing.expect(rows[95].getColumn(2).?.isNull());
+    try std.testing.expectEqualStrings("", rows[96].getColumn(2).?.asBytes().?);
+    try std.testing.expectEqualStrings("x", rows[97].getColumn(2).?.asBytes().?);
+    try std.testing.expect(rows[98].getColumn(2).?.isNull());
+    try std.testing.expectEqualStrings("", rows[99].getColumn(2).?.asBytes().?);
 
-    // Read no_nulls column - ["a", "b", "c"] * 33 + ["d"]
-    const no_nulls = try reader.readColumn(3, []const u8);
-    defer {
-        for (no_nulls) |v| {
-            switch (v) {
-                .value => |s| allocator.free(s),
-                .null_value => {},
-            }
-        }
-        allocator.free(no_nulls);
-    }
-
-    try std.testing.expectEqual(@as(usize, 100), no_nulls.len);
-    try std.testing.expectEqualStrings("a", no_nulls[0].value);
-    try std.testing.expectEqualStrings("b", no_nulls[1].value);
-    try std.testing.expectEqualStrings("c", no_nulls[2].value);
-    try std.testing.expectEqualStrings("d", no_nulls[99].value);
+    // Check no_nulls column (col 3) - ["a", "b", "c"] * 33 + ["d"]
+    try std.testing.expectEqualStrings("a", rows[0].getColumn(3).?.asBytes().?);
+    try std.testing.expectEqualStrings("b", rows[1].getColumn(3).?.asBytes().?);
+    try std.testing.expectEqualStrings("c", rows[2].getColumn(3).?.asBytes().?);
+    try std.testing.expectEqualStrings("d", rows[99].getColumn(3).?.asBytes().?);
 }
 
 test "read boundary_values.parquet" {
@@ -219,29 +154,29 @@ test "read boundary_values.parquet" {
     };
     defer file.close();
 
-    var reader = try parquet.openFile(allocator, file);
+    var reader = try parquet.openFileDynamic(allocator, file, .{});
     defer reader.deinit();
 
     // Verify metadata
     try std.testing.expectEqual(@as(i64, 3), reader.metadata.num_rows);
 
+    const rows = try reader.readAllRows(0);
+    defer {
+        for (rows) |row| row.deinit();
+        allocator.free(rows);
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), rows.len);
+
     // Read i32 column (column 2) - Parquet stores i8/i16 as i32 physical type
     // Values: [-2147483648, 2147483647, 0]
-    const i32_col = try reader.readColumn(2, i32);
-    defer allocator.free(i32_col);
-
-    try std.testing.expectEqual(@as(usize, 3), i32_col.len);
-    try std.testing.expectEqual(@as(i32, -2147483648), i32_col[0].value);
-    try std.testing.expectEqual(@as(i32, 2147483647), i32_col[1].value);
-    try std.testing.expectEqual(@as(i32, 0), i32_col[2].value);
+    try std.testing.expectEqual(@as(i32, -2147483648), rows[0].getColumn(2).?.asInt32().?);
+    try std.testing.expectEqual(@as(i32, 2147483647), rows[1].getColumn(2).?.asInt32().?);
+    try std.testing.expectEqual(@as(i32, 0), rows[2].getColumn(2).?.asInt32().?);
 
     // Read i64 column (column 3)
     // Values: [-9223372036854775808, 9223372036854775807, 0]
-    const i64_col = try reader.readColumn(3, i64);
-    defer allocator.free(i64_col);
-
-    try std.testing.expectEqual(@as(usize, 3), i64_col.len);
-    try std.testing.expectEqual(@as(i64, -9223372036854775808), i64_col[0].value);
-    try std.testing.expectEqual(@as(i64, 9223372036854775807), i64_col[1].value);
-    try std.testing.expectEqual(@as(i64, 0), i64_col[2].value);
+    try std.testing.expectEqual(@as(i64, -9223372036854775808), rows[0].getColumn(3).?.asInt64().?);
+    try std.testing.expectEqual(@as(i64, 9223372036854775807), rows[1].getColumn(3).?.asInt64().?);
+    try std.testing.expectEqual(@as(i64, 0), rows[2].getColumn(3).?.asInt64().?);
 }

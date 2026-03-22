@@ -39,34 +39,29 @@ pub fn main() !void {
 
     std.debug.print("Reading columns from {s}...\n", .{output_path});
 
-    // Read phase — readColumn returns []Optional(T)
+    // Read phase — DynamicReader returns rows of Value types
     {
         const file = try std.fs.cwd().openFile(output_path, .{});
         defer file.close();
 
-        var reader = try parquet.openFile(allocator, file);
+        var reader = try parquet.openFileDynamic(allocator, file, .{});
         defer reader.deinit();
 
-        const ids = try reader.readColumn(0, i64);
-        defer allocator.free(ids);
-
-        const scores = try reader.readColumn(1, f64);
-        defer allocator.free(scores);
-
-        const names = try reader.readColumn(2, []const u8);
+        const rows = try reader.readAllRows(0);
         defer {
-            for (names) |n| if (!n.isNull()) allocator.free(n.value);
-            allocator.free(names);
+            for (rows) |row| row.deinit();
+            allocator.free(rows);
         }
 
-        for (ids, scores, names) |id, score, name| {
-            const id_val = id.value;
-            const score_val = score.value;
+        for (rows) |row| {
+            const id_val = if (row.getColumn(0)) |v| v.asInt64() orelse 0 else 0;
+            const score_val = if (row.getColumn(1)) |v| v.asDouble() orelse 0 else 0;
+            const name_val = if (row.getColumn(2)) |v| v.asBytes() else null;
 
-            if (name.isNull()) {
-                std.debug.print("ID {d}: score {d:.1}, name: (null)\n", .{ id_val, score_val });
+            if (name_val) |name| {
+                std.debug.print("ID {d}: score {d:.1}, name: {s}\n", .{ id_val, score_val, name });
             } else {
-                std.debug.print("ID {d}: score {d:.1}, name: {s}\n", .{ id_val, score_val, name.value });
+                std.debug.print("ID {d}: score {d:.1}, name: (null)\n", .{ id_val, score_val });
             }
         }
     }

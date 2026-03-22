@@ -6,8 +6,6 @@
 const std = @import("std");
 const parquet = @import("../lib.zig");
 const format = parquet.format;
-const Reader = parquet.Reader;
-const Optional = parquet.Optional;
 
 test "read PyArrow STRING logical type" {
     const allocator = std.testing.allocator;
@@ -18,7 +16,7 @@ test "read PyArrow STRING logical type" {
     };
     defer file.close();
 
-    var reader = try parquet.openFile(allocator, file);
+    var reader = try parquet.openFileDynamic(allocator, file, .{});
     defer reader.deinit();
 
     // Verify metadata
@@ -46,23 +44,18 @@ test "read PyArrow STRING logical type" {
     }
 
     // Read and verify data
-    const values = try reader.readColumn(0, []const u8);
+    const rows = try reader.readAllRows(0);
     defer {
-        for (values) |v| {
-            switch (v) {
-                .value => |s| allocator.free(s),
-                .null_value => {},
-            }
-        }
-        allocator.free(values);
+        for (rows) |row| row.deinit();
+        allocator.free(rows);
     }
 
-    try std.testing.expectEqual(@as(usize, 5), values.len);
-    try std.testing.expectEqualStrings("hello", values[0].value);
-    try std.testing.expectEqualStrings("world", values[1].value);
-    try std.testing.expectEqualStrings("", values[2].value);
-    try std.testing.expectEqualStrings("unicode: 🎉", values[3].value);
-    try std.testing.expectEqual(Optional([]const u8){ .null_value = {} }, values[4]);
+    try std.testing.expectEqual(@as(usize, 5), rows.len);
+    try std.testing.expectEqualStrings("hello", rows[0].getColumn(0).?.asBytes().?);
+    try std.testing.expectEqualStrings("world", rows[1].getColumn(0).?.asBytes().?);
+    try std.testing.expectEqualStrings("", rows[2].getColumn(0).?.asBytes().?);
+    try std.testing.expectEqualStrings("unicode: 🎉", rows[3].getColumn(0).?.asBytes().?);
+    try std.testing.expect(rows[4].getColumn(0).?.isNull());
 }
 
 test "read PyArrow DATE logical type" {
@@ -74,7 +67,7 @@ test "read PyArrow DATE logical type" {
     };
     defer file.close();
 
-    var reader = try parquet.openFile(allocator, file);
+    var reader = try parquet.openFileDynamic(allocator, file, .{});
     defer reader.deinit();
 
     try std.testing.expectEqual(@as(i64, 5), reader.metadata.num_rows);
@@ -91,21 +84,24 @@ test "read PyArrow DATE logical type" {
     }
 
     // Read and verify data (days since epoch)
-    const values = try reader.readColumn(0, i32);
-    defer allocator.free(values);
+    const rows = try reader.readAllRows(0);
+    defer {
+        for (rows) |row| row.deinit();
+        allocator.free(rows);
+    }
 
-    try std.testing.expectEqual(@as(usize, 5), values.len);
+    try std.testing.expectEqual(@as(usize, 5), rows.len);
 
     // 2024-01-15 = 19737 days since 1970-01-01
-    try std.testing.expectEqual(@as(i32, 19737), values[0].value);
+    try std.testing.expectEqual(@as(i32, 19737), rows[0].getColumn(0).?.asInt32().?);
     // 1970-01-01 = 0 days
-    try std.testing.expectEqual(@as(i32, 0), values[1].value);
+    try std.testing.expectEqual(@as(i32, 0), rows[1].getColumn(0).?.asInt32().?);
     // 2000-06-15 = 11123 days
-    try std.testing.expectEqual(@as(i32, 11123), values[2].value);
+    try std.testing.expectEqual(@as(i32, 11123), rows[2].getColumn(0).?.asInt32().?);
     // 1999-12-31 = 10956 days
-    try std.testing.expectEqual(@as(i32, 10956), values[3].value);
+    try std.testing.expectEqual(@as(i32, 10956), rows[3].getColumn(0).?.asInt32().?);
     // null
-    try std.testing.expectEqual(Optional(i32){ .null_value = {} }, values[4]);
+    try std.testing.expect(rows[4].getColumn(0).?.isNull());
 }
 
 test "read PyArrow TIMESTAMP logical type" {
@@ -117,7 +113,7 @@ test "read PyArrow TIMESTAMP logical type" {
     };
     defer file.close();
 
-    var reader = try parquet.openFile(allocator, file);
+    var reader = try parquet.openFileDynamic(allocator, file, .{});
     defer reader.deinit();
 
     try std.testing.expectEqual(@as(i64, 5), reader.metadata.num_rows);
@@ -182,20 +178,17 @@ test "read PyArrow TIMESTAMP logical type" {
     }
 
     // Read millis column and verify data
-    const values = try reader.readColumn(0, i64);
-    defer allocator.free(values);
+    const rows = try reader.readAllRows(0);
+    defer {
+        for (rows) |row| row.deinit();
+        allocator.free(rows);
+    }
 
-    try std.testing.expectEqual(@as(usize, 5), values.len);
-    // First value should be non-null
-    switch (values[0]) {
-        .value => {}, // Expected
-        .null_value => return error.ExpectedValue,
-    }
+    try std.testing.expectEqual(@as(usize, 5), rows.len);
+    // First value should be non-null (col 0 = ts_millis_utc)
+    try std.testing.expect(!rows[0].getColumn(0).?.isNull());
     // Fourth value should be null
-    switch (values[3]) {
-        .value => return error.ExpectedNull,
-        .null_value => {}, // Expected
-    }
+    try std.testing.expect(rows[3].getColumn(0).?.isNull());
 }
 
 test "read PyArrow TIME logical type" {
@@ -207,7 +200,7 @@ test "read PyArrow TIME logical type" {
     };
     defer file.close();
 
-    var reader = try parquet.openFile(allocator, file);
+    var reader = try parquet.openFileDynamic(allocator, file, .{});
     defer reader.deinit();
 
     try std.testing.expectEqual(@as(i64, 5), reader.metadata.num_rows);
@@ -256,22 +249,25 @@ test "read PyArrow TIME logical type" {
         }
     }
 
-    // Read millis column and verify data (INT32)
-    const millis_values = try reader.readColumn(0, i32);
-    defer allocator.free(millis_values);
+    // Read all rows and verify millis column (col 0, INT32)
+    const rows = try reader.readAllRows(0);
+    defer {
+        for (rows) |row| row.deinit();
+        allocator.free(rows);
+    }
 
-    try std.testing.expectEqual(@as(usize, 5), millis_values.len);
+    try std.testing.expectEqual(@as(usize, 5), rows.len);
 
     // 10:30:00 = 37800000 ms
-    try std.testing.expectEqual(@as(i32, 37800000), millis_values[0].value);
+    try std.testing.expectEqual(@as(i32, 37800000), rows[0].getColumn(0).?.asInt32().?);
     // 00:00:00 = 0 ms
-    try std.testing.expectEqual(@as(i32, 0), millis_values[1].value);
+    try std.testing.expectEqual(@as(i32, 0), rows[1].getColumn(0).?.asInt32().?);
     // 23:59:59 = 86399000 ms
-    try std.testing.expectEqual(@as(i32, 86399000), millis_values[2].value);
+    try std.testing.expectEqual(@as(i32, 86399000), rows[2].getColumn(0).?.asInt32().?);
     // null
-    try std.testing.expectEqual(Optional(i32){ .null_value = {} }, millis_values[3]);
+    try std.testing.expect(rows[3].getColumn(0).?.isNull());
     // 12:00:00 = 43200000 ms
-    try std.testing.expectEqual(@as(i32, 43200000), millis_values[4].value);
+    try std.testing.expectEqual(@as(i32, 43200000), rows[4].getColumn(0).?.asInt32().?);
 }
 
 test "read PyArrow DECIMAL logical type" {
@@ -283,7 +279,7 @@ test "read PyArrow DECIMAL logical type" {
     };
     defer file.close();
 
-    var reader = try parquet.openFile(allocator, file);
+    var reader = try parquet.openFileDynamic(allocator, file, .{});
     defer reader.deinit();
 
     try std.testing.expectEqual(@as(i64, 5), reader.metadata.num_rows);
@@ -342,7 +338,7 @@ test "read PyArrow INT types logical type" {
     };
     defer file.close();
 
-    var reader = try parquet.openFile(allocator, file);
+    var reader = try parquet.openFileDynamic(allocator, file, .{});
     defer reader.deinit();
 
     try std.testing.expectEqual(@as(i64, 5), reader.metadata.num_rows);
@@ -394,14 +390,17 @@ test "read PyArrow INT types logical type" {
         }
     }
 
-    // Read int8 data and verify
-    const int8_values = try reader.readColumn(0, i32);
-    defer allocator.free(int8_values);
+    // Read int8 data and verify (col 0)
+    const rows = try reader.readAllRows(0);
+    defer {
+        for (rows) |row| row.deinit();
+        allocator.free(rows);
+    }
 
-    try std.testing.expectEqual(@as(usize, 5), int8_values.len);
-    try std.testing.expectEqual(@as(i32, 1), int8_values[0].value);
-    try std.testing.expectEqual(@as(i32, -128), int8_values[1].value);
-    try std.testing.expectEqual(@as(i32, 127), int8_values[2].value);
+    try std.testing.expectEqual(@as(usize, 5), rows.len);
+    try std.testing.expectEqual(@as(i32, 1), rows[0].getColumn(0).?.asInt32().?);
+    try std.testing.expectEqual(@as(i32, -128), rows[1].getColumn(0).?.asInt32().?);
+    try std.testing.expectEqual(@as(i32, 127), rows[2].getColumn(0).?.asInt32().?);
 }
 
 test "read PyArrow FLOAT16 logical type" {
@@ -413,7 +412,7 @@ test "read PyArrow FLOAT16 logical type" {
     };
     defer file.close();
 
-    var reader = try parquet.openFile(allocator, file);
+    var reader = try parquet.openFileDynamic(allocator, file, .{});
     defer reader.deinit();
 
     try std.testing.expectEqual(@as(i64, 5), reader.metadata.num_rows);
@@ -432,23 +431,17 @@ test "read PyArrow FLOAT16 logical type" {
     }
 
     // Read data and verify it's 2-byte values
-    const values = try reader.readColumn(0, []const u8);
+    const rows = try reader.readAllRows(0);
     defer {
-        for (values) |v| {
-            switch (v) {
-                .value => |s| allocator.free(s),
-                .null_value => {},
-            }
-        }
-        allocator.free(values);
+        for (rows) |row| row.deinit();
+        allocator.free(rows);
     }
 
-    try std.testing.expectEqual(@as(usize, 5), values.len);
+    try std.testing.expectEqual(@as(usize, 5), rows.len);
     // First non-null value should be 2 bytes
-    switch (values[0]) {
-        .value => |v| try std.testing.expectEqual(@as(usize, 2), v.len),
-        .null_value => return error.ExpectedValue,
-    }
+    const val = rows[0].getColumn(0).?;
+    if (val.isNull()) return error.ExpectedValue;
+    try std.testing.expectEqual(@as(usize, 2), val.asBytes().?.len);
 }
 
 test "read PyArrow JSON logical type" {
@@ -460,7 +453,7 @@ test "read PyArrow JSON logical type" {
     };
     defer file.close();
 
-    var reader = try parquet.openFile(allocator, file);
+    var reader = try parquet.openFileDynamic(allocator, file, .{});
     defer reader.deinit();
 
     try std.testing.expectEqual(@as(i64, 5), reader.metadata.num_rows);
@@ -473,17 +466,12 @@ test "read PyArrow JSON logical type" {
     try std.testing.expectEqual(format.PhysicalType.byte_array, json_schema.type_.?);
 
     // Read data
-    const values = try reader.readColumn(0, []const u8);
+    const rows = try reader.readAllRows(0);
     defer {
-        for (values) |v| {
-            switch (v) {
-                .value => |s| allocator.free(s),
-                .null_value => {},
-            }
-        }
-        allocator.free(values);
+        for (rows) |row| row.deinit();
+        allocator.free(rows);
     }
 
-    try std.testing.expectEqual(@as(usize, 5), values.len);
-    try std.testing.expectEqualStrings("{\"name\": \"Alice\", \"age\": 30}", values[0].value);
+    try std.testing.expectEqual(@as(usize, 5), rows.len);
+    try std.testing.expectEqualStrings("{\"name\": \"Alice\", \"age\": 30}", rows[0].getColumn(0).?.asBytes().?);
 }

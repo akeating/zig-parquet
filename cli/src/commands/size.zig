@@ -3,6 +3,7 @@
 const std = @import("std");
 const parquet = @import("parquet");
 const helpers = @import("../helpers.zig");
+const cat = @import("cat.zig");
 
 pub fn run(allocator: std.mem.Allocator, file_path: []const u8) !void {
     var stdout_buf: [8192]u8 = undefined;
@@ -27,7 +28,7 @@ pub fn run(allocator: std.mem.Allocator, file_path: []const u8) !void {
     };
     const file_size = file_stat.size;
 
-    var reader = parquet.openFile(allocator, file) catch |err| {
+    var reader = parquet.openFileDynamic(allocator, file, .{}) catch |err| {
         try stderr.print("Error: Cannot read parquet file: {}\n", .{err});
         try stderr.flush();
         std.process.exit(1);
@@ -48,7 +49,7 @@ pub fn run(allocator: std.mem.Allocator, file_path: []const u8) !void {
     const header_size: u64 = 4; // PAR1 magic
 
     // Column compressed sizes summed across all row groups
-    const col_names = reader.getColumnNames(allocator) catch &.{};
+    const col_names = cat.getTopLevelColumnNames(allocator, reader.getSchema()) catch &.{};
     defer allocator.free(col_names);
 
     const num_columns = helpers.countLeafColumns(reader.getSchema());

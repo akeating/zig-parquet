@@ -3,6 +3,7 @@
 const std = @import("std");
 const parquet = @import("parquet");
 const helpers = @import("../helpers.zig");
+const cat = @import("cat.zig");
 
 pub fn run(allocator: std.mem.Allocator, file_path: []const u8) !void {
     var stdout_buf: [8192]u8 = undefined;
@@ -30,7 +31,7 @@ pub fn run(allocator: std.mem.Allocator, file_path: []const u8) !void {
     const file_size = file_stat.size;
 
     // Create reader
-    var reader = parquet.openFile(allocator, file) catch |err| {
+    var reader = parquet.openFileDynamic(allocator, file, .{}) catch |err| {
         try stderr.print("Error: Cannot read parquet file: {}\n", .{err});
         try stderr.flush();
         std.process.exit(1);
@@ -100,7 +101,7 @@ pub fn run(allocator: std.mem.Allocator, file_path: []const u8) !void {
 
     // Print column statistics (for first row group)
     try stdout.writeAll("\nColumn Statistics:\n");
-    const col_names = reader.getColumnNames(allocator) catch {
+    const col_names = cat.getTopLevelColumnNames(allocator, reader.getSchema()) catch {
         try stdout.writeAll("  (unable to get column names)\n");
         try stdout.flush();
         return;
@@ -108,7 +109,7 @@ pub fn run(allocator: std.mem.Allocator, file_path: []const u8) !void {
     defer allocator.free(col_names);
 
     for (0..num_columns) |col_idx| {
-        const col_type = reader.getColumnType(col_idx);
+        const col_type: ?parquet.format.PhysicalType = if (reader.getLeafSchemaElement(col_idx)) |elem| elem.type_ else null;
         const stats = reader.getColumnStatistics(col_idx, 0);
 
         try stdout.print("  [{:>2}] {s} ({s}): ", .{

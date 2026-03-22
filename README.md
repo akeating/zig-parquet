@@ -209,42 +209,6 @@ while (try iter.next()) |row| {
 }
 ```
 
-### Column-Based API
-
-For more control, use the lower-level column API:
-
-```zig
-const parquet = @import("parquet");
-const Optional = parquet.Optional;
-
-// Write columns directly
-var writer = try parquet.writeToFile(allocator, file, &.{
-    .{ .name = "id", .type_ = .int64, .optional = false, .codec = .zstd },
-    .{ .name = "name", .type_ = .byte_array, .optional = true },
-});
-defer writer.deinit();
-
-try writer.writeColumnOptional(i64, 0, &[_]Optional(i64){
-    .{ .value = 1 }, .{ .value = 2 }, .{ .value = 3 }, .{ .value = 4 }, .{ .value = 5 },
-});
-try writer.writeColumnOptional([]const u8, 1, &[_]Optional([]const u8){
-    .{ .value = "Alice" }, .null_value, .{ .value = "Charlie" }, .{ .value = "Diana" }, .null_value,
-});
-try writer.close();
-
-// Read columns — readColumn returns []Optional(T)
-var reader = try parquet.openFile(allocator, file);
-defer reader.deinit();
-
-const ids = try reader.readColumn(0, i64);
-defer allocator.free(ids);
-
-for (ids) |id| {
-    if (id.isNull()) { /* handle null */ }
-    else std.debug.print("id: {}\n", .{id.value});
-}
-```
-
 ## Supported Types
 
 ### Physical Types
@@ -458,8 +422,8 @@ zig-parquet/
 ├── zig-parquet/          # Core library
 │   ├── src/
 │   │   ├── lib.zig       # Public API
-│   │   ├── reader.zig    # Parquet reader
-│   │   ├── writer.zig    # Parquet writer
+│   │   ├── core/         # Reader, writer, codec modules
+│   │   ├── api/          # C ABI and WASM surface layers
 │   │   ├── format/       # Parquet format types
 │   │   ├── encoding/     # PLAIN, RLE, DICTIONARY, DELTA_*
 │   │   ├── compress/     # Compression codecs

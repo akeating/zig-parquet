@@ -24,7 +24,7 @@ pub fn main() !void {
     };
     defer file.close();
 
-    var reader = parquet.openFile(allocator, file) catch |err| {
+    var reader = parquet.openFileDynamic(allocator, file, .{}) catch |err| {
         std.debug.print("Error initializing parquet reader: {}\n", .{err});
         return err;
     };
@@ -57,8 +57,16 @@ pub fn main() !void {
         seconds,
     });
 
-    // Column indices: timestamp=0, seq=1, voltage_a..power_factor=2..9
+    // Read columns 2-9 (voltage_a..power_factor) using projection
     const channel_indices = [_]usize{ 2, 3, 4, 5, 6, 7, 8, 9 };
+    const rows = reader.readRowsProjected(row_group_idx, &channel_indices) catch |err| {
+        std.debug.print("Error reading row group {}: {}\n", .{ row_group_idx, err });
+        return err;
+    };
+    defer {
+        for (rows) |row| row.deinit();
+        allocator.free(rows);
+    }
 
     var stdout_buf: [8192]u8 = undefined;
     var stdout_stream = std.fs.File.stdout().writerStreaming(&stdout_buf);
@@ -66,28 +74,26 @@ pub fn main() !void {
 
     try stdout.writeAll("[\n");
 
-    for (channel_indices, 0..) |col_index, i| {
-        const column_data = reader.readColumnFromRowGroup(col_index, row_group_idx, i32) catch |err| {
-            std.debug.print("Error reading column {} from row group {}: {}\n", .{ col_index, row_group_idx, err });
-            continue;
-        };
-        defer allocator.free(column_data);
-
-        if (i > 0) {
+    for (0..channel_indices.len) |ch_idx| {
+        if (ch_idx > 0) {
             try stdout.writeAll(",\n");
         }
         try stdout.writeAll("  [");
 
-        for (column_data, 0..) |val, j| {
+        for (rows, 0..) |row, j| {
             if (j > 0) {
                 try stdout.writeAll(", ");
             }
-            if (val.isNull()) {
-                try stdout.writeAll("null");
+            if (row.getColumn(ch_idx)) |val| {
+                if (val.asInt32()) |v| {
+                    var buf: [16]u8 = undefined;
+                    const num_str = std.fmt.bufPrint(&buf, "{}", .{v}) catch "?";
+                    try stdout.writeAll(num_str);
+                } else {
+                    try stdout.writeAll("null");
+                }
             } else {
-                var buf: [16]u8 = undefined;
-                const num_str = std.fmt.bufPrint(&buf, "{}", .{val.value}) catch "?";
-                try stdout.writeAll(num_str);
+                try stdout.writeAll("null");
             }
         }
 
@@ -97,5 +103,5 @@ pub fn main() !void {
     try stdout.writeAll("\n]\n");
     try stdout_stream.interface.flush();
 
-    std.debug.print("\nOutput: 8 channels x {} samples = {} values\n", .{ rows_per_group, 8 * rows_per_group });
+    std.debug.print("\nOutput: 8 channels x {} samples = {} values\n", .{ rows.len, 8 * rows.len });
 }

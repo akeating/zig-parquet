@@ -11,7 +11,6 @@ const parquet = @import("../lib.zig");
 const format = parquet.format;
 const types = parquet.types;
 const Interval = types.Interval;
-const Optional = types.Optional;
 const TypeInfo = parquet.TypeInfo;
 
 test "Interval struct basic operations" {
@@ -78,7 +77,7 @@ test "round-trip INTERVAL with Writer/Reader API" {
         const file = try tmp_dir.dir.openFile(file_path, .{});
         defer file.close();
 
-        var reader = try parquet.openFile(allocator, file);
+        var reader = try parquet.openFileDynamic(allocator, file, .{});
         defer reader.deinit();
 
         const schema = reader.getSchema();
@@ -98,21 +97,16 @@ test "round-trip INTERVAL with Writer/Reader API" {
         try std.testing.expect(col_schema.logical_type == null);
 
         // Read the values back
-        const values = try reader.readColumn(0, []const u8);
+        const rows = try reader.readAllRows(0);
         defer {
-            for (values) |v| {
-                switch (v) {
-                    .value => |b| allocator.free(b),
-                    .null_value => {},
-                }
-            }
-            allocator.free(values);
+            for (rows) |row| row.deinit();
+            allocator.free(rows);
         }
 
-        try std.testing.expectEqual(@as(usize, 3), values.len);
+        try std.testing.expectEqual(@as(usize, 3), rows.len);
 
         // Verify first interval: 1 month, 15 days, 1 hour
-        const read_interval1 = Interval.fromBytes(values[0].value[0..12].*);
+        const read_interval1 = Interval.fromBytes(rows[0].getColumn(0).?.asBytes().?[0..12].*);
         try std.testing.expectEqual(@as(u32, 1), read_interval1.months);
         try std.testing.expectEqual(@as(u32, 15), read_interval1.days);
         try std.testing.expectEqual(@as(u32, 3600000), read_interval1.millis);
@@ -294,7 +288,7 @@ test "INTERVAL statistics are not written" {
         const file = try tmp_dir.dir.openFile(file_path, .{});
         defer file.close();
 
-        var reader = try parquet.openFile(allocator, file);
+        var reader = try parquet.openFileDynamic(allocator, file, .{});
         defer reader.deinit();
 
         // Get statistics for the INTERVAL column

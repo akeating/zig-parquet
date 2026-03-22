@@ -146,7 +146,7 @@ test "C ABI: write and read round-trip" {
     defer allocator.free(src_buf);
 
     // 2. Read source data as Arrow using the Zig batch API
-    var src_reader = try parquet.openBuffer(allocator, src_buf);
+    var src_reader = try parquet.openBufferDynamic(allocator, src_buf, .{});
     defer src_reader.deinit();
     var read_result = try parquet.readRowGroupAsArrow(
         allocator,
@@ -443,7 +443,7 @@ test "C ABI: writer handle unusable after transport error" {
     const src_buf = try createTestParquetBuffer(allocator);
     defer allocator.free(src_buf);
 
-    var src_reader = try parquet.openBuffer(allocator, src_buf);
+    var src_reader = try parquet.openBufferDynamic(allocator, src_buf, .{});
     defer src_reader.deinit();
     var read_result = try parquet.readRowGroupAsArrow(
         allocator,
@@ -1236,7 +1236,7 @@ test "Test B: Regular Writer baseline (known-good)" {
     try std.testing.expectEqualStrings("PAR1", buf[0..4]);
     try std.testing.expectEqualStrings("PAR1", buf[buf.len - 4 ..]);
 
-    var reader = try parquet.openBuffer(allocator, buf);
+    var reader = try parquet.openBufferDynamic(allocator, buf, .{});
     defer reader.deinit();
     var rr = try parquet.readRowGroupAsArrow(allocator, reader.getSource(), reader.metadata, 0, null);
     defer rr.deinit();
@@ -1278,7 +1278,7 @@ test "Test C: RowWriterHandle minimal flat write via Zig methods" {
     try std.testing.expectEqualStrings("PAR1", written[written.len - 4 ..]);
 
     // Try to read it back
-    var reader = try parquet.openBuffer(allocator, written);
+    var reader = try parquet.openBufferDynamic(allocator, written, .{});
     defer reader.deinit();
     try std.testing.expectEqual(@as(usize, 1), reader.metadata.schema.len - 1);
     var rr = try parquet.readRowGroupAsArrow(allocator, reader.getSource(), reader.metadata, 0, null);
@@ -1336,14 +1336,14 @@ test "Test D: RowWriterHandle vs Writer both produce readable files" {
 
     // Both must be readable
     {
-        var reader = try parquet.openBuffer(allocator, good_buf);
+        var reader = try parquet.openBufferDynamic(allocator, good_buf, .{});
         defer reader.deinit();
         var rr = try parquet.readRowGroupAsArrow(allocator, reader.getSource(), reader.metadata, 0, null);
         defer rr.deinit();
         try std.testing.expectEqual(@as(i64, 3), rr.arrays[0].length);
     }
     {
-        var reader = try parquet.openBuffer(allocator, rw_buf);
+        var reader = try parquet.openBufferDynamic(allocator, rw_buf, .{});
         defer reader.deinit();
         var rr = try parquet.readRowGroupAsArrow(allocator, reader.getSource(), reader.metadata, 0, null);
         defer rr.deinit();

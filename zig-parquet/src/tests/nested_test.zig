@@ -330,14 +330,9 @@ test "assembleValues: multi-row list<int32> flatten-assemble roundtrip" {
     try std.testing.expectEqual(@as(usize, 1), list1.len);
     try std.testing.expectEqual(@as(?i32, 30), list1[0].asInt32());
 
-    // Row 2: Per the Parquet spec, a required list with def=0 means "empty list"
-    // (the repeated group has no instances). However, the assembler currently
-    // treats def <= def_threshold as null. In practice, Parquet writers always
-    // use the 3-level LIST encoding (optional group -> repeated group -> element),
-    // which gives the assembler enough def levels to distinguish null vs empty.
-    // For a bare required list schema (no optional wrapper), null and empty
-    // are encoded identically (def=0), and the assembler returns null.
-    try std.testing.expect(assembled[2].isNull());
+    // Row 2: empty list []
+    const list2 = assembled[2].asList().?;
+    try std.testing.expectEqual(@as(usize, 0), list2.len);
 }
 
 test "assembleValues: multi-row struct flatten-assemble roundtrip" {
@@ -531,9 +526,9 @@ test "parquet round-trip: list<int32> with existing reader" {
     // Reset file position for reading
     try file.seekTo(0);
 
-    // Read back using the existing typed list reader
+    // Read back using the DynamicReader
     {
-        var reader = parquet.openFile(allocator, file) catch |err| {
+        var reader = parquet.openFileDynamic(allocator, file, .{}) catch |err| {
             std.debug.print("Reader init error: {}\n", .{err});
             return err;
         };
@@ -543,32 +538,31 @@ test "parquet round-trip: list<int32> with existing reader" {
         try std.testing.expectEqual(@as(i64, 3), reader.metadata.num_rows);
         try std.testing.expectEqual(@as(usize, 1), reader.metadata.row_groups[0].columns.len);
 
-        // Read back using the existing typed list reader
-        const read_lists = try reader.readListColumn(0, i32);
-        defer reader.freeListColumn(i32, read_lists);
+        const rows = try reader.readAllRows(0);
+        defer {
+            for (rows) |row| row.deinit();
+            allocator.free(rows);
+        }
 
-        try std.testing.expectEqual(@as(usize, 3), read_lists.len);
+        try std.testing.expectEqual(@as(usize, 3), rows.len);
 
         // Row 0: [1, 2, 3]
-        try std.testing.expect(!read_lists[0].isNull());
-        const row0 = read_lists[0].value;
-        try std.testing.expectEqual(@as(usize, 3), row0.len);
-        try std.testing.expectEqual(@as(i32, 1), row0[0].value);
-        try std.testing.expectEqual(@as(i32, 2), row0[1].value);
-        try std.testing.expectEqual(@as(i32, 3), row0[2].value);
+        const list0 = rows[0].getColumn(0).?.asList().?;
+        try std.testing.expectEqual(@as(usize, 3), list0.len);
+        try std.testing.expectEqual(@as(?i32, 1), list0[0].asInt32());
+        try std.testing.expectEqual(@as(?i32, 2), list0[1].asInt32());
+        try std.testing.expectEqual(@as(?i32, 3), list0[2].asInt32());
 
         // Row 1: [10, 20]
-        try std.testing.expect(!read_lists[1].isNull());
-        const row1 = read_lists[1].value;
-        try std.testing.expectEqual(@as(usize, 2), row1.len);
-        try std.testing.expectEqual(@as(i32, 10), row1[0].value);
-        try std.testing.expectEqual(@as(i32, 20), row1[1].value);
+        const list1 = rows[1].getColumn(0).?.asList().?;
+        try std.testing.expectEqual(@as(usize, 2), list1.len);
+        try std.testing.expectEqual(@as(?i32, 10), list1[0].asInt32());
+        try std.testing.expectEqual(@as(?i32, 20), list1[1].asInt32());
 
         // Row 2: [100]
-        try std.testing.expect(!read_lists[2].isNull());
-        const row2 = read_lists[2].value;
-        try std.testing.expectEqual(@as(usize, 1), row2.len);
-        try std.testing.expectEqual(@as(i32, 100), row2[0].value);
+        const list2 = rows[2].getColumn(0).?.asList().?;
+        try std.testing.expectEqual(@as(usize, 1), list2.len);
+        try std.testing.expectEqual(@as(?i32, 100), list2[0].asInt32());
     }
 }
 
@@ -642,7 +636,7 @@ test "parquet round-trip: list<struct<id:i64, score:f64>>" {
 
     // Read back and verify
     {
-        var reader = parquet.openFile(allocator, file) catch |err| {
+        var reader = parquet.openFileDynamic(allocator, file, .{}) catch |err| {
             std.debug.print("Reader init error: {}\n", .{err});
             return err;
         };
@@ -652,42 +646,27 @@ test "parquet round-trip: list<struct<id:i64, score:f64>>" {
         try std.testing.expectEqual(@as(i64, 2), reader.metadata.num_rows);
         try std.testing.expectEqual(@as(usize, 2), reader.metadata.row_groups[0].columns.len);
 
-        // Read the "id" column (column 0) using list reader
-        const id_lists = try reader.readListColumn(0, i64);
-        defer reader.freeListColumn(i64, id_lists);
+        const rows = try reader.readAllRows(0);
+        defer {
+            for (rows) |row| row.deinit();
+            allocator.free(rows);
+        }
 
-        // Read the "score" column (column 1) using list reader
-        const score_lists = try reader.readListColumn(1, f64);
-        defer reader.freeListColumn(f64, score_lists);
-
-        // Verify we have 2 rows
-        try std.testing.expectEqual(@as(usize, 2), id_lists.len);
-        try std.testing.expectEqual(@as(usize, 2), score_lists.len);
+        try std.testing.expectEqual(@as(usize, 2), rows.len);
 
         // Row 0: [{id: 1, score: 95.5}, {id: 2, score: 88.0}]
-        // ids: [1, 2], scores: [95.5, 88.0]
-        try std.testing.expect(!id_lists[0].isNull());
-        const row0_ids = id_lists[0].value;
-        try std.testing.expectEqual(@as(usize, 2), row0_ids.len);
-        try std.testing.expectEqual(@as(i64, 1), row0_ids[0].value);
-        try std.testing.expectEqual(@as(i64, 2), row0_ids[1].value);
-
-        try std.testing.expect(!score_lists[0].isNull());
-        const row0_scores = score_lists[0].value;
-        try std.testing.expectEqual(@as(usize, 2), row0_scores.len);
-        try std.testing.expectEqual(@as(f64, 95.5), row0_scores[0].value);
-        try std.testing.expectEqual(@as(f64, 88.0), row0_scores[1].value);
+        const list0 = rows[0].getColumn(0).?.asList().?;
+        try std.testing.expectEqual(@as(usize, 2), list0.len);
+        try std.testing.expectEqual(@as(?i64, 1), list0[0].getField("id").?.asInt64());
+        try std.testing.expectEqual(@as(?f64, 95.5), list0[0].getField("score").?.asDouble());
+        try std.testing.expectEqual(@as(?i64, 2), list0[1].getField("id").?.asInt64());
+        try std.testing.expectEqual(@as(?f64, 88.0), list0[1].getField("score").?.asDouble());
 
         // Row 1: [{id: 100, score: 77.3}]
-        try std.testing.expect(!id_lists[1].isNull());
-        const row1_ids = id_lists[1].value;
-        try std.testing.expectEqual(@as(usize, 1), row1_ids.len);
-        try std.testing.expectEqual(@as(i64, 100), row1_ids[0].value);
-
-        try std.testing.expect(!score_lists[1].isNull());
-        const row1_scores = score_lists[1].value;
-        try std.testing.expectEqual(@as(usize, 1), row1_scores.len);
-        try std.testing.expectEqual(@as(f64, 77.3), row1_scores[0].value);
+        const list1 = rows[1].getColumn(0).?.asList().?;
+        try std.testing.expectEqual(@as(usize, 1), list1.len);
+        try std.testing.expectEqual(@as(?i64, 100), list1[0].getField("id").?.asInt64());
+        try std.testing.expectEqual(@as(?f64, 77.3), list1[0].getField("score").?.asDouble());
     }
 }
 
@@ -749,7 +728,7 @@ test "parquet round-trip: struct with byte_array field" {
 
     // Read back and verify
     {
-        var reader = parquet.openFile(allocator, file) catch |err| {
+        var reader = parquet.openFileDynamic(allocator, file, .{}) catch |err| {
             std.debug.print("Reader init error: {}\n", .{err});
             return err;
         };
@@ -759,30 +738,20 @@ test "parquet round-trip: struct with byte_array field" {
         try std.testing.expectEqual(@as(i64, 2), reader.metadata.num_rows);
         try std.testing.expectEqual(@as(usize, 2), reader.metadata.row_groups[0].columns.len);
 
-        // Read the "name" column (column 0)
-        const names = try reader.readColumn(0, []const u8);
+        const rows = try reader.readAllRows(0);
         defer {
-            for (names) |n| {
-                if (!n.isNull()) allocator.free(n.value);
-            }
-            allocator.free(names);
+            for (rows) |row| row.deinit();
+            allocator.free(rows);
         }
 
-        try std.testing.expectEqual(@as(usize, 2), names.len);
-        try std.testing.expect(!names[0].isNull());
-        try std.testing.expectEqualStrings("Alice", names[0].value);
-        try std.testing.expect(!names[1].isNull());
-        try std.testing.expectEqualStrings("Bob", names[1].value);
+        try std.testing.expectEqual(@as(usize, 2), rows.len);
+        const person0 = rows[0].getColumn(0).?;
+        const person1 = rows[1].getColumn(0).?;
+        try std.testing.expectEqualStrings("Alice", person0.getField("name").?.asBytes().?);
+        try std.testing.expectEqualStrings("Bob", person1.getField("name").?.asBytes().?);
 
-        // Read the "id" column (column 1)
-        const ids = try reader.readColumn(1, i32);
-        defer allocator.free(ids);
-
-        try std.testing.expectEqual(@as(usize, 2), ids.len);
-        try std.testing.expect(!ids[0].isNull());
-        try std.testing.expectEqual(@as(i32, 1), ids[0].value);
-        try std.testing.expect(!ids[1].isNull());
-        try std.testing.expectEqual(@as(i32, 2), ids[1].value);
+        try std.testing.expectEqual(@as(?i32, 1), person0.getField("id").?.asInt32());
+        try std.testing.expectEqual(@as(?i32, 2), person1.getField("id").?.asInt32());
     }
 }
 
@@ -847,7 +816,7 @@ test "parquet round-trip: struct with list field" {
 
     // Read back and verify
     {
-        var reader = parquet.openFile(allocator, file) catch |err| {
+        var reader = parquet.openFileDynamic(allocator, file, .{}) catch |err| {
             std.debug.print("Reader init error: {}\n", .{err});
             return err;
         };
@@ -857,41 +826,30 @@ test "parquet round-trip: struct with list field" {
         try std.testing.expectEqual(@as(i64, 2), reader.metadata.num_rows);
         try std.testing.expectEqual(@as(usize, 2), reader.metadata.row_groups[0].columns.len);
 
-        // Read the "name" column (column 0)
-        const names = try reader.readColumn(0, []const u8);
+        const rows = try reader.readAllRows(0);
         defer {
-            for (names) |n| {
-                if (!n.isNull()) allocator.free(n.value);
-            }
-            allocator.free(names);
+            for (rows) |row| row.deinit();
+            allocator.free(rows);
         }
 
-        try std.testing.expectEqual(@as(usize, 2), names.len);
-        try std.testing.expect(!names[0].isNull());
-        try std.testing.expectEqualStrings("Alice", names[0].value);
-        try std.testing.expect(!names[1].isNull());
-        try std.testing.expectEqualStrings("Bob", names[1].value);
-
-        // Read the "scores" column (column 1) as a list
-        const scores = try reader.readListColumn(1, i32);
-        defer reader.freeListColumn(i32, scores);
-
-        try std.testing.expectEqual(@as(usize, 2), scores.len);
+        try std.testing.expectEqual(@as(usize, 2), rows.len);
+        const student0 = rows[0].getColumn(0).?;
+        const student1 = rows[1].getColumn(0).?;
+        try std.testing.expectEqualStrings("Alice", student0.getField("name").?.asBytes().?);
+        try std.testing.expectEqualStrings("Bob", student1.getField("name").?.asBytes().?);
 
         // Row 0: [90, 85, 92]
-        try std.testing.expect(!scores[0].isNull());
-        const s0 = scores[0].value;
-        try std.testing.expectEqual(@as(usize, 3), s0.len);
-        try std.testing.expectEqual(@as(i32, 90), s0[0].value);
-        try std.testing.expectEqual(@as(i32, 85), s0[1].value);
-        try std.testing.expectEqual(@as(i32, 92), s0[2].value);
+        const scores0 = student0.getField("scores").?.asList().?;
+        try std.testing.expectEqual(@as(usize, 3), scores0.len);
+        try std.testing.expectEqual(@as(?i32, 90), scores0[0].asInt32());
+        try std.testing.expectEqual(@as(?i32, 85), scores0[1].asInt32());
+        try std.testing.expectEqual(@as(?i32, 92), scores0[2].asInt32());
 
         // Row 1: [88, 95]
-        try std.testing.expect(!scores[1].isNull());
-        const s1 = scores[1].value;
-        try std.testing.expectEqual(@as(usize, 2), s1.len);
-        try std.testing.expectEqual(@as(i32, 88), s1[0].value);
-        try std.testing.expectEqual(@as(i32, 95), s1[1].value);
+        const scores1 = student1.getField("scores").?.asList().?;
+        try std.testing.expectEqual(@as(usize, 2), scores1.len);
+        try std.testing.expectEqual(@as(?i32, 88), scores1[0].asInt32());
+        try std.testing.expectEqual(@as(?i32, 95), scores1[1].asInt32());
     }
 }
 
@@ -995,7 +953,7 @@ test "parquet round-trip: map<string, i32>" {
 
     // Read back and verify
     {
-        var reader = parquet.openFile(allocator, file) catch |err| {
+        var reader = parquet.openFileDynamic(allocator, file, .{}) catch |err| {
             std.debug.print("Reader init error: {}\n", .{err});
             return err;
         };
@@ -1005,27 +963,27 @@ test "parquet round-trip: map<string, i32>" {
         try std.testing.expectEqual(@as(i64, 2), reader.metadata.num_rows);
         try std.testing.expectEqual(@as(usize, 2), reader.metadata.row_groups[0].columns.len);
 
-        // Use the existing map reader
-        const maps = try reader.readMapColumn(0, []const u8, i32);
-        defer reader.freeMapColumn([]const u8, i32, maps);
+        const rows = try reader.readAllRows(0);
+        defer {
+            for (rows) |row| row.deinit();
+            allocator.free(rows);
+        }
 
-        try std.testing.expectEqual(@as(usize, 2), maps.len);
+        try std.testing.expectEqual(@as(usize, 2), rows.len);
 
         // Row 0: {"a": 1, "b": 2}
-        try std.testing.expect(!maps[0].isNull());
-        const m0 = maps[0].value;
+        const m0 = rows[0].getColumn(0).?.asMap().?;
         try std.testing.expectEqual(@as(usize, 2), m0.len);
-        try std.testing.expectEqualStrings("a", m0[0].key);
-        try std.testing.expectEqual(@as(i32, 1), m0[0].value.value);
-        try std.testing.expectEqualStrings("b", m0[1].key);
-        try std.testing.expectEqual(@as(i32, 2), m0[1].value.value);
+        try std.testing.expectEqualStrings("a", m0[0].key.asBytes().?);
+        try std.testing.expectEqual(@as(?i32, 1), m0[0].value.asInt32());
+        try std.testing.expectEqualStrings("b", m0[1].key.asBytes().?);
+        try std.testing.expectEqual(@as(?i32, 2), m0[1].value.asInt32());
 
         // Row 1: {"x": 100}
-        try std.testing.expect(!maps[1].isNull());
-        const m1 = maps[1].value;
+        const m1 = rows[1].getColumn(0).?.asMap().?;
         try std.testing.expectEqual(@as(usize, 1), m1.len);
-        try std.testing.expectEqualStrings("x", m1[0].key);
-        try std.testing.expectEqual(@as(i32, 100), m1[0].value.value);
+        try std.testing.expectEqualStrings("x", m1[0].key.asBytes().?);
+        try std.testing.expectEqual(@as(?i32, 100), m1[0].value.asInt32());
     }
 }
 
@@ -1080,7 +1038,7 @@ test "parquet round-trip: map<i32, i64>" {
 
     // Read back and verify
     {
-        var reader = parquet.openFile(allocator, file) catch |err| {
+        var reader = parquet.openFileDynamic(allocator, file, .{}) catch |err| {
             std.debug.print("Reader init error: {}\n", .{err});
             return err;
         };
@@ -1090,27 +1048,27 @@ test "parquet round-trip: map<i32, i64>" {
         try std.testing.expectEqual(@as(i64, 2), reader.metadata.num_rows);
         try std.testing.expectEqual(@as(usize, 2), reader.metadata.row_groups[0].columns.len);
 
-        // Use the existing map reader with i32 keys
-        const maps = try reader.readMapColumn(0, i32, i64);
-        defer reader.freeMapColumn(i32, i64, maps);
+        const rows = try reader.readAllRows(0);
+        defer {
+            for (rows) |row| row.deinit();
+            allocator.free(rows);
+        }
 
-        try std.testing.expectEqual(@as(usize, 2), maps.len);
+        try std.testing.expectEqual(@as(usize, 2), rows.len);
 
         // Row 0: {1: 100, 2: 200}
-        try std.testing.expect(!maps[0].isNull());
-        const m0 = maps[0].value;
+        const m0 = rows[0].getColumn(0).?.asMap().?;
         try std.testing.expectEqual(@as(usize, 2), m0.len);
-        try std.testing.expectEqual(@as(i32, 1), m0[0].key);
-        try std.testing.expectEqual(@as(i64, 100), m0[0].value.value);
-        try std.testing.expectEqual(@as(i32, 2), m0[1].key);
-        try std.testing.expectEqual(@as(i64, 200), m0[1].value.value);
+        try std.testing.expectEqual(@as(?i32, 1), m0[0].key.asInt32());
+        try std.testing.expectEqual(@as(?i64, 100), m0[0].value.asInt64());
+        try std.testing.expectEqual(@as(?i32, 2), m0[1].key.asInt32());
+        try std.testing.expectEqual(@as(?i64, 200), m0[1].value.asInt64());
 
         // Row 1: {10: 1000}
-        try std.testing.expect(!maps[1].isNull());
-        const m1 = maps[1].value;
+        const m1 = rows[1].getColumn(0).?.asMap().?;
         try std.testing.expectEqual(@as(usize, 1), m1.len);
-        try std.testing.expectEqual(@as(i32, 10), m1[0].key);
-        try std.testing.expectEqual(@as(i64, 1000), m1[0].value.value);
+        try std.testing.expectEqual(@as(?i32, 10), m1[0].key.asInt32());
+        try std.testing.expectEqual(@as(?i64, 1000), m1[0].value.asInt64());
     }
 }
 
@@ -1213,7 +1171,7 @@ test "parquet round-trip: struct with logical types" {
 
     // Read back and verify both data and schema
     {
-        var reader = parquet.openFile(allocator, file) catch |err| {
+        var reader = parquet.openFileDynamic(allocator, file, .{}) catch |err| {
             std.debug.print("Reader init error: {}\n", .{err});
             return err;
         };
@@ -1247,27 +1205,23 @@ test "parquet round-trip: struct with logical types" {
         try std.testing.expect(date_found);
 
         // Read the data and verify values
-        const names = try reader.readColumn(0, []const u8);
+        const rows = try reader.readAllRows(0);
         defer {
-            for (names) |n| {
-                if (!n.isNull()) allocator.free(n.value);
-            }
-            allocator.free(names);
+            for (rows) |row| row.deinit();
+            allocator.free(rows);
         }
-        try std.testing.expectEqualStrings("Alice", names[0].value);
-        try std.testing.expectEqualStrings("Bob", names[1].value);
+        const user0 = rows[0].getColumn(0).?;
+        const user1 = rows[1].getColumn(0).?;
+        try std.testing.expectEqualStrings("Alice", user0.getField("name").?.asBytes().?);
+        try std.testing.expectEqualStrings("Bob", user1.getField("name").?.asBytes().?);
 
         // Read dates
-        const dates = try reader.readColumn(1, i32);
-        defer allocator.free(dates);
-        try std.testing.expectEqual(@as(i32, 19000), dates[0].value);
-        try std.testing.expectEqual(@as(i32, 19365), dates[1].value);
+        try std.testing.expectEqual(@as(?i32, 19000), user0.getField("created").?.asInt32());
+        try std.testing.expectEqual(@as(?i32, 19365), user1.getField("created").?.asInt32());
 
         // Read scores
-        const scores = try reader.readColumn(2, i32);
-        defer allocator.free(scores);
-        try std.testing.expectEqual(@as(i32, 95), scores[0].value);
-        try std.testing.expectEqual(@as(i32, 88), scores[1].value);
+        try std.testing.expectEqual(@as(?i32, 95), user0.getField("score").?.asInt32());
+        try std.testing.expectEqual(@as(?i32, 88), user1.getField("score").?.asInt32());
     }
 }
 
@@ -1327,7 +1281,7 @@ test "parquet round-trip: TIMESTAMP logical type" {
 
     // Read back and verify
     {
-        var reader = parquet.openFile(allocator, file) catch |err| {
+        var reader = parquet.openFileDynamic(allocator, file, .{}) catch |err| {
             std.debug.print("Reader init error: {}\n", .{err});
             return err;
         };
@@ -1356,15 +1310,18 @@ test "parquet round-trip: TIMESTAMP logical type" {
         try std.testing.expect(ts_millis_found);
 
         // Verify data
-        const ts_micros = try reader.readColumn(1, i64);
-        defer allocator.free(ts_micros);
-        try std.testing.expectEqual(@as(i64, 1705321800000000), ts_micros[0].value);
-        try std.testing.expectEqual(@as(i64, 1705325400000000), ts_micros[1].value);
+        const rows = try reader.readAllRows(0);
+        defer {
+            for (rows) |row| row.deinit();
+            allocator.free(rows);
+        }
+        const log0 = rows[0].getColumn(0).?;
+        const log1 = rows[1].getColumn(0).?;
+        try std.testing.expectEqual(@as(?i64, 1705321800000000), log0.getField("ts_micros").?.asInt64());
+        try std.testing.expectEqual(@as(?i64, 1705325400000000), log1.getField("ts_micros").?.asInt64());
 
-        const ts_millis = try reader.readColumn(2, i64);
-        defer allocator.free(ts_millis);
-        try std.testing.expectEqual(@as(i64, 1705321800000), ts_millis[0].value);
-        try std.testing.expectEqual(@as(i64, 1705325400000), ts_millis[1].value);
+        try std.testing.expectEqual(@as(?i64, 1705321800000), log0.getField("ts_millis").?.asInt64());
+        try std.testing.expectEqual(@as(?i64, 1705325400000), log1.getField("ts_millis").?.asInt64());
     }
 }
 
@@ -1420,7 +1377,7 @@ test "parquet round-trip: TIME logical type" {
 
     // Read back and verify
     {
-        var reader = parquet.openFile(allocator, file) catch |err| {
+        var reader = parquet.openFileDynamic(allocator, file, .{}) catch |err| {
             std.debug.print("Reader init error: {}\n", .{err});
             return err;
         };
@@ -1447,15 +1404,18 @@ test "parquet round-trip: TIME logical type" {
         try std.testing.expect(micros_found);
 
         // Verify data
-        const millis = try reader.readColumn(0, i32);
-        defer allocator.free(millis);
-        try std.testing.expectEqual(@as(i32, 45045000), millis[0].value);
-        try std.testing.expectEqual(@as(i32, 64800000), millis[1].value);
+        const rows = try reader.readAllRows(0);
+        defer {
+            for (rows) |row| row.deinit();
+            allocator.free(rows);
+        }
+        const t0 = rows[0].getColumn(0).?;
+        const t1 = rows[1].getColumn(0).?;
+        try std.testing.expectEqual(@as(?i32, 45045000), t0.getField("time_millis").?.asInt32());
+        try std.testing.expectEqual(@as(?i32, 64800000), t1.getField("time_millis").?.asInt32());
 
-        const micros = try reader.readColumn(1, i64);
-        defer allocator.free(micros);
-        try std.testing.expectEqual(@as(i64, 45045000000), micros[0].value);
-        try std.testing.expectEqual(@as(i64, 64800000000), micros[1].value);
+        try std.testing.expectEqual(@as(?i64, 45045000000), t0.getField("time_micros").?.asInt64());
+        try std.testing.expectEqual(@as(?i64, 64800000000), t1.getField("time_micros").?.asInt64());
     }
 }
 
@@ -1512,7 +1472,7 @@ test "parquet round-trip: DECIMAL logical type" {
 
     // Read back and verify
     {
-        var reader = parquet.openFile(allocator, file) catch |err| {
+        var reader = parquet.openFileDynamic(allocator, file, .{}) catch |err| {
             std.debug.print("Reader init error: {}\n", .{err});
             return err;
         };
@@ -1541,15 +1501,18 @@ test "parquet round-trip: DECIMAL logical type" {
         try std.testing.expect(qty_found);
 
         // Verify data
-        const prices = try reader.readColumn(0, i64);
-        defer allocator.free(prices);
-        try std.testing.expectEqual(@as(i64, 12345), prices[0].value);
-        try std.testing.expectEqual(@as(i64, 99999), prices[1].value);
+        const rows = try reader.readAllRows(0);
+        defer {
+            for (rows) |row| row.deinit();
+            allocator.free(rows);
+        }
+        const order0 = rows[0].getColumn(0).?;
+        const order1 = rows[1].getColumn(0).?;
+        try std.testing.expectEqual(@as(?i64, 12345), order0.getField("price").?.asInt64());
+        try std.testing.expectEqual(@as(?i64, 99999), order1.getField("price").?.asInt64());
 
-        const quantities = try reader.readColumn(1, i32);
-        defer allocator.free(quantities);
-        try std.testing.expectEqual(@as(i32, 100), quantities[0].value);
-        try std.testing.expectEqual(@as(i32, 50), quantities[1].value);
+        try std.testing.expectEqual(@as(?i32, 100), order0.getField("quantity").?.asInt32());
+        try std.testing.expectEqual(@as(?i32, 50), order1.getField("quantity").?.asInt32());
     }
 }
 
@@ -1607,7 +1570,7 @@ test "parquet round-trip: INT logical types (INT8, INT16, UINT32)" {
 
     // Read back and verify
     {
-        var reader = parquet.openFile(allocator, file) catch |err| {
+        var reader = parquet.openFileDynamic(allocator, file, .{}) catch |err| {
             std.debug.print("Reader init error: {}\n", .{err});
             return err;
         };
@@ -1645,10 +1608,15 @@ test "parquet round-trip: INT logical types (INT8, INT16, UINT32)" {
         try std.testing.expect(uint32_found);
 
         // Verify data
-        const tiny = try reader.readColumn(0, i32);
-        defer allocator.free(tiny);
-        try std.testing.expectEqual(@as(i32, -128), tiny[0].value);
-        try std.testing.expectEqual(@as(i32, 127), tiny[1].value);
+        const rows = try reader.readAllRows(0);
+        defer {
+            for (rows) |row| row.deinit();
+            allocator.free(rows);
+        }
+        const ints0 = rows[0].getColumn(0).?;
+        const ints1 = rows[1].getColumn(0).?;
+        try std.testing.expectEqual(@as(?i32, -128), ints0.getField("tiny").?.asInt32());
+        try std.testing.expectEqual(@as(?i32, 127), ints1.getField("tiny").?.asInt32());
     }
 }
 
@@ -1697,7 +1665,7 @@ test "parquet round-trip: JSON logical type" {
 
     // Read back and verify
     {
-        var reader = parquet.openFile(allocator, file) catch |err| {
+        var reader = parquet.openFileDynamic(allocator, file, .{}) catch |err| {
             std.debug.print("Reader init error: {}\n", .{err});
             return err;
         };
@@ -1715,15 +1683,13 @@ test "parquet round-trip: JSON logical type" {
         try std.testing.expect(json_found);
 
         // Verify data
-        const payloads = try reader.readColumn(0, []const u8);
+        const rows = try reader.readAllRows(0);
         defer {
-            for (payloads) |p| {
-                if (!p.isNull()) allocator.free(p.value);
-            }
-            allocator.free(payloads);
+            for (rows) |row| row.deinit();
+            allocator.free(rows);
         }
-        try std.testing.expectEqualStrings("{\"name\":\"Alice\",\"age\":30}", payloads[0].value);
-        try std.testing.expectEqualStrings("[1,2,3]", payloads[1].value);
+        try std.testing.expectEqualStrings("{\"name\":\"Alice\",\"age\":30}", rows[0].getColumn(0).?.getField("payload").?.asBytes().?);
+        try std.testing.expectEqualStrings("[1,2,3]", rows[1].getColumn(0).?.getField("payload").?.asBytes().?);
     }
 }
 
@@ -1775,7 +1741,7 @@ test "parquet round-trip: UUID logical type" {
 
     // Read back and verify
     {
-        var reader = parquet.openFile(allocator, file) catch |err| {
+        var reader = parquet.openFileDynamic(allocator, file, .{}) catch |err| {
             std.debug.print("Reader init error: {}\n", .{err});
             return err;
         };
@@ -1796,20 +1762,18 @@ test "parquet round-trip: UUID logical type" {
         }
         try std.testing.expect(uuid_found);
 
-        // Read data back via DynamicReader and verify UUID values
-        var dyn = try parquet.openFileDynamic(allocator, file, .{});
-        defer dyn.deinit();
-        const dyn_rows = try dyn.readAllRows(0);
+        // Read data back and verify UUID values
+        const rows = try reader.readAllRows(0);
         defer {
-            for (dyn_rows) |r| r.deinit();
-            allocator.free(dyn_rows);
+            for (rows) |r| r.deinit();
+            allocator.free(rows);
         }
-        try std.testing.expectEqual(@as(usize, 2), dyn_rows.len);
+        try std.testing.expectEqual(@as(usize, 2), rows.len);
 
-        const row1_struct = dyn_rows[0].getColumn(0).?;
+        const row1_struct = rows[0].getColumn(0).?;
         const row1_id = row1_struct.getField("id").?.asBytes().?;
         try std.testing.expectEqualSlices(u8, &uuid1, row1_id);
-        const row2_struct = dyn_rows[1].getColumn(0).?;
+        const row2_struct = rows[1].getColumn(0).?;
         const row2_id = row2_struct.getField("id").?.asBytes().?;
         try std.testing.expectEqualSlices(u8, &uuid2, row2_id);
     }
@@ -1865,7 +1829,7 @@ test "parquet round-trip: ENUM logical type" {
 
     // Read back and verify
     {
-        var reader = parquet.openFile(allocator, file) catch |err| {
+        var reader = parquet.openFileDynamic(allocator, file, .{}) catch |err| {
             std.debug.print("Reader init error: {}\n", .{err});
             return err;
         };
@@ -1883,16 +1847,14 @@ test "parquet round-trip: ENUM logical type" {
         try std.testing.expect(enum_found);
 
         // Verify data
-        const statuses = try reader.readColumn(0, []const u8);
+        const rows = try reader.readAllRows(0);
         defer {
-            for (statuses) |s| {
-                if (!s.isNull()) allocator.free(s.value);
-            }
-            allocator.free(statuses);
+            for (rows) |row| row.deinit();
+            allocator.free(rows);
         }
-        try std.testing.expectEqualStrings("PENDING", statuses[0].value);
-        try std.testing.expectEqualStrings("COMPLETED", statuses[1].value);
-        try std.testing.expectEqualStrings("FAILED", statuses[2].value);
+        try std.testing.expectEqualStrings("PENDING", rows[0].getColumn(0).?.getField("status").?.asBytes().?);
+        try std.testing.expectEqualStrings("COMPLETED", rows[1].getColumn(0).?.getField("status").?.asBytes().?);
+        try std.testing.expectEqualStrings("FAILED", rows[2].getColumn(0).?.getField("status").?.asBytes().?);
     }
 }
 
@@ -1933,7 +1895,7 @@ test "parquet round-trip: list with logical types" {
 
     // Read back and verify
     {
-        var reader = parquet.openFile(allocator, file) catch |err| {
+        var reader = parquet.openFileDynamic(allocator, file, .{}) catch |err| {
             std.debug.print("Reader init error: {}\n", .{err});
             return err;
         };
@@ -1950,23 +1912,26 @@ test "parquet round-trip: list with logical types" {
         }
         try std.testing.expect(string_found);
 
-        // Verify data using list reader
-        const lists = try reader.readListColumn(0, []const u8);
-        defer reader.freeListColumn([]const u8, lists);
+        // Verify data
+        const rows = try reader.readAllRows(0);
+        defer {
+            for (rows) |row| row.deinit();
+            allocator.free(rows);
+        }
 
-        try std.testing.expectEqual(@as(usize, 2), lists.len);
+        try std.testing.expectEqual(@as(usize, 2), rows.len);
 
         // Row 0: ["rust", "zig", "go"]
-        const row0 = lists[0].value;
-        try std.testing.expectEqual(@as(usize, 3), row0.len);
-        try std.testing.expectEqualStrings("rust", row0[0].value);
-        try std.testing.expectEqualStrings("zig", row0[1].value);
-        try std.testing.expectEqualStrings("go", row0[2].value);
+        const list0 = rows[0].getColumn(0).?.asList().?;
+        try std.testing.expectEqual(@as(usize, 3), list0.len);
+        try std.testing.expectEqualStrings("rust", list0[0].asBytes().?);
+        try std.testing.expectEqualStrings("zig", list0[1].asBytes().?);
+        try std.testing.expectEqualStrings("go", list0[2].asBytes().?);
 
         // Row 1: ["python"]
-        const row1 = lists[1].value;
-        try std.testing.expectEqual(@as(usize, 1), row1.len);
-        try std.testing.expectEqualStrings("python", row1[0].value);
+        const list1 = rows[1].getColumn(0).?.asList().?;
+        try std.testing.expectEqual(@as(usize, 1), list1.len);
+        try std.testing.expectEqualStrings("python", list1[0].asBytes().?);
     }
 }
 

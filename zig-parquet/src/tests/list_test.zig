@@ -5,7 +5,7 @@
 const std = @import("std");
 const parquet = @import("../lib.zig");
 
-const Reader = parquet.Reader;
+const Value = parquet.Value;
 const Optional = parquet.Optional;
 
 // =============================================================================
@@ -22,54 +22,87 @@ test "read list_int.parquet" {
     };
     defer file.close();
 
-    var reader = try parquet.openFile(allocator, file);
+    var reader = try parquet.openFileDynamic(allocator, file, .{});
     defer reader.deinit();
 
     // Verify schema
     const schema = reader.getSchema();
     try std.testing.expect(schema.len > 0);
 
-    // Read the list column
-    const lists = try reader.readListColumn(0, i32);
-    defer reader.freeListColumn(i32, lists);
+    // Read all rows
+    const rows = try reader.readAllRows(0);
+    defer {
+        for (rows) |row| row.deinit();
+        allocator.free(rows);
+    }
 
     // Expected data: [[1, 2, 3], [4, 5], [6], [], [7, 8, 9, 10]]
-    try std.testing.expectEqual(@as(usize, 5), lists.len);
+    try std.testing.expectEqual(@as(usize, 5), rows.len);
 
     // Row 0: [1, 2, 3]
-    try std.testing.expect(!lists[0].isNull());
-    const row0 = lists[0].value;
-    try std.testing.expectEqual(@as(usize, 3), row0.len);
-    try std.testing.expectEqual(@as(i32, 1), row0[0].value);
-    try std.testing.expectEqual(@as(i32, 2), row0[1].value);
-    try std.testing.expectEqual(@as(i32, 3), row0[2].value);
+    {
+        const list = rows[0].getColumn(0).?;
+        switch (list) {
+            .list_val => |items| {
+                try std.testing.expectEqual(@as(usize, 3), items.len);
+                try std.testing.expectEqual(@as(i32, 1), items[0].asInt32().?);
+                try std.testing.expectEqual(@as(i32, 2), items[1].asInt32().?);
+                try std.testing.expectEqual(@as(i32, 3), items[2].asInt32().?);
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
 
     // Row 1: [4, 5]
-    try std.testing.expect(!lists[1].isNull());
-    const row1 = lists[1].value;
-    try std.testing.expectEqual(@as(usize, 2), row1.len);
-    try std.testing.expectEqual(@as(i32, 4), row1[0].value);
-    try std.testing.expectEqual(@as(i32, 5), row1[1].value);
+    {
+        const list = rows[1].getColumn(0).?;
+        switch (list) {
+            .list_val => |items| {
+                try std.testing.expectEqual(@as(usize, 2), items.len);
+                try std.testing.expectEqual(@as(i32, 4), items[0].asInt32().?);
+                try std.testing.expectEqual(@as(i32, 5), items[1].asInt32().?);
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
 
     // Row 2: [6]
-    try std.testing.expect(!lists[2].isNull());
-    const row2 = lists[2].value;
-    try std.testing.expectEqual(@as(usize, 1), row2.len);
-    try std.testing.expectEqual(@as(i32, 6), row2[0].value);
+    {
+        const list = rows[2].getColumn(0).?;
+        switch (list) {
+            .list_val => |items| {
+                try std.testing.expectEqual(@as(usize, 1), items.len);
+                try std.testing.expectEqual(@as(i32, 6), items[0].asInt32().?);
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
 
     // Row 3: [] (empty list)
-    try std.testing.expect(!lists[3].isNull());
-    const row3 = lists[3].value;
-    try std.testing.expectEqual(@as(usize, 0), row3.len);
+    {
+        const list = rows[3].getColumn(0).?;
+        switch (list) {
+            .list_val => |items| {
+                try std.testing.expectEqual(@as(usize, 0), items.len);
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
 
     // Row 4: [7, 8, 9, 10]
-    try std.testing.expect(!lists[4].isNull());
-    const row4 = lists[4].value;
-    try std.testing.expectEqual(@as(usize, 4), row4.len);
-    try std.testing.expectEqual(@as(i32, 7), row4[0].value);
-    try std.testing.expectEqual(@as(i32, 8), row4[1].value);
-    try std.testing.expectEqual(@as(i32, 9), row4[2].value);
-    try std.testing.expectEqual(@as(i32, 10), row4[3].value);
+    {
+        const list = rows[4].getColumn(0).?;
+        switch (list) {
+            .list_val => |items| {
+                try std.testing.expectEqual(@as(usize, 4), items.len);
+                try std.testing.expectEqual(@as(i32, 7), items[0].asInt32().?);
+                try std.testing.expectEqual(@as(i32, 8), items[1].asInt32().?);
+                try std.testing.expectEqual(@as(i32, 9), items[2].asInt32().?);
+                try std.testing.expectEqual(@as(i32, 10), items[3].asInt32().?);
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
 }
 
 test "read list_nullable.parquet" {
@@ -82,45 +115,72 @@ test "read list_nullable.parquet" {
     };
     defer file.close();
 
-    var reader = try parquet.openFile(allocator, file);
+    var reader = try parquet.openFileDynamic(allocator, file, .{});
     defer reader.deinit();
 
-    // Read the list column
-    const lists = try reader.readListColumn(0, i32);
-    defer reader.freeListColumn(i32, lists);
+    // Read all rows
+    const rows = try reader.readAllRows(0);
+    defer {
+        for (rows) |row| row.deinit();
+        allocator.free(rows);
+    }
 
     // Expected data: [[1, null, 3], null, [4, 5], [], [null, null]]
-    try std.testing.expectEqual(@as(usize, 5), lists.len);
+    try std.testing.expectEqual(@as(usize, 5), rows.len);
 
     // Row 0: [1, null, 3]
-    try std.testing.expect(!lists[0].isNull());
-    const row0 = lists[0].value;
-    try std.testing.expectEqual(@as(usize, 3), row0.len);
-    try std.testing.expectEqual(@as(i32, 1), row0[0].value);
-    try std.testing.expect(row0[1].isNull());
-    try std.testing.expectEqual(@as(i32, 3), row0[2].value);
+    {
+        const list = rows[0].getColumn(0).?;
+        switch (list) {
+            .list_val => |items| {
+                try std.testing.expectEqual(@as(usize, 3), items.len);
+                try std.testing.expectEqual(@as(i32, 1), items[0].asInt32().?);
+                try std.testing.expect(items[1].isNull());
+                try std.testing.expectEqual(@as(i32, 3), items[2].asInt32().?);
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
 
     // Row 1: null
-    try std.testing.expect(lists[1].isNull());
+    try std.testing.expect(rows[1].getColumn(0).?.isNull());
 
     // Row 2: [4, 5]
-    try std.testing.expect(!lists[2].isNull());
-    const row2 = lists[2].value;
-    try std.testing.expectEqual(@as(usize, 2), row2.len);
-    try std.testing.expectEqual(@as(i32, 4), row2[0].value);
-    try std.testing.expectEqual(@as(i32, 5), row2[1].value);
+    {
+        const list = rows[2].getColumn(0).?;
+        switch (list) {
+            .list_val => |items| {
+                try std.testing.expectEqual(@as(usize, 2), items.len);
+                try std.testing.expectEqual(@as(i32, 4), items[0].asInt32().?);
+                try std.testing.expectEqual(@as(i32, 5), items[1].asInt32().?);
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
 
     // Row 3: [] (empty list)
-    try std.testing.expect(!lists[3].isNull());
-    const row3 = lists[3].value;
-    try std.testing.expectEqual(@as(usize, 0), row3.len);
+    {
+        const list = rows[3].getColumn(0).?;
+        switch (list) {
+            .list_val => |items| {
+                try std.testing.expectEqual(@as(usize, 0), items.len);
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
 
     // Row 4: [null, null]
-    try std.testing.expect(!lists[4].isNull());
-    const row4 = lists[4].value;
-    try std.testing.expectEqual(@as(usize, 2), row4.len);
-    try std.testing.expect(row4[0].isNull());
-    try std.testing.expect(row4[1].isNull());
+    {
+        const list = rows[4].getColumn(0).?;
+        switch (list) {
+            .list_val => |items| {
+                try std.testing.expectEqual(@as(usize, 2), items.len);
+                try std.testing.expect(items[0].isNull());
+                try std.testing.expect(items[1].isNull());
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
 }
 
 // =============================================================================
@@ -160,29 +220,44 @@ test "write and read list of i32" {
 
     // Read it back
     try file.seekTo(0);
-    var reader = try parquet.openFile(allocator, file);
+    var reader = try parquet.openFileDynamic(allocator, file, .{});
     defer reader.deinit();
 
-    const read_lists = try reader.readListColumn(0, i32);
-    defer reader.freeListColumn(i32, read_lists);
+    const rows = try reader.readAllRows(0);
+    defer {
+        for (rows) |row| row.deinit();
+        allocator.free(rows);
+    }
 
     // Verify
-    try std.testing.expectEqual(@as(usize, 2), read_lists.len);
+    try std.testing.expectEqual(@as(usize, 2), rows.len);
 
     // Row 0: [1, 2, 3]
-    try std.testing.expect(!read_lists[0].isNull());
-    const row0 = read_lists[0].value;
-    try std.testing.expectEqual(@as(usize, 3), row0.len);
-    try std.testing.expectEqual(@as(i32, 1), row0[0].value);
-    try std.testing.expectEqual(@as(i32, 2), row0[1].value);
-    try std.testing.expectEqual(@as(i32, 3), row0[2].value);
+    {
+        const list = rows[0].getColumn(0).?;
+        switch (list) {
+            .list_val => |items| {
+                try std.testing.expectEqual(@as(usize, 3), items.len);
+                try std.testing.expectEqual(@as(i32, 1), items[0].asInt32().?);
+                try std.testing.expectEqual(@as(i32, 2), items[1].asInt32().?);
+                try std.testing.expectEqual(@as(i32, 3), items[2].asInt32().?);
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
 
     // Row 1: [4, 5]
-    try std.testing.expect(!read_lists[1].isNull());
-    const row1 = read_lists[1].value;
-    try std.testing.expectEqual(@as(usize, 2), row1.len);
-    try std.testing.expectEqual(@as(i32, 4), row1[0].value);
-    try std.testing.expectEqual(@as(i32, 5), row1[1].value);
+    {
+        const list = rows[1].getColumn(0).?;
+        switch (list) {
+            .list_val => |items| {
+                try std.testing.expectEqual(@as(usize, 2), items.len);
+                try std.testing.expectEqual(@as(i32, 4), items[0].asInt32().?);
+                try std.testing.expectEqual(@as(i32, 5), items[1].asInt32().?);
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
 }
 
 test "write and read list with null list" {
@@ -217,27 +292,44 @@ test "write and read list with null list" {
 
     // Read it back
     try file.seekTo(0);
-    var reader = try parquet.openFile(allocator, file);
+    var reader = try parquet.openFileDynamic(allocator, file, .{});
     defer reader.deinit();
 
-    const read_lists = try reader.readListColumn(0, i32);
-    defer reader.freeListColumn(i32, read_lists);
+    const rows = try reader.readAllRows(0);
+    defer {
+        for (rows) |row| row.deinit();
+        allocator.free(rows);
+    }
 
     // Verify
-    try std.testing.expectEqual(@as(usize, 3), read_lists.len);
+    try std.testing.expectEqual(@as(usize, 3), rows.len);
 
     // Row 0: [1]
-    try std.testing.expect(!read_lists[0].isNull());
-    try std.testing.expectEqual(@as(usize, 1), read_lists[0].value.len);
-    try std.testing.expectEqual(@as(i32, 1), read_lists[0].value[0].value);
+    {
+        const list = rows[0].getColumn(0).?;
+        switch (list) {
+            .list_val => |items| {
+                try std.testing.expectEqual(@as(usize, 1), items.len);
+                try std.testing.expectEqual(@as(i32, 1), items[0].asInt32().?);
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
 
     // Row 1: null
-    try std.testing.expect(read_lists[1].isNull());
+    try std.testing.expect(rows[1].getColumn(0).?.isNull());
 
     // Row 2: [2]
-    try std.testing.expect(!read_lists[2].isNull());
-    try std.testing.expectEqual(@as(usize, 1), read_lists[2].value.len);
-    try std.testing.expectEqual(@as(i32, 2), read_lists[2].value[0].value);
+    {
+        const list = rows[2].getColumn(0).?;
+        switch (list) {
+            .list_val => |items| {
+                try std.testing.expectEqual(@as(usize, 1), items.len);
+                try std.testing.expectEqual(@as(i32, 2), items[0].asInt32().?);
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
 }
 
 test "write and read list with empty list" {
@@ -273,26 +365,50 @@ test "write and read list with empty list" {
 
     // Read it back
     try file.seekTo(0);
-    var reader = try parquet.openFile(allocator, file);
+    var reader = try parquet.openFileDynamic(allocator, file, .{});
     defer reader.deinit();
 
-    const read_lists = try reader.readListColumn(0, i32);
-    defer reader.freeListColumn(i32, read_lists);
+    const rows = try reader.readAllRows(0);
+    defer {
+        for (rows) |row| row.deinit();
+        allocator.free(rows);
+    }
 
     // Verify
-    try std.testing.expectEqual(@as(usize, 3), read_lists.len);
+    try std.testing.expectEqual(@as(usize, 3), rows.len);
 
     // Row 0: [1]
-    try std.testing.expect(!read_lists[0].isNull());
-    try std.testing.expectEqual(@as(usize, 1), read_lists[0].value.len);
+    {
+        const list = rows[0].getColumn(0).?;
+        switch (list) {
+            .list_val => |items| {
+                try std.testing.expectEqual(@as(usize, 1), items.len);
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
 
     // Row 1: [] (empty)
-    try std.testing.expect(!read_lists[1].isNull());
-    try std.testing.expectEqual(@as(usize, 0), read_lists[1].value.len);
+    {
+        const list = rows[1].getColumn(0).?;
+        switch (list) {
+            .list_val => |items| {
+                try std.testing.expectEqual(@as(usize, 0), items.len);
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
 
     // Row 2: [2]
-    try std.testing.expect(!read_lists[2].isNull());
-    try std.testing.expectEqual(@as(usize, 1), read_lists[2].value.len);
+    {
+        const list = rows[2].getColumn(0).?;
+        switch (list) {
+            .list_val => |items| {
+                try std.testing.expectEqual(@as(usize, 1), items.len);
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
 }
 
 test "write and read list with null elements" {
@@ -324,20 +440,29 @@ test "write and read list with null elements" {
 
     // Read it back
     try file.seekTo(0);
-    var reader = try parquet.openFile(allocator, file);
+    var reader = try parquet.openFileDynamic(allocator, file, .{});
     defer reader.deinit();
 
-    const read_lists = try reader.readListColumn(0, i32);
-    defer reader.freeListColumn(i32, read_lists);
+    const rows = try reader.readAllRows(0);
+    defer {
+        for (rows) |row| row.deinit();
+        allocator.free(rows);
+    }
 
     // Verify
-    try std.testing.expectEqual(@as(usize, 1), read_lists.len);
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
 
     // Row 0: [1, null, 3]
-    try std.testing.expect(!read_lists[0].isNull());
-    const row0 = read_lists[0].value;
-    try std.testing.expectEqual(@as(usize, 3), row0.len);
-    try std.testing.expectEqual(@as(i32, 1), row0[0].value);
-    try std.testing.expect(row0[1].isNull());
-    try std.testing.expectEqual(@as(i32, 3), row0[2].value);
+    {
+        const list = rows[0].getColumn(0).?;
+        switch (list) {
+            .list_val => |items| {
+                try std.testing.expectEqual(@as(usize, 3), items.len);
+                try std.testing.expectEqual(@as(i32, 1), items[0].asInt32().?);
+                try std.testing.expect(items[1].isNull());
+                try std.testing.expectEqual(@as(i32, 3), items[2].asInt32().?);
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
 }

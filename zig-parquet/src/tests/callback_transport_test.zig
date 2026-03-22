@@ -181,22 +181,20 @@ test "callback round-trip: Writer -> Reader" {
         .size_fn = MemorySource.size,
     };
 
-    var reader = try parquet.Reader.initFromSeekable(allocator, cb_reader.reader());
+    var reader = try parquet.DynamicReader.initFromSeekable(allocator, cb_reader.reader(), .{});
     defer reader.deinit();
 
     try std.testing.expectEqual(@as(i64, 5), reader.metadata.num_rows);
 
-    const read_ids = try reader.readColumn(0, i32);
-    defer allocator.free(read_ids);
-    try std.testing.expectEqual(@as(usize, 5), read_ids.len);
-    for (read_ids, 0..) |opt_val, i| {
-        try std.testing.expectEqual(ids[i], opt_val.value);
+    const rows = try reader.readAllRows(0);
+    defer {
+        for (rows) |row| row.deinit();
+        allocator.free(rows);
     }
-
-    const read_values = try reader.readColumn(1, i64);
-    defer allocator.free(read_values);
-    for (read_values, 0..) |opt_val, i| {
-        try std.testing.expectEqual(values[i], opt_val.value);
+    try std.testing.expectEqual(@as(usize, 5), rows.len);
+    for (rows, 0..) |row, i| {
+        try std.testing.expectEqual(ids[i], row.getColumn(0).?.asInt32().?);
+        try std.testing.expectEqual(values[i], row.getColumn(1).?.asInt64().?);
     }
 }
 

@@ -94,7 +94,7 @@ fn testLowLevelWriter(allocator: std.mem.Allocator) ![]u8 {
 }
 
 fn testLowLevelReader(allocator: std.mem.Allocator, data: []const u8) !void {
-    var reader = try parquet.openBuffer(allocator, data);
+    var reader = try parquet.openBufferDynamic(allocator, data, .{});
     defer reader.deinit();
 
     assert(reader.metadata.num_rows == 3);

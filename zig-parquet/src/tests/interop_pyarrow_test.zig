@@ -6,8 +6,6 @@
 const std = @import("std");
 const parquet = @import("../lib.zig");
 const format = parquet.format;
-const Reader = parquet.Reader;
-const Writer = parquet.Writer;
 const Optional = parquet.Optional;
 const Interval = parquet.types.Interval;
 
@@ -33,7 +31,7 @@ test "PyArrow interop: read UUID" {
     };
     defer file.close();
 
-    var reader = try parquet.openFile(allocator, file);
+    var reader = try parquet.openFileDynamic(allocator, file, .{});
     defer reader.deinit();
 
     try std.testing.expectEqual(@as(i64, 5), reader.metadata.num_rows);
@@ -44,34 +42,29 @@ test "PyArrow interop: read UUID" {
     try std.testing.expectEqual(format.PhysicalType.fixed_len_byte_array, uuid_schema.type_.?);
     try std.testing.expectEqual(@as(?i32, 16), uuid_schema.type_length);
 
-    const values = try reader.readColumn(0, []const u8);
+    const rows = try reader.readAllRows(0);
     defer {
-        for (values) |v| {
-            switch (v) {
-                .value => |s| allocator.free(s),
-                .null_value => {},
-            }
-        }
-        allocator.free(values);
+        for (rows) |row| row.deinit();
+        allocator.free(rows);
     }
 
-    try std.testing.expectEqual(@as(usize, 5), values.len);
+    try std.testing.expectEqual(@as(usize, 5), rows.len);
 
     // UUID "12345678-1234-5678-1234-567812345678"
-    try std.testing.expectEqual(@as(usize, 16), values[0].value.len);
-    try std.testing.expectEqualSlices(u8, &.{ 0x12, 0x34, 0x56, 0x78, 0x12, 0x34, 0x56, 0x78, 0x12, 0x34, 0x56, 0x78, 0x12, 0x34, 0x56, 0x78 }, values[0].value);
+    try std.testing.expectEqual(@as(usize, 16), rows[0].getColumn(0).?.asBytes().?.len);
+    try std.testing.expectEqualSlices(u8, &.{ 0x12, 0x34, 0x56, 0x78, 0x12, 0x34, 0x56, 0x78, 0x12, 0x34, 0x56, 0x78, 0x12, 0x34, 0x56, 0x78 }, rows[0].getColumn(0).?.asBytes().?);
 
     // UUID "00000000-0000-0000-0000-000000000000"
-    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 16), values[1].value);
+    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 16), rows[1].getColumn(0).?.asBytes().?);
 
     // UUID "ffffffff-ffff-ffff-ffff-ffffffffffff"
-    try std.testing.expectEqualSlices(u8, &([_]u8{0xff} ** 16), values[2].value);
+    try std.testing.expectEqualSlices(u8, &([_]u8{0xff} ** 16), rows[2].getColumn(0).?.asBytes().?);
 
     // null
-    try std.testing.expect(values[3].isNull());
+    try std.testing.expect(rows[3].getColumn(0).?.isNull());
 
     // UUID "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
-    try std.testing.expectEqualSlices(u8, &.{ 0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6, 0x78, 0x90, 0xab, 0xcd, 0xef, 0x12, 0x34, 0x56, 0x78, 0x90 }, values[4].value);
+    try std.testing.expectEqualSlices(u8, &.{ 0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6, 0x78, 0x90, 0xab, 0xcd, 0xef, 0x12, 0x34, 0x56, 0x78, 0x90 }, rows[4].getColumn(0).?.asBytes().?);
 }
 
 test "PyArrow interop: read ENUM" {
@@ -83,29 +76,24 @@ test "PyArrow interop: read ENUM" {
     };
     defer file.close();
 
-    var reader = try parquet.openFile(allocator, file);
+    var reader = try parquet.openFileDynamic(allocator, file, .{});
     defer reader.deinit();
 
     try std.testing.expectEqual(@as(i64, 5), reader.metadata.num_rows);
 
     // Read first column (dictionary-encoded strings)
-    const values = try reader.readColumn(0, []const u8);
+    const rows = try reader.readAllRows(0);
     defer {
-        for (values) |v| {
-            switch (v) {
-                .value => |s| allocator.free(s),
-                .null_value => {},
-            }
-        }
-        allocator.free(values);
+        for (rows) |row| row.deinit();
+        allocator.free(rows);
     }
 
-    try std.testing.expectEqual(@as(usize, 5), values.len);
-    try std.testing.expectEqualStrings("RED", values[0].value);
-    try std.testing.expectEqualStrings("GREEN", values[1].value);
-    try std.testing.expectEqualStrings("BLUE", values[2].value);
-    try std.testing.expect(values[3].isNull());
-    try std.testing.expectEqualStrings("RED", values[4].value);
+    try std.testing.expectEqual(@as(usize, 5), rows.len);
+    try std.testing.expectEqualStrings("RED", rows[0].getColumn(0).?.asBytes().?);
+    try std.testing.expectEqualStrings("GREEN", rows[1].getColumn(0).?.asBytes().?);
+    try std.testing.expectEqualStrings("BLUE", rows[2].getColumn(0).?.asBytes().?);
+    try std.testing.expect(rows[3].getColumn(0).?.isNull());
+    try std.testing.expectEqualStrings("RED", rows[4].getColumn(0).?.asBytes().?);
 }
 
 test "PyArrow interop: read INT96 timestamp" {

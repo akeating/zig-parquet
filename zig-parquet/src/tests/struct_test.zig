@@ -5,9 +5,6 @@
 const std = @import("std");
 const parquet = @import("../lib.zig");
 
-const Reader = parquet.Reader;
-const Optional = parquet.Optional;
-
 // =============================================================================
 // Read Tests
 // =============================================================================
@@ -22,7 +19,7 @@ test "read struct_simple.parquet" {
     };
     defer file.close();
 
-    var reader = try parquet.openFile(allocator, file);
+    var reader = try parquet.openFileDynamic(allocator, file, .{});
     defer reader.deinit();
 
     // Verify schema
@@ -30,25 +27,12 @@ test "read struct_simple.parquet" {
     try std.testing.expect(schema.len > 0);
 
     // Schema should be: point (struct with x, y, name)
-    // Physical columns: point.x (0), point.y (1), point.name (2)
+    // Top-level column 0: point
 
-    // Read column 0: point.x (i32)
-    const col_x = try reader.readColumn(0, i32);
-    defer allocator.free(col_x);
-
-    // Read column 1: point.y (i32)
-    const col_y = try reader.readColumn(1, i32);
-    defer allocator.free(col_y);
-
-    // Read column 2: point.name (string)
-    const col_name = try reader.readColumn(2, []const u8);
+    const rows = try reader.readAllRows(0);
     defer {
-        for (col_name) |opt| {
-            if (!opt.isNull()) {
-                allocator.free(opt.value);
-            }
-        }
-        allocator.free(col_name);
+        for (rows) |row| row.deinit();
+        allocator.free(rows);
     }
 
     // Expected data from generate.py:
@@ -58,45 +42,39 @@ test "read struct_simple.parquet" {
     // Row 3: {x: 5, y: 6, name: "C"}
     // Row 4: {x: 7, y: 8, name: null} (null field)
 
-    try std.testing.expectEqual(@as(usize, 5), col_x.len);
-    try std.testing.expectEqual(@as(usize, 5), col_y.len);
-    try std.testing.expectEqual(@as(usize, 5), col_name.len);
+    try std.testing.expectEqual(@as(usize, 5), rows.len);
 
     // Row 0: {x: 1, y: 2, name: "A"}
-    try std.testing.expect(!col_x[0].isNull());
-    try std.testing.expectEqual(@as(i32, 1), col_x[0].value);
-    try std.testing.expect(!col_y[0].isNull());
-    try std.testing.expectEqual(@as(i32, 2), col_y[0].value);
-    try std.testing.expect(!col_name[0].isNull());
-    try std.testing.expectEqualStrings("A", col_name[0].value);
+    const point0 = rows[0].getColumn(0).?;
+    try std.testing.expect(!point0.isNull());
+    try std.testing.expectEqual(@as(i32, 1), point0.getField("x").?.asInt32().?);
+    try std.testing.expectEqual(@as(i32, 2), point0.getField("y").?.asInt32().?);
+    try std.testing.expectEqualStrings("A", point0.getField("name").?.asBytes().?);
 
     // Row 1: {x: 3, y: 4, name: "B"}
-    try std.testing.expect(!col_x[1].isNull());
-    try std.testing.expectEqual(@as(i32, 3), col_x[1].value);
-    try std.testing.expect(!col_y[1].isNull());
-    try std.testing.expectEqual(@as(i32, 4), col_y[1].value);
-    try std.testing.expect(!col_name[1].isNull());
-    try std.testing.expectEqualStrings("B", col_name[1].value);
+    const point1 = rows[1].getColumn(0).?;
+    try std.testing.expect(!point1.isNull());
+    try std.testing.expectEqual(@as(i32, 3), point1.getField("x").?.asInt32().?);
+    try std.testing.expectEqual(@as(i32, 4), point1.getField("y").?.asInt32().?);
+    try std.testing.expectEqualStrings("B", point1.getField("name").?.asBytes().?);
 
     // Row 2: null (entire struct is null - all fields should be null)
-    try std.testing.expect(col_x[2].isNull());
-    try std.testing.expect(col_y[2].isNull());
-    try std.testing.expect(col_name[2].isNull());
+    const point2 = rows[2].getColumn(0).?;
+    try std.testing.expect(point2.isNull());
 
     // Row 3: {x: 5, y: 6, name: "C"}
-    try std.testing.expect(!col_x[3].isNull());
-    try std.testing.expectEqual(@as(i32, 5), col_x[3].value);
-    try std.testing.expect(!col_y[3].isNull());
-    try std.testing.expectEqual(@as(i32, 6), col_y[3].value);
-    try std.testing.expect(!col_name[3].isNull());
-    try std.testing.expectEqualStrings("C", col_name[3].value);
+    const point3 = rows[3].getColumn(0).?;
+    try std.testing.expect(!point3.isNull());
+    try std.testing.expectEqual(@as(i32, 5), point3.getField("x").?.asInt32().?);
+    try std.testing.expectEqual(@as(i32, 6), point3.getField("y").?.asInt32().?);
+    try std.testing.expectEqualStrings("C", point3.getField("name").?.asBytes().?);
 
     // Row 4: {x: 7, y: 8, name: null}
-    try std.testing.expect(!col_x[4].isNull());
-    try std.testing.expectEqual(@as(i32, 7), col_x[4].value);
-    try std.testing.expect(!col_y[4].isNull());
-    try std.testing.expectEqual(@as(i32, 8), col_y[4].value);
-    try std.testing.expect(col_name[4].isNull()); // null field
+    const point4 = rows[4].getColumn(0).?;
+    try std.testing.expect(!point4.isNull());
+    try std.testing.expectEqual(@as(i32, 7), point4.getField("x").?.asInt32().?);
+    try std.testing.expectEqual(@as(i32, 8), point4.getField("y").?.asInt32().?);
+    try std.testing.expect(point4.getField("name").?.isNull()); // null field
 }
 
 test "read struct_nested.parquet" {
@@ -109,40 +87,16 @@ test "read struct_nested.parquet" {
     };
     defer file.close();
 
-    var reader = try parquet.openFile(allocator, file);
+    var reader = try parquet.openFileDynamic(allocator, file, .{});
     defer reader.deinit();
 
     // Schema: nested (struct with inner (struct with a, b), value (string))
-    // Physical columns: nested.inner.a (0), nested.inner.b (1), nested.value (2)
-    //
-    // For nested.inner.a/b: max_def_level = 3
-    //   def=0: nested is null
-    //   def=1: nested.inner is null
-    //   def=2: inner is present but field is null
-    //   def=3: field is present
-    //
-    // For nested.value: max_def_level = 2
-    //   def=0: nested is null
-    //   def=1: nested.value is null
-    //   def=2: value is present
+    // Top-level column 0: nested
 
-    // Read column 0: nested.inner.a (i32)
-    const col_a = try reader.readColumn(0, i32);
-    defer allocator.free(col_a);
-
-    // Read column 1: nested.inner.b (i32)
-    const col_b = try reader.readColumn(1, i32);
-    defer allocator.free(col_b);
-
-    // Read column 2: nested.value (string)
-    const col_value = try reader.readColumn(2, []const u8);
+    const rows = try reader.readAllRows(0);
     defer {
-        for (col_value) |opt| {
-            if (!opt.isNull()) {
-                allocator.free(opt.value);
-            }
-        }
-        allocator.free(col_value);
+        for (rows) |row| row.deinit();
+        allocator.free(rows);
     }
 
     // Expected data from generate.py:
@@ -152,43 +106,44 @@ test "read struct_nested.parquet" {
     // Row 3: null (entire struct is null)
     // Row 4: {inner: {a: 5, b: 6}, value: null}
 
-    try std.testing.expectEqual(@as(usize, 5), col_a.len);
-    try std.testing.expectEqual(@as(usize, 5), col_b.len);
-    try std.testing.expectEqual(@as(usize, 5), col_value.len);
+    try std.testing.expectEqual(@as(usize, 5), rows.len);
 
     // Row 0: {inner: {a: 1, b: 2}, value: "first"}
-    try std.testing.expect(!col_a[0].isNull());
-    try std.testing.expectEqual(@as(i32, 1), col_a[0].value);
-    try std.testing.expect(!col_b[0].isNull());
-    try std.testing.expectEqual(@as(i32, 2), col_b[0].value);
-    try std.testing.expect(!col_value[0].isNull());
-    try std.testing.expectEqualStrings("first", col_value[0].value);
+    const nested0 = rows[0].getColumn(0).?;
+    try std.testing.expect(!nested0.isNull());
+    const inner0 = nested0.getField("inner").?;
+    try std.testing.expect(!inner0.isNull());
+    try std.testing.expectEqual(@as(i32, 1), inner0.getField("a").?.asInt32().?);
+    try std.testing.expectEqual(@as(i32, 2), inner0.getField("b").?.asInt32().?);
+    try std.testing.expectEqualStrings("first", nested0.getField("value").?.asBytes().?);
 
     // Row 1: {inner: {a: 3, b: 4}, value: "second"}
-    try std.testing.expect(!col_a[1].isNull());
-    try std.testing.expectEqual(@as(i32, 3), col_a[1].value);
-    try std.testing.expect(!col_b[1].isNull());
-    try std.testing.expectEqual(@as(i32, 4), col_b[1].value);
-    try std.testing.expect(!col_value[1].isNull());
-    try std.testing.expectEqualStrings("second", col_value[1].value);
+    const nested1 = rows[1].getColumn(0).?;
+    try std.testing.expect(!nested1.isNull());
+    const inner1 = nested1.getField("inner").?;
+    try std.testing.expect(!inner1.isNull());
+    try std.testing.expectEqual(@as(i32, 3), inner1.getField("a").?.asInt32().?);
+    try std.testing.expectEqual(@as(i32, 4), inner1.getField("b").?.asInt32().?);
+    try std.testing.expectEqualStrings("second", nested1.getField("value").?.asBytes().?);
 
     // Row 2: {inner: null, value: "null_inner"} - inner struct is null
-    try std.testing.expect(col_a[2].isNull()); // inner is null, so a is null
-    try std.testing.expect(col_b[2].isNull()); // inner is null, so b is null
-    try std.testing.expect(!col_value[2].isNull());
-    try std.testing.expectEqualStrings("null_inner", col_value[2].value);
+    const nested2 = rows[2].getColumn(0).?;
+    try std.testing.expect(!nested2.isNull());
+    try std.testing.expect(nested2.getField("inner").?.isNull());
+    try std.testing.expectEqualStrings("null_inner", nested2.getField("value").?.asBytes().?);
 
     // Row 3: null (entire nested struct is null)
-    try std.testing.expect(col_a[3].isNull());
-    try std.testing.expect(col_b[3].isNull());
-    try std.testing.expect(col_value[3].isNull());
+    const nested3 = rows[3].getColumn(0).?;
+    try std.testing.expect(nested3.isNull());
 
     // Row 4: {inner: {a: 5, b: 6}, value: null}
-    try std.testing.expect(!col_a[4].isNull());
-    try std.testing.expectEqual(@as(i32, 5), col_a[4].value);
-    try std.testing.expect(!col_b[4].isNull());
-    try std.testing.expectEqual(@as(i32, 6), col_b[4].value);
-    try std.testing.expect(col_value[4].isNull()); // null field
+    const nested4 = rows[4].getColumn(0).?;
+    try std.testing.expect(!nested4.isNull());
+    const inner4 = nested4.getField("inner").?;
+    try std.testing.expect(!inner4.isNull());
+    try std.testing.expectEqual(@as(i32, 5), inner4.getField("a").?.asInt32().?);
+    try std.testing.expectEqual(@as(i32, 6), inner4.getField("b").?.asInt32().?);
+    try std.testing.expect(nested4.getField("value").?.isNull()); // null field
 }
 
 // =============================================================================
@@ -241,41 +196,37 @@ test "write and read simple struct" {
         const file = try tmp_dir.dir.openFile(file_path, .{});
         defer file.close();
 
-        var reader = try parquet.openFile(allocator, file);
+        var reader = try parquet.openFileDynamic(allocator, file, .{});
         defer reader.deinit();
 
-        // Read x column
-        const col_x = try reader.readColumn(0, i32);
-        defer allocator.free(col_x);
+        const rows = try reader.readAllRows(0);
+        defer {
+            for (rows) |row| row.deinit();
+            allocator.free(rows);
+        }
 
-        // Read y column
-        const col_y = try reader.readColumn(1, i32);
-        defer allocator.free(col_y);
-
-        try std.testing.expectEqual(@as(usize, 4), col_x.len);
-        try std.testing.expectEqual(@as(usize, 4), col_y.len);
+        try std.testing.expectEqual(@as(usize, 4), rows.len);
 
         // Row 0: {x: 1, y: 2}
-        try std.testing.expect(!col_x[0].isNull());
-        try std.testing.expectEqual(@as(i32, 1), col_x[0].value);
-        try std.testing.expect(!col_y[0].isNull());
-        try std.testing.expectEqual(@as(i32, 2), col_y[0].value);
+        const point0 = rows[0].getColumn(0).?;
+        try std.testing.expect(!point0.isNull());
+        try std.testing.expectEqual(@as(i32, 1), point0.getField("x").?.asInt32().?);
+        try std.testing.expectEqual(@as(i32, 2), point0.getField("y").?.asInt32().?);
 
         // Row 1: {x: 3, y: 4}
-        try std.testing.expect(!col_x[1].isNull());
-        try std.testing.expectEqual(@as(i32, 3), col_x[1].value);
-        try std.testing.expect(!col_y[1].isNull());
-        try std.testing.expectEqual(@as(i32, 4), col_y[1].value);
+        const point1 = rows[1].getColumn(0).?;
+        try std.testing.expect(!point1.isNull());
+        try std.testing.expectEqual(@as(i32, 3), point1.getField("x").?.asInt32().?);
+        try std.testing.expectEqual(@as(i32, 4), point1.getField("y").?.asInt32().?);
 
         // Row 2: null struct
-        try std.testing.expect(col_x[2].isNull());
-        try std.testing.expect(col_y[2].isNull());
+        try std.testing.expect(rows[2].getColumn(0).?.isNull());
 
         // Row 3: {x: 5, y: 6}
-        try std.testing.expect(!col_x[3].isNull());
-        try std.testing.expectEqual(@as(i32, 5), col_x[3].value);
-        try std.testing.expect(!col_y[3].isNull());
-        try std.testing.expectEqual(@as(i32, 6), col_y[3].value);
+        const point3 = rows[3].getColumn(0).?;
+        try std.testing.expect(!point3.isNull());
+        try std.testing.expectEqual(@as(i32, 5), point3.getField("x").?.asInt32().?);
+        try std.testing.expectEqual(@as(i32, 6), point3.getField("y").?.asInt32().?);
     }
 }
 
@@ -321,36 +272,40 @@ test "write and read struct with null fields" {
         const file = try tmp_dir.dir.openFile(file_path, .{});
         defer file.close();
 
-        var reader = try parquet.openFile(allocator, file);
+        var reader = try parquet.openFileDynamic(allocator, file, .{});
         defer reader.deinit();
 
-        const col_a = try reader.readColumn(0, i32);
-        defer allocator.free(col_a);
+        const rows = try reader.readAllRows(0);
+        defer {
+            for (rows) |row| row.deinit();
+            allocator.free(rows);
+        }
 
-        const col_b = try reader.readColumn(1, i32);
-        defer allocator.free(col_b);
-
-        try std.testing.expectEqual(@as(usize, 4), col_a.len);
+        try std.testing.expectEqual(@as(usize, 4), rows.len);
 
         // Row 0: {a: 1, b: 2}
-        try std.testing.expect(!col_a[0].isNull());
-        try std.testing.expectEqual(@as(i32, 1), col_a[0].value);
-        try std.testing.expect(!col_b[0].isNull());
-        try std.testing.expectEqual(@as(i32, 2), col_b[0].value);
+        const data0 = rows[0].getColumn(0).?;
+        try std.testing.expect(!data0.getField("a").?.isNull());
+        try std.testing.expectEqual(@as(i32, 1), data0.getField("a").?.asInt32().?);
+        try std.testing.expect(!data0.getField("b").?.isNull());
+        try std.testing.expectEqual(@as(i32, 2), data0.getField("b").?.asInt32().?);
 
         // Row 1: {a: 3, b: null}
-        try std.testing.expect(!col_a[1].isNull());
-        try std.testing.expectEqual(@as(i32, 3), col_a[1].value);
-        try std.testing.expect(col_b[1].isNull());
+        const data1 = rows[1].getColumn(0).?;
+        try std.testing.expect(!data1.getField("a").?.isNull());
+        try std.testing.expectEqual(@as(i32, 3), data1.getField("a").?.asInt32().?);
+        try std.testing.expect(data1.getField("b").?.isNull());
 
         // Row 2: {a: null, b: 4}
-        try std.testing.expect(col_a[2].isNull());
-        try std.testing.expect(!col_b[2].isNull());
-        try std.testing.expectEqual(@as(i32, 4), col_b[2].value);
+        const data2 = rows[2].getColumn(0).?;
+        try std.testing.expect(data2.getField("a").?.isNull());
+        try std.testing.expect(!data2.getField("b").?.isNull());
+        try std.testing.expectEqual(@as(i32, 4), data2.getField("b").?.asInt32().?);
 
         // Row 3: {a: null, b: null}
-        try std.testing.expect(col_a[3].isNull());
-        try std.testing.expect(col_b[3].isNull());
+        const data3 = rows[3].getColumn(0).?;
+        try std.testing.expect(data3.getField("a").?.isNull());
+        try std.testing.expect(data3.getField("b").?.isNull());
     }
 }
 
@@ -395,37 +350,31 @@ test "write and read struct with string field" {
         const file = try tmp_dir.dir.openFile(file_path, .{});
         defer file.close();
 
-        var reader = try parquet.openFile(allocator, file);
+        var reader = try parquet.openFileDynamic(allocator, file, .{});
         defer reader.deinit();
 
-        const col_id = try reader.readColumn(0, i32);
-        defer allocator.free(col_id);
-
-        const col_name = try reader.readColumn(1, []const u8);
+        const rows = try reader.readAllRows(0);
         defer {
-            for (col_name) |opt| {
-                if (!opt.isNull()) {
-                    allocator.free(opt.value);
-                }
-            }
-            allocator.free(col_name);
+            for (rows) |row| row.deinit();
+            allocator.free(rows);
         }
 
-        try std.testing.expectEqual(@as(usize, 3), col_id.len);
+        try std.testing.expectEqual(@as(usize, 3), rows.len);
 
         // Row 0: {id: 1, name: "Alice"}
-        try std.testing.expect(!col_id[0].isNull());
-        try std.testing.expectEqual(@as(i32, 1), col_id[0].value);
-        try std.testing.expect(!col_name[0].isNull());
-        try std.testing.expectEqualStrings("Alice", col_name[0].value);
+        const person0 = rows[0].getColumn(0).?;
+        try std.testing.expect(!person0.getField("id").?.isNull());
+        try std.testing.expectEqual(@as(i32, 1), person0.getField("id").?.asInt32().?);
+        try std.testing.expect(!person0.getField("name").?.isNull());
+        try std.testing.expectEqualStrings("Alice", person0.getField("name").?.asBytes().?);
 
         // Row 1: null struct
-        try std.testing.expect(col_id[1].isNull());
-        try std.testing.expect(col_name[1].isNull());
+        try std.testing.expect(rows[1].getColumn(0).?.isNull());
 
         // Row 2: {id: 2, name: null}
-        try std.testing.expect(!col_id[2].isNull());
-        try std.testing.expectEqual(@as(i32, 2), col_id[2].value);
-        try std.testing.expect(col_name[2].isNull());
+        const person2 = rows[2].getColumn(0).?;
+        try std.testing.expect(!person2.getField("id").?.isNull());
+        try std.testing.expectEqual(@as(i32, 2), person2.getField("id").?.asInt32().?);
+        try std.testing.expect(person2.getField("name").?.isNull());
     }
 }

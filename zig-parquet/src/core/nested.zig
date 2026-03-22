@@ -385,8 +385,9 @@ fn assembleRecursive(
             }
 
             const def = col.def_levels[pos];
-            if (def <= def_threshold) {
-                // Null list
+            if (def < def_threshold) {
+                // Null list (for required lists this never triggers; for optional
+                // lists the .optional wrapper handles null before reaching here)
                 consumeNullFromLeaves(element, ctx);
                 return .{ .null_val = {} };
             }

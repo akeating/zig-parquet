@@ -7,6 +7,7 @@
 const std = @import("std");
 const parquet = @import("parquet");
 const helpers = @import("../helpers.zig");
+const cat = @import("cat.zig");
 
 pub fn run(allocator: std.mem.Allocator, file_path: []const u8, column_names: []const []const u8) !void {
     var stdout_buf: [8192]u8 = undefined;
@@ -24,7 +25,7 @@ pub fn run(allocator: std.mem.Allocator, file_path: []const u8, column_names: []
     };
     defer file.close();
 
-    var reader = parquet.openFile(allocator, file) catch |err| {
+    var reader = parquet.openFileDynamic(allocator, file, .{}) catch |err| {
         try stderr.print("Error: Cannot read parquet file: {}\n", .{err});
         try stderr.flush();
         std.process.exit(1);
@@ -57,12 +58,12 @@ pub fn run(allocator: std.mem.Allocator, file_path: []const u8, column_names: []
 
 fn printAllColumnsSummary(
     stdout: *std.Io.Writer,
-    reader: *parquet.Reader,
+    reader: *parquet.DynamicReader,
     schema: []const parquet.format.SchemaElement,
     num_columns: usize,
     allocator: std.mem.Allocator,
 ) !void {
-    const col_names = reader.getColumnNames(allocator) catch &.{};
+    const col_names = cat.getTopLevelColumnNames(allocator, reader.getSchema()) catch &.{};
     defer allocator.free(col_names);
 
     var logical_type_buf: [64]u8 = undefined;
@@ -119,12 +120,12 @@ fn printAllColumnsSummary(
 
 fn printColumnDetail(
     stdout: *std.Io.Writer,
-    reader: *parquet.Reader,
+    reader: *parquet.DynamicReader,
     schema: []const parquet.format.SchemaElement,
     col_idx: usize,
     allocator: std.mem.Allocator,
 ) !void {
-    const col_names = reader.getColumnNames(allocator) catch &.{};
+    const col_names = cat.getTopLevelColumnNames(allocator, reader.getSchema()) catch &.{};
     defer allocator.free(col_names);
 
     const elem = helpers.getLeafElement(schema, col_idx) orelse return;

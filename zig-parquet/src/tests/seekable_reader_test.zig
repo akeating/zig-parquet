@@ -285,19 +285,21 @@ test "Reader.initFromBuffer reads real Parquet file" {
     );
     defer allocator.free(file_data);
 
-    // Initialize Reader from buffer
-    var reader = try parquet.openBuffer(allocator, file_data);
+    var reader = try parquet.openBufferDynamic(allocator, file_data, .{});
     defer reader.deinit();
 
     // Verify we can read metadata
     try std.testing.expect(reader.metadata.num_rows > 0);
     try std.testing.expect(reader.metadata.schema.len > 0);
 
-    // Read int32 column (column 1)
-    const col = try reader.readColumn(1, i32);
-    defer allocator.free(col);
+    // Read rows and check int32 column (column 1)
+    const rows = try reader.readAllRows(0);
+    defer {
+        for (rows) |row| row.deinit();
+        allocator.free(rows);
+    }
 
-    try std.testing.expect(col.len > 0);
+    try std.testing.expect(rows.len > 0);
 }
 
 test "Reader.initFromBuffer matches file-based reading" {
@@ -311,31 +313,40 @@ test "Reader.initFromBuffer matches file-based reading" {
     defer allocator.free(file_data);
 
     // Initialize from buffer
-    var buf_reader = try parquet.openBuffer(allocator, file_data);
-    defer buf_reader.deinit();
+    var buf_reader_inst = try parquet.openBufferDynamic(allocator, file_data, .{});
+    defer buf_reader_inst.deinit();
 
     // Initialize from file
     const file = try std.fs.cwd().openFile(file_path, .{});
     defer file.close();
-    var file_reader = try parquet.openFile(allocator, file);
-    defer file_reader.deinit();
+    var file_reader_inst = try parquet.openFileDynamic(allocator, file, .{});
+    defer file_reader_inst.deinit();
 
     // Metadata should match
-    try std.testing.expectEqual(buf_reader.metadata.num_rows, file_reader.metadata.num_rows);
-    try std.testing.expectEqual(buf_reader.metadata.schema.len, file_reader.metadata.schema.len);
+    try std.testing.expectEqual(buf_reader_inst.metadata.num_rows, file_reader_inst.metadata.num_rows);
+    try std.testing.expectEqual(buf_reader_inst.metadata.schema.len, file_reader_inst.metadata.schema.len);
 
     // Column data should match (using int32 column at index 1)
-    const buf_col = try buf_reader.readColumn(1, i32);
-    defer allocator.free(buf_col);
+    const buf_rows = try buf_reader_inst.readAllRows(0);
+    defer {
+        for (buf_rows) |row| row.deinit();
+        allocator.free(buf_rows);
+    }
 
-    const file_col = try file_reader.readColumn(1, i32);
-    defer allocator.free(file_col);
+    const file_rows = try file_reader_inst.readAllRows(0);
+    defer {
+        for (file_rows) |row| row.deinit();
+        allocator.free(file_rows);
+    }
 
-    try std.testing.expectEqual(buf_col.len, file_col.len);
-    for (buf_col, file_col) |bv, fv| {
-        switch (bv) {
-            .value => |b| try std.testing.expectEqual(b, fv.value),
-            .null_value => try std.testing.expect(fv == .null_value),
+    try std.testing.expectEqual(buf_rows.len, file_rows.len);
+    for (buf_rows, file_rows) |br, fr| {
+        const bv = br.getColumn(1).?;
+        const fv = fr.getColumn(1).?;
+        if (bv.isNull()) {
+            try std.testing.expect(fv.isNull());
+        } else {
+            try std.testing.expectEqual(bv.asInt32().?, fv.asInt32().?);
         }
     }
 }
@@ -407,18 +418,20 @@ test "Reader.initFromBuffer with compressed file" {
     );
     defer allocator.free(file_data);
 
-    // Initialize Reader from buffer
-    var reader = try parquet.openBuffer(allocator, file_data);
+    var reader = try parquet.openBufferDynamic(allocator, file_data, .{});
     defer reader.deinit();
 
     // Verify we can read metadata and data
     try std.testing.expect(reader.metadata.num_rows > 0);
 
-    // Read sequence column (i64)
-    const col = try reader.readColumn(1, i64);
-    defer allocator.free(col);
+    // Read rows and check sequence column (i64)
+    const rows = try reader.readAllRows(0);
+    defer {
+        for (rows) |row| row.deinit();
+        allocator.free(rows);
+    }
 
-    try std.testing.expect(col.len > 0);
+    try std.testing.expect(rows.len > 0);
 }
 
 // =============================================================================
@@ -471,26 +484,23 @@ test "Writer round-trip buffer" {
     const buffer = try writer.toOwnedSlice();
     defer allocator.free(buffer);
 
-    // Read it back using Reader.initFromBuffer
-    var reader = try parquet.openBuffer(allocator, buffer);
+    // Read it back using DynamicReader
+    var reader = try parquet.openBufferDynamic(allocator, buffer, .{});
     defer reader.deinit();
 
     // Verify metadata
     try std.testing.expectEqual(@as(i64, 5), reader.metadata.num_rows);
 
     // Read and verify columns
-    const read_ids = try reader.readColumn(0, i32);
-    defer allocator.free(read_ids);
-    try std.testing.expectEqual(@as(usize, 5), read_ids.len);
-    for (read_ids, 0..) |opt_val, i| {
-        try std.testing.expectEqual(ids[i], opt_val.value);
+    const rows = try reader.readAllRows(0);
+    defer {
+        for (rows) |row| row.deinit();
+        allocator.free(rows);
     }
-
-    const read_values = try reader.readColumn(1, i64);
-    defer allocator.free(read_values);
-    try std.testing.expectEqual(@as(usize, 5), read_values.len);
-    for (read_values, 0..) |opt_val, i| {
-        try std.testing.expectEqual(values[i], opt_val.value);
+    try std.testing.expectEqual(@as(usize, 5), rows.len);
+    for (rows, 0..) |row, i| {
+        try std.testing.expectEqual(ids[i], row.getColumn(0).?.asInt32().?);
+        try std.testing.expectEqual(values[i], row.getColumn(1).?.asInt64().?);
     }
 }
 

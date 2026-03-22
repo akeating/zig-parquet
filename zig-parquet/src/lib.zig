@@ -6,25 +6,29 @@
 //! ```zig
 //! const parquet = @import("parquet");
 //!
-//! var reader = try parquet.openFile(allocator, file);
+//! var reader = try parquet.openFileDynamic(allocator, file, .{});
 //! defer reader.deinit();
 //!
-//! const values = try reader.readColumn(0, i32);
-//! defer allocator.free(values);
+//! var iter = reader.rowIterator();
+//! defer iter.deinit();
+//!
+//! while (try iter.next()) |row| {
+//!     const id = if (row.getColumn(0)) |v| v.asInt32() orelse 0 else 0;
+//!     std.debug.print("id={}\n", .{id});
+//! }
 //! ```
 //!
 //! ## Writing Example
 //! ```zig
 //! const parquet = @import("parquet");
 //!
-//! var writer = try parquet.writeToFile(allocator, file, &.{
-//!     .{ .name = "id", .type_ = .int64, .optional = true },
-//! });
+//! var writer = try parquet.createFileDynamic(allocator, file);
 //! defer writer.deinit();
 //!
-//! try writer.writeColumnOptional(i64, 0, &[_]parquet.Optional(i64){
-//!     .{ .value = 1 }, .{ .value = 2 }, .{ .null_value = {} },
-//! });
+//! try writer.addColumn("id", parquet.TypeInfo.int64, .{});
+//! try writer.begin();
+//! try writer.setInt64(0, 1);
+//! try writer.addRow();
 //! try writer.close();
 //! ```
 
@@ -39,22 +43,19 @@ const is_wasm = builtin.cpu.arch == .wasm32 or builtin.cpu.arch == .wasm64;
 // Convenience constructors: the simplest way to read/write Parquet.
 //
 //   Reading:
-//     parquet.openFile(allocator, file)                        -> Reader
-//     parquet.openBuffer(allocator, data)                      -> Reader
 //     parquet.openFileDynamic(allocator, file, opts)           -> DynamicReader
 //     parquet.openBufferDynamic(allocator, data, opts)         -> DynamicReader
 //
 //   Writing:
-//     parquet.writeToFile(allocator, file, columns)            -> Writer
-//     parquet.writeToBuffer(allocator, columns)                -> Writer
 //     parquet.createFileDynamic(allocator, file)               -> DynamicWriter
 //     parquet.createBufferDynamic(allocator)                   -> DynamicWriter
+//     parquet.writeToFile(allocator, file, columns)            -> Writer (column API)
+//     parquet.writeToBuffer(allocator, columns)                -> Writer (column API)
 //
 // Advanced — transport-neutral constructors on core types:
-//     Reader.initFromSeekable(allocator, seekable)
-//     Writer.initWithTarget(allocator, target, columns)
-//     DynamicWriter.init(allocator, target)
 //     DynamicReader.initFromSeekable(allocator, seekable, opts)
+//     DynamicWriter.init(allocator, target)
+//     Writer.initWithTarget(allocator, target, columns)
 //
 // Internals — low-level codec/encoding/format access:
 //     parquet.internals.*
@@ -88,14 +89,6 @@ pub const exportSchemaAsArrow = arrow_batch.exportSchemaAsArrow;
 pub const importSchemaFromArrow = arrow_batch.importSchemaFromArrow;
 pub const readRowGroupAsArrow = arrow_batch.readRowGroupAsArrow;
 pub const writeRowGroupFromArrow = arrow_batch.writeRowGroupFromArrow;
-
-// Reader (core type)
-const reader_mod = @import("core/reader.zig");
-pub const Reader = reader_mod.Reader;
-pub const ListColumn = reader_mod.ListColumn;
-pub const MapColumn = reader_mod.MapColumn;
-pub const ColumnMapEntry = reader_mod.MapEntry;
-pub const MapEntry = types.MapEntry;
 
 // Writer (core type)
 const writer_mod = @import("core/writer.zig");
@@ -149,8 +142,6 @@ pub const io = struct {
 const api_reader = @import("api/zig/reader.zig");
 const api_writer = @import("api/zig/writer.zig");
 
-pub const openFile = api_reader.openFile;
-pub const openBuffer = api_reader.openBuffer;
 pub const openFileDynamic = api_reader.openFileDynamic;
 pub const openBufferDynamic = api_reader.openBufferDynamic;
 pub const writeToFile = api_writer.writeToFile;
@@ -680,7 +671,6 @@ test {
     _ = internals.encoding.delta_binary_packed_encoder;
     _ = internals.encoding.delta_length_byte_array_encoder;
     _ = internals.encoding.delta_byte_array_encoder;
-    _ = @import("core/reader.zig");
     _ = internals.reader;
     _ = internals.reader.seekable_reader;
     _ = @import("core/writer.zig");
