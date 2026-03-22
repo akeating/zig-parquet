@@ -90,10 +90,8 @@ pub fn flattenMap(
     comptime V: type,
     allocator: std.mem.Allocator,
     maps: []const Optional([]const MapEntry(K, V)),
-    key_max_def: u8,
     value_max_def: u8,
 ) !FlattenedMap(K, V) {
-    _ = key_max_def; // Always 2 for maps
 
     // First pass: count total slots, keys, and values
     var num_slots: usize = 0;
@@ -242,7 +240,7 @@ test "flattenMap simple" {
         .{ .value = &entries1 },
     };
 
-    var result = try flattenMap([]const u8, i32, allocator, &maps, 2, 3);
+    var result = try flattenMap([]const u8, i32, allocator, &maps, 3);
     defer result.deinit();
 
     // 3 slots total
@@ -284,7 +282,7 @@ test "flattenMap with null map" {
         .{ .value = &entries2 },
     };
 
-    var result = try flattenMap([]const u8, i32, allocator, &maps, 2, 3);
+    var result = try flattenMap([]const u8, i32, allocator, &maps, 3);
     defer result.deinit();
 
     // 3 slots total
@@ -319,7 +317,7 @@ test "flattenMap with empty map" {
         .{ .value = &entries2 },
     };
 
-    var result = try flattenMap([]const u8, i32, allocator, &maps, 2, 3);
+    var result = try flattenMap([]const u8, i32, allocator, &maps, 3);
     defer result.deinit();
 
     // 3 slots total
@@ -348,7 +346,7 @@ test "flattenMap with null value" {
         .{ .value = &entries0 },
     };
 
-    var result = try flattenMap([]const u8, i32, allocator, &maps, 2, 3);
+    var result = try flattenMap([]const u8, i32, allocator, &maps, 3);
     defer result.deinit();
 
     // 3 slots

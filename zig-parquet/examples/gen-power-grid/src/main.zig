@@ -58,7 +58,7 @@ pub fn main() !void {
     try writer.addColumn("power_factor", parquet.TypeInfo.int32, .{});
     writer.setCompression(.zstd);
     writer.setUseDictionary(false);
-    writer.setIntEncoding(.delta_binary_packed);
+    try writer.setIntEncoding(.delta_binary_packed);
     try writer.begin();
 
     var prng = std.Random.DefaultPrng.init(12345);

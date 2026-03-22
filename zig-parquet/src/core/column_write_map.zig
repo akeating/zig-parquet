@@ -116,6 +116,7 @@ pub fn writeColumnChunkMapKeyMultiPage(
                 error.InvalidFixedLength => return error.InvalidFixedLength,
                 error.IntegerOverflow => return error.IntegerOverflow,
         error.ValueTooLarge => return error.ValueTooLarge,
+        error.UnsupportedEncoding => return error.UnsupportedEncoding,
             }
         else
             page_writer.writeDataPageWithLevels(
@@ -131,6 +132,7 @@ pub fn writeColumnChunkMapKeyMultiPage(
             error.InvalidFixedLength => return error.InvalidFixedLength,
             error.IntegerOverflow => return error.IntegerOverflow,
             error.ValueTooLarge => return error.ValueTooLarge,
+            error.UnsupportedEncoding => return error.UnsupportedEncoding,
         };
         defer page_result.deinit(allocator);
 
@@ -180,6 +182,7 @@ pub fn writeColumnChunkMapKeyMultiPage(
                 error.InvalidFixedLength => return error.InvalidFixedLength,
                 error.IntegerOverflow => return error.IntegerOverflow,
         error.ValueTooLarge => return error.ValueTooLarge,
+        error.UnsupportedEncoding => return error.UnsupportedEncoding,
             }
         else
             page_writer.writeDataPageWithLevels(
@@ -195,6 +198,7 @@ pub fn writeColumnChunkMapKeyMultiPage(
             error.InvalidFixedLength => return error.InvalidFixedLength,
             error.IntegerOverflow => return error.IntegerOverflow,
             error.ValueTooLarge => return error.ValueTooLarge,
+            error.UnsupportedEncoding => return error.UnsupportedEncoding,
         };
         defer page_result.deinit(allocator);
 
@@ -359,6 +363,7 @@ pub fn writeColumnChunkMapValueMultiPage(
                 error.InvalidFixedLength => return error.InvalidFixedLength,
                 error.IntegerOverflow => return error.IntegerOverflow,
         error.ValueTooLarge => return error.ValueTooLarge,
+        error.UnsupportedEncoding => return error.UnsupportedEncoding,
             }
         else
             page_writer.writeDataPageWithLevels(
@@ -374,6 +379,7 @@ pub fn writeColumnChunkMapValueMultiPage(
             error.InvalidFixedLength => return error.InvalidFixedLength,
             error.IntegerOverflow => return error.IntegerOverflow,
             error.ValueTooLarge => return error.ValueTooLarge,
+            error.UnsupportedEncoding => return error.UnsupportedEncoding,
         };
         defer page_result.deinit(allocator);
 
@@ -423,6 +429,7 @@ pub fn writeColumnChunkMapValueMultiPage(
                 error.InvalidFixedLength => return error.InvalidFixedLength,
                 error.IntegerOverflow => return error.IntegerOverflow,
         error.ValueTooLarge => return error.ValueTooLarge,
+        error.UnsupportedEncoding => return error.UnsupportedEncoding,
             }
         else
             page_writer.writeDataPageWithLevels(
@@ -438,6 +445,7 @@ pub fn writeColumnChunkMapValueMultiPage(
             error.InvalidFixedLength => return error.InvalidFixedLength,
             error.IntegerOverflow => return error.IntegerOverflow,
             error.ValueTooLarge => return error.ValueTooLarge,
+            error.UnsupportedEncoding => return error.UnsupportedEncoding,
         };
         defer page_result.deinit(allocator);
 

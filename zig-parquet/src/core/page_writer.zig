@@ -24,6 +24,7 @@ pub const PageWriteError = error{
     InvalidFixedLength,
     IntegerOverflow,
     ValueTooLarge,
+    UnsupportedEncoding,
 };
 
 /// Result of writing a data page
@@ -597,8 +598,7 @@ fn encodeValuesWithEncoding(
             } else if (T == f16) {
                 break :blk byte_stream_split_encoder.encodeFloat16(allocator, values) catch return error.OutOfMemory;
             } else {
-                // Fallback to PLAIN for unsupported types
-                break :blk try encodePlain(allocator, T, values);
+                return error.UnsupportedEncoding;
             }
         },
         .delta_binary_packed => blk: {
@@ -607,17 +607,14 @@ fn encodeValuesWithEncoding(
             } else if (T == i64) {
                 break :blk delta_binary_packed_encoder.encodeInt64(allocator, values) catch return error.OutOfMemory;
             } else {
-                // Fallback to PLAIN for unsupported types
-                break :blk try encodePlain(allocator, T, values);
+                return error.UnsupportedEncoding;
             }
         },
         .rle => blk: {
             if (T == bool) {
-                // RLE encoding for booleans (efficient for runs of same value)
                 break :blk rle_encoder.encodeBooleans(allocator, values) catch return error.OutOfMemory;
             } else {
-                // Fallback to PLAIN for unsupported types
-                break :blk try encodePlain(allocator, T, values);
+                return error.UnsupportedEncoding;
             }
         },
         else => try encodePlain(allocator, T, values),

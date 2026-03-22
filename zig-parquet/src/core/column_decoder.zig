@@ -1343,12 +1343,7 @@ fn decodeDeltaEncodedValuesV2(
                         }
                     }
                 },
-                else => {
-                    // DELTA_BINARY_PACKED only applies to int32/int64
-                    for (0..num_values) |i| {
-                        values[i] = .{ .null_val = {} };
-                    }
-                },
+                else => return error.UnsupportedEncoding,
             }
         },
         .delta_length_byte_array => {
@@ -1465,20 +1460,10 @@ fn decodeDeltaEncodedValuesV2(
                         }
                     }
                 },
-                else => {
-                    // BYTE_STREAM_SPLIT: unsupported physical type (e.g., fixed_len_byte_array without schema context)
-                    for (0..num_values) |i| {
-                        values[i] = .{ .null_val = {} };
-                    }
-                },
+                else => return error.UnsupportedEncoding,
             }
         },
-        else => {
-            // Unsupported encoding - return nulls
-            for (0..num_values) |i| {
-                values[i] = .{ .null_val = {} };
-            }
-        },
+        else => return error.UnsupportedEncoding,
     }
 
     return values;

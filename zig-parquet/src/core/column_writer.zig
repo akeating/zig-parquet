@@ -52,6 +52,7 @@ pub const ColumnWriteError = error{
     UnsupportedCompression,
     IntegerOverflow,
     ValueTooLarge,
+    UnsupportedEncoding,
 };
 
 /// Result of writing a column chunk
@@ -693,6 +694,7 @@ pub fn writeColumnChunkFixedByteArrayOptionalWithPathArrayAndEncoding(
         error.InvalidFixedLength => return error.InvalidFixedLength,
         error.IntegerOverflow => return error.IntegerOverflow,
         error.ValueTooLarge => return error.ValueTooLarge,
+        error.UnsupportedEncoding => return error.UnsupportedEncoding,
     };
     defer page_result.deinit(allocator);
 
@@ -957,6 +959,7 @@ fn writeColumnChunkFromValuesTyped(
         error.InvalidFixedLength => return error.InvalidFixedLength,
         error.IntegerOverflow => return error.IntegerOverflow,
         error.ValueTooLarge => return error.ValueTooLarge,
+        error.UnsupportedEncoding => return error.UnsupportedEncoding,
     };
     defer page_result.deinit(allocator);
 
@@ -1020,6 +1023,7 @@ fn writeColumnChunkFromValuesBytes(
         error.InvalidFixedLength => return error.InvalidFixedLength,
         error.IntegerOverflow => return error.IntegerOverflow,
         error.ValueTooLarge => return error.ValueTooLarge,
+        error.UnsupportedEncoding => return error.UnsupportedEncoding,
     };
     defer page_result.deinit(allocator);
 
@@ -1080,6 +1084,7 @@ fn writeColumnChunkFromValuesFixedBytes(
         error.InvalidFixedLength => return error.InvalidFixedLength,
         error.IntegerOverflow => return error.IntegerOverflow,
         error.ValueTooLarge => return error.ValueTooLarge,
+        error.UnsupportedEncoding => return error.UnsupportedEncoding,
     };
     defer page_result.deinit(allocator);
 
@@ -1128,6 +1133,7 @@ fn writeColumnChunkFromValuesBool(
         error.InvalidFixedLength => return error.InvalidFixedLength,
         error.IntegerOverflow => return error.IntegerOverflow,
         error.ValueTooLarge => return error.ValueTooLarge,
+        error.UnsupportedEncoding => return error.UnsupportedEncoding,
     };
     defer page_result.deinit(allocator);
 
@@ -1245,6 +1251,7 @@ fn writeColumnChunkFromValuesTypedDict(
             error.InvalidFixedLength => return error.InvalidFixedLength,
             error.IntegerOverflow => return error.IntegerOverflow,
             error.ValueTooLarge => return error.ValueTooLarge,
+            error.UnsupportedEncoding => return error.UnsupportedEncoding,
         };
         defer page_result.deinit(allocator);
         return writeColumnChunkWithPath(
@@ -1490,6 +1497,7 @@ fn writeColumnChunkFromValuesTypedPlainFallback(
         error.InvalidFixedLength => return error.InvalidFixedLength,
         error.IntegerOverflow => return error.IntegerOverflow,
         error.ValueTooLarge => return error.ValueTooLarge,
+        error.UnsupportedEncoding => return error.UnsupportedEncoding,
     };
     defer page_result.deinit(allocator);
 
@@ -1527,6 +1535,7 @@ fn writeColumnChunkFromValuesBytesDict(
             error.InvalidFixedLength => return error.InvalidFixedLength,
             error.IntegerOverflow => return error.IntegerOverflow,
             error.ValueTooLarge => return error.ValueTooLarge,
+            error.UnsupportedEncoding => return error.UnsupportedEncoding,
         };
         defer page_result.deinit(allocator);
         return writeColumnChunkWithPath(
@@ -1761,6 +1770,7 @@ fn writeColumnChunkFromValuesBytesPlainFallback(
         error.InvalidFixedLength => return error.InvalidFixedLength,
         error.IntegerOverflow => return error.IntegerOverflow,
         error.ValueTooLarge => return error.ValueTooLarge,
+        error.UnsupportedEncoding => return error.UnsupportedEncoding,
     };
     defer page_result.deinit(allocator);
 
@@ -1920,6 +1930,7 @@ pub fn writeColumnChunkWithEncoding(
         error.InvalidFixedLength => return error.InvalidFixedLength,
         error.IntegerOverflow => return error.IntegerOverflow,
         error.ValueTooLarge => return error.ValueTooLarge,
+        error.UnsupportedEncoding => return error.UnsupportedEncoding,
     };
     defer page_result.deinit(allocator);
 
@@ -2037,6 +2048,7 @@ pub fn writeColumnChunkOptionalWithEncoding(
             error.InvalidFixedLength => return error.InvalidFixedLength,
             error.IntegerOverflow => return error.IntegerOverflow,
             error.ValueTooLarge => return error.ValueTooLarge,
+            error.UnsupportedEncoding => return error.UnsupportedEncoding,
         };
         defer page_result.deinit(allocator);
 
@@ -2159,6 +2171,7 @@ pub fn writeColumnChunkByteArrayOptionalWithEncoding(
             error.InvalidFixedLength => return error.InvalidFixedLength,
             error.IntegerOverflow => return error.IntegerOverflow,
             error.ValueTooLarge => return error.ValueTooLarge,
+            error.UnsupportedEncoding => return error.UnsupportedEncoding,
         };
         defer page_result.deinit(allocator);
 
@@ -2326,6 +2339,7 @@ pub fn writeColumnChunkByteArrayWithEncoding(
         error.InvalidFixedLength => return error.InvalidFixedLength,
         error.IntegerOverflow => return error.IntegerOverflow,
         error.ValueTooLarge => return error.ValueTooLarge,
+        error.UnsupportedEncoding => return error.UnsupportedEncoding,
     };
     defer page_result.deinit(allocator);
 
@@ -2422,6 +2436,7 @@ pub fn writeColumnChunkInt96OptionalWithPathArray(
         error.InvalidFixedLength => return error.InvalidFixedLength,
         error.IntegerOverflow => return error.IntegerOverflow,
         error.ValueTooLarge => return error.ValueTooLarge,
+        error.UnsupportedEncoding => return error.UnsupportedEncoding,
     };
     defer page_result.deinit(allocator);
 

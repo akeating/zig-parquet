@@ -232,6 +232,7 @@ pub const DynamicWriterError = error{
     TooManyValues,
     InvalidFixedLength,
     DuplicateColumnName,
+    UnsupportedEncoding,
 };
 
 pub const DynamicWriter = struct {
@@ -291,8 +292,31 @@ pub const DynamicWriter = struct {
 
     // -- Schema building --
 
+    /// Validates that a value encoding is compatible with the given column type.
+    fn validateEncodingForType(enc: format.Encoding, col_type: ColumnType) DynamicWriterError!void {
+        switch (enc) {
+            .byte_stream_split => switch (col_type) {
+                .int32, .int64, .float_, .double_ => {},
+                else => return error.UnsupportedEncoding,
+            },
+            .delta_binary_packed => switch (col_type) {
+                .int32, .int64 => {},
+                else => return error.UnsupportedEncoding,
+            },
+            .rle => switch (col_type) {
+                .bool_ => {},
+                else => return error.UnsupportedEncoding,
+            },
+            .plain, .rle_dictionary => {},
+            else => return error.UnsupportedEncoding,
+        }
+    }
+
     pub fn addColumn(self: *DynamicWriter, name: []const u8, info: TypeInfo, opts: ColumnProperties) DynamicWriterError!void {
         if (self.began) return error.InvalidState;
+        if (opts.encoding) |enc| {
+            try validateEncodingForType(enc, info.physical);
+        }
         for (self.pending_columns.items) |col| {
             if (std.mem.eql(u8, col.name, name)) return error.DuplicateColumnName;
         }
@@ -358,11 +382,13 @@ pub const DynamicWriter = struct {
         self.use_dictionary = enable;
     }
 
-    pub fn setIntEncoding(self: *DynamicWriter, enc: format.Encoding) void {
+    pub fn setIntEncoding(self: *DynamicWriter, enc: format.Encoding) DynamicWriterError!void {
+        try validateEncodingForType(enc, .int32);
         self.int_encoding = enc;
     }
 
-    pub fn setFloatEncoding(self: *DynamicWriter, enc: format.Encoding) void {
+    pub fn setFloatEncoding(self: *DynamicWriter, enc: format.Encoding) DynamicWriterError!void {
+        try validateEncodingForType(enc, .float_);
         self.float_encoding = enc;
     }
 
@@ -776,16 +802,16 @@ pub const DynamicWriter = struct {
                 const path: []const []const u8 = &.{col_name};
                 const opts = self.resolveOpts(col, &.{col_name});
                 const result: column_writer.ColumnChunkResult = switch (self.column_types[col]) {
-                    .bool_ => flushColumnBool(allocator, writer, path, items, n, self.current_offset, codec, opts) catch return error.WriteError,
-                    .int32 => flushColumnTyped(i32, allocator, writer, path, items, n, self.current_offset, codec, opts) catch return error.WriteError,
-                    .int64 => flushColumnTyped(i64, allocator, writer, path, items, n, self.current_offset, codec, opts) catch return error.WriteError,
-                    .float_ => flushColumnTyped(f32, allocator, writer, path, items, n, self.current_offset, codec, opts) catch return error.WriteError,
-                    .double_ => flushColumnTyped(f64, allocator, writer, path, items, n, self.current_offset, codec, opts) catch return error.WriteError,
-                    .bytes => flushColumnBytes(allocator, writer, path, items, n, self.current_offset, codec, opts) catch return error.WriteError,
+                    .bool_ => flushColumnBool(allocator, writer, path, items, n, self.current_offset, codec, opts) catch |e| return mapFlushError(e),
+                    .int32 => flushColumnTyped(i32, allocator, writer, path, items, n, self.current_offset, codec, opts) catch |e| return mapFlushError(e),
+                    .int64 => flushColumnTyped(i64, allocator, writer, path, items, n, self.current_offset, codec, opts) catch |e| return mapFlushError(e),
+                    .float_ => flushColumnTyped(f32, allocator, writer, path, items, n, self.current_offset, codec, opts) catch |e| return mapFlushError(e),
+                    .double_ => flushColumnTyped(f64, allocator, writer, path, items, n, self.current_offset, codec, opts) catch |e| return mapFlushError(e),
+                    .bytes => flushColumnBytes(allocator, writer, path, items, n, self.current_offset, codec, opts) catch |e| return mapFlushError(e),
                     .fixed_bytes => flushColumnFixedBytes(
                         allocator, writer, path, items, n, self.current_offset, codec,
                         self.column_type_lengths[col] orelse return error.InvalidState, opts,
-                    ) catch return error.WriteError,
+                    ) catch |e| return mapFlushError(e),
                     .nested => unreachable,
                 };
 
@@ -972,6 +998,14 @@ pub const DynamicWriter = struct {
         dictionary_cardinality_threshold: ?f32 = null,
         write_page_checksum: bool = true,
     };
+
+    fn mapFlushError(e: anyerror) DynamicWriterError {
+        return switch (e) {
+            error.UnsupportedEncoding => error.UnsupportedEncoding,
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.WriteError,
+        };
+    }
 
     fn flushColumnBool(
         allocator: Allocator,

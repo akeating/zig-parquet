@@ -60,9 +60,7 @@ pub fn flattenList(
     allocator: std.mem.Allocator,
     lists: []const Optional([]const Optional(T)),
     max_def_level: u8,
-    max_rep_level: u8,
 ) !FlattenedList(T) {
-    _ = max_rep_level; // Currently only single-level lists
 
     // First pass: count total slots and values
     var num_slots: usize = 0;
@@ -165,165 +163,6 @@ pub fn flattenList(
     };
 }
 
-/// Flatten nested list (list<list<T>>) into values + def/rep levels
-///
-/// For a 5-level nested list schema with optional outer list and required elements:
-///   - def=0: outer list is null
-///   - def=1: outer list is empty
-///   - def=2: inner list is empty (element container exists but inner list is empty)
-///   - def=3: element value is present
-///
-/// When leaf elements are optional, the null element level is inserted before the value level:
-///   - inner_empty_def shifts down by 1 to make room for null_element_def
-///
-///   - rep=0: new record (row)
-///   - rep=1: new inner list (outer element)
-///   - rep=2: continue same inner list
-pub fn flattenNestedList(
-    comptime T: type,
-    allocator: std.mem.Allocator,
-    outer_lists: []const Optional([]const Optional([]const Optional(T))),
-    max_def_level: u8,
-    max_rep_level: u8,
-    leaf_element_optional: bool,
-) !FlattenedList(T) {
-    _ = max_rep_level; // Always 2 for nested lists
-    const value_def: u32 = max_def_level;
-    const leaf_opt_delta: u32 = if (leaf_element_optional) 1 else 0;
-    const null_element_def: u32 = max_def_level - 1;
-    const inner_empty_def: u32 = if (max_def_level >= 1 + leaf_opt_delta) max_def_level - 1 - leaf_opt_delta else 0;
-    const outer_empty_def: u32 = if (inner_empty_def >= 1) inner_empty_def - 1 else 0;
-
-    // First pass: count total slots and values
-    var num_slots: usize = 0;
-    var num_values: usize = 0;
-
-    for (outer_lists) |outer_opt| {
-        switch (outer_opt) {
-            .null_value => {
-                // Outer list null: 1 slot
-                num_slots += 1;
-            },
-            .value => |inner_lists| {
-                if (inner_lists.len == 0) {
-                    // Outer list empty: 1 slot
-                    num_slots += 1;
-                } else {
-                    for (inner_lists) |inner_opt| {
-                        switch (inner_opt) {
-                            .null_value => {
-                                // Inner list null: 1 slot
-                                num_slots += 1;
-                            },
-                            .value => |elements| {
-                                if (elements.len == 0) {
-                                    // Inner list empty: 1 slot
-                                    num_slots += 1;
-                                } else {
-                                    // Elements
-                                    num_slots += elements.len;
-                                    for (elements) |elem| {
-                                        switch (elem) {
-                                            .value => num_values += 1,
-                                            .null_value => {},
-                                        }
-                                    }
-                                }
-                            },
-                        }
-                    }
-                }
-            },
-        }
-    }
-
-    // Allocate result arrays
-    var def_levels = try allocator.alloc(u32, num_slots);
-    errdefer allocator.free(def_levels);
-
-    var rep_levels = try allocator.alloc(u32, num_slots);
-    errdefer allocator.free(rep_levels);
-
-    var values = try allocator.alloc(T, num_values);
-    errdefer {
-        if (T == []const u8) {
-            for (values) |v| allocator.free(v);
-        }
-        allocator.free(values);
-    }
-
-    // Second pass: fill in levels and values
-    var slot_idx: usize = 0;
-    var value_idx: usize = 0;
-
-    for (outer_lists) |outer_opt| {
-        switch (outer_opt) {
-            .null_value => {
-                // Outer list null: def=0, rep=0
-                def_levels[slot_idx] = 0;
-                rep_levels[slot_idx] = 0;
-                slot_idx += 1;
-            },
-            .value => |inner_lists| {
-                if (inner_lists.len == 0) {
-                    def_levels[slot_idx] = outer_empty_def;
-                    rep_levels[slot_idx] = 0;
-                    slot_idx += 1;
-                } else {
-                    for (inner_lists, 0..) |inner_opt, inner_idx| {
-                        // rep=0 for first inner list, rep=1 for subsequent
-                        const base_rep: u32 = if (inner_idx == 0) 0 else 1;
-
-                        switch (inner_opt) {
-                            .null_value => {
-                                def_levels[slot_idx] = inner_empty_def;
-                                rep_levels[slot_idx] = base_rep;
-                                slot_idx += 1;
-                            },
-                            .value => |elements| {
-                                if (elements.len == 0) {
-                                    def_levels[slot_idx] = inner_empty_def;
-                                    rep_levels[slot_idx] = base_rep;
-                                    slot_idx += 1;
-                                } else {
-                                    for (elements, 0..) |elem, elem_idx| {
-                                        // rep=base_rep for first element, rep=2 for subsequent
-                                        rep_levels[slot_idx] = if (elem_idx == 0) base_rep else 2;
-
-                                        switch (elem) {
-                                            .null_value => {
-                                                def_levels[slot_idx] = null_element_def;
-                                            },
-                                            .value => |v| {
-                                                def_levels[slot_idx] = value_def;
-                                                if (T == []const u8) {
-                                                    values[value_idx] = try allocator.dupe(u8, v);
-                                                } else {
-                                                    values[value_idx] = v;
-                                                }
-                                                value_idx += 1;
-                                            },
-                                        }
-                                        slot_idx += 1;
-                                    }
-                                }
-                            },
-                        }
-                    }
-                }
-            },
-        }
-    }
-
-    return FlattenedList(T){
-        .values = values,
-        .def_levels = def_levels,
-        .rep_levels = rep_levels,
-        .num_slots = num_slots,
-        .allocator = allocator,
-    };
-}
-
 // =============================================================================
 // Tests
 // =============================================================================
@@ -339,7 +178,7 @@ test "flattenList simple non-null" {
         .{ .value = &inner1 },
     };
 
-    var result = try flattenList(i32, allocator, &lists, 3, 1);
+    var result = try flattenList(i32, allocator, &lists, 3);
     defer result.deinit();
 
     // 5 slots total
@@ -368,7 +207,7 @@ test "flattenList with null list" {
         .{ .value = &inner2 },
     };
 
-    var result = try flattenList(i32, allocator, &lists, 3, 1);
+    var result = try flattenList(i32, allocator, &lists, 3);
     defer result.deinit();
 
     // 3 slots total
@@ -395,7 +234,7 @@ test "flattenList with empty list" {
         .{ .value = &inner2 },
     };
 
-    var result = try flattenList(i32, allocator, &lists, 3, 1);
+    var result = try flattenList(i32, allocator, &lists, 3);
     defer result.deinit();
 
     // 3 slots total
@@ -418,7 +257,7 @@ test "flattenList with null elements" {
         .{ .value = &inner0 },
     };
 
-    var result = try flattenList(i32, allocator, &lists, 3, 1);
+    var result = try flattenList(i32, allocator, &lists, 3);
     defer result.deinit();
 
     // 3 slots

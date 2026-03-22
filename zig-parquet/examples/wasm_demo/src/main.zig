@@ -431,7 +431,7 @@ fn testEncodings(allocator: std.mem.Allocator) ![]u8 {
     try writer.addColumn("bss_float", parquet.TypeInfo.double_, .{ .encoding = .plain });
 
     writer.setUseDictionary(false);
-    writer.setIntEncoding(.delta_binary_packed);
+    try writer.setIntEncoding(.delta_binary_packed);
     writer.setMaxPageSize(4096);
     try writer.begin();
 

@@ -79,6 +79,7 @@ pub fn writeColumnChunkList(
         error.InvalidFixedLength => return error.InvalidFixedLength,
         error.IntegerOverflow => return error.IntegerOverflow,
         error.ValueTooLarge => return error.ValueTooLarge,
+        error.UnsupportedEncoding => return error.UnsupportedEncoding,
     };
     defer page_result.deinit(allocator);
 
@@ -135,6 +136,7 @@ pub fn writeColumnChunkListFixedByteArray(
         error.InvalidFixedLength => return error.InvalidFixedLength,
         error.IntegerOverflow => return error.IntegerOverflow,
         error.ValueTooLarge => return error.ValueTooLarge,
+        error.UnsupportedEncoding => return error.UnsupportedEncoding,
     };
     defer page_result.deinit(allocator);
 
@@ -222,6 +224,7 @@ pub fn writeColumnChunkListWithPathArrayMultiPage(
             error.InvalidFixedLength => return error.InvalidFixedLength,
             error.IntegerOverflow => return error.IntegerOverflow,
             error.ValueTooLarge => return error.ValueTooLarge,
+            error.UnsupportedEncoding => return error.UnsupportedEncoding,
         };
         defer page_result.deinit(allocator);
 
@@ -277,6 +280,7 @@ pub fn writeColumnChunkListWithPathArrayMultiPage(
             error.InvalidFixedLength => return error.InvalidFixedLength,
             error.IntegerOverflow => return error.IntegerOverflow,
             error.ValueTooLarge => return error.ValueTooLarge,
+            error.UnsupportedEncoding => return error.UnsupportedEncoding,
         };
         defer page_result.deinit(allocator);
 
@@ -710,6 +714,7 @@ pub fn writeColumnChunkListFixedByteArrayWithPathArrayMultiPage(
             error.InvalidFixedLength => return error.InvalidFixedLength,
             error.IntegerOverflow => return error.IntegerOverflow,
             error.ValueTooLarge => return error.ValueTooLarge,
+            error.UnsupportedEncoding => return error.UnsupportedEncoding,
         };
         defer page_result.deinit(allocator);
 
@@ -760,6 +765,7 @@ pub fn writeColumnChunkListFixedByteArrayWithPathArrayMultiPage(
             error.InvalidFixedLength => return error.InvalidFixedLength,
             error.IntegerOverflow => return error.IntegerOverflow,
             error.ValueTooLarge => return error.ValueTooLarge,
+            error.UnsupportedEncoding => return error.UnsupportedEncoding,
         };
         defer page_result.deinit(allocator);
 
@@ -902,6 +908,7 @@ pub fn writeColumnChunkNestedListWithPathArrayMultiPage(
             error.InvalidFixedLength => return error.InvalidFixedLength,
             error.IntegerOverflow => return error.IntegerOverflow,
             error.ValueTooLarge => return error.ValueTooLarge,
+            error.UnsupportedEncoding => return error.UnsupportedEncoding,
         };
         defer page_result.deinit(allocator);
 
@@ -950,6 +957,7 @@ pub fn writeColumnChunkNestedListWithPathArrayMultiPage(
             error.InvalidFixedLength => return error.InvalidFixedLength,
             error.IntegerOverflow => return error.IntegerOverflow,
             error.ValueTooLarge => return error.ValueTooLarge,
+            error.UnsupportedEncoding => return error.UnsupportedEncoding,
         };
         defer page_result.deinit(allocator);
 
@@ -1065,6 +1073,7 @@ pub fn writeColumnChunkNestedListFixedByteArrayWithPathArray(
         error.InvalidFixedLength => return error.InvalidFixedLength,
         error.IntegerOverflow => return error.IntegerOverflow,
         error.ValueTooLarge => return error.ValueTooLarge,
+        error.UnsupportedEncoding => return error.UnsupportedEncoding,
     };
     defer page_result.deinit(allocator);
 
@@ -1182,6 +1191,7 @@ pub fn writeColumnChunkWithLevelsAndFullPath(
         error.InvalidFixedLength => return error.InvalidFixedLength,
         error.IntegerOverflow => return error.IntegerOverflow,
         error.ValueTooLarge => return error.ValueTooLarge,
+        error.UnsupportedEncoding => return error.UnsupportedEncoding,
     };
     defer page_result.deinit(allocator);
 
@@ -1236,6 +1246,7 @@ pub fn writeColumnChunkFixedByteArrayWithLevelsAndFullPath(
         error.InvalidFixedLength => return error.InvalidFixedLength,
         error.IntegerOverflow => return error.IntegerOverflow,
         error.ValueTooLarge => return error.ValueTooLarge,
+        error.UnsupportedEncoding => return error.UnsupportedEncoding,
     };
     defer page_result.deinit(allocator);
 
@@ -1275,6 +1286,7 @@ pub fn writeColumnChunkListInt96WithPathArray(
         error.InvalidFixedLength => return error.InvalidFixedLength,
         error.IntegerOverflow => return error.IntegerOverflow,
         error.ValueTooLarge => return error.ValueTooLarge,
+        error.UnsupportedEncoding => return error.UnsupportedEncoding,
     };
     defer page_result.deinit(allocator);
 
@@ -1307,6 +1319,7 @@ pub fn writeColumnChunkInt96WithLevelsAndFullPath(
         error.InvalidFixedLength => return error.InvalidFixedLength,
         error.IntegerOverflow => return error.IntegerOverflow,
         error.ValueTooLarge => return error.ValueTooLarge,
+        error.UnsupportedEncoding => return error.UnsupportedEncoding,
     };
     defer page_result.deinit(allocator);
 

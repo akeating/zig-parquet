@@ -105,6 +105,7 @@ pub const ReaderError = TransportError || FormatError || DecodingError || Compre
 pub const WriterError = ResourceError || CallerError || CompressionError || error{
     WriteError,
     IntegerOverflow,
+    UnsupportedEncoding,
 };
 
 /// Composed error set for DynamicReader operations.

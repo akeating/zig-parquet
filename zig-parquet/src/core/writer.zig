@@ -447,8 +447,7 @@ pub const Writer = struct {
             i32,
             self.allocator,
             lists,
-            3, // max_def_level for 3-level list
-            1, // max_rep_level for single-level list
+            3,
         ) catch return error.OutOfMemory;
         defer flattened.deinit();
 
@@ -487,8 +486,7 @@ pub const Writer = struct {
             i64,
             self.allocator,
             lists,
-            3, // max_def_level for 3-level list
-            1, // max_rep_level for single-level list
+            3,
         ) catch return error.OutOfMemory;
         defer flattened.deinit();
 
@@ -529,7 +527,6 @@ pub const Writer = struct {
             self.allocator,
             lists,
             3,
-            1,
         ) catch return error.OutOfMemory;
         defer flattened.deinit();
 
@@ -694,7 +691,6 @@ pub const Writer = struct {
             V,
             self.allocator,
             maps,
-            2,
             3,
         ) catch return error.OutOfMemory;
         defer flattened.deinit();
@@ -1723,6 +1719,7 @@ pub const Writer = struct {
             error.UnsupportedCompression => error.UnsupportedCompression,
             error.IntegerOverflow => error.IntegerOverflow,
             error.ValueTooLarge => error.ValueTooLarge,
+            error.UnsupportedEncoding => error.UnsupportedEncoding,
         };
     }
 };

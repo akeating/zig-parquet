@@ -96,6 +96,7 @@ pub fn writeColumnChunkStructMultiPage(
             error.InvalidFixedLength => return error.InvalidFixedLength,
             error.IntegerOverflow => return error.IntegerOverflow,
             error.ValueTooLarge => return error.ValueTooLarge,
+            error.UnsupportedEncoding => return error.UnsupportedEncoding,
         };
         defer page_result.deinit(allocator);
 
@@ -146,6 +147,7 @@ pub fn writeColumnChunkStructMultiPage(
             error.InvalidFixedLength => return error.InvalidFixedLength,
             error.IntegerOverflow => return error.IntegerOverflow,
             error.ValueTooLarge => return error.ValueTooLarge,
+            error.UnsupportedEncoding => return error.UnsupportedEncoding,
         };
         defer page_result.deinit(allocator);
 
@@ -287,6 +289,7 @@ pub fn writeColumnChunkStructByteArrayMultiPage(
             error.InvalidFixedLength => return error.InvalidFixedLength,
             error.IntegerOverflow => return error.IntegerOverflow,
             error.ValueTooLarge => return error.ValueTooLarge,
+            error.UnsupportedEncoding => return error.UnsupportedEncoding,
         };
         defer page_result.deinit(allocator);
 
@@ -336,6 +339,7 @@ pub fn writeColumnChunkStructByteArrayMultiPage(
             error.InvalidFixedLength => return error.InvalidFixedLength,
             error.IntegerOverflow => return error.IntegerOverflow,
             error.ValueTooLarge => return error.ValueTooLarge,
+            error.UnsupportedEncoding => return error.UnsupportedEncoding,
         };
         defer page_result.deinit(allocator);
 
