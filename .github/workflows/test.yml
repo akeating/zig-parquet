@@ -75,6 +75,12 @@ jobs:
         with:
           version: 0.15.2
 
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Generate test files
+        working-directory: test-files-arrow
+        run: uv run python generate.py
+
       - name: Build pqi
         working-directory: cli
         run: zig build
