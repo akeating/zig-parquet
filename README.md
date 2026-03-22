@@ -144,6 +144,28 @@ pub fn main() !void {
 }
 ```
 
+### Column Projection
+
+Read only a subset of top-level columns (skips I/O for unrequested columns):
+
+```zig
+var reader = try parquet.openFileDynamic(allocator, file, .{});
+defer reader.deinit();
+
+// Read only columns 1 and 3 (dense-packed: returned rows have 2 values)
+const rows = try reader.readRowsProjected(0, &.{ 1, 3 });
+defer {
+    for (rows) |row| row.deinit();
+    allocator.free(rows);
+}
+
+for (rows) |row| {
+    const name = if (row.getColumn(0)) |v| v.asBytes() orelse "" else "";
+    const score = if (row.getColumn(1)) |v| v.asDouble() orelse 0 else 0;
+    std.debug.print("{s}: {d}\n", .{ name, score });
+}
+```
+
 ### Column-Based API
 
 For more control, use the lower-level column API:
@@ -323,6 +345,7 @@ writer.setMaxPageSize(1_048_576);      // 1MB page size limit
 | DATA_PAGE_V2 | ✅ | Read only; optimized split decompression |
 | DICTIONARY_PAGE | ✅ | |
 | **Features** | | |
+| Column projection | ✅ | Read subset of columns; skips I/O for unselected columns |
 | Column statistics | ✅ | min/max/null_count |
 | Multi-page columns | ✅ | Large column support |
 | Multi-row-group files | ✅ | |
@@ -338,7 +361,6 @@ Files containing unsupported features return explicit errors rather than silentl
 ## Known Limitations
 
 **Reader:**
-- No column projection (all columns are read)
 - No predicate pushdown or row group filtering
 - No streaming/iterator API (all rows materialized at once)
 

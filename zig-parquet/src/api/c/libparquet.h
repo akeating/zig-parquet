@@ -491,6 +491,17 @@ const char* zp_row_reader_get_column_name(zp_row_reader_t handle,
 int zp_row_reader_read_row_group(zp_row_reader_t handle, int rg_index);
 
 /**
+ * Load a row group with column projection.
+ * Only the specified top-level columns are read.
+ * If col_indices is NULL, all columns are read (same as zp_row_reader_read_row_group).
+ * Returned rows contain values in dense order matching the projection list.
+ */
+int zp_row_reader_read_row_group_projected(zp_row_reader_t handle,
+                                           int rg_index,
+                                           const int* col_indices,
+                                           int num_cols);
+
+/**
  * Advance to the next row.
  * Returns ZP_OK when a row is available, ZP_ROW_END when done.
  */

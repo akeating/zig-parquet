@@ -165,6 +165,67 @@ pub export fn zp_row_reader_read_row_group(
     return ZP_OK;
 }
 
+/// Load a row group with column projection.
+/// Only the specified top-level columns are read. If col_indices is null, all columns are read.
+pub export fn zp_row_reader_read_row_group_projected(
+    handle_ptr: ?*anyopaque,
+    rg_index: c_int,
+    col_indices: ?[*]const c_int,
+    num_cols: c_int,
+) callconv(.c) c_int {
+    const handle = castHandle(handle_ptr) orelse return err.ZP_ERROR_INVALID_ARGUMENT;
+    handle.err_ctx.setOk();
+
+    if (rg_index < 0) {
+        handle.err_ctx.setError(err.ZP_ERROR_INVALID_ARGUMENT, "negative row group index");
+        return handle.err_ctx.code;
+    }
+    const idx = safe.castTo(usize, rg_index) catch {
+        handle.err_ctx.setError(err.ZP_ERROR_INVALID_ARGUMENT, "row group index out of range");
+        return handle.err_ctx.code;
+    };
+    if (idx >= handle.reader.metadata.row_groups.len) {
+        handle.err_ctx.setErrorFmt(err.ZP_ERROR_INVALID_ARGUMENT, "row group index {d} >= {d}", .{ idx, handle.reader.metadata.row_groups.len });
+        return handle.err_ctx.code;
+    }
+
+    if (col_indices == null) {
+        handle.readRowGroup(idx) catch |e| {
+            handle.err_ctx.setErrorFmt(err.mapError(e), "readRowGroup failed: {s}", .{err.errorMessage(e)});
+            return handle.err_ctx.code;
+        };
+        return ZP_OK;
+    }
+
+    if (num_cols < 0) {
+        handle.err_ctx.setError(err.ZP_ERROR_INVALID_ARGUMENT, "negative num_cols");
+        return handle.err_ctx.code;
+    }
+    const n: usize = safe.castTo(usize, num_cols) catch {
+        handle.err_ctx.setError(err.ZP_ERROR_INVALID_ARGUMENT, "num_cols out of range");
+        return handle.err_ctx.code;
+    };
+
+    var zig_indices = handle.allocator.alloc(usize, n) catch {
+        handle.err_ctx.setError(err.ZP_ERROR_OUT_OF_MEMORY, "alloc failed");
+        return handle.err_ctx.code;
+    };
+    defer handle.allocator.free(zig_indices);
+
+    for (0..n) |i| {
+        zig_indices[i] = safe.castTo(usize, col_indices.?[i]) catch {
+            handle.err_ctx.setError(err.ZP_ERROR_INVALID_ARGUMENT, "negative column index");
+            return handle.err_ctx.code;
+        };
+    }
+
+    handle.readRowGroupProjected(idx, zig_indices) catch |e| {
+        handle.err_ctx.setErrorFmt(err.mapError(e), "readRowGroupProjected failed: {s}", .{err.errorMessage(e)});
+        return handle.err_ctx.code;
+    };
+    return ZP_OK;
+}
+
 /// Advance to the next row. Returns ZP_OK if a row is available,
 /// ZP_ROW_END when all rows have been consumed.
 pub export fn zp_row_reader_next(handle_ptr: ?*anyopaque) callconv(.c) c_int {

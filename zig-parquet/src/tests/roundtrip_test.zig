@@ -3804,3 +3804,255 @@ test "setBytes validates fixed-length byte array length" {
     // Correct length should succeed
     try writer.setBytes(0, "0123456789abcdef");
 }
+
+// =============================================================================
+// Column projection tests
+// =============================================================================
+
+test "readRowsProjected reads subset of flat columns" {
+    const allocator = std.testing.allocator;
+
+    var writer = try parquet.createBufferDynamic(allocator);
+    defer writer.deinit();
+
+    try writer.addColumn("id", TypeInfo.int32, .{});
+    try writer.addColumn("name", TypeInfo.string, .{});
+    try writer.addColumn("score", TypeInfo.double_, .{});
+    try writer.addColumn("active", TypeInfo.bool_, .{});
+    try writer.begin();
+
+    try writer.setInt32(0, 1);
+    try writer.setBytes(1, "alice");
+    try writer.setDouble(2, 95.5);
+    try writer.setBool(3, true);
+    try writer.addRow();
+
+    try writer.setInt32(0, 2);
+    try writer.setBytes(1, "bob");
+    try writer.setDouble(2, 88.0);
+    try writer.setBool(3, false);
+    try writer.addRow();
+
+    try writer.close();
+    const buffer = try writer.toOwnedSlice();
+    defer allocator.free(buffer);
+
+    var reader = try parquet.openBufferDynamic(allocator, buffer, .{});
+    defer reader.deinit();
+
+    // Project columns 1 (name) and 2 (score)
+    const rows = try reader.readRowsProjected(0, &.{ 1, 2 });
+    defer deferFreeRows(allocator, rows);
+
+    try std.testing.expectEqual(@as(usize, 2), rows.len);
+    // Each row should have exactly 2 values (dense packing)
+    try std.testing.expectEqual(@as(usize, 2), rows[0].columnCount());
+
+    // Row 0: name=alice, score=95.5
+    try std.testing.expectEqualStrings("alice", rows[0].getColumn(0).?.asBytes().?);
+    try std.testing.expectApproxEqAbs(@as(f64, 95.5), rows[0].getColumn(1).?.asDouble().?, 0.001);
+
+    // Row 1: name=bob, score=88.0
+    try std.testing.expectEqualStrings("bob", rows[1].getColumn(0).?.asBytes().?);
+    try std.testing.expectApproxEqAbs(@as(f64, 88.0), rows[1].getColumn(1).?.asDouble().?, 0.001);
+}
+
+test "readRowsProjected single column" {
+    const allocator = std.testing.allocator;
+
+    var writer = try parquet.createBufferDynamic(allocator);
+    defer writer.deinit();
+
+    try writer.addColumn("a", TypeInfo.int32, .{});
+    try writer.addColumn("b", TypeInfo.int64, .{});
+    try writer.addColumn("c", TypeInfo.double_, .{});
+    try writer.begin();
+
+    try writer.setInt32(0, 10);
+    try writer.setInt64(1, 20);
+    try writer.setDouble(2, 30.0);
+    try writer.addRow();
+
+    try writer.close();
+    const buffer = try writer.toOwnedSlice();
+    defer allocator.free(buffer);
+
+    var reader = try parquet.openBufferDynamic(allocator, buffer, .{});
+    defer reader.deinit();
+
+    // Project only column 2 (c)
+    const rows = try reader.readRowsProjected(0, &.{2});
+    defer deferFreeRows(allocator, rows);
+
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    try std.testing.expectEqual(@as(usize, 1), rows[0].columnCount());
+    try std.testing.expectApproxEqAbs(@as(f64, 30.0), rows[0].getColumn(0).?.asDouble().?, 0.001);
+}
+
+test "readRowsProjected all columns matches readAllRows" {
+    const allocator = std.testing.allocator;
+
+    var writer = try parquet.createBufferDynamic(allocator);
+    defer writer.deinit();
+
+    try writer.addColumn("x", TypeInfo.int32, .{});
+    try writer.addColumn("y", TypeInfo.int64, .{});
+    try writer.begin();
+
+    try writer.setInt32(0, 42);
+    try writer.setInt64(1, 100);
+    try writer.addRow();
+
+    try writer.close();
+    const buffer = try writer.toOwnedSlice();
+    defer allocator.free(buffer);
+
+    var reader = try parquet.openBufferDynamic(allocator, buffer, .{});
+    defer reader.deinit();
+
+    // Project all columns explicitly
+    const projected = try reader.readRowsProjected(0, &.{ 0, 1 });
+    defer deferFreeRows(allocator, projected);
+
+    try std.testing.expectEqual(@as(usize, 1), projected.len);
+    try std.testing.expectEqual(@as(usize, 2), projected[0].columnCount());
+    try std.testing.expectEqual(@as(?i32, 42), projected[0].getColumn(0).?.asInt32());
+    try std.testing.expectEqual(@as(?i64, 100), projected[0].getColumn(1).?.asInt64());
+}
+
+test "readRowsProjected out-of-range index returns error" {
+    const allocator = std.testing.allocator;
+
+    var writer = try parquet.createBufferDynamic(allocator);
+    defer writer.deinit();
+
+    try writer.addColumn("x", TypeInfo.int32, .{});
+    try writer.addColumn("y", TypeInfo.int64, .{});
+    try writer.begin();
+
+    try writer.setInt32(0, 1);
+    try writer.setInt64(1, 2);
+    try writer.addRow();
+
+    try writer.close();
+    const buffer = try writer.toOwnedSlice();
+    defer allocator.free(buffer);
+
+    var reader = try parquet.openBufferDynamic(allocator, buffer, .{});
+    defer reader.deinit();
+
+    // Column index 5 does not exist (only 0 and 1)
+    const result = reader.readRowsProjected(0, &.{5});
+    try std.testing.expectError(error.InvalidArgument, result);
+}
+
+test "readRowsProjected with nested struct columns" {
+    const allocator = std.testing.allocator;
+
+    var writer = try parquet.createBufferDynamic(allocator);
+    defer writer.deinit();
+
+    // Top-level column 0: flat int
+    try writer.addColumn("id", TypeInfo.int32, .{});
+
+    // Top-level column 1: struct with 2 leaf columns
+    const fields = try writer.allocSchemaFields(2);
+    fields[0] = .{ .name = "city", .node = try writer.allocSchemaNode(.{ .byte_array = .{ .logical = .string } }) };
+    fields[1] = .{ .name = "zip", .node = try writer.allocSchemaNode(.{ .int32 = .{} }) };
+    const struct_node = try writer.allocSchemaNode(.{ .struct_ = .{ .fields = fields } });
+    try writer.addColumnNested("address", struct_node, .{});
+
+    // Top-level column 2: flat string
+    try writer.addColumn("note", TypeInfo.string, .{});
+
+    try writer.begin();
+
+    // Row 1
+    try writer.setInt32(0, 1);
+    try writer.beginStruct(1);
+    try writer.setStructFieldBytes(1, 0, "NYC");
+    try writer.setStructField(1, 1, .{ .int32_val = 10001 });
+    try writer.endStruct(1);
+    try writer.setBytes(2, "first");
+    try writer.addRow();
+
+    // Row 2
+    try writer.setInt32(0, 2);
+    try writer.beginStruct(1);
+    try writer.setStructFieldBytes(1, 0, "LA");
+    try writer.setStructField(1, 1, .{ .int32_val = 90001 });
+    try writer.endStruct(1);
+    try writer.setBytes(2, "second");
+    try writer.addRow();
+
+    try writer.close();
+    const buffer = try writer.toOwnedSlice();
+    defer allocator.free(buffer);
+
+    var reader = try parquet.openBufferDynamic(allocator, buffer, .{});
+    defer reader.deinit();
+
+    // Project columns 0 (id) and 1 (address struct), skip column 2 (note)
+    const rows = try reader.readRowsProjected(0, &.{ 0, 1 });
+    defer deferFreeRows(allocator, rows);
+
+    try std.testing.expectEqual(@as(usize, 2), rows.len);
+    try std.testing.expectEqual(@as(usize, 2), rows[0].columnCount());
+
+    // Row 0: id=1, address={city:"NYC", zip:10001}
+    try std.testing.expectEqual(@as(?i32, 1), rows[0].getColumn(0).?.asInt32());
+    const s0 = rows[0].getColumn(1).?.asStruct().?;
+    try std.testing.expectEqualStrings("NYC", s0[0].value.asBytes().?);
+    try std.testing.expectEqual(@as(?i32, 10001), s0[1].value.asInt32());
+
+    // Row 1: id=2, address={city:"LA", zip:90001}
+    try std.testing.expectEqual(@as(?i32, 2), rows[1].getColumn(0).?.asInt32());
+    const s1 = rows[1].getColumn(1).?.asStruct().?;
+    try std.testing.expectEqualStrings("LA", s1[0].value.asBytes().?);
+    try std.testing.expectEqual(@as(?i32, 90001), s1[1].value.asInt32());
+}
+
+test "readRowsProjected struct-only skips flat columns" {
+    const allocator = std.testing.allocator;
+
+    var writer = try parquet.createBufferDynamic(allocator);
+    defer writer.deinit();
+
+    try writer.addColumn("id", TypeInfo.int32, .{});
+
+    const fields = try writer.allocSchemaFields(2);
+    fields[0] = .{ .name = "x", .node = try writer.allocSchemaNode(.{ .int32 = .{} }) };
+    fields[1] = .{ .name = "y", .node = try writer.allocSchemaNode(.{ .int32 = .{} }) };
+    const struct_node = try writer.allocSchemaNode(.{ .struct_ = .{ .fields = fields } });
+    try writer.addColumnNested("point", struct_node, .{});
+
+    try writer.addColumn("label", TypeInfo.string, .{});
+
+    try writer.begin();
+
+    try writer.setInt32(0, 99);
+    try writer.beginStruct(1);
+    try writer.setStructField(1, 0, .{ .int32_val = 10 });
+    try writer.setStructField(1, 1, .{ .int32_val = 20 });
+    try writer.endStruct(1);
+    try writer.setBytes(2, "origin");
+    try writer.addRow();
+
+    try writer.close();
+    const buffer = try writer.toOwnedSlice();
+    defer allocator.free(buffer);
+
+    var reader = try parquet.openBufferDynamic(allocator, buffer, .{});
+    defer reader.deinit();
+
+    // Project only the struct column (top-level index 1)
+    const rows = try reader.readRowsProjected(0, &.{1});
+    defer deferFreeRows(allocator, rows);
+
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    try std.testing.expectEqual(@as(usize, 1), rows[0].columnCount());
+
+    const s = rows[0].getColumn(0).?.asStruct().?;
+    try std.testing.expectEqual(@as(?i32, 10), s[0].value.asInt32());
+    try std.testing.expectEqual(@as(?i32, 20), s[1].value.asInt32());
+}

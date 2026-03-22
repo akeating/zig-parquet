@@ -520,6 +520,12 @@ pub const RowReaderHandle = struct {
         self.cursor = 0;
     }
 
+    pub fn readRowGroupProjected(self: *RowReaderHandle, rg_index: usize, col_indices: []const usize) !void {
+        self.freeCurrentRows();
+        self.current_rows = try self.reader.readRowsProjected(rg_index, col_indices);
+        self.cursor = 0;
+    }
+
     /// Advance cursor. Returns true if a row is available.
     pub fn next(self: *RowReaderHandle) bool {
         const rows = self.current_rows orelse return false;
