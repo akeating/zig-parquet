@@ -207,6 +207,7 @@ fn decodeColumnWithLevelsAndDeltaEncoding(
         ctx.float32_dict,
         ctx.float64_dict,
         ctx.fixed_byte_array_dict,
+        ctx.int96_dict,
         ctx.def_level_encoding,
         ctx.rep_level_encoding,
         ctx.value_encoding,
@@ -257,6 +258,7 @@ fn decodeColumnWithDeltaEncoding(
         ctx.float32_dict,
         ctx.float64_dict,
         ctx.fixed_byte_array_dict,
+        ctx.int96_dict,
         ctx.def_level_encoding,
         ctx.rep_level_encoding,
         ctx.value_encoding,
@@ -397,6 +399,7 @@ pub fn decodeColumnV2(
         null, // float32_dict - typed reader doesn't use these
         null, // float64_dict
         fixed_byte_array_dict,
+        null, // int96_dict - typed reader uses Int96 directly
         value_encoding,
     );
     errdefer {
@@ -1044,6 +1047,10 @@ pub fn decodeColumnDynamic(
         string_dict,
         int32_dict,
         int64_dict,
+        null,
+        null,
+        null,
+        null,
         .rle,
         .rle,
     );
@@ -1064,10 +1071,10 @@ pub fn decodeColumnDynamicWithEncoding(
     float32_dict: ?*dictionary.Float32Dictionary,
     float64_dict: ?*dictionary.Float64Dictionary,
     fixed_byte_array_dict: ?*dictionary.FixedByteArrayDictionary,
+    int96_dict: ?*dictionary.Int96Dictionary,
     def_level_encoding: format.Encoding,
     rep_level_encoding: format.Encoding,
 ) !DynamicDecodeResult {
-    // Default to PLAIN encoding for backwards compatibility
     return decodeColumnDynamicWithValueEncoding(
         allocator,
         schema_elem,
@@ -1082,6 +1089,7 @@ pub fn decodeColumnDynamicWithEncoding(
         float32_dict,
         float64_dict,
         fixed_byte_array_dict,
+        int96_dict,
         def_level_encoding,
         rep_level_encoding,
         .plain,
@@ -1103,6 +1111,7 @@ pub fn decodeColumnDynamicWithValueEncoding(
     float32_dict: ?*dictionary.Float32Dictionary,
     float64_dict: ?*dictionary.Float64Dictionary,
     fixed_byte_array_dict: ?*dictionary.FixedByteArrayDictionary,
+    int96_dict: ?*dictionary.Int96Dictionary,
     def_level_encoding: format.Encoding,
     rep_level_encoding: format.Encoding,
     value_encoding: format.Encoding,
@@ -1146,7 +1155,7 @@ pub fn decodeColumnDynamicWithValueEncoding(
         .double => decodeDynamicDouble(allocator, schema_elem, value_data, num_values, max_def_level, max_rep_level, is_dict_encoded, float64_dict, def_level_encoding, rep_level_encoding),
         .byte_array => decodeDynamicByteArray(allocator, schema_elem, value_data, num_values, max_def_level, max_rep_level, is_dict_encoded, string_dict, def_level_encoding, rep_level_encoding),
         .fixed_len_byte_array => decodeDynamicFixedByteArray(allocator, schema_elem, value_data, num_values, max_def_level, max_rep_level, is_dict_encoded, fixed_byte_array_dict, def_level_encoding, rep_level_encoding),
-        .int96 => decodeDynamicInt96(allocator, schema_elem, value_data, num_values, max_def_level, max_rep_level, def_level_encoding, rep_level_encoding),
+        .int96 => decodeDynamicInt96(allocator, schema_elem, value_data, num_values, max_def_level, max_rep_level, is_dict_encoded, int96_dict, def_level_encoding, rep_level_encoding),
     };
 }
 
@@ -1168,6 +1177,7 @@ pub fn decodeColumnDynamicV2(
     float32_dict: ?*dictionary.Float32Dictionary,
     float64_dict: ?*dictionary.Float64Dictionary,
     fixed_byte_array_dict: ?*dictionary.FixedByteArrayDictionary,
+    int96_dict: ?*dictionary.Int96Dictionary,
     value_encoding: format.Encoding,
 ) !DynamicDecodeResult {
     // Decode levels from pre-extracted data (V2 format: RLE without length prefix)
@@ -1199,7 +1209,7 @@ pub fn decodeColumnDynamicV2(
                 .double => decodeDynamicDoubleV2(allocator, values_data, num_values, levels_result.def_mask, levels_result.non_null_count, uses_dict, float64_dict),
                 .byte_array => decodeDynamicByteArrayV2(allocator, values_data, num_values, levels_result.def_mask, levels_result.non_null_count, uses_dict, string_dict),
                 .fixed_len_byte_array => decodeDynamicFixedByteArrayV2(allocator, schema_elem, values_data, num_values, levels_result.def_mask, levels_result.non_null_count, uses_dict, fixed_byte_array_dict),
-                .int96 => decodeDynamicInt96V2(allocator, values_data, num_values, levels_result.def_mask, levels_result.non_null_count),
+                .int96 => decodeDynamicInt96V2(allocator, values_data, num_values, levels_result.def_mask, levels_result.non_null_count, uses_dict, int96_dict),
                 else => error.UnsupportedEncoding,
             };
         },
@@ -1216,7 +1226,7 @@ pub fn decodeColumnDynamicV2(
                 .double => decodeDynamicDoubleV2(allocator, values_data, num_values, levels_result.def_mask, levels_result.non_null_count, is_dict_encoded, float64_dict),
                 .byte_array => decodeDynamicByteArrayV2(allocator, values_data, num_values, levels_result.def_mask, levels_result.non_null_count, is_dict_encoded, string_dict),
                 .fixed_len_byte_array => decodeDynamicFixedByteArrayV2(allocator, schema_elem, values_data, num_values, levels_result.def_mask, levels_result.non_null_count, is_dict_encoded, fixed_byte_array_dict),
-                .int96 => decodeDynamicInt96V2(allocator, values_data, num_values, levels_result.def_mask, levels_result.non_null_count),
+                .int96 => decodeDynamicInt96V2(allocator, values_data, num_values, levels_result.def_mask, levels_result.non_null_count, is_dict_encoded, int96_dict),
             };
         },
     };
@@ -2437,10 +2447,16 @@ pub fn decodeDynamicInt96(
     num_values: usize,
     max_def_level: u8,
     max_rep_level: u8,
+    uses_dict: bool,
+    int96_dict: ?*dictionary.Int96Dictionary,
     def_level_encoding: format.Encoding,
     rep_level_encoding: format.Encoding,
 ) !DynamicDecodeResult {
     _ = schema_elem;
+
+    if (uses_dict and int96_dict != null) {
+        return decodeDictInt96(allocator, value_data, num_values, max_def_level, max_rep_level, int96_dict.?, def_level_encoding, rep_level_encoding);
+    }
 
     // Decode levels first to get data offset
     const levels_info = try decodeLevelsForDynamicWithEncoding(
@@ -2453,11 +2469,9 @@ pub fn decodeDynamicInt96(
     const values = try allocator.alloc(Value, num_values);
     errdefer allocator.free(values);
 
-    // Read 12-byte INT96 values and convert to i64 nanoseconds
     var data_offset: usize = 0;
     for (0..num_values) |i| {
         if (levels_info.def_mask[i]) {
-            // Read 12 bytes for INT96
             if (data_offset + 12 > values_data.len) {
                 values[i] = .{ .null_val = {} };
                 continue;
@@ -2478,6 +2492,54 @@ pub fn decodeDynamicInt96(
     };
 }
 
+fn decodeDictInt96(
+    allocator: std.mem.Allocator,
+    value_data: []const u8,
+    num_values: usize,
+    max_def_level: u8,
+    max_rep_level: u8,
+    int96_dict: *dictionary.Int96Dictionary,
+    def_level_encoding: format.Encoding,
+    rep_level_encoding: format.Encoding,
+) !DynamicDecodeResult {
+    const levels_info = try decodeLevelsForDynamicWithEncoding(allocator, value_data, num_values, max_def_level, max_rep_level, def_level_encoding, rep_level_encoding);
+    defer allocator.free(levels_info.def_mask);
+
+    const values = try allocator.alloc(Value, num_values);
+    errdefer allocator.free(values);
+
+    const indices_data = value_data[levels_info.data_offset..];
+    if (indices_data.len == 0) {
+        for (0..num_values) |i| {
+            values[i] = .{ .null_val = {} };
+        }
+    } else {
+        const bit_width = try extractBitWidth(indices_data, 0);
+        const indices = try rle.decode(allocator, indices_data[1..], bit_width, levels_info.non_null_count);
+        defer allocator.free(indices);
+
+        var idx_pos: usize = 0;
+        for (0..num_values) |i| {
+            if (levels_info.def_mask[i]) {
+                if (int96_dict.get(indices[idx_pos])) |bytes| {
+                    values[i] = .{ .int64_val = Int96.fromBytes(bytes).toNanos() };
+                } else {
+                    values[i] = .{ .int64_val = 0 };
+                }
+                idx_pos += 1;
+            } else {
+                values[i] = .{ .null_val = {} };
+            }
+        }
+    }
+
+    return .{
+        .values = values,
+        .def_levels = levels_info.def_levels,
+        .rep_levels = levels_info.rep_levels,
+    };
+}
+
 /// Decode INT96 values for V2 pages (pre-extracted levels)
 fn decodeDynamicInt96V2(
     allocator: std.mem.Allocator,
@@ -2485,15 +2547,42 @@ fn decodeDynamicInt96V2(
     num_values: usize,
     def_mask: []const bool,
     non_null_count: usize,
+    uses_dict: bool,
+    int96_dict: ?*dictionary.Int96Dictionary,
 ) ![]Value {
-    _ = non_null_count;
     const values = try allocator.alloc(Value, num_values);
     errdefer allocator.free(values);
+
+    if (uses_dict and int96_dict != null) {
+        if (values_data.len == 0) {
+            for (0..num_values) |i| {
+                values[i] = .{ .null_val = {} };
+            }
+        } else {
+            const bit_width = try extractBitWidth(values_data, 0);
+            const indices = try rle.decode(allocator, values_data[1..], bit_width, non_null_count);
+            defer allocator.free(indices);
+
+            var idx_pos: usize = 0;
+            for (0..num_values) |i| {
+                if (def_mask[i]) {
+                    if (int96_dict.?.get(indices[idx_pos])) |bytes| {
+                        values[i] = .{ .int64_val = Int96.fromBytes(bytes).toNanos() };
+                    } else {
+                        values[i] = .{ .int64_val = 0 };
+                    }
+                    idx_pos += 1;
+                } else {
+                    values[i] = .{ .null_val = {} };
+                }
+            }
+        }
+        return values;
+    }
 
     var data_offset: usize = 0;
     for (0..num_values) |i| {
         if (def_mask[i]) {
-            // Read 12 bytes for INT96
             if (data_offset + 12 > values_data.len) {
                 values[i] = .{ .null_val = {} };
                 continue;

@@ -303,6 +303,8 @@ pub const DynamicReader = struct {
         defer if (float64_dict) |*d| d.deinit();
         var fixed_byte_array_dict: ?dictionary.FixedByteArrayDictionary = null;
         defer if (fixed_byte_array_dict) |*d| d.deinit();
+        var int96_dict: ?dictionary.Int96Dictionary = null;
+        defer if (int96_dict) |*d| d.deinit();
 
         // Check for dictionary page - might be indicated by metadata OR by first page in stream
         // Some writers don't set dictionary_page_offset but still include dictionary pages
@@ -366,6 +368,9 @@ pub const DynamicReader = struct {
                                 if (fixed_len > 0) {
                                     fixed_byte_array_dict = try dictionary.FixedByteArrayDictionary.fromPlain(self.allocator, dict_data, dict_num_values, fixed_len);
                                 }
+                            },
+                            .int96 => {
+                                int96_dict = try dictionary.Int96Dictionary.fromPlain(self.allocator, dict_data, dict_num_values);
                             },
                             else => {},
                         }
@@ -462,7 +467,7 @@ pub const DynamicReader = struct {
 
                 // Get value encoding from page header (used for delta encodings)
                 const value_encoding = v2.encoding;
-                const uses_dict = string_dict != null or int32_dict != null or int64_dict != null or float32_dict != null or float64_dict != null;
+                const uses_dict = string_dict != null or int32_dict != null or int64_dict != null or float32_dict != null or float64_dict != null or int96_dict != null;
 
                 // Decode with V2 format (levels already extracted, no length prefix)
                 var page_result = try column_decoder.decodeColumnDynamicV2(
@@ -481,6 +486,7 @@ pub const DynamicReader = struct {
                     if (float32_dict) |*d| d else null,
                     if (float64_dict) |*d| d else null,
                     if (fixed_byte_array_dict) |*d| d else null,
+                    if (int96_dict) |*d| d else null,
                     value_encoding,
                 );
 
@@ -512,7 +518,7 @@ pub const DynamicReader = struct {
                 if (num_values == 0) continue;
 
                 // Get encodings from page header
-                const uses_dict_v1 = string_dict != null or int32_dict != null or int64_dict != null or float32_dict != null or float64_dict != null or fixed_byte_array_dict != null;
+                const uses_dict_v1 = string_dict != null or int32_dict != null or int64_dict != null or float32_dict != null or float64_dict != null or fixed_byte_array_dict != null or int96_dict != null;
                 const def_level_encoding = dph.definition_level_encoding;
                 const rep_level_encoding = dph.repetition_level_encoding;
                 const value_encoding_v1 = dph.encoding;
@@ -532,6 +538,7 @@ pub const DynamicReader = struct {
                     if (float32_dict) |*d| d else null,
                     if (float64_dict) |*d| d else null,
                     if (fixed_byte_array_dict) |*d| d else null,
+                    if (int96_dict) |*d| d else null,
                     def_level_encoding,
                     rep_level_encoding,
                     value_encoding_v1,

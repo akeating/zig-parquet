@@ -1253,6 +1253,7 @@ fn decodeV2PageRaw(
         if (dict_set.float32_dict) |*d| d else null,
         if (dict_set.float64_dict) |*d| d else null,
         if (dict_set.fixed_byte_array_dict) |*d| d else null,
+        if (dict_set.int96_dict) |*d| d else null,
         v2.encoding,
     ) catch return error.EndOfData;
 
@@ -1311,6 +1312,7 @@ fn decodeV1PageRaw(
         if (dict_set.float32_dict) |*d| d else null,
         if (dict_set.float64_dict) |*d| d else null,
         if (dict_set.fixed_byte_array_dict) |*d| d else null,
+        if (dict_set.int96_dict) |*d| d else null,
         dph.definition_level_encoding,
         dph.repetition_level_encoding,
         dph.encoding,
@@ -1890,6 +1892,7 @@ fn decodeV2Page(
         if (dict_set.float32_dict) |*d| d else null,
         if (dict_set.float64_dict) |*d| d else null,
         if (dict_set.fixed_byte_array_dict) |*d| d else null,
+        if (dict_set.int96_dict) |*d| d else null,
         v2.encoding,
     );
     defer {
@@ -1936,6 +1939,7 @@ fn decodeV1Page(
         if (dict_set.float32_dict) |*d| d else null,
         if (dict_set.float64_dict) |*d| d else null,
         if (dict_set.fixed_byte_array_dict) |*d| d else null,
+        if (dict_set.int96_dict) |*d| d else null,
         dph.definition_level_encoding,
         dph.repetition_level_encoding,
         dph.encoding,

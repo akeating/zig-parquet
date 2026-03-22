@@ -341,7 +341,6 @@ Files containing unsupported features return explicit errors rather than silentl
 - No column projection (all columns are read)
 - No predicate pushdown or row group filtering
 - No streaming/iterator API (all rows materialized at once)
-- INT96 dictionary encoding is not handled
 
 ## WASM Support
 
