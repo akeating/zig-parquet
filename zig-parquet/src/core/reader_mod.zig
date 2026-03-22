@@ -8,8 +8,6 @@ pub const seekable_reader = @import("seekable_reader.zig");
 pub const parquet_reader = @import("parquet_reader.zig");
 
 // Re-export commonly used types
-pub const DecodeContext = column_decoder.DecodeContext;
-pub const decodeColumn = column_decoder.decodeColumn;
 pub const decodeColumnDynamic = column_decoder.decodeColumnDynamic;
 pub const DynamicDecodeResult = column_decoder.DynamicDecodeResult;
 pub const DynamicReader = dynamic_reader.DynamicReader;

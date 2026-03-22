@@ -152,41 +152,6 @@ pub fn decodeColumnWithLevels(
     };
 }
 
-/// Decode column values from page data (legacy API - discards levels)
-pub fn decodeColumn(
-    comptime T: type,
-    ctx: DecodeContext,
-    value_data: []const u8,
-) ![]Optional(T) {
-    // Check for delta encodings and dispatch to specialized decoders
-    switch (ctx.value_encoding) {
-        .delta_binary_packed, .delta_length_byte_array, .delta_byte_array, .byte_stream_split => {
-            return decodeColumnWithDeltaEncoding(T, ctx, value_data);
-        },
-        else => {},
-    }
-
-    const is_optional = ctx.schema_elem.repetition_type == .optional;
-    const is_fixed_len = ctx.schema_elem.type_ == .fixed_len_byte_array;
-    const fixed_len: usize = if (ctx.schema_elem.type_length) |tl| blk: {
-        if (tl < 0) return error.InvalidTypeLength;
-        break :blk safe.cast(tl) catch return error.InvalidTypeLength;
-    } else 0;
-
-    const result = try ctx.allocator.alloc(Optional(T), ctx.num_values);
-    errdefer ctx.allocator.free(result);
-
-    // For nested columns (lists, maps), even required fields have level data
-    // that needs to be parsed and skipped to find the values.
-    if (is_optional or ctx.max_repetition_level > 0) {
-        try decodeOptionalColumn(T, ctx, value_data, result, is_fixed_len, fixed_len);
-    } else {
-        try decodeRequiredColumn(T, ctx, value_data, result, is_fixed_len, fixed_len);
-    }
-
-    return result;
-}
-
 /// Decode column with delta/BSS encoding, returning values and levels
 fn decodeColumnWithLevelsAndDeltaEncoding(
     comptime T: type,
@@ -224,10 +189,21 @@ fn decodeColumnWithLevelsAndDeltaEncoding(
     }
 
     const result = try ctx.allocator.alloc(Optional(T), ctx.num_values);
-    errdefer ctx.allocator.free(result);
+    errdefer {
+        if (T == []const u8) {
+            for (result) |opt| {
+                switch (opt) {
+                    .value => |v| ctx.allocator.free(v),
+                    .null_value => {},
+                }
+            }
+        }
+        ctx.allocator.free(result);
+    }
+    @memset(result, .null_value);
 
     for (dynamic_result.values, 0..) |v, i| {
-        result[i] = convertDynamicValue(T, v, ctx.allocator) catch .null_value;
+        result[i] = try convertDynamicValue(T, v, ctx.allocator);
     }
 
     return .{
@@ -235,57 +211,6 @@ fn decodeColumnWithLevelsAndDeltaEncoding(
         .def_levels = dynamic_result.def_levels,
         .rep_levels = dynamic_result.rep_levels,
     };
-}
-
-/// Decode column with delta encoding using the dynamic decoder and converting results
-fn decodeColumnWithDeltaEncoding(
-    comptime T: type,
-    ctx: DecodeContext,
-    value_data: []const u8,
-) ![]Optional(T) {
-    // Use the dynamic decoder which handles delta encodings
-    const dynamic_result = try decodeColumnDynamicWithValueEncoding(
-        ctx.allocator,
-        ctx.schema_elem,
-        value_data,
-        ctx.num_values,
-        ctx.max_definition_level,
-        ctx.max_repetition_level,
-        ctx.uses_dict,
-        ctx.string_dict,
-        ctx.int32_dict,
-        ctx.int64_dict,
-        ctx.float32_dict,
-        ctx.float64_dict,
-        ctx.fixed_byte_array_dict,
-        ctx.int96_dict,
-        ctx.def_level_encoding,
-        ctx.rep_level_encoding,
-        ctx.value_encoding,
-    );
-    defer {
-        if (dynamic_result.def_levels) |dl| ctx.allocator.free(dl);
-        if (dynamic_result.rep_levels) |rl| ctx.allocator.free(rl);
-        // Free the dynamic values - they will be converted
-        for (dynamic_result.values) |v| {
-            switch (v) {
-                .bytes_val => |ba| ctx.allocator.free(ba),
-                .fixed_bytes_val => |ba| ctx.allocator.free(ba),
-                else => {},
-            }
-        }
-        ctx.allocator.free(dynamic_result.values);
-    }
-
-    // Convert dynamic values to typed values
-    const result = try ctx.allocator.alloc(Optional(T), ctx.num_values);
-    errdefer ctx.allocator.free(result);
-
-    for (dynamic_result.values, 0..) |v, i| {
-        result[i] = convertDynamicValue(T, v, ctx.allocator) catch .null_value;
-    }
-
-    return result;
 }
 
 /// Convert a dynamic Value to a typed Optional(T)
@@ -358,85 +283,7 @@ fn convertDynamicValue(comptime T: type, v: Value, allocator: std.mem.Allocator)
                 break :blk .null_value;
             }
         },
-        // Nested types not supported in typed reader conversion
         .list_val, .map_val, .struct_val => .null_value,
-    };
-}
-
-/// Decode a column from V2 page data (typed version)
-/// V2 pages have levels pre-extracted (uncompressed) at the start
-pub fn decodeColumnV2(
-    comptime T: type,
-    allocator: std.mem.Allocator,
-    schema_elem: format.SchemaElement,
-    rep_levels_data: []const u8,
-    def_levels_data: []const u8,
-    values_data: []const u8,
-    num_values: usize,
-    max_def_level: u8,
-    max_rep_level: u8,
-    uses_dict: bool,
-    string_dict: ?*dictionary.StringDictionary,
-    int32_dict: ?*dictionary.Int32Dictionary,
-    int64_dict: ?*dictionary.Int64Dictionary,
-    fixed_byte_array_dict: ?*dictionary.FixedByteArrayDictionary,
-    value_encoding: format.Encoding,
-) !DecodeResult(T) {
-    // Use the dynamic V2 decoder
-    const dynamic_result = try decodeColumnDynamicV2(
-        allocator,
-        schema_elem,
-        rep_levels_data,
-        def_levels_data,
-        values_data,
-        num_values,
-        max_def_level,
-        max_rep_level,
-        uses_dict,
-        string_dict,
-        int32_dict,
-        int64_dict,
-        null, // float32_dict - typed reader doesn't use these
-        null, // float64_dict
-        fixed_byte_array_dict,
-        null, // int96_dict - typed reader uses Int96 directly
-        value_encoding,
-    );
-    errdefer {
-        if (dynamic_result.def_levels) |dl| allocator.free(dl);
-        if (dynamic_result.rep_levels) |rl| allocator.free(rl);
-        for (dynamic_result.values) |v| {
-            switch (v) {
-                .bytes_val => |ba| allocator.free(ba),
-                .fixed_bytes_val => |ba| allocator.free(ba),
-                else => {},
-            }
-        }
-        allocator.free(dynamic_result.values);
-    }
-
-    // Convert dynamic values to typed values
-    const result = try allocator.alloc(Optional(T), num_values);
-    errdefer allocator.free(result);
-
-    for (dynamic_result.values, 0..) |v, i| {
-        result[i] = convertDynamicValue(T, v, allocator) catch .null_value;
-    }
-
-    // Free the dynamic values (they've been converted/copied)
-    for (dynamic_result.values) |v| {
-        switch (v) {
-            .bytes_val => |ba| allocator.free(ba),
-            .fixed_bytes_val => |ba| allocator.free(ba),
-            else => {},
-        }
-    }
-    allocator.free(dynamic_result.values);
-
-    return .{
-        .values = result,
-        .def_levels = dynamic_result.def_levels,
-        .rep_levels = dynamic_result.rep_levels,
     };
 }
 
