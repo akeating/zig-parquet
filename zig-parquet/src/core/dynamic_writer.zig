@@ -1177,6 +1177,7 @@ pub const DynamicWriter = struct {
     // -- Close (flush remaining + write footer) --
 
     pub fn close(self: *DynamicWriter) DynamicWriterError!void {
+        if (!self.began) return error.InvalidState;
         if (self.column_buffers.len > 0 and self.column_buffers[0].items.len > 0) {
             try self.flush();
         }

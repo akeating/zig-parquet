@@ -1044,24 +1044,12 @@ pub fn decodeColumnDynamicV2(
             break :blk try decodeDeltaEncodedValuesV2(allocator, physical_type, values_data, num_values, levels_result.def_mask, levels_result.non_null_count, value_encoding);
         },
         .rle => blk: {
-            // RLE encoding for boolean values
             if (physical_type == .boolean) {
                 break :blk try decodeDynamicBoolRLEV2(allocator, values_data, num_values, levels_result.def_mask, levels_result.non_null_count);
             }
-            // Other types don't use RLE for values, fall through to PLAIN
-            break :blk switch (physical_type) {
-                .int32 => decodeDynamicInt32V2(allocator, values_data, num_values, levels_result.def_mask, levels_result.non_null_count, uses_dict, int32_dict),
-                .int64 => decodeDynamicInt64V2(allocator, values_data, num_values, levels_result.def_mask, levels_result.non_null_count, uses_dict, int64_dict),
-                .float => decodeDynamicFloatV2(allocator, values_data, num_values, levels_result.def_mask, levels_result.non_null_count, uses_dict, float32_dict),
-                .double => decodeDynamicDoubleV2(allocator, values_data, num_values, levels_result.def_mask, levels_result.non_null_count, uses_dict, float64_dict),
-                .byte_array => decodeDynamicByteArrayV2(allocator, values_data, num_values, levels_result.def_mask, levels_result.non_null_count, uses_dict, string_dict),
-                .fixed_len_byte_array => decodeDynamicFixedByteArrayV2(allocator, schema_elem, values_data, num_values, levels_result.def_mask, levels_result.non_null_count, uses_dict, fixed_byte_array_dict),
-                .int96 => decodeDynamicInt96V2(allocator, values_data, num_values, levels_result.def_mask, levels_result.non_null_count, uses_dict, int96_dict),
-                else => error.UnsupportedEncoding,
-            };
+            return error.UnsupportedEncoding;
         },
-        else => blk: {
-            // Only use dictionary decoding if the encoding is actually dictionary-based
+        .plain, .rle_dictionary, .plain_dictionary => blk: {
             const is_dict_encoded = uses_dict and
                 (value_encoding == .rle_dictionary or value_encoding == .plain_dictionary);
 
@@ -1076,6 +1064,7 @@ pub fn decodeColumnDynamicV2(
                 .int96 => decodeDynamicInt96V2(allocator, values_data, num_values, levels_result.def_mask, levels_result.non_null_count, is_dict_encoded, int96_dict),
             };
         },
+        else => return error.UnsupportedEncoding,
     };
 
     allocator.free(levels_result.def_mask);

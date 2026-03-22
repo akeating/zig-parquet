@@ -28,4 +28,5 @@ test {
     _ = @import("interop_pyarrow_test.zig");
     _ = @import("callback_transport_test.zig");
     _ = @import("c_abi_test.zig");
+    _ = @import("negative_test.zig");
 }
