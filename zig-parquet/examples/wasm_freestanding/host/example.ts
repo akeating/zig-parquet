@@ -23,6 +23,18 @@ const ZP_TYPE_BYTES = 6;
 const ZP_TYPE_LIST = 7;
 const ZP_TYPE_MAP = 8;
 const ZP_TYPE_STRUCT = 9;
+const ZP_TYPE_STRING = 10;
+const ZP_TYPE_DATE = 11;
+const ZP_TYPE_TIMESTAMP_MILLIS = 12;
+const ZP_TYPE_TIMESTAMP_MICROS = 13;
+const ZP_TYPE_TIMESTAMP_NANOS = 14;
+const ZP_TYPE_TIME_MILLIS = 15;
+const ZP_TYPE_TIME_MICROS = 16;
+const ZP_TYPE_TIME_NANOS = 17;
+const ZP_TYPE_UUID = 24;
+const ZP_TYPE_JSON = 25;
+const ZP_TYPE_ENUM = 26;
+const ZP_TYPE_DECIMAL = 27;
 
 // ---------------------------------------------------------------------------
 // Host IO implementation backed by ArrayBuffer(s)
@@ -86,18 +98,35 @@ function readCString(memory: WebAssembly.Memory, ptr: number): string {
 
 function typeLabel(t: number): string {
   switch (t) {
-    case ZP_TYPE_NULL:   return "null";
-    case ZP_TYPE_BOOL:   return "bool";
-    case ZP_TYPE_INT32:  return "int32";
-    case ZP_TYPE_INT64:  return "int64";
-    case ZP_TYPE_FLOAT:  return "float";
-    case ZP_TYPE_DOUBLE: return "double";
-    case ZP_TYPE_BYTES:  return "bytes";
-    case ZP_TYPE_LIST:   return "list";
-    case ZP_TYPE_MAP:    return "map";
-    case ZP_TYPE_STRUCT: return "struct";
-    default:             return `unknown(${t})`;
+    case ZP_TYPE_NULL:             return "null";
+    case ZP_TYPE_BOOL:             return "bool";
+    case ZP_TYPE_INT32:            return "int32";
+    case ZP_TYPE_INT64:            return "int64";
+    case ZP_TYPE_FLOAT:            return "float";
+    case ZP_TYPE_DOUBLE:           return "double";
+    case ZP_TYPE_BYTES:            return "bytes";
+    case ZP_TYPE_LIST:             return "list";
+    case ZP_TYPE_MAP:              return "map";
+    case ZP_TYPE_STRUCT:           return "struct";
+    case ZP_TYPE_STRING:           return "string";
+    case ZP_TYPE_DATE:             return "date";
+    case ZP_TYPE_TIMESTAMP_MILLIS: return "timestamp_ms";
+    case ZP_TYPE_TIMESTAMP_MICROS: return "timestamp_us";
+    case ZP_TYPE_TIMESTAMP_NANOS:  return "timestamp_ns";
+    case ZP_TYPE_TIME_MILLIS:      return "time_ms";
+    case ZP_TYPE_TIME_MICROS:      return "time_us";
+    case ZP_TYPE_TIME_NANOS:       return "time_ns";
+    case ZP_TYPE_UUID:             return "uuid";
+    case ZP_TYPE_JSON:             return "json";
+    case ZP_TYPE_ENUM:             return "enum";
+    case ZP_TYPE_DECIMAL:          return "decimal";
+    default:                       return `unknown(${t})`;
   }
+}
+
+function isStringLike(t: number): boolean {
+  return t === ZP_TYPE_STRING || t === ZP_TYPE_JSON || t === ZP_TYPE_ENUM ||
+         t === ZP_TYPE_UUID;
 }
 
 // ---------------------------------------------------------------------------
@@ -206,9 +235,16 @@ async function main() {
             fields.push(zp.zp_row_reader_get_bool(handle, c) ? "true" : "false");
             break;
           case ZP_TYPE_INT32:
+          case ZP_TYPE_DATE:
+          case ZP_TYPE_TIME_MILLIS:
             fields.push(String(zp.zp_row_reader_get_int32(handle, c)));
             break;
           case ZP_TYPE_INT64:
+          case ZP_TYPE_TIMESTAMP_MILLIS:
+          case ZP_TYPE_TIMESTAMP_MICROS:
+          case ZP_TYPE_TIMESTAMP_NANOS:
+          case ZP_TYPE_TIME_MICROS:
+          case ZP_TYPE_TIME_NANOS:
             fields.push(String(zp.zp_row_reader_get_int64(handle, c)));
             break;
           case ZP_TYPE_FLOAT:
@@ -217,15 +253,23 @@ async function main() {
           case ZP_TYPE_DOUBLE:
             fields.push(zp.zp_row_reader_get_double(handle, c).toFixed(4));
             break;
+          case ZP_TYPE_STRING:
+          case ZP_TYPE_JSON:
+          case ZP_TYPE_ENUM:
+          case ZP_TYPE_UUID:
           case ZP_TYPE_BYTES: {
             const ptr = zp.zp_row_reader_get_bytes_ptr(handle, c);
             const len = zp.zp_row_reader_get_bytes_len(handle, c);
             if (ptr && len > 0) {
               const raw = new Uint8Array(wasmMemory!.buffer, ptr, len);
-              try {
-                fields.push(`"${new TextDecoder("utf-8", { fatal: true }).decode(raw)}"`);
-              } catch {
-                fields.push(`<${len} bytes>`);
+              if (isStringLike(t)) {
+                fields.push(`"${new TextDecoder().decode(raw)}"`);
+              } else {
+                try {
+                  fields.push(`"${new TextDecoder("utf-8", { fatal: true }).decode(raw)}"`);
+                } catch {
+                  fields.push(`<${len} bytes>`);
+                }
               }
             } else {
               fields.push(`""`);

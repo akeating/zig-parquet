@@ -24,6 +24,10 @@ jobs:
         with:
           enable-cache: false
 
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
       - name: Generate test files
         working-directory: test-files-arrow
         run: uv run python generate.py
@@ -47,6 +51,10 @@ jobs:
           cd ../../examples/gen-eeg && zig build
           cd ../../examples/wasm_demo && zig build
           cd ../../examples/wasm_freestanding && zig build
+
+      - name: Run freestanding WASM example
+        working-directory: zig-parquet/examples/wasm_freestanding
+        run: deno run --allow-read host/example.ts ${{ github.workspace }}/test-files-arrow/basic/basic_types_plain_uncompressed.parquet
 
       - name: Check interop artifacts are up to date
         run: git diff --exit-code test-files-arrow/interop/
