@@ -1,8 +1,10 @@
 /**
  * Deno host example for zig-parquet freestanding WASM module.
  *
- * Demonstrates the **row reader API** — a cursor-based interface that yields
- * one row at a time with typed getters. No Arrow knowledge required.
+ * Demonstrates the **low-level freestanding WASM API** — the host provides
+ * IO callbacks (host_read_at, host_size, host_write, host_close) and drives
+ * the row reader/writer through explicit handle management, manual memory
+ * allocation (zp_alloc/zp_free), and typed getters.
  *
  * Usage:
  *   deno run --allow-read example.ts <path-to-parquet-file>
@@ -11,7 +13,6 @@
 import type { HostImports, ParquetFreestandingExports } from "./types.d.ts";
 
 const ZP_OK = 0;
-const ZP_ROW_END = 11;
 
 const ZP_TYPE_NULL = 0;
 const ZP_TYPE_BOOL = 1;
@@ -50,6 +51,7 @@ class BufferStore {
     return ctx;
   }
 
+  /** Returns the four host callbacks the WASM module imports (see HostImports). */
   getImports(memory: () => WebAssembly.Memory): HostImports {
     const self = this;
     return {
