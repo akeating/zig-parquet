@@ -277,43 +277,6 @@ pub const FixedByteArrayDictionary = struct {
     }
 };
 
-/// Decode dictionary-encoded string values
-pub fn decodeStrings(
-    allocator: std.mem.Allocator,
-    dict_data: []const u8,
-    dict_num_values: usize,
-    indices_data: []const u8,
-    bit_width: u5,
-    num_values: usize,
-) ![][]const u8 {
-    // Build dictionary
-    var dict = try StringDictionary.fromPlain(allocator, dict_data, dict_num_values);
-    defer dict.deinit();
-
-    // Decode indices
-    const indices = try rle.decode(allocator, indices_data, bit_width, num_values);
-    defer allocator.free(indices);
-
-    // Look up values
-    var result = try allocator.alloc([]const u8, num_values);
-    errdefer {
-        for (result) |v| {
-            if (v.len > 0) allocator.free(v);
-        }
-        allocator.free(result);
-    }
-
-    for (0..num_values) |i| {
-        if (dict.get(indices[i])) |v| {
-            result[i] = try allocator.dupe(u8, v);
-        } else {
-            result[i] = "";
-        }
-    }
-
-    return result;
-}
-
 // Tests
 test "StringDictionary basic" {
     const allocator = std.testing.allocator;

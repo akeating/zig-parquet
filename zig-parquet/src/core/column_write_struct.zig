@@ -412,7 +412,7 @@ pub fn writeColumnChunkStructByteArrayMultiPage(
 }
 
 /// Write a column chunk with pre-encoded page data for a struct field
-pub fn writeColumnChunkWithDataStruct(
+fn writeColumnChunkWithDataStruct(
     allocator: std.mem.Allocator,
     output: *std.Io.Writer,
     struct_name: []const u8,

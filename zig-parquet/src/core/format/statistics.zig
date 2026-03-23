@@ -155,19 +155,6 @@ pub const Statistics = struct {
         return @bitCast(bits);
     }
 
-    /// Decode min value as bool (for BOOLEAN columns)
-    pub fn minAsBool(self: *const Self) ?bool {
-        const bytes = self.getMinBytes() orelse return null;
-        if (bytes.len < 1) return null;
-        return bytes[0] != 0;
-    }
-
-    /// Decode max value as bool (for BOOLEAN columns)
-    pub fn maxAsBool(self: *const Self) ?bool {
-        const bytes = self.getMaxBytes() orelse return null;
-        if (bytes.len < 1) return null;
-        return bytes[0] != 0;
-    }
 };
 
 /// Bounding box for geospatial statistics (Thrift struct BoundingBox)

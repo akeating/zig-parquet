@@ -112,7 +112,7 @@ pub fn DecodeResult(comptime T: type) type {
 }
 
 /// Decode column values from page data, returning values and levels
-pub fn decodeColumnWithLevels(
+fn decodeColumnWithLevels(
     comptime T: type,
     ctx: DecodeContext,
     value_data: []const u8,
@@ -904,7 +904,7 @@ pub fn decodeColumnDynamic(
 }
 
 /// Decode column values dynamically with explicit level encodings
-pub fn decodeColumnDynamicWithEncoding(
+fn decodeColumnDynamicWithEncoding(
     allocator: std.mem.Allocator,
     schema_elem: format.SchemaElement,
     value_data: []const u8,
@@ -2261,7 +2261,7 @@ fn decodeDynamicFixedByteArray(
 
 /// Decode INT96 values (12-byte legacy timestamp format)
 /// Converts to i64 nanoseconds since Unix epoch for compatibility with modern timestamps
-pub fn decodeDynamicInt96(
+fn decodeDynamicInt96(
     allocator: std.mem.Allocator,
     schema_elem: format.SchemaElement,
     value_data: []const u8,

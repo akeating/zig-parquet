@@ -46,7 +46,7 @@ pub const CompactWriter = struct {
     }
 
     /// Write multiple bytes
-    pub fn writeBytes(self: *Self, bytes: []const u8) !void {
+    fn writeBytes(self: *Self, bytes: []const u8) !void {
         try self.buffer.appendSlice(self.allocator, bytes);
     }
 

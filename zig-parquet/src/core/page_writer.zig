@@ -45,28 +45,6 @@ pub const DataPageResult = struct {
 // Byte Array Data Pages (non-generic encoding)
 // =============================================================================
 
-/// Write a data page for Optional byte array values (unified API).
-/// This is the preferred method - accepts the same Optional type that Reader returns.
-pub fn writeDataPageByteArrayOptional(
-    allocator: std.mem.Allocator,
-    values: []const Optional([]const u8),
-    is_optional: bool,
-) PageWriteError!DataPageResult {
-    return writeDataPageByteArrayOptionalWithEncoding(allocator, values, is_optional, .plain);
-}
-
-/// Write a data page for Optional fixed-length byte array values (unified API).
-/// This is the preferred method - accepts the same Optional type that Reader returns.
-/// Definition levels are written based on is_optional (schema), not data content.
-pub fn writeDataPageFixedByteArrayOptional(
-    allocator: std.mem.Allocator,
-    values: []const Optional([]const u8),
-    fixed_len: usize,
-    is_optional: bool,
-) PageWriteError!DataPageResult {
-    return writeDataPageFixedByteArrayOptionalWithEncoding(allocator, values, fixed_len, is_optional, .plain);
-}
-
 /// Write a data page for Optional fixed-length byte array values with a specific encoding.
 pub fn writeDataPageFixedByteArrayOptionalWithEncoding(
     allocator: std.mem.Allocator,
@@ -102,17 +80,6 @@ pub fn writeDataPageFixedByteArrayOptionalWithEncoding(
         };
     }
     return combineDefLevelsAndValues(allocator, is_defined.items, encoded_values, values.len);
-}
-
-/// Write a data page with Optional(T) values (unified API).
-/// This is the preferred method - accepts the same Optional(T) type that Reader returns.
-pub fn writeDataPageOptional(
-    allocator: std.mem.Allocator,
-    comptime T: type,
-    values: []const Optional(T),
-    is_optional: bool,
-) PageWriteError!DataPageResult {
-    return writeDataPageOptionalWithEncoding(allocator, T, values, is_optional, .plain);
 }
 
 /// Internal generic function to write a typed data page
@@ -508,37 +475,6 @@ pub fn writeDataPageWithEncoding(
     return writeDataPageTypedWithEncoding(allocator, T, values, null, is_optional, encoding);
 }
 
-/// Write a nullable data page with a specific value encoding
-pub fn writeDataPageNullableWithEncoding(
-    allocator: std.mem.Allocator,
-    comptime T: type,
-    values: []const ?T,
-    encoding: format.Encoding,
-) PageWriteError!DataPageResult {
-    // Separate into values and null mask
-    var non_null_values: std.ArrayList(T) = .empty;
-    defer non_null_values.deinit(allocator);
-
-    var is_defined: std.ArrayList(bool) = .empty;
-    defer is_defined.deinit(allocator);
-
-    for (values) |v| {
-        try is_defined.append(allocator, v != null);
-        if (v) |val| {
-            try non_null_values.append(allocator, val);
-        }
-    }
-
-    return writeDataPageTypedWithEncoding(
-        allocator,
-        T,
-        non_null_values.items,
-        is_defined.items,
-        true,
-        encoding,
-    );
-}
-
 /// Internal function to write a typed data page with encoding
 fn writeDataPageTypedWithEncoding(
     allocator: std.mem.Allocator,
@@ -639,9 +575,6 @@ fn encodePlain(allocator: std.mem.Allocator, comptime T: type, values: []const T
 
 /// Write a data page with Optional(T) values and a specific encoding.
 /// This is the unified function that handles both nullable and non-nullable cases.
-/// The old writeDataPageWithEncoding and writeDataPageNullableWithEncoding are
-/// thin wrappers around this function.
-/// Note: Always includes definition levels since Optional indicates an optional column.
 pub fn writeDataPageOptionalWithEncoding(
     allocator: std.mem.Allocator,
     comptime T: type,
@@ -703,32 +636,6 @@ pub fn writeDataPageByteArrayWithEncoding(
     return combineDefLevelsAndValues(allocator, is_defined, encoded_values, values.len);
 }
 
-/// Write a nullable byte array data page with a specific encoding
-pub fn writeDataPageByteArrayNullableWithEncoding(
-    allocator: std.mem.Allocator,
-    values: []const ?[]const u8,
-    encoding: format.Encoding,
-) PageWriteError!DataPageResult {
-    var non_null_values: std.ArrayList([]const u8) = .empty;
-    defer non_null_values.deinit(allocator);
-
-    var is_defined: std.ArrayList(bool) = .empty;
-    defer is_defined.deinit(allocator);
-
-    for (values) |v| {
-        try is_defined.append(allocator, v != null);
-        if (v) |val| {
-            try non_null_values.append(allocator, val);
-        }
-    }
-
-    // Encode the non-null values with specified encoding
-    const encoded_values = try encodeByteArraysWithEncoding(allocator, non_null_values.items, encoding);
-    defer allocator.free(encoded_values);
-
-    return combineDefLevelsAndValues(allocator, is_defined.items, encoded_values, values.len);
-}
-
 /// Encode byte arrays with the specified encoding
 fn encodeByteArraysWithEncoding(
     allocator: std.mem.Allocator,
@@ -768,7 +675,7 @@ fn encodeFixedByteArraysWithEncoding(
 
 /// Encode INT96 values from i64 nanoseconds
 /// Each value is 12 bytes: 8 bytes nanoseconds within day + 4 bytes Julian day
-pub fn encodeInt96Values(allocator: std.mem.Allocator, values: []const i64) ![]u8 {
+fn encodeInt96Values(allocator: std.mem.Allocator, values: []const i64) ![]u8 {
     const result = try allocator.alloc(u8, values.len * 12);
     errdefer allocator.free(result);
 
@@ -778,34 +685,6 @@ pub fn encodeInt96Values(allocator: std.mem.Allocator, values: []const i64) ![]u
     }
 
     return result;
-}
-
-/// Write a data page for INT96 values (legacy timestamp format)
-/// Takes i64 nanoseconds and encodes as 12-byte INT96 values
-pub fn writeDataPageInt96(
-    allocator: std.mem.Allocator,
-    values: []const i64,
-    is_optional: bool,
-) PageWriteError!DataPageResult {
-    // Encode all values as INT96
-    const encoded_values = try encodeInt96Values(allocator, values);
-    defer allocator.free(encoded_values);
-
-    if (!is_optional) {
-        const result = try allocator.dupe(u8, encoded_values);
-        return .{
-            .data = result,
-            .num_values = values.len,
-            .num_non_null = values.len,
-        };
-    }
-
-    // For optional, create all-defined mask
-    const is_defined = try allocator.alloc(bool, values.len);
-    defer allocator.free(is_defined);
-    @memset(is_defined, true);
-
-    return combineDefLevelsAndValues(allocator, is_defined, encoded_values, values.len);
 }
 
 /// Write a data page for Optional INT96 values (with nulls)
@@ -935,196 +814,3 @@ pub fn writeDataPageByteArrayOptionalWithEncoding(
     return combineDefLevelsAndValues(allocator, is_defined.items, encoded_values, values.len);
 }
 
-// =============================================================================
-// Tests
-// =============================================================================
-
-test "write data page i32 non-optional" {
-    const allocator = std.testing.allocator;
-
-    const values = [_]Optional(i32){
-        .{ .value = 1 },
-        .{ .value = 2 },
-        .{ .value = 3 },
-    };
-    var result = try writeDataPageOptional(allocator, i32, &values, false);
-    defer result.deinit(allocator);
-
-    try std.testing.expectEqual(@as(usize, 3), result.num_values);
-    try std.testing.expectEqual(@as(usize, 3), result.num_non_null);
-    // Data should be 3 * 4 = 12 bytes (no def levels for required columns)
-    try std.testing.expectEqual(@as(usize, 12), result.data.len);
-}
-
-test "write data page i32 optional with nulls" {
-    const allocator = std.testing.allocator;
-
-    const values = [_]Optional(i32){
-        .{ .value = 1 },
-        .{ .null_value = {} },
-        .{ .value = 3 },
-    };
-    var result = try writeDataPageOptional(allocator, i32, &values, true);
-    defer result.deinit(allocator);
-
-    try std.testing.expectEqual(@as(usize, 3), result.num_values);
-    try std.testing.expectEqual(@as(usize, 2), result.num_non_null);
-    // Data should have def levels (4 byte prefix + encoded) + values (2 * 4 = 8 bytes)
-    try std.testing.expect(result.data.len > 8);
-}
-
-test "write data page byte array optional with nulls" {
-    const allocator = std.testing.allocator;
-
-    const values = [_]Optional([]const u8){
-        .{ .value = "hello" },
-        .{ .null_value = {} },
-        .{ .value = "world" },
-    };
-    var result = try writeDataPageByteArrayOptional(allocator, &values, true);
-    defer result.deinit(allocator);
-
-    try std.testing.expectEqual(@as(usize, 3), result.num_values);
-    try std.testing.expectEqual(@as(usize, 2), result.num_non_null);
-}
-
-// =============================================================================
-// Tests for Optional page writers (Phase 11 unified API)
-// =============================================================================
-
-test "writeDataPageOptional i32 with mixed values" {
-    const allocator = std.testing.allocator;
-
-    const values = [_]Optional(i32){
-        .{ .value = 1 },
-        .{ .null_value = {} },
-        .{ .value = 3 },
-    };
-    var result = try writeDataPageOptional(allocator, i32, &values, true);
-    defer result.deinit(allocator);
-
-    try std.testing.expectEqual(@as(usize, 3), result.num_values);
-    try std.testing.expectEqual(@as(usize, 2), result.num_non_null);
-    // Data should have def levels + values
-    try std.testing.expect(result.data.len > 8);
-}
-
-test "writeDataPageOptional i32 all values - optional column" {
-    const allocator = std.testing.allocator;
-
-    const values = [_]Optional(i32){
-        .{ .value = 1 },
-        .{ .value = 2 },
-        .{ .value = 3 },
-    };
-    // is_optional=true: includes def levels (6 bytes header + 12 bytes values = 18 bytes)
-    var result = try writeDataPageOptional(allocator, i32, &values, true);
-    defer result.deinit(allocator);
-
-    try std.testing.expectEqual(@as(usize, 3), result.num_values);
-    try std.testing.expectEqual(@as(usize, 3), result.num_non_null);
-    try std.testing.expectEqual(@as(usize, 18), result.data.len);
-}
-
-test "writeDataPageOptional i32 all values - required column" {
-    const allocator = std.testing.allocator;
-
-    const values = [_]Optional(i32){
-        .{ .value = 1 },
-        .{ .value = 2 },
-        .{ .value = 3 },
-    };
-    // is_optional=false: no def levels (just 12 bytes values)
-    var result = try writeDataPageOptional(allocator, i32, &values, false);
-    defer result.deinit(allocator);
-
-    try std.testing.expectEqual(@as(usize, 3), result.num_values);
-    try std.testing.expectEqual(@as(usize, 3), result.num_non_null);
-    try std.testing.expectEqual(@as(usize, 12), result.data.len);
-}
-
-test "writeDataPageByteArrayOptional with mixed values" {
-    const allocator = std.testing.allocator;
-
-    const values = [_]Optional([]const u8){
-        .{ .value = "hello" },
-        .{ .null_value = {} },
-        .{ .value = "world" },
-    };
-    var result = try writeDataPageByteArrayOptional(allocator, &values, true);
-    defer result.deinit(allocator);
-
-    try std.testing.expectEqual(@as(usize, 3), result.num_values);
-    try std.testing.expectEqual(@as(usize, 2), result.num_non_null);
-}
-
-test "writeDataPageByteArrayOptional all values" {
-    const allocator = std.testing.allocator;
-
-    const values = [_]Optional([]const u8){
-        .{ .value = "hello" },
-        .{ .value = "world" },
-    };
-    var result = try writeDataPageByteArrayOptional(allocator, &values, true);
-    defer result.deinit(allocator);
-
-    try std.testing.expectEqual(@as(usize, 2), result.num_values);
-    try std.testing.expectEqual(@as(usize, 2), result.num_non_null);
-}
-
-test "writeDataPageFixedByteArrayOptional with mixed values" {
-    const allocator = std.testing.allocator;
-
-    // UUID-like 16-byte arrays
-    const uuid1 = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10 };
-    const uuid2 = [_]u8{ 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20 };
-
-    const values = [_]Optional([]const u8){
-        .{ .value = &uuid1 },
-        .{ .null_value = {} },
-        .{ .value = &uuid2 },
-    };
-    var result = try writeDataPageFixedByteArrayOptional(allocator, &values, 16, true);
-    defer result.deinit(allocator);
-
-    try std.testing.expectEqual(@as(usize, 3), result.num_values);
-    try std.testing.expectEqual(@as(usize, 2), result.num_non_null);
-}
-
-test "writeDataPageFixedByteArrayOptional all values - optional column" {
-    const allocator = std.testing.allocator;
-
-    const uuid1 = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10 };
-    const uuid2 = [_]u8{ 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20 };
-
-    const values = [_]Optional([]const u8){
-        .{ .value = &uuid1 },
-        .{ .value = &uuid2 },
-    };
-    // is_optional=true: includes def levels (6 bytes header + 32 bytes values = 38 bytes)
-    var result = try writeDataPageFixedByteArrayOptional(allocator, &values, 16, true);
-    defer result.deinit(allocator);
-
-    try std.testing.expectEqual(@as(usize, 2), result.num_values);
-    try std.testing.expectEqual(@as(usize, 2), result.num_non_null);
-    try std.testing.expectEqual(@as(usize, 38), result.data.len);
-}
-
-test "writeDataPageFixedByteArrayOptional all values - required column" {
-    const allocator = std.testing.allocator;
-
-    const uuid1 = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10 };
-    const uuid2 = [_]u8{ 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20 };
-
-    const values = [_]Optional([]const u8){
-        .{ .value = &uuid1 },
-        .{ .value = &uuid2 },
-    };
-    // is_optional=false: no def levels (just 32 bytes values)
-    var result = try writeDataPageFixedByteArrayOptional(allocator, &values, 16, false);
-    defer result.deinit(allocator);
-
-    try std.testing.expectEqual(@as(usize, 2), result.num_values);
-    try std.testing.expectEqual(@as(usize, 2), result.num_non_null);
-    try std.testing.expectEqual(@as(usize, 32), result.data.len);
-}

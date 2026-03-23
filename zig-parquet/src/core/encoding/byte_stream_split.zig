@@ -72,7 +72,7 @@ fn decodeGenericInto(comptime T: type, data: []const u8, result: []T) !void {
 }
 
 /// Decode BYTE_STREAM_SPLIT for fixed-length byte arrays
-pub fn decodeFixedLenInto(data: []const u8, result: [][]u8, type_length: usize) !void {
+fn decodeFixedLenInto(data: []const u8, result: [][]u8, type_length: usize) !void {
     const num_values = result.len;
     
     if (data.len < num_values * type_length) {
@@ -121,14 +121,6 @@ pub fn decodeInt64Alloc(allocator: std.mem.Allocator, data: []const u8, num_valu
     const result = try allocator.alloc(i64, num_values);
     errdefer allocator.free(result);
     try decodeInt64Into(data, result);
-    return result;
-}
-
-/// Decode BYTE_STREAM_SPLIT encoded f16 values with allocation
-pub fn decodeFloat16Alloc(allocator: std.mem.Allocator, data: []const u8, num_values: usize) ![]f16 {
-    const result = try allocator.alloc(f16, num_values);
-    errdefer allocator.free(result);
-    try decodeFloat16Into(data, result);
     return result;
 }
 
@@ -271,26 +263,6 @@ test "byte stream split decode i32 with negative" {
     defer allocator.free(result);
 
     try std.testing.expectEqual(@as(i32, -1), result[0]);
-}
-
-test "byte stream split decode f16" {
-    const allocator = std.testing.allocator;
-
-    // 2 values: 1.0 and 2.0
-    // f16 1.0 = 0x3C00, f16 2.0 = 0x4000 (IEEE 754 half-precision)
-    // Little-endian: 1.0 = 00 3C, 2.0 = 00 40
-    // Stream 0 (byte 0 of each): 0x00, 0x00
-    // Stream 1 (byte 1 of each): 0x3C, 0x40
-    const data = [_]u8{
-        0x00, 0x00, // stream 0
-        0x3C, 0x40, // stream 1
-    };
-
-    const result = try decodeFloat16Alloc(allocator, &data, 2);
-    defer allocator.free(result);
-
-    try std.testing.expectEqual(@as(f16, 1.0), result[0]);
-    try std.testing.expectEqual(@as(f16, 2.0), result[1]);
 }
 
 test "byte stream split decode fixed len" {

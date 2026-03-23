@@ -125,9 +125,7 @@ pub const Writer = struct {
         }
     }
 
-    /// Get physical column index for a given ColumnDef and field index
-    /// For non-struct columns, field_index should be 0
-    pub fn getPhysicalColumnIndex(self: *Self, col_def_index: usize, field_index: usize) WriterError!usize {
+    fn getPhysicalColumnIndex(self: *Self, col_def_index: usize, field_index: usize) WriterError!usize {
         if (col_def_index >= self.columns.len) return error.InvalidColumnIndex;
 
         var physical_idx: usize = 0;
@@ -137,7 +135,7 @@ pub const Writer = struct {
             } else if (col.is_struct) {
                 physical_idx += if (col.struct_fields) |fields| fields.len else 0;
             } else if (col.is_map) {
-                physical_idx += 2; // key and value columns
+                physical_idx += 2;
             } else {
                 physical_idx += 1;
             }
@@ -153,7 +151,6 @@ pub const Writer = struct {
             if (field_index >= fields.len) return error.InvalidColumnIndex;
             return physical_idx + field_index;
         } else if (col_def.is_map) {
-            // field_index 0 = key column, field_index 1 = value column
             if (field_index >= 2) return error.InvalidColumnIndex;
             return physical_idx + field_index;
         } else {
@@ -350,18 +347,6 @@ pub const Writer = struct {
         return self.writeColumnFixedByteArrayOptional(column_index, optional_values);
     }
 
-    /// Write a nullable fixed length byte array column
-    /// Deprecated: Use writeColumnFixedByteArrayOptional with Optional([]const u8) instead.
-    pub fn writeColumnFixedByteArrayNullable(self: *Self, column_index: usize, values: []const ?[]const u8) WriterError!void {
-        // Convert ?[]const u8 to Optional([]const u8) and delegate
-        const optional_values = self.allocator.alloc(Optional([]const u8), values.len) catch return error.OutOfMemory;
-        defer self.allocator.free(optional_values);
-        for (values, 0..) |v, i| {
-            optional_values[i] = Optional([]const u8).from(v);
-        }
-        return self.writeColumnFixedByteArrayOptional(column_index, optional_values);
-    }
-
     /// Write a fixed length byte array column with Optional values (unified API).
     /// This is the preferred method - accepts the same Optional type that Reader returns.
     /// Works for both required and optional columns (uses schema to control def levels).
@@ -453,45 +438,6 @@ pub const Writer = struct {
 
         var result = column_writer.writeColumnChunkList(
             i32,
-            self.allocator,
-            writer,
-            col_def.name,
-            flattened.values,
-            flattened.def_levels,
-            flattened.rep_levels,
-            3,
-            1,
-            self.current_offset,
-            col_def.codec,
-        ) catch |e| return mapColumnError(e);
-
-        try self.flushWriter();
-        try self.recordColumnWrite(physical_idx, &result, lists.len);
-    }
-
-    /// Write a list column of i64 values
-    pub fn writeListColumnI64(
-        self: *Self,
-        column_index: usize,
-        lists: []const Optional([]const Optional(i64)),
-    ) WriterError!void {
-        try self.validateListColumnWrite(column_index, .int64);
-        const physical_idx = try self.getPhysicalColumnIndex(column_index, 0);
-
-        const col_def = self.columns[column_index];
-        const writer = self.getWriter();
-
-        // Flatten the list data
-        var flattened = list_encoder.flattenList(
-            i64,
-            self.allocator,
-            lists,
-            3,
-        ) catch return error.OutOfMemory;
-        defer flattened.deinit();
-
-        var result = column_writer.writeColumnChunkList(
-            i64,
             self.allocator,
             writer,
             col_def.name,
@@ -1419,7 +1365,7 @@ pub const Writer = struct {
         return idx;
     }
 
-    pub fn countStructChildren(node: *const SchemaNode) WriterError!i32 {
+    fn countStructChildren(node: *const SchemaNode) WriterError!i32 {
         return switch (node.*) {
             .optional => |child| countStructChildren(child),
             .struct_ => |s| safe.castTo(i32, s.fields.len),
@@ -1427,7 +1373,7 @@ pub const Writer = struct {
         };
     }
 
-    pub fn makePrimitiveElement(
+    fn makePrimitiveElement(
         name: []const u8,
         type_: format.PhysicalType,
         type_length: ?i32,

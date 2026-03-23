@@ -819,7 +819,7 @@ pub const ValuePhysicalType = enum {
 };
 
 /// Detect the physical type from a slice of Values
-pub fn detectValueType(values: []const Value) ValuePhysicalType {
+fn detectValueType(values: []const Value) ValuePhysicalType {
     for (values) |v| {
         switch (v) {
             .int32_val => return .int32,
@@ -1906,7 +1906,7 @@ test "write column chunk with statistics i32 optional" {
 
 /// Write a column chunk with a specific value encoding.
 /// Supports delta encodings for improved compression of specific data patterns.
-pub fn writeColumnChunkWithEncoding(
+fn writeColumnChunkWithEncoding(
     comptime T: type,
     allocator: std.mem.Allocator,
     output: *std.Io.Writer,
@@ -2263,24 +2263,7 @@ pub fn writeColumnChunkOptionalWithPathArray(
     codec: format.CompressionCodec,
     write_page_checksum: bool,
 ) ColumnWriteError!ColumnChunkResult {
-    return writeColumnChunkOptionalWithPathArrayMultiPage(T, allocator, output, path_in_schema, values, is_optional, start_offset, codec, null, write_page_checksum);
-}
-
-/// Write a column chunk with Optional(T) values and optional multi-page support (unified API).
-/// is_optional: true if column is optional in schema (writes def levels), false for required columns.
-pub fn writeColumnChunkOptionalWithPathArrayMultiPage(
-    comptime T: type,
-    allocator: std.mem.Allocator,
-    output: *std.Io.Writer,
-    path_in_schema: []const []const u8,
-    values: []const Optional(T),
-    is_optional: bool,
-    start_offset: i64,
-    codec: format.CompressionCodec,
-    max_page_size: ?usize,
-    write_page_checksum: bool,
-) ColumnWriteError!ColumnChunkResult {
-    return writeColumnChunkOptionalWithEncoding(T, allocator, output, path_in_schema, values, is_optional, start_offset, codec, .plain, max_page_size, write_page_checksum);
+    return writeColumnChunkOptionalWithEncoding(T, allocator, output, path_in_schema, values, is_optional, start_offset, codec, .plain, null, write_page_checksum);
 }
 
 /// Write a byte array column chunk with Optional values (unified API).
@@ -2295,122 +2278,7 @@ pub fn writeColumnChunkByteArrayOptionalWithPathArray(
     codec: format.CompressionCodec,
     write_page_checksum: bool,
 ) ColumnWriteError!ColumnChunkResult {
-    return writeColumnChunkByteArrayOptionalWithPathArrayMultiPage(allocator, output, path_in_schema, values, is_optional, start_offset, codec, null, write_page_checksum);
-}
-
-/// Write a byte array column chunk with Optional values and multi-page support (unified API).
-/// is_optional: true if column is optional in schema (writes def levels), false for required columns.
-pub fn writeColumnChunkByteArrayOptionalWithPathArrayMultiPage(
-    allocator: std.mem.Allocator,
-    output: *std.Io.Writer,
-    path_in_schema: []const []const u8,
-    values: []const Optional([]const u8),
-    is_optional: bool,
-    start_offset: i64,
-    codec: format.CompressionCodec,
-    max_page_size: ?usize,
-    write_page_checksum: bool,
-) ColumnWriteError!ColumnChunkResult {
-    return writeColumnChunkByteArrayOptionalWithEncoding(allocator, output, path_in_schema, values, is_optional, start_offset, codec, .plain, max_page_size, write_page_checksum);
-}
-
-/// Write a byte array column chunk with a specific value encoding.
-pub fn writeColumnChunkByteArrayWithEncoding(
-    allocator: std.mem.Allocator,
-    output: *std.Io.Writer,
-    path_in_schema: []const []const u8,
-    values: []const []const u8,
-    is_optional: bool,
-    start_offset: i64,
-    codec: format.CompressionCodec,
-    value_encoding: format.Encoding,
-    write_page_checksum: bool,
-) ColumnWriteError!ColumnChunkResult {
-    // Compute statistics from values
-    var stats_builder = statistics.ByteArrayStatisticsBuilder.init(allocator);
-    defer stats_builder.deinit();
-    stats_builder.update(values) catch return error.OutOfMemory;
-    const stats = stats_builder.build();
-    errdefer if (stats) |s| freeStatistics(allocator, s);
-
-    // Write data page with specified encoding
-    var page_result = page_writer.writeDataPageByteArrayWithEncoding(allocator, values, is_optional, value_encoding) catch |e| switch (e) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.InvalidFixedLength => return error.InvalidFixedLength,
-        error.IntegerOverflow => return error.IntegerOverflow,
-        error.ValueTooLarge => return error.ValueTooLarge,
-        error.UnsupportedEncoding => return error.UnsupportedEncoding,
-    };
-    defer page_result.deinit(allocator);
-
-    // Compress if needed
-    const compressed_data = if (codec != .uncompressed) blk: {
-        break :blk compress.compress(allocator, page_result.data, codec) catch |err| switch (err) {
-            error.UnsupportedCompression => return error.UnsupportedCompression,
-            else => return error.CompressionError,
-        };
-    } else page_result.data;
-    defer if (codec != .uncompressed) allocator.free(compressed_data);
-
-    // Create page header with correct encoding
-    const page_header = format.PageHeader{
-        .type_ = .data_page,
-        .uncompressed_page_size = try safe.castTo(i32, page_result.data.len),
-        .compressed_page_size = try safe.castTo(i32, compressed_data.len),
-        .crc = if (write_page_checksum) computePageCrc(compressed_data) else null,
-        .data_page_header = .{
-            .num_values = try safe.castTo(i32, page_result.num_values),
-            .encoding = value_encoding,
-            .definition_level_encoding = .rle,
-            .repetition_level_encoding = .rle,
-            .statistics = null,
-        },
-        .dictionary_page_header = null,
-    };
-
-    // Serialize page header
-    var thrift_writer = thrift.CompactWriter.init(allocator);
-    defer thrift_writer.deinit();
-
-    page_header.serialize(&thrift_writer) catch return error.OutOfMemory;
-    const header_bytes = thrift_writer.getWritten();
-
-    // Write header and compressed data
-    output.writeAll(header_bytes) catch return error.WriteError;
-    output.writeAll(compressed_data) catch return error.WriteError;
-
-    const total_bytes_written = header_bytes.len + compressed_data.len;
-
-    // Duplicate path_in_schema for metadata (writeColumnChunkByteArrayWithEncoding)
-    const path = allocator.alloc([]const u8, path_in_schema.len) catch return error.OutOfMemory;
-    for (path_in_schema, 0..) |segment, i| {
-        path[i] = allocator.dupe(u8, segment) catch return error.OutOfMemory;
-    }
-
-    // Build encodings list with the actual encoding used
-    const encodings = allocator.alloc(format.Encoding, 2) catch return error.OutOfMemory;
-    encodings[0] = .rle; // Definition levels
-    encodings[1] = value_encoding; // Values
-
-    var result = ColumnChunkResult{
-        .metadata = .{
-            .type_ = .byte_array,
-            .encodings = encodings,
-            .path_in_schema = path,
-            .codec = codec,
-            .num_values = try safe.castTo(i32, page_result.num_values),
-            .total_uncompressed_size = try safe.castTo(i64, header_bytes.len + page_result.data.len),
-            .total_compressed_size = try safe.castTo(i64, total_bytes_written),
-            .data_page_offset = start_offset,
-            .index_page_offset = null,
-            .dictionary_page_offset = null,
-            .statistics = null,
-        },
-        .file_offset = start_offset,
-        .total_bytes = total_bytes_written,
-    };
-    result.metadata.statistics = stats;
-    return result;
+    return writeColumnChunkByteArrayOptionalWithEncoding(allocator, output, path_in_schema, values, is_optional, start_offset, codec, .plain, null, write_page_checksum);
 }
 
 // =============================================================================
@@ -2652,59 +2520,3 @@ test "write column chunk with byte_stream_split encoding" {
     try std.testing.expectEqual(format.Encoding.byte_stream_split, result.metadata.encodings[1]);
 }
 
-test "write column chunk with delta_length_byte_array encoding" {
-    const allocator = std.testing.allocator;
-
-    var aw: std.Io.Writer.Allocating = .init(allocator);
-    defer aw.deinit();
-
-    const values = [_][]const u8{ "hello", "world", "test", "data" };
-    var result = try writeColumnChunkByteArrayWithEncoding(
-        allocator,
-        &aw.writer,
-        &.{"string_col"},
-        &values,
-        false,
-        4,
-        .uncompressed,
-        .delta_length_byte_array,
-        true, // write_page_checksum
-    );
-    defer result.deinit(allocator);
-
-    // Verify metadata
-    try std.testing.expectEqual(format.PhysicalType.byte_array, result.metadata.type_);
-    try std.testing.expectEqual(@as(i64, 4), result.metadata.num_values);
-    try std.testing.expectEqual(format.Encoding.delta_length_byte_array, result.metadata.encodings[1]);
-}
-
-test "write column chunk with delta_byte_array encoding" {
-    const allocator = std.testing.allocator;
-
-    var aw: std.Io.Writer.Allocating = .init(allocator);
-    defer aw.deinit();
-
-    // Sorted strings with common prefixes - ideal for delta_byte_array
-    const values = [_][]const u8{
-        "https://example.com/api/v1/users/0",
-        "https://example.com/api/v1/users/1",
-        "https://example.com/api/v1/users/2",
-    };
-    var result = try writeColumnChunkByteArrayWithEncoding(
-        allocator,
-        &aw.writer,
-        &.{"url_col"},
-        &values,
-        false,
-        4,
-        .uncompressed,
-        .delta_byte_array,
-        true, // write_page_checksum
-    );
-    defer result.deinit(allocator);
-
-    // Verify metadata
-    try std.testing.expectEqual(format.PhysicalType.byte_array, result.metadata.type_);
-    try std.testing.expectEqual(@as(i64, 3), result.metadata.num_values);
-    try std.testing.expectEqual(format.Encoding.delta_byte_array, result.metadata.encodings[1]);
-}

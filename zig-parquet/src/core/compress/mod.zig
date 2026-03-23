@@ -86,17 +86,6 @@ pub fn compress(
     }
 }
 
-/// Check if a codec is supported for compression
-pub fn isCompressionSupported(codec: format.CompressionCodec) bool {
-    if (no_compression) {
-        return codec == .uncompressed;
-    }
-    return switch (codec) {
-        .uncompressed, .zstd, .gzip, .snappy, .lz4_raw, .brotli => true,
-        else => false,
-    };
-}
-
 /// Decompress data based on the codec
 pub fn decompress(
     allocator: std.mem.Allocator,
@@ -152,17 +141,6 @@ pub fn decompress(
         },
         else => return error.UnsupportedCompression,
     }
-}
-
-/// Check if a codec is supported for decompression
-pub fn isDecompressionSupported(codec: format.CompressionCodec) bool {
-    if (no_compression) {
-        return codec == .uncompressed;
-    }
-    return switch (codec) {
-        .uncompressed, .zstd, .gzip, .lz4_raw, .brotli, .snappy => true,
-        else => false,
-    };
 }
 
 /// Get a human-readable name for a codec

@@ -73,36 +73,6 @@ pub const AllocationLimits = struct {
 };
 
 
-/// Deinitialize an ArrayListUnmanaged, freeing string values if T == []const u8.
-///
-/// This is a helper to avoid repeating the pattern:
-/// ```
-/// defer {
-///     if (T == []const u8) {
-///         for (list.items) |v| allocator.free(v);
-///     }
-///     list.deinit(allocator);
-/// }
-/// ```
-pub fn deinitArrayList(comptime T: type, allocator: std.mem.Allocator, list: *std.ArrayListUnmanaged(T)) void {
-    if (T == []const u8) {
-        for (list.items) |v| allocator.free(v);
-    }
-    list.deinit(allocator);
-}
-
-/// Deinitialize an ArrayListUnmanaged of Optional(T), freeing string values if T == []const u8.
-///
-/// Used for nullable columns where values are wrapped in Optional.
-pub fn deinitOptionalArrayList(comptime T: type, allocator: std.mem.Allocator, list: *std.ArrayListUnmanaged(types.Optional(T))) void {
-    if (T == []const u8) {
-        for (list.items) |v| {
-            if (v == .value) allocator.free(v.value);
-        }
-    }
-    list.deinit(allocator);
-}
-
 /// Result of parsing a Parquet file footer
 pub const FooterInfo = struct {
     metadata: format.FileMetaData,

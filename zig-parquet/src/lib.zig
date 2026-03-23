@@ -70,21 +70,21 @@ pub const WriterError = types.WriterError;
 pub const safe = @import("core/safe.zig");
 
 // Schema and Value types for nested composition
-pub const schema = @import("core/schema.zig");
+const schema = @import("core/schema.zig");
 pub const SchemaNode = schema.SchemaNode;
-pub const value = @import("core/value.zig");
+const value = @import("core/value.zig");
 pub const Value = value.Value;
 pub const nested = @import("core/nested.zig");
 
 // Arrow types for zero-copy interop
-pub const arrow = @import("core/arrow.zig");
+const arrow = @import("core/arrow.zig");
 pub const ArrowSchema = arrow.ArrowSchema;
 pub const ArrowArray = arrow.ArrowArray;
 pub const ArrowColumn = arrow.ArrowColumn;
 pub const ArrowArrayStream = arrow.ArrowArrayStream;
 
 // Arrow batch API (runtime type dispatch for row group I/O)
-pub const arrow_batch = @import("core/arrow_batch.zig");
+const arrow_batch = @import("core/arrow_batch.zig");
 pub const exportSchemaAsArrow = arrow_batch.exportSchemaAsArrow;
 pub const importSchemaFromArrow = arrow_batch.importSchemaFromArrow;
 pub const readRowGroupAsArrow = arrow_batch.readRowGroupAsArrow;
@@ -104,7 +104,6 @@ pub const WriteTargetWriter = write_target_mod.WriteTargetWriter;
 
 // Format types (Thrift-decoded Parquet structures)
 pub const format = @import("core/format.zig");
-pub const Encoding = format.Encoding;
 pub const CompressionCodec = format.CompressionCodec;
 
 // Dynamic Writer (runtime row-oriented writing)
@@ -112,8 +111,6 @@ const writer_module = @import("core/writer_mod.zig");
 pub const DynamicWriter = writer_module.DynamicWriter;
 pub const DynamicWriterError = writer_module.DynamicWriterError;
 pub const TypeInfo = writer_module.TypeInfo;
-pub const ColumnType = writer_module.ColumnType;
-pub const ColumnProperties = writer_module.ColumnProperties;
 
 // Dynamic Reader (schema-agnostic row reading)
 const reader_module = @import("core/reader_mod.zig");

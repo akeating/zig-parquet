@@ -1423,7 +1423,7 @@ fn writeColumnChunkWithPathOwnedAndEncoding(
 }
 
 /// Write a column chunk with pre-encoded page data for a list column
-pub fn writeColumnChunkWithDataList(
+fn writeColumnChunkWithDataList(
     allocator: std.mem.Allocator,
     output: *std.Io.Writer,
     column_name: []const u8,

@@ -288,7 +288,7 @@ pub const FlatColumnSlice = struct {
 ///
 /// This is the inverse of `flattenValue` - it takes flat column data with
 /// definition and repetition levels and reconstructs the nested structure.
-pub fn assembleValue(
+fn assembleValue(
     allocator: std.mem.Allocator,
     node: *const SchemaNode,
     columns: []const FlatColumnSlice,

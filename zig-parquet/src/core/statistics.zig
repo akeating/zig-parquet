@@ -27,7 +27,7 @@ pub fn StatisticsBuilder(comptime T: type) type {
         }
 
         /// Update statistics with a single value.
-        pub fn updateValue(self: *Self, value: T) void {
+        fn updateValue(self: *Self, value: T) void {
             if (!self.has_values) {
                 self.min = value;
                 self.max = value;
@@ -44,7 +44,7 @@ pub fn StatisticsBuilder(comptime T: type) type {
 
         /// Update statistics with a slice of nullable values.
         /// Deprecated: Use updateOptional with Optional(T) instead.
-        pub fn updateNullable(self: *Self, values: []const ?T) void {
+        fn updateNullable(self: *Self, values: []const ?T) void {
             for (values) |v| {
                 if (v) |val| {
                     self.updateValue(val);
@@ -183,7 +183,7 @@ pub const ByteArrayStatisticsBuilder = struct {
     }
 
     /// Update statistics with a single byte array value.
-    pub fn updateValue(self: *Self, value: []const u8) !void {
+    fn updateValue(self: *Self, value: []const u8) !void {
         if (!self.has_values) {
             self.min = try self.allocator.dupe(u8, value);
             self.max = try self.allocator.dupe(u8, value);
@@ -202,7 +202,7 @@ pub const ByteArrayStatisticsBuilder = struct {
 
     /// Update statistics with a slice of nullable byte array values.
     /// Deprecated: Use updateOptional with Optional([]const u8) instead.
-    pub fn updateNullable(self: *Self, values: []const ?[]const u8) !void {
+    fn updateNullable(self: *Self, values: []const ?[]const u8) !void {
         for (values) |v| {
             if (v) |val| {
                 try self.updateValue(val);
@@ -295,12 +295,12 @@ pub const GeospatialStatisticsBuilder = struct {
     }
 
     /// Update with a single WKB value.
-    pub fn updateValue(self: *Self, value: []const u8) void {
+    fn updateValue(self: *Self, value: []const u8) void {
         self.bbox_builder.update(value);
     }
 
     /// Update with a slice of nullable WKB values.
-    pub fn updateNullable(self: *Self, values: []const ?[]const u8) void {
+    fn updateNullable(self: *Self, values: []const ?[]const u8) void {
         for (values) |v| {
             if (v) |val| {
                 self.bbox_builder.update(val);
@@ -323,12 +323,6 @@ pub const GeospatialStatisticsBuilder = struct {
     /// Add to null count.
     pub fn addNulls(self: *Self, count: i64) void {
         self.null_count += count;
-    }
-
-    /// Build GeospatialStatistics for ColumnMetaData.
-    /// Returns null if no valid coordinates were accumulated.
-    pub fn buildGeospatial(self: *Self) !?format.GeospatialStatistics {
-        return try self.bbox_builder.buildStatistics(self.allocator);
     }
 
     /// Build regular Statistics (only null_count, no min/max for geospatial).

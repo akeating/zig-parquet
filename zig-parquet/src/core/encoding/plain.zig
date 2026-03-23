@@ -40,12 +40,6 @@ pub fn decodeI64(data: []const u8) !i64 {
     return std.mem.readInt(i64, data[0..8], .little);
 }
 
-/// Decode a u64 from the current position
-pub fn decodeU64(data: []const u8) !u64 {
-    if (data.len < 8) return error.EndOfData;
-    return std.mem.readInt(u64, data[0..8], .little);
-}
-
 /// Decode an f32 from the current position
 pub fn decodeFloat(data: []const u8) !f32 {
     if (data.len < 4) return error.EndOfData;

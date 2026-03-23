@@ -55,7 +55,7 @@ pub const ColumnType = enum {
     fixed_bytes,
     nested,
 
-    pub fn toPhysicalType(self: ColumnType) ?format.PhysicalType {
+    fn toPhysicalType(self: ColumnType) ?format.PhysicalType {
         return switch (self) {
             .bool_ => .boolean,
             .int32 => .int32,
@@ -168,7 +168,7 @@ pub const ValueBuilder = struct {
 
     stack: std.ArrayListUnmanaged(Frame) = .empty,
 
-    pub fn push(self: *ValueBuilder, allocator: Allocator, kind: FrameKind) !void {
+    fn push(self: *ValueBuilder, allocator: Allocator, kind: FrameKind) !void {
         try self.stack.append(allocator, .{ .kind = kind });
     }
 
@@ -182,7 +182,7 @@ pub const ValueBuilder = struct {
         return self.stack.pop();
     }
 
-    pub fn appendValue(self: *ValueBuilder, allocator: Allocator, val: Value) !void {
+    fn appendValue(self: *ValueBuilder, allocator: Allocator, val: Value) !void {
         const frame = self.top() orelse return error.InvalidState;
         switch (frame.kind) {
             .list => try frame.items.append(allocator, val),

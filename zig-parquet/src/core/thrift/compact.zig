@@ -55,7 +55,7 @@ pub const CompactReader = struct {
     }
 
     /// Read N bytes
-    pub fn readBytes(self: *Self, n: usize) ![]const u8 {
+    fn readBytes(self: *Self, n: usize) ![]const u8 {
         if (self.pos + n > self.data.len) return error.EndOfData;
             const bytes = try safe.slice(self.data, self.pos, n);
         self.pos += n;

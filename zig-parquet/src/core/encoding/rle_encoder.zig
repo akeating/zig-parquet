@@ -156,7 +156,7 @@ fn writeVarInt(buffer: *std.ArrayList(u8), allocator: std.mem.Allocator, value: 
 
 /// Encode definition levels from a bool array (true = present, false = null)
 /// This is a convenience wrapper for flat schemas where max_def_level = 1.
-pub fn encodeDefLevels(allocator: std.mem.Allocator, is_defined: []const bool) ![]u8 {
+fn encodeDefLevels(allocator: std.mem.Allocator, is_defined: []const bool) ![]u8 {
     // Convert bools to u32s (0 or 1)
     const values = try allocator.alloc(u32, is_defined.len);
     defer allocator.free(values);
@@ -172,7 +172,7 @@ pub fn encodeDefLevels(allocator: std.mem.Allocator, is_defined: []const bool) !
 /// Encode levels (definition or repetition) with a specified max level.
 /// For nested types, max_level can be > 1.
 /// The bit width is computed from max_level.
-pub fn encodeLevels(allocator: std.mem.Allocator, levels: []const u32, max_level: u8) ![]u8 {
+fn encodeLevels(allocator: std.mem.Allocator, levels: []const u32, max_level: u8) ![]u8 {
     const bit_width = computeBitWidth(max_level);
     return encode(allocator, levels, bit_width);
 }

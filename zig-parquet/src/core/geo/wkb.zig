@@ -15,7 +15,7 @@ pub const Dimensions = enum(u2) {
     xym = 2, // 3D with M
     xyzm = 3, // 4D
 
-    pub fn coordCount(self: Dimensions) usize {
+    fn coordCount(self: Dimensions) usize {
         return switch (self) {
             .xy => 2,
             .xyz, .xym => 3,
@@ -59,14 +59,14 @@ pub const WkbBuffer = struct {
         return self.data.len - self.pos;
     }
 
-    pub fn readU8(self: *Self) WkbError!u8 {
+    fn readU8(self: *Self) WkbError!u8 {
         if (self.pos >= self.data.len) return error.UnexpectedEndOfData;
         const val = self.data[self.pos];
         self.pos += 1;
         return val;
     }
 
-    pub fn readU32(self: *Self, swap: bool) WkbError!u32 {
+    fn readU32(self: *Self, swap: bool) WkbError!u32 {
         if (self.pos + 4 > self.data.len) return error.UnexpectedEndOfData;
         const bytes = safe.slice(self.data, self.pos, 4) catch return error.UnexpectedEndOfData;
         self.pos += 4;
@@ -78,7 +78,7 @@ pub const WkbBuffer = struct {
         return native_endian;
     }
 
-    pub fn readF64(self: *Self, swap: bool) WkbError!f64 {
+    fn readF64(self: *Self, swap: bool) WkbError!f64 {
         if (self.pos + 8 > self.data.len) return error.UnexpectedEndOfData;
         const bytes = safe.slice(self.data, self.pos, 8) catch return error.UnexpectedEndOfData;
         self.pos += 8;
@@ -91,7 +91,7 @@ pub const WkbBuffer = struct {
     }
 
     /// Read coordinate values and call visitor for each
-    pub fn readCoords(
+    fn readCoords(
         self: *Self,
         n_coords: u32,
         dims: Dimensions,

@@ -112,91 +112,6 @@ pub fn encodeFixedByteArrays(allocator: std.mem.Allocator, values: []const []con
 
     return result;
 }
-
-/// A streaming encoder that builds up encoded data
-pub fn PlainEncoder(comptime T: type) type {
-    return struct {
-        buffer: std.ArrayList(u8),
-        allocator: std.mem.Allocator,
-        count: usize = 0,
-        // For booleans, we need to buffer bits
-        bool_byte: u8 = 0,
-        bool_bit_pos: u3 = 0,
-
-        const Self = @This();
-
-        pub fn init(allocator: std.mem.Allocator) Self {
-            return .{
-                .buffer = .empty,
-                .allocator = allocator,
-            };
-        }
-
-        pub fn deinit(self: *Self) void {
-            self.buffer.deinit(self.allocator);
-        }
-
-        pub fn append(self: *Self, value: T) !void {
-            if (T == bool) {
-                if (value) {
-                    self.bool_byte |= @as(u8, 1) << self.bool_bit_pos;
-                }
-                self.bool_bit_pos +%= 1;
-                if (self.bool_bit_pos == 0) {
-                    // Byte is complete
-                    try self.buffer.append(self.allocator, self.bool_byte);
-                    self.bool_byte = 0;
-                }
-            } else if (T == i32) {
-                var buf: [4]u8 = undefined;
-                std.mem.writeInt(i32, &buf, value, .little);
-                try self.buffer.appendSlice(self.allocator, &buf);
-            } else if (T == i64) {
-                var buf: [8]u8 = undefined;
-                std.mem.writeInt(i64, &buf, value, .little);
-                try self.buffer.appendSlice(self.allocator, &buf);
-            } else if (T == f32) {
-                var buf: [4]u8 = undefined;
-                const bits: u32 = @bitCast(value);
-                std.mem.writeInt(u32, &buf, bits, .little);
-                try self.buffer.appendSlice(self.allocator, &buf);
-            } else if (T == f64) {
-                var buf: [8]u8 = undefined;
-                const bits: u64 = @bitCast(value);
-                std.mem.writeInt(u64, &buf, bits, .little);
-                try self.buffer.appendSlice(self.allocator, &buf);
-            } else if (T == []const u8) {
-                if (value.len > std.math.maxInt(i32)) return error.ValueTooLarge;
-                // Length prefix + data
-                var len_buf: [4]u8 = undefined;
-                std.mem.writeInt(u32, &len_buf, try safe.castTo(u32, value.len), .little);
-                try self.buffer.appendSlice(self.allocator, &len_buf);
-                try self.buffer.appendSlice(self.allocator, value);
-            } else {
-                @compileError("Unsupported type for PlainEncoder");
-            }
-            self.count += 1;
-        }
-
-        /// Finalize and return the encoded bytes (caller owns the memory)
-        pub fn finish(self: *Self) ![]u8 {
-            // Flush any remaining boolean bits
-            if (T == bool and self.bool_bit_pos != 0) {
-                try self.buffer.append(self.allocator, self.bool_byte);
-            }
-
-            // Return owned slice
-            const result = try self.allocator.dupe(u8, self.buffer.items);
-            return result;
-        }
-
-        /// Get current encoded data (without finalizing)
-        pub fn getEncoded(self: *const Self) []const u8 {
-            return self.buffer.items;
-        }
-    };
-}
-
 // Tests
 test "encode booleans" {
     const allocator = std.testing.allocator;
@@ -269,47 +184,6 @@ test "encode byte arrays" {
         0x02, 0x00, 0x00, 0x00, 'h', 'i', // "hi"
         0x03, 0x00, 0x00, 0x00, 'b', 'y', 'e', // "bye"
     }, encoded);
-}
-
-test "PlainEncoder i32" {
-    const allocator = std.testing.allocator;
-
-    var encoder = PlainEncoder(i32).init(allocator);
-    defer encoder.deinit();
-
-    try encoder.append(1);
-    try encoder.append(-2);
-    try encoder.append(2147483647);
-
-    const encoded = try encoder.finish();
-    defer allocator.free(encoded);
-
-    try std.testing.expectEqualSlices(u8, &[_]u8{
-        0x01, 0x00, 0x00, 0x00, // 1
-        0xFE, 0xFF, 0xFF, 0xFF, // -2
-        0xFF, 0xFF, 0xFF, 0x7F, // 2147483647
-    }, encoded);
-}
-
-test "PlainEncoder round-trip" {
-    const allocator = std.testing.allocator;
-    const plain = @import("plain.zig");
-
-    // Encode
-    var encoder = PlainEncoder(i32).init(allocator);
-    defer encoder.deinit();
-
-    try encoder.append(42);
-    try encoder.append(-100);
-
-    const encoded = try encoder.finish();
-    defer allocator.free(encoded);
-
-    // Decode
-    var decoder = plain.PlainDecoder(i32).init(encoded, 2);
-    try std.testing.expectEqual(@as(?i32, 42), decoder.next());
-    try std.testing.expectEqual(@as(?i32, -100), decoder.next());
-    try std.testing.expectEqual(@as(?i32, null), decoder.next());
 }
 
 test "encodeByteArrays round-trip" {
