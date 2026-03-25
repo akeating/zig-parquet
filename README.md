@@ -9,20 +9,20 @@ A native Parquet library built for portability, embeddability, and low deploymen
 ## Features
 
 - **Embeddable Native Library** - Link Parquet support directly into native applications
-- **C ABI with Arrow C Data Interface** - Call from C, C++, and other languages via ArrowSchema, ArrowArray, and ArrowArrayStream
-- **Full Read/Write Support** - Read and write Parquet files with all physical types
+- **Full Read/Write Support** - Read and write Parquet files with all physical and logical types
 - **All Standard Encodings** - PLAIN, RLE, DICTIONARY, DELTA_BINARY_PACKED, DELTA_LENGTH_BYTE_ARRAY, DELTA_BYTE_ARRAY, BYTE_STREAM_SPLIT
 - **Nested Types** - Lists, structs, maps, and arbitrary nesting depth
 - **Compression** - zstd, gzip, snappy, lz4, brotli (via C/C++ libraries)
-- **Logical Types** - Timestamps, dates, decimals, UUIDs, JSON, BSON, enums, geometry, geography
+- **Logical Types** - STRING, DATE, TIME, TIMESTAMP (millis/micros/nanos), DECIMAL, UUID, INT annotations, FLOAT16, ENUM, JSON, BSON, INTERVAL, GEOMETRY, GEOGRAPHY
 - **Dynamic Row API** - Runtime `DynamicWriter` / `DynamicReader` for all types and arbitrary nesting depth
 - **Schema-Agnostic Reading** - Read any Parquet file without knowing the schema at compile time
 - **Column Statistics** - Min/max/null_count in column metadata
 - **Page-Level CRC Checksums** - Written by default, validated on read
 - **Key-Value Metadata** - Read and write arbitrary file-level metadata
-- **DataPage V1 and V2** - Full support for both page format versions
+- **DataPage V1 and V2** - Read both page formats; write uses V1
 - **Buffer and Callback Transports** - Read/write from memory, files, or custom I/O backends
-- **Hardened Against Malformed Input** - Safe casting, bounds checking, no undefined behavior on untrusted data
+- **Hardened Against Malformed Input** - Designed for safe casting, bounds checking, and no undefined behavior on untrusted data
+- **C ABI with Arrow C Data Interface** - Call from C, C++, and other languages via ArrowSchema, ArrowArray, and ArrowArrayStream
 - **Portable Deployment** - Native library and CLI for desktops, servers, edge devices, and serverless jobs
 - **WASM Compatible** - 103 KB plain or 438 KB with all compression codecs (brotli-compressed)
 - **CLI Tool** - `pqi` for inspecting and validating Parquet files
