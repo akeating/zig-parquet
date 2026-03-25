@@ -1,6 +1,6 @@
 .{
     .name = .pq,
-    .version = "0.1.0",
+    .version = "0.1.1",
     .description = "CLI tool for inspecting, validating, and converting Parquet files",
     .fingerprint = 0x49e42aa3ef62df09,
     .dependencies = .{
