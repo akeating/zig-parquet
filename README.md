@@ -427,31 +427,6 @@ See `examples/wasm_demo/` and `examples/wasm_freestanding/` for usage examples.
 - C compiler (for compression libraries)
 - C++ compiler (for Snappy)
 
-## Project Structure
-
-```
-zig-parquet/
-├── zig-parquet/          # Core library
-│   ├── src/
-│   │   ├── lib.zig       # Public API
-│   │   ├── core/         # Reader, writer, codec modules
-│   │   ├── api/          # C ABI and WASM surface layers
-│   │   ├── format/       # Parquet format types
-│   │   ├── encoding/     # PLAIN, RLE, DICTIONARY, DELTA_*
-│   │   ├── compress/     # Compression codecs
-│   │   └── tests/        # Test suite
-│   └── examples/
-├── cli/                  # pqi CLI tool
-└── test-files-arrow/     # PyArrow-generated test files
-```
-
-## Testing
-
-```bash
-cd zig-parquet
-zig build test
-```
-
 ## License
 
 Licensed under either of
