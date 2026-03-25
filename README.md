@@ -41,11 +41,23 @@ pqi schema data.parquet
 # Preview rows
 pqi head data.parquet -n 10
 
-# Output as JSON
+# Output all rows as JSON
 pqi cat data.parquet --json
 
-# Show file statistics
+# Row count
+pqi count data.parquet
+
+# File statistics
 pqi stats data.parquet
+
+# Row group details
+pqi rowgroups data.parquet
+
+# File size breakdown
+pqi size data.parquet
+
+# Column detail across row groups
+pqi column data.parquet price quantity
 
 # Validate file integrity
 pqi validate data.parquet
