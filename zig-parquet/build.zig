@@ -286,6 +286,18 @@ pub fn build(b: *std.Build) void {
 
     const run_lib_unit_tests = b.addRunArtifact(lib_unit_tests);
 
+    const check_test_files = b.addSystemCommand(&.{
+        "sh", "-c",
+        \\test -f ../test-files-arrow/basic/basic_types_plain_uncompressed.parquet || {
+        \\  echo ""
+        \\  echo "ERROR: Test files not found."
+        \\  echo "Generate them first:  cd test-files-arrow && uv run python generate.py"
+        \\  echo ""
+        \\  exit 1
+        \\}
+    });
+    run_lib_unit_tests.step.dependOn(&check_test_files.step);
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_lib_unit_tests.step);
 
