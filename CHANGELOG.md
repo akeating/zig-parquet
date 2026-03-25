@@ -1,0 +1,45 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+## [0.1.1] - 2026-03-25
+
+### Added
+- Test file pre-check in `zig build test` — fails early with a clear message instead of 52 FileNotFound errors
+
+### Fixed
+- Deduplicate `safeTypeLength` between column_decoder and dynamic_reader
+- Fix incorrect file paths in AGENTS.md
+- Document all pqi commands in README (count, column, rowgroups, size)
+- Fix README feature claims: complete logical types list, clarify DataPage V2 and hardening
+
+### Changed
+- Reorder README features to lead with core capabilities
+- Clean up CONTRIBUTING.md section ordering
+
+## [0.1.0] - 2026-03-23
+
+Initial release.
+
+### Added
+- Full read/write support for all Parquet physical types
+- All standard encodings: PLAIN, RLE, DICTIONARY, DELTA_BINARY_PACKED, DELTA_LENGTH_BYTE_ARRAY, DELTA_BYTE_ARRAY, BYTE_STREAM_SPLIT
+- Nested types: LIST, MAP, STRUCT with arbitrary nesting depth
+- Logical types: STRING, DATE, TIME, TIMESTAMP, DECIMAL, UUID, INT, FLOAT16, ENUM, JSON, BSON, INTERVAL, GEOMETRY, GEOGRAPHY
+- Compression: zstd, gzip, snappy, lz4_raw, brotli
+- DataPage V1 and V2 read support; write uses V1
+- Runtime DynamicWriter and DynamicReader for schema-agnostic row I/O
+- Column statistics (min/max/null_count)
+- Page-level CRC32 checksums (written by default, validated on read)
+- Key-value metadata read/write
+- Column projection on DynamicReader
+- Streaming RowIterator with C ABI support
+- C ABI with Arrow C Data Interface (ArrowSchema, ArrowArray, ArrowArrayStream)
+- WASM targets: wasm32-wasi (with compression) and wasm32-freestanding (no compression)
+- `pqi` CLI: schema, head, cat, count, stats, rowgroups, size, column, validate
+- Buffer, file, and callback I/O transports
+- Hardening: safe casting, bounds checking, no `@intCast` on external data
+- 219/219 pass rate on supported Apache parquet-testing files
+
+[0.1.1]: https://github.com/akeating/zig-parquet/compare/v0.1.0...v0.1.1
+[0.1.0]: https://github.com/akeating/zig-parquet/releases/tag/v0.1.0
