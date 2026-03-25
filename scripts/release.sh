@@ -46,7 +46,7 @@ git --no-pager diff
 
 echo ""
 echo "If everything looks good, commit and push to trigger the release workflow:"
-echo "  git commit -am \"Release v$VERSION\""
+echo "  git commit -am \"Change version to v$VERSION\""
 echo "  git tag v$VERSION"
 echo "  git push origin main --tags"
 echo ""
