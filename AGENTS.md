@@ -13,11 +13,16 @@ zig-parquet is a native Parquet library written in Zig 0.15.2. It provides read/
 
 ### Key Files
 
-- `zig-parquet/src/lib.zig` - Library exports
-- `zig-parquet/src/reader.zig` - Parquet reader
-- `zig-parquet/src/writer.zig` - Parquet writer
-- `zig-parquet/src/format.zig` - Parquet format types (re-exports from format/)
-- `zig-parquet/src/safe.zig` - Safe casting/slicing helpers for untrusted data
+- `zig-parquet/src/lib.zig` - Library exports (package root)
+- `zig-parquet/src/core/dynamic_reader.zig` - DynamicReader (schema-agnostic row reading)
+- `zig-parquet/src/core/column_decoder.zig` - Column value decoding (encodings, levels, types)
+- `zig-parquet/src/core/writer.zig` - High-level typed Parquet writer
+- `zig-parquet/src/core/dynamic_writer.zig` - DynamicWriter (runtime-schema row writing)
+- `zig-parquet/src/core/format.zig` - Parquet format types (re-exports from format/)
+- `zig-parquet/src/core/safe.zig` - Safe casting/slicing helpers for untrusted data
+- `zig-parquet/src/core/arrow_batch.zig` - Arrow C Data Interface bridge
+- `zig-parquet/src/core/schema.zig` - Recursive schema for nested types + logical types
+- `cli/src/main.zig` - pqi CLI entry point
 
 ### Documentation
 
