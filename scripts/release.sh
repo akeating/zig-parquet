@@ -35,8 +35,8 @@ sed -i.bak -E "s/\.version = \"[^\"]+\"/.version = \"$VERSION\"/" cli/build.zig.
 rm -f cli/build.zig.zon.bak
 
 # Update README.md
-# This looks for the GitHub archive URL and replaces the tag portion
-sed -i.bak -E "s/refs\/tags\/v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?\.tar\.gz/refs\/tags\/v$VERSION.tar.gz/g" README.md
+# Replace version in zig fetch URL: .../download/vX.Y.Z/zig-parquet-vX.Y.Z.tar.gz
+sed -i.bak -E "s|/download/v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?/zig-parquet-v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?\.tar\.gz|/download/v$VERSION/zig-parquet-v$VERSION.tar.gz|g" README.md
 rm -f README.md.bak
 
 echo "✅ Updated build.zig.zon and README.md"
