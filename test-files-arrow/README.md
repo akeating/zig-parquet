@@ -20,37 +20,23 @@ uv run python generate.py --p0
 ```
 test-files-arrow/
 ├── basic/                    # P0: Core functionality
-│   ├── basic_types_plain_uncompressed.parquet
-│   ├── boundary_values.parquet
-│   └── nulls_and_empties.parquet
-├── encodings/                # P1: Encoding variations
-│   ├── dictionary_low_cardinality.parquet
-│   └── dictionary_high_cardinality.parquet
-├── compression/              # P1: Compression codecs
-│   ├── compression_none.parquet
-│   ├── compression_zstd.parquet
-│   ├── compression_gzip.parquet
-│   └── compression_snappy.parquet
-├── structure/                # P1: File structure variations
-│   └── multiple_row_groups.parquet
-├── edge_cases/               # Edge cases
-│   ├── single_value.parquet
-│   ├── empty_table.parquet
-│   └── large_strings.parquet
+├── encodings/                # Encoding variations (dictionary, delta, byte_stream_split)
+├── compression/              # Compression codecs (zstd, gzip, snappy, lz4, brotli)
+├── structure/                # File structure (multiple row groups)
+├── edge_cases/               # Edge cases (empty, single value, large strings)
 ├── logical_types/            # Logical type annotations
-│   ├── string.parquet
-│   ├── date.parquet
-│   ├── timestamp.parquet
-│   ├── time.parquet
-│   ├── decimal.parquet
-│   ├── uuid.parquet
-│   ├── int_types.parquet
-│   ├── float16.parquet
-│   ├── enum.parquet
-│   └── json.parquet
+├── nested/                   # Nested types (list, map, struct)
+├── multipage/                # Multi-page column chunks
+├── interop/                  # Interop: files written by zig-parquet, validated by PyArrow
 ├── manifest.json             # Expected metadata for validation
-└── generate.py               # Regeneration script
+├── generate.py               # Regeneration script
+└── test_interop.py           # PyArrow validation of interop/ files
 ```
+
+Most directories contain **generated** test files (PyArrow writes, Zig reads) that are
+gitignored and recreated by `generate.py`. The `interop/` directory is the opposite:
+files **written by zig-parquet** during `zig build test` and committed to git, then
+validated by `test_interop.py` to confirm cross-implementation compatibility.
 
 ## Priority Levels
 
