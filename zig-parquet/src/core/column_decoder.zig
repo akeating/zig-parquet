@@ -34,7 +34,7 @@ fn extractBitWidth(data: []const u8, offset: usize) error{InvalidBitWidth, EndOf
 }
 
 /// Safely cast type_length (i32) to usize, validating non-negative.
-fn safeTypeLength(type_length: ?i32) error{InvalidTypeLength}!usize {
+pub fn safeTypeLength(type_length: ?i32) error{InvalidTypeLength}!usize {
     const tl = type_length orelse return 0;
     return safe.cast(tl) catch return error.InvalidTypeLength;
 }

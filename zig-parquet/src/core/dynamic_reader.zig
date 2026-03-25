@@ -70,11 +70,7 @@ fn safeRowCount(count: i64) error{InvalidRowCount}!usize {
     return safe.cast(count) catch return error.InvalidRowCount;
 }
 
-/// Safely cast type_length to usize.
-fn safeTypeLength(type_length: ?i32) error{InvalidTypeLength}!usize {
-    const tl = type_length orelse return 0;
-    return safe.cast(tl) catch return error.InvalidTypeLength;
-}
+const safeTypeLength = column_decoder.safeTypeLength;
 
 /// Schema-agnostic Parquet reader
 pub const DynamicReader = struct {
