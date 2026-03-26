@@ -24,11 +24,7 @@ const Optional = types.Optional;
 fn DictHashContext(comptime K: type) type {
     return struct {
         pub fn hash(_: @This(), key: K) u64 {
-            if (K == f32 or K == f64) {
-                return std.hash.Wyhash.hash(0, std.mem.asBytes(&key));
-            } else {
-                return std.hash.Wyhash.hash(0, std.mem.asBytes(&key));
-            }
+            return std.hash.Wyhash.hash(0, std.mem.asBytes(&key));
         }
         pub fn eql(_: @This(), a: K, b: K) bool {
             if (K == f32 or K == f64) {
