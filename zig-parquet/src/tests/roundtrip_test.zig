@@ -4190,3 +4190,89 @@ test "rowIterator on empty file returns null immediately" {
 
     try std.testing.expectEqual(@as(?*const DynRow, null), try iter.next());
 }
+
+test "round-trip required columns (DynamicWriter)" {
+    const allocator = std.testing.allocator;
+    const format = parquet.format;
+
+    var writer = try parquet.createBufferDynamic(allocator);
+    defer writer.deinit();
+
+    try writer.addColumn("id", TypeInfo.int32.asRequired(), .{});
+    try writer.addColumn("name", TypeInfo.string.asRequired(), .{});
+    try writer.addColumn("score", TypeInfo.float_, .{});
+    try writer.begin();
+
+    try writer.setInt32(0, 1);
+    try writer.setBytes(1, "alice");
+    try writer.setFloat(2, 1.5);
+    try writer.addRow();
+
+    try writer.setInt32(0, 2);
+    try writer.setBytes(1, "bob");
+    try writer.setNull(2);
+    try writer.addRow();
+
+    try writer.setInt32(0, 3);
+    try writer.setBytes(1, "charlie");
+    try writer.setFloat(2, 3.5);
+    try writer.addRow();
+
+    try writer.close();
+
+    const buffer = try writer.toOwnedSlice();
+    defer allocator.free(buffer);
+
+    var reader = try parquet.openBufferDynamic(allocator, buffer, .{});
+    defer reader.deinit();
+
+    // schema[0] is the root "schema" element; columns start at index 1
+    try std.testing.expectEqual(format.RepetitionType.required, reader.metadata.schema[1].repetition_type.?);
+    try std.testing.expectEqual(format.RepetitionType.required, reader.metadata.schema[2].repetition_type.?);
+    try std.testing.expectEqual(format.RepetitionType.optional, reader.metadata.schema[3].repetition_type.?);
+
+    const rows = try reader.readAllRows(0);
+    defer deferFreeRows(allocator, rows);
+
+    try std.testing.expectEqual(@as(usize, 3), rows.len);
+
+    try std.testing.expectEqual(@as(?i32, 1), rows[0].getColumn(0).?.asInt32());
+    try std.testing.expectEqualStrings("alice", rows[0].getColumn(1).?.asBytes().?);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.5), rows[0].getColumn(2).?.asFloat().?, 0.01);
+
+    try std.testing.expectEqual(@as(?i32, 2), rows[1].getColumn(0).?.asInt32());
+    try std.testing.expectEqualStrings("bob", rows[1].getColumn(1).?.asBytes().?);
+    try std.testing.expect(rows[1].getColumn(2).?.isNull());
+
+    try std.testing.expectEqual(@as(?i32, 3), rows[2].getColumn(0).?.asInt32());
+    try std.testing.expectEqualStrings("charlie", rows[2].getColumn(1).?.asBytes().?);
+    try std.testing.expectApproxEqAbs(@as(f32, 3.5), rows[2].getColumn(2).?.asFloat().?, 0.01);
+}
+
+test "required column rejects setNull (DynamicWriter)" {
+    const allocator = std.testing.allocator;
+
+    var writer = try parquet.createBufferDynamic(allocator);
+    defer writer.deinit();
+
+    try writer.addColumn("id", TypeInfo.int32.asRequired(), .{});
+    try writer.begin();
+
+    const result = writer.setNull(0);
+    try std.testing.expectError(error.InvalidArgument, result);
+}
+
+test "required column rejects unset addRow (DynamicWriter)" {
+    const allocator = std.testing.allocator;
+
+    var writer = try parquet.createBufferDynamic(allocator);
+    defer writer.deinit();
+
+    try writer.addColumn("id", TypeInfo.int32.asRequired(), .{});
+    try writer.addColumn("name", TypeInfo.string, .{});
+    try writer.begin();
+
+    try writer.setBytes(1, "alice");
+    const result = writer.addRow();
+    try std.testing.expectError(error.InvalidArgument, result);
+}

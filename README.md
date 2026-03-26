@@ -117,10 +117,12 @@ pub fn main() !void {
         var writer = try parquet.createFileDynamic(allocator, file);
         defer writer.deinit();
 
-        try writer.addColumn("sensor_id", parquet.TypeInfo.int32, .{});
-        try writer.addColumn("timestamp", parquet.TypeInfo.timestamp_micros, .{});
-        try writer.addColumn("temperature", parquet.TypeInfo.double_, .{});
-        try writer.addColumn("location", parquet.TypeInfo.string, .{});
+        // Columns are OPTIONAL by default; use .asRequired() for non-nullable
+        const TypeInfo = parquet.TypeInfo;
+        try writer.addColumn("sensor_id", TypeInfo.int32.asRequired(), .{});
+        try writer.addColumn("timestamp", TypeInfo.timestamp_micros, .{});
+        try writer.addColumn("temperature", TypeInfo.double_, .{});
+        try writer.addColumn("location", TypeInfo.string, .{});
         writer.setCompression(.zstd);
         try writer.begin();
 

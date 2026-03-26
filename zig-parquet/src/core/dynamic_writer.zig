@@ -73,6 +73,7 @@ pub const TypeInfo = struct {
     physical: ColumnType,
     logical: ?format.LogicalType,
     type_length: ?i32,
+    required: bool = false,
 
     pub const bool_ = TypeInfo{ .physical = .bool_, .logical = null, .type_length = null };
     pub const int32 = TypeInfo{ .physical = .int32, .logical = null, .type_length = null };
@@ -132,6 +133,12 @@ pub const TypeInfo = struct {
     pub fn fixedBytes(len: i32) TypeInfo {
         return .{ .physical = .fixed_bytes, .logical = null, .type_length = len };
     }
+
+    pub fn asRequired(self: TypeInfo) TypeInfo {
+        var copy = self;
+        copy.required = true;
+        return copy;
+    }
 };
 
 /// Per-column or per-leaf-path property overrides.
@@ -149,6 +156,7 @@ const PendingColumn = struct {
     col_type: ColumnType,
     logical_type: ?format.LogicalType = null,
     type_length: ?i32 = null,
+    required: bool = false,
     props: ColumnProperties = .{},
     schema_node: ?*const SchemaNode = null,
 };
@@ -261,6 +269,7 @@ pub const DynamicWriter = struct {
     column_type_lengths: []?i32 = &.{},
     column_codecs: []format.CompressionCodec = &.{},
     column_props: []ColumnProperties = &.{},
+    column_required: []bool = &.{},
     column_names_owned: [][:0]u8 = &.{},
     current_row: []Value = &.{},
     row_set: []bool = &.{},
@@ -327,6 +336,7 @@ pub const DynamicWriter = struct {
             .col_type = info.physical,
             .logical_type = info.logical,
             .type_length = info.type_length,
+            .required = info.required,
             .props = opts,
         }) catch return error.OutOfMemory;
     }
@@ -488,6 +498,7 @@ pub const DynamicWriter = struct {
         self.column_type_lengths = allocator.alloc(?i32, n) catch return error.OutOfMemory;
         self.column_codecs = allocator.alloc(format.CompressionCodec, n) catch return error.OutOfMemory;
         self.column_props = allocator.alloc(ColumnProperties, n) catch return error.OutOfMemory;
+        self.column_required = allocator.alloc(bool, n) catch return error.OutOfMemory;
         self.column_names_owned = allocator.alloc([:0]u8, n) catch return error.OutOfMemory;
         self.current_row = allocator.alloc(Value, n) catch return error.OutOfMemory;
         self.row_set = allocator.alloc(bool, n) catch return error.OutOfMemory;
@@ -502,6 +513,7 @@ pub const DynamicWriter = struct {
             self.column_type_lengths[i] = pc.type_length;
             self.column_codecs[i] = pc.props.compression orelse self.default_codec;
             self.column_props[i] = pc.props;
+            self.column_required[i] = pc.required;
             self.column_names_owned[i] = pc.name;
             self.current_row[i] = .null_val;
             self.row_set[i] = false;
@@ -519,6 +531,7 @@ pub const DynamicWriter = struct {
     pub fn setNull(self: *DynamicWriter, col: usize) DynamicWriterError!void {
         if (!self.began) return error.InvalidState;
         if (col >= self.num_columns) return error.InvalidArgument;
+        if (self.column_required[col]) return error.InvalidArgument;
         self.current_row[col] = .null_val;
         self.row_set[col] = true;
     }
@@ -750,6 +763,7 @@ pub const DynamicWriter = struct {
         if (!self.began) return error.InvalidState;
         for (0..self.num_columns) |i| {
             if (!self.row_set[i]) {
+                if (self.column_required[i]) return error.InvalidArgument;
                 self.current_row[i] = .null_val;
             }
             self.column_buffers[i].append(self.allocator, self.current_row[i]) catch return error.OutOfMemory;
@@ -801,16 +815,17 @@ pub const DynamicWriter = struct {
             } else {
                 const path: []const []const u8 = &.{col_name};
                 const opts = self.resolveOpts(col, &.{col_name});
+                const is_optional = !self.column_required[col];
                 const result: column_writer.ColumnChunkResult = switch (self.column_types[col]) {
-                    .bool_ => flushColumnBool(allocator, writer, path, items, n, self.current_offset, codec, opts) catch |e| return mapFlushError(e),
-                    .int32 => flushColumnTyped(i32, allocator, writer, path, items, n, self.current_offset, codec, opts) catch |e| return mapFlushError(e),
-                    .int64 => flushColumnTyped(i64, allocator, writer, path, items, n, self.current_offset, codec, opts) catch |e| return mapFlushError(e),
-                    .float_ => flushColumnTyped(f32, allocator, writer, path, items, n, self.current_offset, codec, opts) catch |e| return mapFlushError(e),
-                    .double_ => flushColumnTyped(f64, allocator, writer, path, items, n, self.current_offset, codec, opts) catch |e| return mapFlushError(e),
-                    .bytes => flushColumnBytes(allocator, writer, path, items, n, self.current_offset, codec, opts) catch |e| return mapFlushError(e),
+                    .bool_ => flushColumnBool(allocator, writer, path, items, n, self.current_offset, codec, is_optional, opts) catch |e| return mapFlushError(e),
+                    .int32 => flushColumnTyped(i32, allocator, writer, path, items, n, self.current_offset, codec, is_optional, opts) catch |e| return mapFlushError(e),
+                    .int64 => flushColumnTyped(i64, allocator, writer, path, items, n, self.current_offset, codec, is_optional, opts) catch |e| return mapFlushError(e),
+                    .float_ => flushColumnTyped(f32, allocator, writer, path, items, n, self.current_offset, codec, is_optional, opts) catch |e| return mapFlushError(e),
+                    .double_ => flushColumnTyped(f64, allocator, writer, path, items, n, self.current_offset, codec, is_optional, opts) catch |e| return mapFlushError(e),
+                    .bytes => flushColumnBytes(allocator, writer, path, items, n, self.current_offset, codec, is_optional, opts) catch |e| return mapFlushError(e),
                     .fixed_bytes => flushColumnFixedBytes(
                         allocator, writer, path, items, n, self.current_offset, codec,
-                        self.column_type_lengths[col] orelse return error.InvalidState, opts,
+                        self.column_type_lengths[col] orelse return error.InvalidState, is_optional, opts,
                     ) catch |e| return mapFlushError(e),
                     .nested => return error.InvalidState,
                 };
@@ -1015,6 +1030,7 @@ pub const DynamicWriter = struct {
         n: usize,
         offset: i64,
         codec: format.CompressionCodec,
+        is_optional: bool,
         opts: EncodingOpts,
     ) !column_writer.ColumnChunkResult {
         const typed = try allocator.alloc(types.Optional(bool), n);
@@ -1026,7 +1042,7 @@ pub const DynamicWriter = struct {
         }
         return column_writer.writeColumnChunkOptionalWithPathArray(
             bool, allocator, writer, path, typed,
-            true, offset, codec, opts.write_page_checksum,
+            is_optional, offset, codec, opts.write_page_checksum,
         );
     }
 
@@ -1039,6 +1055,7 @@ pub const DynamicWriter = struct {
         n: usize,
         offset: i64,
         codec: format.CompressionCodec,
+        is_optional: bool,
         opts: EncodingOpts,
     ) !column_writer.ColumnChunkResult {
         const typed = try allocator.alloc(types.Optional(T), n);
@@ -1052,7 +1069,7 @@ pub const DynamicWriter = struct {
         if (opts.encoding_override) |enc| {
             return column_writer.writeColumnChunkOptionalWithEncoding(
                 T, allocator, writer, path, typed,
-                true, offset, codec, enc, opts.max_page_size, opts.write_page_checksum,
+                is_optional, offset, codec, enc, opts.max_page_size, opts.write_page_checksum,
             );
         }
 
@@ -1064,13 +1081,13 @@ pub const DynamicWriter = struct {
             };
             return column_writer.writeColumnChunkOptionalWithEncoding(
                 T, allocator, writer, path, typed,
-                true, offset, codec, enc, opts.max_page_size, opts.write_page_checksum,
+                is_optional, offset, codec, enc, opts.max_page_size, opts.write_page_checksum,
             );
         }
 
         return column_writer.writeColumnChunkDictOptionalWithPathArray(
             T, allocator, writer, path, typed,
-            true, offset, codec,
+            is_optional, offset, codec,
             opts.dictionary_size_limit,
             opts.dictionary_cardinality_threshold,
             opts.max_page_size,
@@ -1086,6 +1103,7 @@ pub const DynamicWriter = struct {
         n: usize,
         offset: i64,
         codec: format.CompressionCodec,
+        is_optional: bool,
         opts: EncodingOpts,
     ) !column_writer.ColumnChunkResult {
         const typed = try allocator.alloc(types.Optional([]const u8), n);
@@ -1099,20 +1117,20 @@ pub const DynamicWriter = struct {
         if (opts.encoding_override) |enc| {
             return column_writer.writeColumnChunkByteArrayOptionalWithEncoding(
                 allocator, writer, path, typed,
-                true, offset, codec, enc, opts.max_page_size, opts.write_page_checksum,
+                is_optional, offset, codec, enc, opts.max_page_size, opts.write_page_checksum,
             );
         }
 
         if (!opts.use_dictionary) {
             return column_writer.writeColumnChunkByteArrayOptionalWithEncoding(
                 allocator, writer, path, typed,
-                true, offset, codec, .plain, opts.max_page_size, opts.write_page_checksum,
+                is_optional, offset, codec, .plain, opts.max_page_size, opts.write_page_checksum,
             );
         }
 
         return column_writer.writeColumnChunkByteArrayDictOptionalWithPathArray(
             allocator, writer, path, typed,
-            true, offset, codec,
+            is_optional, offset, codec,
             opts.dictionary_size_limit,
             opts.dictionary_cardinality_threshold,
             opts.max_page_size,
@@ -1129,6 +1147,7 @@ pub const DynamicWriter = struct {
         offset: i64,
         codec: format.CompressionCodec,
         type_length: i32,
+        is_optional: bool,
         opts: EncodingOpts,
     ) !column_writer.ColumnChunkResult {
         const typed = try allocator.alloc(types.Optional([]const u8), n);
@@ -1141,7 +1160,7 @@ pub const DynamicWriter = struct {
         const fixed_len = safe.castTo(u32, type_length) catch return error.InvalidTypeLength;
         return column_writer.writeColumnChunkFixedByteArrayOptionalWithPathArray(
             allocator, writer, path, typed,
-            fixed_len, true, offset, codec, opts.write_page_checksum,
+            fixed_len, is_optional, offset, codec, opts.write_page_checksum,
         );
     }
 
@@ -1253,7 +1272,7 @@ pub const DynamicWriter = struct {
                 schema[idx] = .{
                     .type_ = pt,
                     .type_length = self.column_type_lengths[i],
-                    .repetition_type = .optional,
+                    .repetition_type = if (self.column_required[i]) .required else .optional,
                     .name = self.column_names_owned[i],
                     .num_children = null,
                     .converted_type = converted_type,
@@ -1330,6 +1349,7 @@ pub const DynamicWriter = struct {
         if (self.column_type_lengths.len > 0) allocator.free(self.column_type_lengths);
         if (self.column_codecs.len > 0) allocator.free(self.column_codecs);
         if (self.column_props.len > 0) allocator.free(self.column_props);
+        if (self.column_required.len > 0) allocator.free(self.column_required);
         self.path_properties.deinit(allocator);
 
         self.bytes_arena.deinit();
