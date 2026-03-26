@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.2] - 2026-03-26
+
+### Added
+- REQUIRED column support in DynamicWriter via `TypeInfo.asRequired()` — non-nullable schema, write-time validation, no definition levels on disk
+
+### Fixed
+- Fix release script to update `zig fetch` URL in README for new versions
+
+### Changed
+- Document interop/ directory and missing subdirectories in test-files-arrow README
+
 ## [0.1.1] - 2026-03-25
 
 ### Added
@@ -41,5 +52,6 @@ Initial release.
 - Hardening: safe casting, bounds checking, no `@intCast` on external data
 - 219/219 pass rate on supported Apache parquet-testing files
 
+[0.1.2]: https://github.com/akeating/zig-parquet/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/akeating/zig-parquet/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/akeating/zig-parquet/releases/tag/v0.1.0
