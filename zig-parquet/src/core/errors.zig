@@ -42,6 +42,7 @@ pub const FormatError = error{
     InvalidRepetitionType,
     InvalidPageType,
     InvalidSchema,
+    UnsupportedType,
 };
 
 /// Decoding errors from encoding/decoding failures including Thrift parsing.

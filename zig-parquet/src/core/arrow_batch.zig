@@ -25,9 +25,7 @@ const dictionary = @import("encoding/dictionary.zig");
 const Allocator = std.mem.Allocator;
 
 fn fmtZ(allocator: Allocator, comptime fmt_str: []const u8, args: anytype) error{OutOfMemory}![:0]u8 {
-    const s = try std.fmt.allocPrint(allocator, fmt_str, args);
-    defer allocator.free(s);
-    return allocator.dupeZ(u8, s);
+    return std.fmt.allocPrintSentinel(allocator, fmt_str, args, 0);
 }
 const ArrowSchema = arrow.ArrowSchema;
 const ArrowArray = arrow.ArrowArray;
@@ -38,6 +36,7 @@ const schema_mod = @import("schema.zig");
 const SchemaNode = schema_mod.SchemaNode;
 const SeekableReader = parquet_reader.SeekableReader;
 const Optional = types.Optional;
+const ReaderError = types.ReaderError;
 
 pub const BatchError = error{
     OutOfMemory,
@@ -465,14 +464,17 @@ fn physicalTypeToArrowFormat(allocator: Allocator, elem: format.SchemaElement) S
 // ============================================================================
 
 /// Convert an ArrowSchema (root struct) to Parquet ColumnDef[].
-/// The caller owns the returned slice.
+/// The caller owns the returned slice and must call `freeImportedColumnDefs` to free it.
 pub fn importSchemaFromArrow(allocator: Allocator, schema: *const ArrowSchema) ![]ColumnDef {
     const fmt = std.mem.sliceTo(schema.format, 0);
     if (!std.mem.eql(u8, fmt, "+s")) return error.InvalidSchema;
 
     const nc = safe.castTo(usize, schema.n_children) catch return error.InvalidSchema;
     var col_defs = try allocator.alloc(ColumnDef, nc);
-    errdefer allocator.free(col_defs);
+    errdefer {
+        for (col_defs) |*cd| cd.freeStructFields(allocator);
+        allocator.free(col_defs);
+    }
 
     const children: [*]*ArrowSchema = schema.children orelse return error.InvalidSchema;
     for (0..nc) |i| {
@@ -481,6 +483,13 @@ pub fn importSchemaFromArrow(allocator: Allocator, schema: *const ArrowSchema) !
     }
 
     return col_defs;
+}
+
+/// Free ColumnDef[] returned by importSchemaFromArrow, including any
+/// heap-allocated struct_fields within individual column definitions.
+pub fn freeImportedColumnDefs(allocator: Allocator, col_defs: []ColumnDef) void {
+    for (col_defs) |*cd| cd.freeStructFields(allocator);
+    allocator.free(col_defs);
 }
 
 fn arrowSchemaToColumnDef(allocator: Allocator, schema: *const ArrowSchema) !ColumnDef {
@@ -554,226 +563,130 @@ fn arrowSchemaToSchemaNode(allocator: Allocator, schema: *const ArrowSchema, nul
     return node;
 }
 
-fn arrowFormatToSchemaNode(fmt: []const u8) !SchemaNode {
-    if (fmt.len == 1) {
-        return switch (fmt[0]) {
-            'b' => SchemaNode{ .boolean = .{} },
-            'c', 's', 'i' => SchemaNode{ .int32 = .{} },
-            'C', 'S' => SchemaNode{ .int32 = .{} },
-            'l' => SchemaNode{ .int64 = .{} },
-            'I', 'L' => SchemaNode{ .int64 = .{} },
-            'e' => SchemaNode{ .fixed_len_byte_array = .{ .len = 2, .logical = .float16 } },
-            'f' => SchemaNode{ .float = .{} },
-            'g' => SchemaNode{ .double = .{} },
-            'u', 'U' => SchemaNode{ .byte_array = .{ .logical = .string } },
-            'z', 'Z' => SchemaNode{ .byte_array = .{} },
-            else => return error.UnsupportedType,
-        };
-    }
-    if (std.mem.eql(u8, fmt, "tdD") or std.mem.eql(u8, fmt, "tdm")) {
-        return SchemaNode{ .int32 = .{ .logical = .date } };
-    }
-    if (std.mem.eql(u8, fmt, "ttm") or std.mem.eql(u8, fmt, "tts")) {
-        return SchemaNode{ .int32 = .{ .logical = .{ .time = .{ .is_adjusted_to_utc = false, .unit = .millis } } } };
-    }
-    if (std.mem.eql(u8, fmt, "ttu")) {
-        return SchemaNode{ .int64 = .{ .logical = .{ .time = .{ .is_adjusted_to_utc = false, .unit = .micros } } } };
-    }
-    if (std.mem.eql(u8, fmt, "ttn")) {
-        return SchemaNode{ .int64 = .{ .logical = .{ .time = .{ .is_adjusted_to_utc = false, .unit = .nanos } } } };
-    }
-    if (fmt.len >= 4 and std.mem.eql(u8, fmt[0..2], "ts")) {
-        const unit: format.TimeUnit = switch (fmt[2]) {
-            's', 'm' => .millis,
-            'u' => .micros,
-            'n' => .nanos,
-            else => return error.UnsupportedType,
-        };
-        const tz_part = fmt[4..];
-        const is_utc = tz_part.len > 0 and std.mem.eql(u8, tz_part, "UTC");
-        return SchemaNode{ .int64 = .{ .logical = .{ .timestamp = .{ .is_adjusted_to_utc = is_utc, .unit = unit } } } };
-    }
-    if (fmt.len >= 2 and fmt[0] == 'w' and fmt[1] == ':') {
-        const type_length = std.fmt.parseInt(u32, fmt[2..], 10) catch return error.InvalidSchema;
-        const logical: ?format.LogicalType = if (type_length == 16) .uuid else null;
-        return SchemaNode{ .fixed_len_byte_array = .{ .len = type_length, .logical = logical } };
-    }
-    if (fmt.len >= 4 and fmt[0] == 'd' and fmt[1] == ':') {
-        const params = fmt[2..];
-        var parts = std.mem.splitScalar(u8, params, ',');
-        const prec_str = parts.next() orelse return error.InvalidSchema;
-        const scale_str = parts.next() orelse return error.InvalidSchema;
-        const precision = std.fmt.parseInt(i32, prec_str, 10) catch return error.InvalidSchema;
-        const scale = std.fmt.parseInt(i32, scale_str, 10) catch return error.InvalidSchema;
+/// Parsed Arrow format string → Parquet type mapping.
+/// Centralizes format string parsing that was previously duplicated across
+/// arrowFormatToSchemaNode, arrowLeafToColumnDef, and other dispatch sites.
+const ArrowFormatInfo = struct {
+    physical_type: format.PhysicalType,
+    logical_type: ?format.LogicalType = null,
+    type_length: ?i32 = null,
 
-        if (parts.next()) |bw_str| {
-            const bw = std.fmt.parseInt(u32, bw_str, 10) catch return error.InvalidSchema;
-            return SchemaNode{ .fixed_len_byte_array = .{ .len = bw, .logical = .{ .decimal = .{ .precision = precision, .scale = scale } } } };
-        } else if (precision <= 9) {
-            return SchemaNode{ .int32 = .{ .logical = .{ .decimal = .{ .precision = precision, .scale = scale } } } };
-        } else if (precision <= 18) {
-            return SchemaNode{ .int64 = .{ .logical = .{ .decimal = .{ .precision = precision, .scale = scale } } } };
-        } else {
-            const bw: u32 = safe.castTo(u32, decimalByteLength(precision)) catch unreachable; // decimalByteLength max is 16
-            return SchemaNode{ .fixed_len_byte_array = .{ .len = bw, .logical = .{ .decimal = .{ .precision = precision, .scale = scale } } } };
+    fn parse(fmt: []const u8) !ArrowFormatInfo {
+        if (fmt.len == 1) {
+            return switch (fmt[0]) {
+                'b' => .{ .physical_type = .boolean },
+                'c' => .{ .physical_type = .int32, .logical_type = .{ .int = .{ .bit_width = 8, .is_signed = true } } },
+                'C' => .{ .physical_type = .int32, .logical_type = .{ .int = .{ .bit_width = 8, .is_signed = false } } },
+                's' => .{ .physical_type = .int32, .logical_type = .{ .int = .{ .bit_width = 16, .is_signed = true } } },
+                'S' => .{ .physical_type = .int32, .logical_type = .{ .int = .{ .bit_width = 16, .is_signed = false } } },
+                'i' => .{ .physical_type = .int32 },
+                'I' => .{ .physical_type = .int32, .logical_type = .{ .int = .{ .bit_width = 32, .is_signed = false } } },
+                'l' => .{ .physical_type = .int64 },
+                'L' => .{ .physical_type = .int64, .logical_type = .{ .int = .{ .bit_width = 64, .is_signed = false } } },
+                'e' => .{ .physical_type = .fixed_len_byte_array, .type_length = 2, .logical_type = .float16 },
+                'f' => .{ .physical_type = .float },
+                'g' => .{ .physical_type = .double },
+                'u', 'U' => .{ .physical_type = .byte_array, .logical_type = .string },
+                'z', 'Z' => .{ .physical_type = .byte_array },
+                else => return error.UnsupportedType,
+            };
         }
+        if (std.mem.eql(u8, fmt, "tdD") or std.mem.eql(u8, fmt, "tdm")) {
+            return .{ .physical_type = .int32, .logical_type = .date };
+        }
+        if (std.mem.eql(u8, fmt, "ttm") or std.mem.eql(u8, fmt, "tts")) {
+            return .{ .physical_type = .int32, .logical_type = .{ .time = .{ .is_adjusted_to_utc = false, .unit = .millis } } };
+        }
+        if (std.mem.eql(u8, fmt, "ttu")) {
+            return .{ .physical_type = .int64, .logical_type = .{ .time = .{ .is_adjusted_to_utc = false, .unit = .micros } } };
+        }
+        if (std.mem.eql(u8, fmt, "ttn")) {
+            return .{ .physical_type = .int64, .logical_type = .{ .time = .{ .is_adjusted_to_utc = false, .unit = .nanos } } };
+        }
+        if (fmt.len >= 4 and std.mem.eql(u8, fmt[0..2], "ts")) {
+            const unit: format.TimeUnit = switch (fmt[2]) {
+                's', 'm' => .millis,
+                'u' => .micros,
+                'n' => .nanos,
+                else => return error.UnsupportedType,
+            };
+            const tz_part = fmt[4..];
+            const is_utc = tz_part.len > 0 and std.mem.eql(u8, tz_part, "UTC");
+            return .{ .physical_type = .int64, .logical_type = .{ .timestamp = .{ .is_adjusted_to_utc = is_utc, .unit = unit } } };
+        }
+        if (fmt.len >= 2 and fmt[0] == 'w' and fmt[1] == ':') {
+            const type_length = std.fmt.parseInt(i32, fmt[2..], 10) catch return error.InvalidSchema;
+            const logical: ?format.LogicalType = if (type_length == 16) .uuid else null;
+            return .{ .physical_type = .fixed_len_byte_array, .type_length = type_length, .logical_type = logical };
+        }
+        if (fmt.len >= 4 and fmt[0] == 'd' and fmt[1] == ':') {
+            const params = fmt[2..];
+            var parts = std.mem.splitScalar(u8, params, ',');
+            const prec_str = parts.next() orelse return error.InvalidSchema;
+            const scale_str = parts.next() orelse return error.InvalidSchema;
+            const precision = std.fmt.parseInt(i32, prec_str, 10) catch return error.InvalidSchema;
+            const scale = std.fmt.parseInt(i32, scale_str, 10) catch return error.InvalidSchema;
+
+            if (parts.next()) |bw_str| {
+                const bw = std.fmt.parseInt(i32, bw_str, 10) catch return error.InvalidSchema;
+                return .{ .physical_type = .fixed_len_byte_array, .type_length = bw, .logical_type = .{ .decimal = .{ .precision = precision, .scale = scale } } };
+            } else if (precision <= 9) {
+                return .{ .physical_type = .int32, .logical_type = .{ .decimal = .{ .precision = precision, .scale = scale } } };
+            } else if (precision <= 18) {
+                return .{ .physical_type = .int64, .logical_type = .{ .decimal = .{ .precision = precision, .scale = scale } } };
+            } else {
+                const bw = safe.castTo(i32, decimalByteLength(precision)) catch unreachable; // decimalByteLength max is 16
+                return .{ .physical_type = .fixed_len_byte_array, .type_length = bw, .logical_type = .{ .decimal = .{ .precision = precision, .scale = scale } } };
+            }
+        }
+        return error.UnsupportedType;
     }
-    return error.UnsupportedType;
+
+    fn toSchemaNode(self: ArrowFormatInfo) SchemaNode {
+        return switch (self.physical_type) {
+            .boolean => .{ .boolean = .{} },
+            .int32 => .{ .int32 = .{ .logical = self.logicalForSchema() } },
+            .int64 => .{ .int64 = .{ .logical = self.logicalForSchema() } },
+            .float => .{ .float = .{} },
+            .double => .{ .double = .{} },
+            .byte_array => .{ .byte_array = .{ .logical = self.logicalForSchema() } },
+            .fixed_len_byte_array => .{ .fixed_len_byte_array = .{
+                .len = safe.castTo(u32, self.type_length orelse 0) catch unreachable, // type_length from parsed format
+                .logical = self.logicalForSchema(),
+            } },
+            .int96 => .{ .int64 = .{} },
+        };
+    }
+
+    /// Schema nodes don't preserve Arrow int-width annotations
+    fn logicalForSchema(self: ArrowFormatInfo) ?format.LogicalType {
+        if (self.logical_type) |lt| {
+            return switch (lt) {
+                .int => null,
+                else => lt,
+            };
+        }
+        return null;
+    }
+};
+
+fn arrowFormatToSchemaNode(fmt: []const u8) !SchemaNode {
+    const info = try ArrowFormatInfo.parse(fmt);
+    return info.toSchemaNode();
 }
 
 fn arrowLeafToColumnDef(fmt: []const u8, name: []const u8, nullable: bool) !ColumnDef {
-    var def = ColumnDef{
+    const info = try ArrowFormatInfo.parse(fmt);
+    return .{
         .name = name,
-        .type_ = .int32,
+        .type_ = info.physical_type,
         .optional = nullable,
+        .logical_type = info.logical_type,
+        .type_length = info.type_length,
     };
-
-    if (fmt.len == 1) {
-        switch (fmt[0]) {
-            'b' => def.type_ = .boolean,
-            'c' => {
-                def.type_ = .int32;
-                def.logical_type = .{ .int = .{ .bit_width = 8, .is_signed = true } };
-            },
-            'C' => {
-                def.type_ = .int32;
-                def.logical_type = .{ .int = .{ .bit_width = 8, .is_signed = false } };
-            },
-            's' => {
-                def.type_ = .int32;
-                def.logical_type = .{ .int = .{ .bit_width = 16, .is_signed = true } };
-            },
-            'S' => {
-                def.type_ = .int32;
-                def.logical_type = .{ .int = .{ .bit_width = 16, .is_signed = false } };
-            },
-            'i' => def.type_ = .int32,
-            'I' => {
-                def.type_ = .int32;
-                def.logical_type = .{ .int = .{ .bit_width = 32, .is_signed = false } };
-            },
-            'l' => def.type_ = .int64,
-            'L' => {
-                def.type_ = .int64;
-                def.logical_type = .{ .int = .{ .bit_width = 64, .is_signed = false } };
-            },
-            'e' => {
-                def.type_ = .fixed_len_byte_array;
-                def.type_length = 2;
-                def.logical_type = .float16;
-            },
-            'f' => def.type_ = .float,
-            'g' => def.type_ = .double,
-            'u' => {
-                def.type_ = .byte_array;
-                def.logical_type = .string;
-            },
-            'z' => def.type_ = .byte_array,
-            'Z' => def.type_ = .byte_array,
-            'U' => {
-                def.type_ = .byte_array;
-                def.logical_type = .string;
-            },
-            else => return error.UnsupportedType,
-        }
-        return def;
-    }
-
-    // Multi-character format strings
-    if (std.mem.eql(u8, fmt, "tdD")) {
-        def.type_ = .int32;
-        def.logical_type = .date;
-        return def;
-    }
-    if (std.mem.eql(u8, fmt, "tdm")) {
-        // Date64 (millis) → stored as INT32 days in Parquet; conversion happens in write path
-        def.type_ = .int32;
-        def.logical_type = .date;
-        return def;
-    }
-    if (std.mem.eql(u8, fmt, "tts")) {
-        // Time32[s] → stored as INT32 TIME_MILLIS in Parquet; conversion happens in write path
-        def.type_ = .int32;
-        def.logical_type = .{ .time = .{ .is_adjusted_to_utc = false, .unit = .millis } };
-        return def;
-    }
-    if (std.mem.eql(u8, fmt, "ttm")) {
-        def.type_ = .int32;
-        def.logical_type = .{ .time = .{ .is_adjusted_to_utc = false, .unit = .millis } };
-        return def;
-    }
-    if (std.mem.eql(u8, fmt, "ttu")) {
-        def.type_ = .int64;
-        def.logical_type = .{ .time = .{ .is_adjusted_to_utc = false, .unit = .micros } };
-        return def;
-    }
-    if (std.mem.eql(u8, fmt, "ttn")) {
-        def.type_ = .int64;
-        def.logical_type = .{ .time = .{ .is_adjusted_to_utc = false, .unit = .nanos } };
-        return def;
-    }
-
-    // Timestamp: ts{unit}:{tz}
-    if (fmt.len >= 4 and std.mem.eql(u8, fmt[0..2], "ts")) {
-        def.type_ = .int64;
-        const unit: format.TimeUnit = switch (fmt[2]) {
-            's' => .millis,
-            'm' => .millis,
-            'u' => .micros,
-            'n' => .nanos,
-            else => return error.UnsupportedType,
-        };
-        const tz_part = fmt[4..]; // after "ts?:"
-        const is_utc = tz_part.len > 0 and std.mem.eql(u8, tz_part, "UTC");
-        def.logical_type = .{ .timestamp = .{ .is_adjusted_to_utc = is_utc, .unit = unit } };
-        return def;
-    }
-
-    // Fixed-width binary: w:{N}
-    if (fmt.len >= 2 and fmt[0] == 'w' and fmt[1] == ':') {
-        def.type_ = .fixed_len_byte_array;
-        const len_str = fmt[2..];
-        def.type_length = std.fmt.parseInt(i32, len_str, 10) catch return error.InvalidSchema;
-        if (def.type_length.? == 16) {
-            def.logical_type = .uuid;
-        }
-        return def;
-    }
-
-    // Decimal: d:{precision},{scale}[,{byte_width}]
-    if (fmt.len >= 4 and fmt[0] == 'd' and fmt[1] == ':') {
-        const params = fmt[2..];
-        var parts = std.mem.splitScalar(u8, params, ',');
-        const prec_str = parts.next() orelse return error.InvalidSchema;
-        const scale_str = parts.next() orelse return error.InvalidSchema;
-        const precision = std.fmt.parseInt(i32, prec_str, 10) catch return error.InvalidSchema;
-        const scale = std.fmt.parseInt(i32, scale_str, 10) catch return error.InvalidSchema;
-
-        if (parts.next()) |bw_str| {
-            def.type_ = .fixed_len_byte_array;
-            def.type_length = std.fmt.parseInt(i32, bw_str, 10) catch return error.InvalidSchema;
-        } else if (precision <= 9) {
-            def.type_ = .int32;
-        } else if (precision <= 18) {
-            def.type_ = .int64;
-        } else {
-            def.type_ = .fixed_len_byte_array;
-            def.type_length = safe.castTo(i32, decimalByteLength(precision)) catch unreachable; // decimalByteLength max is 16
-        }
-        def.logical_type = .{ .decimal = .{ .precision = precision, .scale = scale } };
-        return def;
-    }
-
-    return error.UnsupportedType;
 }
 
-fn decimalByteLength(precision: i32) usize {
-    // ceil((P * log2(10) + 1) / 8)
-    const p: usize = if (precision > 0) (safe.castTo(usize, precision) catch unreachable) else 1; // guarded > 0
-    const lookup = [_]usize{ 1, 1, 1, 2, 2, 3, 3, 4, 4, 4, 5, 5, 6, 6, 6, 7, 7, 8, 8, 9, 9, 9, 10, 10, 11, 11, 11, 12, 12, 13, 13, 14, 14, 14, 15, 15, 16, 16, 16 };
-    if (p < lookup.len) return lookup[p];
-    return 16;
-}
+const decimalByteLength = types.decimalByteLengthRuntime;
 
 fn arrowListToColumnDef(allocator: Allocator, schema: *const ArrowSchema, name: []const u8, nullable: bool) !ColumnDef {
     if (schema.n_children != 1) return error.InvalidSchema;
@@ -841,17 +754,17 @@ fn arrowStructToColumnDef(allocator: Allocator, schema: *const ArrowSchema, name
         return ColumnDef.fromNode(name, node);
     }
 
-    var struct_fields_buf: [32]StructField = undefined;
-    const field_count = @min(nc, struct_fields_buf.len);
+    const struct_fields = try allocator.alloc(StructField, nc);
+    errdefer allocator.free(struct_fields);
 
-    for (0..field_count) |i| {
+    for (0..nc) |i| {
         const child = children[i];
         const child_fmt = std.mem.sliceTo(child.format, 0);
         const child_name = if (child.name) |n| std.mem.sliceTo(n, 0) else "";
         const child_nullable = (child.flags & arrow.ARROW_FLAG_NULLABLE) != 0;
 
         const child_def = try arrowLeafToColumnDef(child_fmt, child_name, child_nullable);
-        struct_fields_buf[i] = .{
+        struct_fields[i] = .{
             .name = child_name,
             .type_ = child_def.type_,
             .optional = child_nullable,
@@ -864,7 +777,8 @@ fn arrowStructToColumnDef(allocator: Allocator, schema: *const ArrowSchema, name
         .type_ = .int32,
         .optional = nullable,
         .is_struct = true,
-        .struct_fields = struct_fields_buf[0..field_count],
+        .struct_fields = struct_fields,
+        .struct_fields_owned = true,
     };
 }
 
@@ -1104,6 +1018,70 @@ const RawColumnData = struct {
     }
 };
 
+fn decodeDataPages(
+    allocator: Allocator,
+    page_data: []const u8,
+    meta: format.ColumnMetaData,
+    column_info: format.ColumnInfo,
+    all_values: *std.ArrayListUnmanaged(Value),
+    all_def_levels: ?*std.ArrayListUnmanaged(u32),
+    all_rep_levels: ?*std.ArrayListUnmanaged(u32),
+) !void {
+    var dict_set = parquet_reader.DictionarySet.init(allocator);
+    defer dict_set.deinit();
+
+    var pos: usize = 0;
+
+    if (pos < page_data.len) {
+        var peek_thrift = thrift.CompactReader.init(page_data[pos..]);
+        const first_header = try format.PageHeader.parse(allocator, &peek_thrift);
+        defer parquet_reader.freePageHeaderContents(allocator, &first_header);
+
+        if (first_header.dictionary_page_header) |dph| {
+            pos += peek_thrift.pos;
+            const dict_size = safe.cast(first_header.compressed_page_size) catch return error.InvalidPageSize;
+            const dict_body = try safe.slice(page_data, pos, dict_size);
+            pos += dict_size;
+
+            const uncompressed_size = safe.cast(first_header.uncompressed_page_size) catch return error.InvalidPageSize;
+            const num_values = safe.cast(dph.num_values) catch return error.InvalidPageSize;
+            try dict_set.initFromPage(
+                dict_body,
+                num_values,
+                column_info.element.type_,
+                column_info.element.type_length,
+                meta.codec,
+                uncompressed_size,
+            );
+        }
+    }
+
+    while (pos < page_data.len) {
+        var thrift_reader = thrift.CompactReader.init(page_data[pos..]);
+        const header = try format.PageHeader.parse(allocator, &thrift_reader);
+        defer parquet_reader.freePageHeaderContents(allocator, &header);
+
+        pos += thrift_reader.pos;
+
+        if (header.data_page_header == null and header.data_page_header_v2 == null) {
+            const skip = safe.cast(header.compressed_page_size) catch return error.InvalidPageSize;
+            pos += skip;
+            continue;
+        }
+
+        const compressed_size = safe.cast(header.compressed_page_size) catch return error.InvalidPageSize;
+        if (pos + compressed_size > page_data.len) return error.EndOfData;
+        const compressed_body = try safe.slice(page_data, pos, compressed_size);
+        pos += compressed_size;
+
+        if (header.data_page_header_v2) |v2| {
+            try decodeV2PageUnified(allocator, all_values, all_def_levels, all_rep_levels, compressed_body, v2, header, meta, column_info, &dict_set);
+        } else if (header.data_page_header) |dph| {
+            try decodeV1PageUnified(allocator, all_values, all_def_levels, all_rep_levels, compressed_body, dph, header, meta, column_info, &dict_set);
+        }
+    }
+}
+
 fn readPhysicalColumnRaw(
     allocator: Allocator,
     source: SeekableReader,
@@ -1122,9 +1100,6 @@ fn readPhysicalColumnRaw(
     const column_info = format.getColumnInfo(metadata.schema, col_idx) orelse
         return error.InvalidArgument;
 
-    var dict_set = parquet_reader.DictionarySet.init(allocator);
-    defer dict_set.deinit();
-
     var all_values: std.ArrayListUnmanaged(Value) = .empty;
     errdefer {
         for (all_values.items) |v| v.deinit(allocator);
@@ -1135,56 +1110,7 @@ fn readPhysicalColumnRaw(
     var all_rep_levels: std.ArrayListUnmanaged(u32) = .empty;
     errdefer all_rep_levels.deinit(allocator);
 
-    var pos: usize = 0;
-
-    if (pos < page_data.len) {
-        var peek_thrift = thrift.CompactReader.init(page_data[pos..]);
-        const first_header = format.PageHeader.parse(allocator, &peek_thrift) catch return error.EndOfData;
-        defer parquet_reader.freePageHeaderContents(allocator, &first_header);
-
-        if (first_header.dictionary_page_header) |dph| {
-            pos += peek_thrift.pos;
-            const dict_size = safe.cast(first_header.compressed_page_size) catch return error.InvalidPageSize;
-            const dict_body = safe.slice(page_data, pos, dict_size) catch return error.EndOfData;
-            pos += dict_size;
-
-            const uncompressed_size = safe.cast(first_header.uncompressed_page_size) catch return error.InvalidPageSize;
-            const num_values = safe.cast(dph.num_values) catch return error.InvalidPageSize;
-            dict_set.initFromPage(
-                dict_body,
-                num_values,
-                column_info.element.type_,
-                column_info.element.type_length,
-                meta.codec,
-                uncompressed_size,
-            ) catch return error.EndOfData;
-        }
-    }
-
-    while (pos < page_data.len) {
-        var thrift_reader = thrift.CompactReader.init(page_data[pos..]);
-        const header = format.PageHeader.parse(allocator, &thrift_reader) catch return error.EndOfData;
-        defer parquet_reader.freePageHeaderContents(allocator, &header);
-
-        pos += thrift_reader.pos;
-
-        if (header.data_page_header == null and header.data_page_header_v2 == null) {
-            const skip = safe.cast(header.compressed_page_size) catch return error.InvalidPageSize;
-            pos += skip;
-            continue;
-        }
-
-        const compressed_size = safe.cast(header.compressed_page_size) catch return error.InvalidPageSize;
-        if (pos + compressed_size > page_data.len) return error.EndOfData;
-        const compressed_body = safe.slice(page_data, pos, compressed_size) catch return error.EndOfData;
-        pos += compressed_size;
-
-        if (header.data_page_header_v2) |v2| {
-            try decodeV2PageRaw(allocator, &all_values, &all_def_levels, &all_rep_levels, compressed_body, v2, header, meta, column_info, &dict_set);
-        } else if (header.data_page_header) |dph| {
-            try decodeV1PageRaw(allocator, &all_values, &all_def_levels, &all_rep_levels, compressed_body, dph, header, meta, column_info, &dict_set);
-        }
-    }
+    decodeDataPages(allocator, page_data, meta, column_info, &all_values, &all_def_levels, &all_rep_levels) catch return error.EndOfData;
 
     const values = all_values.toOwnedSlice(allocator) catch return error.OutOfMemory;
     errdefer {
@@ -1204,32 +1130,34 @@ fn readPhysicalColumnRaw(
     };
 }
 
-fn decodeV2PageRaw(
+fn decodeV2PageUnified(
     allocator: Allocator,
     all_values: *std.ArrayListUnmanaged(Value),
-    all_def_levels: *std.ArrayListUnmanaged(u32),
-    all_rep_levels: *std.ArrayListUnmanaged(u32),
+    all_def_levels: ?*std.ArrayListUnmanaged(u32),
+    all_rep_levels: ?*std.ArrayListUnmanaged(u32),
     compressed_body: []const u8,
     v2: format.DataPageHeaderV2,
     header: format.PageHeader,
     meta: format.ColumnMetaData,
     column_info: format.ColumnInfo,
     dict_set: *parquet_reader.DictionarySet,
-) BatchError!void {
+) !void {
     const rep_len = safe.cast(v2.repetition_levels_byte_length) catch return error.InvalidPageSize;
     const def_len = safe.cast(v2.definition_levels_byte_length) catch return error.InvalidPageSize;
     const num_values = safe.cast(v2.num_values) catch return error.InvalidPageSize;
     if (num_values == 0) return;
 
-    const rep_data = compressed_body[0..rep_len];
+    const rep_data = safe.slice(compressed_body, 0, rep_len) catch return error.EndOfData;
     const def_data = safe.slice(compressed_body, rep_len, def_len) catch return error.EndOfData;
-    const values_compressed = compressed_body[rep_len + def_len ..];
+    const levels_total = std.math.add(usize, rep_len, def_len) catch return error.EndOfData;
+    if (levels_total > compressed_body.len) return error.EndOfData;
+    const values_compressed = compressed_body[levels_total..];
 
     var values_allocated = false;
     const values_data = if (v2.is_compressed and meta.codec != .uncompressed) blk: {
         const uncompressed = safe.cast(header.uncompressed_page_size) catch return error.InvalidPageSize;
-        if (uncompressed < rep_len + def_len) return error.EndOfData;
-        const val_size = uncompressed - rep_len - def_len;
+        if (uncompressed < levels_total) return error.EndOfData;
+        const val_size = uncompressed - levels_total;
         if (val_size == 0 or values_compressed.len == 0) break :blk values_compressed;
         values_allocated = true;
         break :blk compress.decompress(allocator, values_compressed, meta.codec, val_size) catch return error.DecompressionError;
@@ -1257,36 +1185,45 @@ fn decodeV2PageRaw(
         v2.encoding,
     ) catch return error.EndOfData;
 
+    const n_vals = result.values.len;
     all_values.appendSlice(allocator, result.values) catch return error.OutOfMemory;
     allocator.free(result.values);
 
-    if (result.def_levels) |dl| {
-        all_def_levels.appendSlice(allocator, dl) catch return error.OutOfMemory;
-        allocator.free(dl);
+    if (all_def_levels) |adl| {
+        if (result.def_levels) |dl| {
+            adl.appendSlice(allocator, dl) catch return error.OutOfMemory;
+            allocator.free(dl);
+        } else {
+            adl.appendNTimes(allocator, column_info.max_def_level, n_vals) catch return error.OutOfMemory;
+        }
     } else {
-        all_def_levels.appendNTimes(allocator, column_info.max_def_level, result.values.len) catch return error.OutOfMemory;
+        if (result.def_levels) |dl| allocator.free(dl);
     }
 
-    if (result.rep_levels) |rl| {
-        all_rep_levels.appendSlice(allocator, rl) catch return error.OutOfMemory;
-        allocator.free(rl);
+    if (all_rep_levels) |arl| {
+        if (result.rep_levels) |rl| {
+            arl.appendSlice(allocator, rl) catch return error.OutOfMemory;
+            allocator.free(rl);
+        } else {
+            arl.appendNTimes(allocator, 0, n_vals) catch return error.OutOfMemory;
+        }
     } else {
-        all_rep_levels.appendNTimes(allocator, 0, result.values.len) catch return error.OutOfMemory;
+        if (result.rep_levels) |rl| allocator.free(rl);
     }
 }
 
-fn decodeV1PageRaw(
+fn decodeV1PageUnified(
     allocator: Allocator,
     all_values: *std.ArrayListUnmanaged(Value),
-    all_def_levels: *std.ArrayListUnmanaged(u32),
-    all_rep_levels: *std.ArrayListUnmanaged(u32),
+    all_def_levels: ?*std.ArrayListUnmanaged(u32),
+    all_rep_levels: ?*std.ArrayListUnmanaged(u32),
     compressed_body: []const u8,
     dph: format.DataPageHeader,
     header: format.PageHeader,
     meta: format.ColumnMetaData,
     column_info: format.ColumnInfo,
     dict_set: *parquet_reader.DictionarySet,
-) BatchError!void {
+) !void {
     const value_data = if (meta.codec != .uncompressed) blk: {
         const uncompressed = safe.cast(header.uncompressed_page_size) catch return error.InvalidPageSize;
         break :blk compress.decompress(allocator, compressed_body, meta.codec, uncompressed) catch return error.DecompressionError;
@@ -1318,21 +1255,30 @@ fn decodeV1PageRaw(
         dph.encoding,
     ) catch return error.EndOfData;
 
+    const n_vals = result.values.len;
     all_values.appendSlice(allocator, result.values) catch return error.OutOfMemory;
     allocator.free(result.values);
 
-    if (result.def_levels) |dl| {
-        all_def_levels.appendSlice(allocator, dl) catch return error.OutOfMemory;
-        allocator.free(dl);
+    if (all_def_levels) |adl| {
+        if (result.def_levels) |dl| {
+            adl.appendSlice(allocator, dl) catch return error.OutOfMemory;
+            allocator.free(dl);
+        } else {
+            adl.appendNTimes(allocator, column_info.max_def_level, n_vals) catch return error.OutOfMemory;
+        }
     } else {
-        all_def_levels.appendNTimes(allocator, column_info.max_def_level, result.values.len) catch return error.OutOfMemory;
+        if (result.def_levels) |dl| allocator.free(dl);
     }
 
-    if (result.rep_levels) |rl| {
-        all_rep_levels.appendSlice(allocator, rl) catch return error.OutOfMemory;
-        allocator.free(rl);
+    if (all_rep_levels) |arl| {
+        if (result.rep_levels) |rl| {
+            arl.appendSlice(allocator, rl) catch return error.OutOfMemory;
+            allocator.free(rl);
+        } else {
+            arl.appendNTimes(allocator, 0, n_vals) catch return error.OutOfMemory;
+        }
     } else {
-        all_rep_levels.appendNTimes(allocator, 0, result.values.len) catch return error.OutOfMemory;
+        if (result.rep_levels) |rl| allocator.free(rl);
     }
 }
 
@@ -1404,7 +1350,7 @@ fn readLogicalColumnAsArrow(
     metadata: format.FileMetaData,
     rg: *const format.RowGroup,
     logical_col: *const LogicalColumn,
-) !ArrowArray {
+) ReaderError!ArrowArray {
     return switch (logical_col.kind) {
         .leaf => readColumnAsArrow(allocator, source, metadata, rg, logical_col.physical_col_start),
         .list => readListColumnAsArrow(allocator, source, metadata, rg, logical_col),
@@ -1419,7 +1365,7 @@ fn readListColumnAsArrow(
     metadata: format.FileMetaData,
     rg: *const format.RowGroup,
     logical_col: *const LogicalColumn,
-) !ArrowArray {
+) ReaderError!ArrowArray {
     var raw = try readPhysicalColumnRaw(allocator, source, metadata, rg, logical_col.physical_col_start);
     defer raw.deinit();
 
@@ -1492,7 +1438,7 @@ fn readStructColumnAsArrow(
     metadata: format.FileMetaData,
     rg: *const format.RowGroup,
     logical_col: *const LogicalColumn,
-) !ArrowArray {
+) ReaderError!ArrowArray {
     const nc = logical_col.children.len;
 
     var children = allocator.alloc(ArrowArray, nc) catch return error.OutOfMemory;
@@ -1555,7 +1501,7 @@ fn readMapColumnAsArrow(
     metadata: format.FileMetaData,
     rg: *const format.RowGroup,
     logical_col: *const LogicalColumn,
-) !ArrowArray {
+) ReaderError!ArrowArray {
     // MAP reads like a LIST but has 2 children (key, value) inside an entries struct
     // Read the key and value physical columns with levels
     if (logical_col.children.len != 2) return error.InvalidSchema;
@@ -1647,13 +1593,24 @@ fn readMapColumnAsArrow(
 
     // Build entries struct with key and value children
     var entries_children = allocator.alloc(ArrowArray, 2) catch return error.OutOfMemory;
+    var entries_children_owned = true;
+    errdefer if (entries_children_owned) {
+        for (entries_children) |*child| child.doRelease();
+        allocator.free(entries_children);
+    };
     entries_children[0] = key_array;
     entries_children[1] = val_array;
-    // Transfer ownership: don't release key_array/val_array individually
+    key_array.release = null; // ownership transferred to entries_children
+    val_array.release = null; // ownership transferred to entries_children
 
     const entries_validity = allocator.alloc(u8, (num_entries + 7) / 8) catch return error.OutOfMemory;
+    var entries_validity_owned = true;
+    errdefer if (entries_validity_owned) allocator.free(entries_validity);
     @memset(entries_validity, 0xFF);
+
     var entries_struct = try buildStructArray(allocator, num_entries, 0, entries_validity, entries_children);
+    entries_children_owned = false;
+    entries_validity_owned = false;
     errdefer entries_struct.doRelease();
 
     // Build map array (like a list array with entries struct as child)
@@ -1775,68 +1732,13 @@ fn readColumnAsArrow(
     const column_info = format.getColumnInfo(metadata.schema, col_idx) orelse
         return error.InvalidArgument;
 
-    // Parse pages, handling dictionary and data pages
-    var dict_set = parquet_reader.DictionarySet.init(allocator);
-    defer dict_set.deinit();
-
     var all_values: std.ArrayListUnmanaged(Value) = .empty;
     errdefer {
         for (all_values.items) |v| v.deinit(allocator);
         all_values.deinit(allocator);
     }
 
-    var pos: usize = 0;
-
-    // Check for dictionary page
-    if (pos < page_data.len) {
-        var peek_thrift = thrift.CompactReader.init(page_data[pos..]);
-        const first_header = try format.PageHeader.parse(allocator, &peek_thrift);
-        defer parquet_reader.freePageHeaderContents(allocator, &first_header);
-
-        if (first_header.dictionary_page_header) |dph| {
-            pos += peek_thrift.pos;
-            const dict_size = safe.cast(first_header.compressed_page_size) catch return error.InvalidPageSize;
-            const dict_body = try safe.slice(page_data, pos, dict_size);
-            pos += dict_size;
-
-            const uncompressed_size = safe.cast(first_header.uncompressed_page_size) catch return error.InvalidPageSize;
-            const num_values = safe.cast(dph.num_values) catch return error.InvalidPageSize;
-            try dict_set.initFromPage(
-                dict_body,
-                num_values,
-                column_info.element.type_,
-                column_info.element.type_length,
-                meta.codec,
-                uncompressed_size,
-            );
-        }
-    }
-
-    // Iterate data pages
-    while (pos < page_data.len) {
-        var thrift_reader = thrift.CompactReader.init(page_data[pos..]);
-        const header = try format.PageHeader.parse(allocator, &thrift_reader);
-        defer parquet_reader.freePageHeaderContents(allocator, &header);
-
-        pos += thrift_reader.pos;
-
-        if (header.data_page_header == null and header.data_page_header_v2 == null) {
-            const skip = safe.cast(header.compressed_page_size) catch return error.InvalidPageSize;
-            pos += skip;
-            continue;
-        }
-
-        const compressed_size = safe.cast(header.compressed_page_size) catch return error.InvalidPageSize;
-        if (pos + compressed_size > page_data.len) return error.EndOfData;
-        const compressed_body = try safe.slice(page_data, pos, compressed_size);
-        pos += compressed_size;
-
-        if (header.data_page_header_v2) |v2| {
-            try decodeV2Page(allocator, &all_values, compressed_body, v2, header, meta, column_info, &dict_set);
-        } else if (header.data_page_header) |dph| {
-            try decodeV1Page(allocator, &all_values, compressed_body, dph, header, meta, column_info, &dict_set);
-        }
-    }
+    try decodeDataPages(allocator, page_data, meta, column_info, &all_values, null, null);
 
     // Convert Value[] to ArrowArray, then free the intermediate Values
     const result = try valuesToArrowArray(allocator, all_values.items, column_info.element);
@@ -1845,113 +1747,6 @@ fn readColumnAsArrow(
     return result;
 }
 
-fn decodeV2Page(
-    allocator: Allocator,
-    all_values: *std.ArrayListUnmanaged(Value),
-    compressed_body: []const u8,
-    v2: format.DataPageHeaderV2,
-    header: format.PageHeader,
-    meta: format.ColumnMetaData,
-    column_info: format.ColumnInfo,
-    dict_set: *parquet_reader.DictionarySet,
-) !void {
-    const rep_len = safe.cast(v2.repetition_levels_byte_length) catch return error.InvalidPageSize;
-    const def_len = safe.cast(v2.definition_levels_byte_length) catch return error.InvalidPageSize;
-    const num_values = safe.cast(v2.num_values) catch return error.InvalidPageSize;
-    if (num_values == 0) return;
-
-    const rep_data = compressed_body[0..rep_len];
-    const def_data = try safe.slice(compressed_body, rep_len, def_len);
-    const values_compressed = compressed_body[rep_len + def_len ..];
-
-    var values_allocated = false;
-    const values_data = if (v2.is_compressed and meta.codec != .uncompressed) blk: {
-        const uncompressed = safe.cast(header.uncompressed_page_size) catch return error.InvalidPageSize;
-        if (uncompressed < rep_len + def_len) return error.EndOfData;
-        const val_size = uncompressed - rep_len - def_len;
-        if (val_size == 0 or values_compressed.len == 0) break :blk values_compressed;
-        values_allocated = true;
-        break :blk try compress.decompress(allocator, values_compressed, meta.codec, val_size);
-    } else values_compressed;
-    defer if (values_allocated) allocator.free(values_data);
-
-    const has_dict = dict_set.hasDictionary();
-    const result = try column_decoder.decodeColumnDynamicV2(
-        allocator,
-        column_info.element,
-        rep_data,
-        def_data,
-        values_data,
-        num_values,
-        column_info.max_def_level,
-        column_info.max_rep_level,
-        has_dict,
-        if (dict_set.string_dict) |*d| d else null,
-        if (dict_set.int32_dict) |*d| d else null,
-        if (dict_set.int64_dict) |*d| d else null,
-        if (dict_set.float32_dict) |*d| d else null,
-        if (dict_set.float64_dict) |*d| d else null,
-        if (dict_set.fixed_byte_array_dict) |*d| d else null,
-        if (dict_set.int96_dict) |*d| d else null,
-        v2.encoding,
-    );
-    defer {
-        if (result.def_levels) |dl| allocator.free(dl);
-        if (result.rep_levels) |rl| allocator.free(rl);
-    }
-
-    try all_values.appendSlice(allocator, result.values);
-    allocator.free(result.values);
-}
-
-fn decodeV1Page(
-    allocator: Allocator,
-    all_values: *std.ArrayListUnmanaged(Value),
-    compressed_body: []const u8,
-    dph: format.DataPageHeader,
-    header: format.PageHeader,
-    meta: format.ColumnMetaData,
-    column_info: format.ColumnInfo,
-    dict_set: *parquet_reader.DictionarySet,
-) !void {
-    const value_data = if (meta.codec != .uncompressed) blk: {
-        const uncompressed = safe.cast(header.uncompressed_page_size) catch return error.InvalidPageSize;
-        break :blk try compress.decompress(allocator, compressed_body, meta.codec, uncompressed);
-    } else compressed_body;
-    defer if (meta.codec != .uncompressed) allocator.free(value_data);
-
-    const num_values = safe.cast(dph.num_values) catch return error.InvalidPageSize;
-    if (num_values == 0) return;
-
-    const has_dict = dict_set.hasDictionary();
-
-    const result = try column_decoder.decodeColumnDynamicWithValueEncoding(
-        allocator,
-        column_info.element,
-        value_data,
-        num_values,
-        column_info.max_def_level,
-        column_info.max_rep_level,
-        has_dict,
-        if (dict_set.string_dict) |*d| d else null,
-        if (dict_set.int32_dict) |*d| d else null,
-        if (dict_set.int64_dict) |*d| d else null,
-        if (dict_set.float32_dict) |*d| d else null,
-        if (dict_set.float64_dict) |*d| d else null,
-        if (dict_set.fixed_byte_array_dict) |*d| d else null,
-        if (dict_set.int96_dict) |*d| d else null,
-        dph.definition_level_encoding,
-        dph.repetition_level_encoding,
-        dph.encoding,
-    );
-    defer {
-        if (result.def_levels) |dl| allocator.free(dl);
-        if (result.rep_levels) |rl| allocator.free(rl);
-    }
-
-    try all_values.appendSlice(allocator, result.values);
-    allocator.free(result.values);
-}
 
 // ============================================================================
 // Value[] → ArrowArray conversion
@@ -2371,7 +2166,11 @@ fn writeArrowColumnToParquet(
 
     // Timestamps → INT64
     if (fmt.len >= 4 and std.mem.eql(u8, fmt[0..2], "ts")) {
-        try writeTypedColumn(i64, writer, allocator, col_idx, arr, n);
+        if (fmt[2] == 's') {
+            try writeTimestampSecondsColumn(writer, allocator, col_idx, arr, n);
+        } else {
+            try writeTypedColumn(i64, writer, allocator, col_idx, arr, n);
+        }
         return;
     }
 
@@ -2491,11 +2290,10 @@ fn arrowToValue(allocator: Allocator, arr: ArrowArray, sch: ArrowSchema, idx: us
         return arrowMapToValue(allocator, arr, sch, idx);
     }
 
-    return arrowLeafToValue(arr, sch, fmt, idx);
+    return arrowLeafToValue(arr, fmt, idx);
 }
 
-fn arrowLeafToValue(arr: ArrowArray, sch: ArrowSchema, fmt: []const u8, idx: usize) ArrowValueError!Value {
-    _ = sch;
+fn arrowLeafToValue(arr: ArrowArray, fmt: []const u8, idx: usize) ArrowValueError!Value {
     if (fmt.len == 1) {
         switch (fmt[0]) {
             'b' => {
@@ -2588,6 +2386,9 @@ fn arrowLeafToValue(arr: ArrowArray, sch: ArrowSchema, fmt: []const u8, idx: usi
     }
     if (fmt.len >= 4 and std.mem.eql(u8, fmt[0..2], "ts")) {
         const data: [*]const i64 = @ptrCast(@alignCast(arr.buffers[1].?));
+        if (fmt[2] == 's') {
+            return .{ .int64_val = std.math.mul(i64, data[idx], 1000) catch return error.IntegerOverflow };
+        }
         return .{ .int64_val = data[idx] };
     }
     if (fmt.len >= 2 and fmt[0] == 'w' and fmt[1] == ':') {
@@ -2749,7 +2550,11 @@ fn writeListFromArrow(
         return;
     }
     if (child_fmt.len >= 4 and std.mem.eql(u8, child_fmt[0..2], "ts")) {
-        try writeListColumnTyped(i64, writer, allocator, col_idx, arr, child_arr.*, n);
+        if (child_fmt[2] == 's') {
+            try writeListColumnTimestampSeconds(writer, allocator, col_idx, arr, child_arr.*, n);
+        } else {
+            try writeListColumnTyped(i64, writer, allocator, col_idx, arr, child_arr.*, n);
+        }
         return;
     }
     if (child_fmt.len >= 2 and child_fmt[0] == 'w' and child_fmt[1] == ':') {
@@ -2758,7 +2563,7 @@ fn writeListFromArrow(
         return;
     }
     if (child_fmt.len >= 4 and child_fmt[0] == 'd' and child_fmt[1] == ':') {
-        try writeListColumnDecimal(writer, allocator, col_idx, arr, child_arr.*, n, child_fmt);
+        try writeListColumnDecimal(writer, allocator, col_idx, arr, child_arr.*, n);
         return;
     }
 
@@ -3119,6 +2924,54 @@ fn writeListColumnTime32Seconds(
     try writer.writeListColumn(i32, col_idx, lists);
 }
 
+fn writeListColumnTimestampSeconds(
+    writer: *Writer,
+    allocator: Allocator,
+    col_idx: usize,
+    parent_arr: ArrowArray,
+    child_arr: ArrowArray,
+    n: usize,
+) WriterError!void {
+    const offsets: [*]const i32 = @ptrCast(@alignCast(parent_arr.buffers[1].?));
+    const parent_validity: ?[*]const u8 = if (parent_arr.buffers[0]) |b| @ptrCast(@alignCast(b)) else null;
+    const child_data: [*]const i64 = @ptrCast(@alignCast(child_arr.buffers[1].?));
+    const child_validity: ?[*]const u8 = if (child_arr.buffers[0]) |b| @ptrCast(@alignCast(b)) else null;
+    const child_len = safe.castTo(usize, child_arr.length) catch return error.IntegerOverflow;
+
+    var lists = allocator.alloc(Optional([]const Optional(i64)), n) catch return error.OutOfMemory;
+    defer {
+        for (lists) |l| switch (l) {
+            .value => |elems| allocator.free(elems),
+            .null_value => {},
+        };
+        allocator.free(lists);
+    }
+
+    for (0..n) |i| {
+        if (parent_validity != null and !arrow.getBit(parent_validity.?[0 .. (n + 7) / 8], i)) {
+            lists[i] = .null_value;
+        } else {
+            const start = safe.castTo(usize, offsets[i]) catch return error.IntegerOverflow;
+            const end = safe.castTo(usize, offsets[i + 1]) catch return error.IntegerOverflow;
+            const len = end - start;
+            var elems = allocator.alloc(Optional(i64), len) catch return error.OutOfMemory;
+            for (0..len) |j| {
+                const idx = start + j;
+                if (idx >= child_len) {
+                    elems[j] = .null_value;
+                } else if (child_validity != null and !arrow.getBit(child_validity.?[0 .. (child_len + 7) / 8], idx)) {
+                    elems[j] = .null_value;
+                } else {
+                    elems[j] = .{ .value = std.math.mul(i64, child_data[idx], 1000) catch return error.IntegerOverflow };
+                }
+            }
+            lists[i] = .{ .value = elems };
+        }
+    }
+
+    try writer.writeListColumn(i64, col_idx, lists);
+}
+
 fn writeListColumnDecimal(
     writer: *Writer,
     allocator: Allocator,
@@ -3126,7 +2979,6 @@ fn writeListColumnDecimal(
     parent_arr: ArrowArray,
     child_arr: ArrowArray,
     n: usize,
-    child_fmt: []const u8,
 ) WriterError!void {
     if (col_idx >= writer.columns.len) return error.TypeMismatch;
     const col_def = &writer.columns[col_idx];
@@ -3137,10 +2989,7 @@ fn writeListColumnDecimal(
             const tl = safe.castTo(usize, col_def.type_length orelse return error.InvalidFixedLength) catch return error.IntegerOverflow;
             try writeListColumnFixedByteArray(writer, allocator, col_idx, parent_arr, child_arr, n, tl);
         },
-        else => {
-            _ = child_fmt;
-            return error.TypeMismatch;
-        },
+        else => return error.TypeMismatch,
     }
 }
 
@@ -3226,7 +3075,11 @@ fn writeStructFieldFromArrow(
         return;
     }
     if (child_fmt.len >= 4 and std.mem.eql(u8, child_fmt[0..2], "ts")) {
-        try writeStructFieldTyped(i64, writer, allocator, struct_col_idx, field_idx, child_arr, n, parent_nulls);
+        if (child_fmt[2] == 's') {
+            try writeStructFieldTimestampSeconds(writer, allocator, struct_col_idx, field_idx, child_arr, n, parent_nulls);
+        } else {
+            try writeStructFieldTyped(i64, writer, allocator, struct_col_idx, field_idx, child_arr, n, parent_nulls);
+        }
         return;
     }
     if (child_fmt.len >= 2 and child_fmt[0] == 'w' and child_fmt[1] == ':') {
@@ -3235,7 +3088,7 @@ fn writeStructFieldFromArrow(
         return;
     }
     if (child_fmt.len >= 4 and child_fmt[0] == 'd' and child_fmt[1] == ':') {
-        try writeStructFieldDecimal(writer, allocator, struct_col_idx, field_idx, child_arr, child_fmt, n, parent_nulls);
+        try writeStructFieldDecimal(writer, allocator, struct_col_idx, field_idx, child_arr, n, parent_nulls);
         return;
     }
 
@@ -3447,17 +3300,41 @@ fn writeStructFieldTime32Seconds(
     try writer.writeStructField(i32, struct_col_idx, field_idx, values, parent_nulls);
 }
 
+fn writeStructFieldTimestampSeconds(
+    writer: *Writer,
+    allocator: Allocator,
+    struct_col_idx: usize,
+    field_idx: usize,
+    child_arr: ArrowArray,
+    n: usize,
+    parent_nulls: []const bool,
+) WriterError!void {
+    const data: [*]const i64 = @ptrCast(@alignCast(child_arr.buffers[1].?));
+    const validity: ?[*]const u8 = if (child_arr.buffers[0]) |b| @ptrCast(@alignCast(b)) else null;
+
+    var values = allocator.alloc(?i64, n) catch return error.OutOfMemory;
+    defer allocator.free(values);
+
+    for (0..n) |i| {
+        if (validity != null and !arrow.getBit(validity.?[0 .. (n + 7) / 8], i)) {
+            values[i] = null;
+        } else {
+            values[i] = std.math.mul(i64, data[i], 1000) catch return error.IntegerOverflow;
+        }
+    }
+
+    try writer.writeStructField(i64, struct_col_idx, field_idx, values, parent_nulls);
+}
+
 fn writeStructFieldDecimal(
     writer: *Writer,
     allocator: Allocator,
     struct_col_idx: usize,
     field_idx: usize,
     child_arr: ArrowArray,
-    child_fmt: []const u8,
     n: usize,
     parent_nulls: []const bool,
 ) WriterError!void {
-    _ = child_fmt;
     const phys_col_idx = struct_col_idx + 1 + field_idx;
     if (phys_col_idx >= writer.columns.len) return error.TypeMismatch;
     const col_def = &writer.columns[phys_col_idx];
@@ -3803,6 +3680,30 @@ fn writeTime32SecondsColumn(
     try writer.writeColumnOptional(i32, col_idx, optionals);
 }
 
+fn writeTimestampSecondsColumn(
+    writer: *Writer,
+    allocator: Allocator,
+    col_idx: usize,
+    arr: ArrowArray,
+    n: usize,
+) WriterError!void {
+    const validity: ?[*]const u8 = if (arr.buffers[0]) |b| @ptrCast(@alignCast(b)) else null;
+    const data: [*]const i64 = @ptrCast(@alignCast(arr.buffers[1].?));
+
+    var optionals = allocator.alloc(Optional(i64), n) catch return error.OutOfMemory;
+    defer allocator.free(optionals);
+
+    for (0..n) |i| {
+        if (validity != null and !arrow.getBit(validity.?[0 .. (n + 7) / 8], i)) {
+            optionals[i] = .null_value;
+        } else {
+            optionals[i] = .{ .value = std.math.mul(i64, data[i], 1000) catch return error.IntegerOverflow };
+        }
+    }
+
+    try writer.writeColumnOptional(i64, col_idx, optionals);
+}
+
 fn writeFixedByteArrayColumn(
     writer: *Writer,
     allocator: Allocator,
@@ -3918,7 +3819,7 @@ test "import schema from arrow - flat types" {
 
     // Import back to ColumnDef
     const col_defs = try importSchemaFromArrow(allocator, &arrow_schema);
-    defer allocator.free(col_defs);
+    defer freeImportedColumnDefs(allocator, col_defs);
 
     try std.testing.expectEqual(@as(usize, 2), col_defs.len);
     try std.testing.expectEqual(format.PhysicalType.int32, col_defs[0].type_);
@@ -4214,7 +4115,7 @@ test "schema round-trip: export then import" {
     defer arrow_schema.doRelease();
 
     const col_defs = try importSchemaFromArrow(allocator, &arrow_schema);
-    defer allocator.free(col_defs);
+    defer freeImportedColumnDefs(allocator, col_defs);
 
     try std.testing.expectEqual(@as(usize, 3), col_defs.len);
 
@@ -4469,4 +4370,908 @@ test "round-trip: MAP(string->int32)" {
     try std.testing.expectEqual(@as(i32, 1), val_data[0]);
     try std.testing.expectEqual(@as(i32, 2), val_data[1]);
     try std.testing.expectEqual(@as(i32, 3), val_data[2]);
+}
+
+test "ownership: local release must be null after transfer to struct children" {
+    const allocator = std.testing.allocator;
+
+    const int32_elem = format.SchemaElement{ .name = "k", .type_ = .int32 };
+    const key_vals = [_]Value{.{ .int32_val = 10 }};
+    const val_vals = [_]Value{.{ .int32_val = 20 }};
+
+    var key_array = try valuesToArrowArray(allocator, &key_vals, int32_elem);
+    errdefer key_array.doRelease();
+
+    var val_array = try valuesToArrowArray(allocator, &val_vals, int32_elem);
+    errdefer val_array.doRelease();
+
+    var entries_children = try allocator.alloc(ArrowArray, 2);
+    entries_children[0] = key_array;
+    entries_children[1] = val_array;
+    key_array.release = null; // ownership transferred
+    val_array.release = null; // ownership transferred
+
+    // After ownership transfer, local copies must have null release pointers
+    // to prevent double-free on error paths.
+    try std.testing.expect(key_array.release == null);
+    try std.testing.expect(val_array.release == null);
+
+    const validity = try allocator.alloc(u8, 1);
+    @memset(validity, 0xFF);
+    var entries_struct = try buildStructArray(allocator, 1, 0, validity, entries_children);
+    entries_struct.doRelease();
+}
+
+// ============================================================================
+// Arrow write round-trip tests: temporal types
+// ============================================================================
+
+test "round-trip: arrow write then read - timestamps and date32" {
+    const allocator = std.testing.allocator;
+    const n: usize = 3;
+    const bitmap_len = 1;
+
+    // Timestamp seconds (tss:UTC)
+    const tss_validity = try allocator.alloc(u8, bitmap_len);
+    defer allocator.free(tss_validity);
+    @memset(tss_validity, 0xFF);
+    arrow.clearBit(tss_validity, 2);
+
+    const tss_data = try allocator.alloc(u8, n * 8);
+    defer allocator.free(tss_data);
+    const tss_typed: [*]i64 = @ptrCast(@alignCast(tss_data.ptr));
+    tss_typed[0] = 1705312200; // 2024-01-15 10:30:00 UTC
+    tss_typed[1] = 0; // epoch
+    tss_typed[2] = 0; // null
+
+    var tss_buffers = [_]?*anyopaque{ @ptrCast(tss_validity.ptr), @ptrCast(tss_data.ptr) };
+    const tss_arr = ArrowArray{
+        .length = 3, .null_count = 1, .offset = 0, .n_buffers = 2,
+        .n_children = 0, .buffers = &tss_buffers, .children = null,
+        .dictionary = null, .release = null, .private_data = null,
+    };
+    const tss_sch = ArrowSchema{
+        .format = "tss:UTC", .name = "ts_sec", .metadata = null,
+        .flags = arrow.ARROW_FLAG_NULLABLE, .n_children = 0, .children = null,
+        .dictionary = null, .release = null, .private_data = null,
+    };
+
+    // Timestamp millis (tsm:UTC)
+    const tsm_validity = try allocator.alloc(u8, bitmap_len);
+    defer allocator.free(tsm_validity);
+    @memset(tsm_validity, 0xFF);
+
+    const tsm_data = try allocator.alloc(u8, n * 8);
+    defer allocator.free(tsm_data);
+    const tsm_typed: [*]i64 = @ptrCast(@alignCast(tsm_data.ptr));
+    tsm_typed[0] = 1705312200000;
+    tsm_typed[1] = 0;
+    tsm_typed[2] = 86400000;
+
+    var tsm_buffers = [_]?*anyopaque{ @ptrCast(tsm_validity.ptr), @ptrCast(tsm_data.ptr) };
+    const tsm_arr = ArrowArray{
+        .length = 3, .null_count = 0, .offset = 0, .n_buffers = 2,
+        .n_children = 0, .buffers = &tsm_buffers, .children = null,
+        .dictionary = null, .release = null, .private_data = null,
+    };
+    const tsm_sch = ArrowSchema{
+        .format = "tsm:UTC", .name = "ts_ms", .metadata = null,
+        .flags = arrow.ARROW_FLAG_NULLABLE, .n_children = 0, .children = null,
+        .dictionary = null, .release = null, .private_data = null,
+    };
+
+    // Timestamp micros (tsu:UTC)
+    const tsu_validity = try allocator.alloc(u8, bitmap_len);
+    defer allocator.free(tsu_validity);
+    @memset(tsu_validity, 0xFF);
+
+    const tsu_data = try allocator.alloc(u8, n * 8);
+    defer allocator.free(tsu_data);
+    const tsu_typed: [*]i64 = @ptrCast(@alignCast(tsu_data.ptr));
+    tsu_typed[0] = 1705312200000000;
+    tsu_typed[1] = 0;
+    tsu_typed[2] = 86400000000;
+
+    var tsu_buffers = [_]?*anyopaque{ @ptrCast(tsu_validity.ptr), @ptrCast(tsu_data.ptr) };
+    const tsu_arr = ArrowArray{
+        .length = 3, .null_count = 0, .offset = 0, .n_buffers = 2,
+        .n_children = 0, .buffers = &tsu_buffers, .children = null,
+        .dictionary = null, .release = null, .private_data = null,
+    };
+    const tsu_sch = ArrowSchema{
+        .format = "tsu:UTC", .name = "ts_us", .metadata = null,
+        .flags = arrow.ARROW_FLAG_NULLABLE, .n_children = 0, .children = null,
+        .dictionary = null, .release = null, .private_data = null,
+    };
+
+    // Date32 (tdD)
+    const d32_validity = try allocator.alloc(u8, bitmap_len);
+    defer allocator.free(d32_validity);
+    @memset(d32_validity, 0xFF);
+    arrow.clearBit(d32_validity, 1);
+
+    const d32_data = try allocator.alloc(u8, n * 4);
+    defer allocator.free(d32_data);
+    const d32_typed: [*]i32 = @ptrCast(@alignCast(d32_data.ptr));
+    d32_typed[0] = 19738; // 2024-01-15
+    d32_typed[1] = 0; // null
+    d32_typed[2] = 0; // epoch
+
+    var d32_buffers = [_]?*anyopaque{ @ptrCast(d32_validity.ptr), @ptrCast(d32_data.ptr) };
+    const d32_arr = ArrowArray{
+        .length = 3, .null_count = 1, .offset = 0, .n_buffers = 2,
+        .n_children = 0, .buffers = &d32_buffers, .children = null,
+        .dictionary = null, .release = null, .private_data = null,
+    };
+    const d32_sch = ArrowSchema{
+        .format = "tdD", .name = "date_col", .metadata = null,
+        .flags = arrow.ARROW_FLAG_NULLABLE, .n_children = 0, .children = null,
+        .dictionary = null, .release = null, .private_data = null,
+    };
+
+    // Write to Parquet
+    const col_defs = [_]ColumnDef{
+        .{ .name = "ts_sec", .type_ = .int64, .optional = true, .logical_type = .{ .timestamp = .{ .is_adjusted_to_utc = true, .unit = .millis } } },
+        .{ .name = "ts_ms", .type_ = .int64, .optional = true, .logical_type = .{ .timestamp = .{ .is_adjusted_to_utc = true, .unit = .millis } } },
+        .{ .name = "ts_us", .type_ = .int64, .optional = true, .logical_type = .{ .timestamp = .{ .is_adjusted_to_utc = true, .unit = .micros } } },
+        .{ .name = "date_col", .type_ = .int32, .optional = true, .logical_type = .date },
+    };
+
+    var writer = try api_writer_mod.writeToBuffer(allocator, &col_defs);
+    const arrays = [_]ArrowArray{ tss_arr, tsm_arr, tsu_arr, d32_arr };
+    const schemas = [_]ArrowSchema{ tss_sch, tsm_sch, tsu_sch, d32_sch };
+    try writeRowGroupFromArrow(&writer, allocator, &arrays, &schemas);
+    try writer.close();
+    const buf = try writer.toOwnedSlice();
+    defer allocator.free(buf);
+    writer.deinit();
+
+    // Read back
+    var dr = try api_reader_mod.openBufferDynamic(allocator, buf, .{});
+    defer dr.deinit();
+    var result = try readRowGroupAsArrow(allocator, dr.getSource(), dr.metadata, 0, null);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 4), result.arrays.len);
+
+    // Timestamp seconds should be converted to millis (* 1000)
+    const read_tss: [*]const i64 = @ptrCast(@alignCast(result.arrays[0].buffers[1].?));
+    try std.testing.expectEqual(@as(i64, 1705312200000), read_tss[0]);
+    try std.testing.expectEqual(@as(i64, 0), read_tss[1]);
+    try std.testing.expectEqual(@as(i64, 1), result.arrays[0].null_count);
+
+    // Timestamp millis passthrough
+    const read_tsm: [*]const i64 = @ptrCast(@alignCast(result.arrays[1].buffers[1].?));
+    try std.testing.expectEqual(@as(i64, 1705312200000), read_tsm[0]);
+    try std.testing.expectEqual(@as(i64, 0), read_tsm[1]);
+    try std.testing.expectEqual(@as(i64, 86400000), read_tsm[2]);
+
+    // Timestamp micros passthrough
+    const read_tsu: [*]const i64 = @ptrCast(@alignCast(result.arrays[2].buffers[1].?));
+    try std.testing.expectEqual(@as(i64, 1705312200000000), read_tsu[0]);
+    try std.testing.expectEqual(@as(i64, 0), read_tsu[1]);
+
+    // Date32 passthrough
+    const read_d32: [*]const i32 = @ptrCast(@alignCast(result.arrays[3].buffers[1].?));
+    try std.testing.expectEqual(@as(i32, 19738), read_d32[0]);
+    try std.testing.expectEqual(@as(i32, 0), read_d32[2]);
+    try std.testing.expectEqual(@as(i64, 1), result.arrays[3].null_count);
+}
+
+// ============================================================================
+// Arrow write round-trip tests: temporal types in nested contexts
+// ============================================================================
+
+test "round-trip: arrow write LIST of timestamp seconds" {
+    const allocator = std.testing.allocator;
+
+    const col_defs = [_]ColumnDef{
+        .{ .name = "ts_list", .type_ = .int64, .optional = true, .is_list = true, .element_optional = true, .logical_type = .{ .timestamp = .{ .is_adjusted_to_utc = true, .unit = .millis } } },
+    };
+
+    var writer = try api_writer_mod.writeToBuffer(allocator, &col_defs);
+
+    // Build Arrow list array with tss: child
+    const n: usize = 3;
+    const bitmap_len: usize = 1;
+
+    // Parent offsets
+    const offsets_mem = try allocator.alloc(u8, (n + 1) * 4);
+    defer allocator.free(offsets_mem);
+    const offsets: [*]i32 = @ptrCast(@alignCast(offsets_mem.ptr));
+    offsets[0] = 0;
+    offsets[1] = 2; // first list has 2 elements
+    offsets[2] = 2; // second list is null
+    offsets[3] = 3; // third list has 1 element
+
+    // Parent validity
+    const parent_validity = try allocator.alloc(u8, bitmap_len);
+    defer allocator.free(parent_validity);
+    @memset(parent_validity, 0xFF);
+    arrow.clearBit(parent_validity, 1);
+
+    // Child data: 3 timestamp-second values
+    const child_data_mem = try allocator.alloc(u8, 3 * 8);
+    defer allocator.free(child_data_mem);
+    const child_typed: [*]i64 = @ptrCast(@alignCast(child_data_mem.ptr));
+    child_typed[0] = 1000; // 1000 seconds
+    child_typed[1] = 2000; // 2000 seconds
+    child_typed[2] = 3000; // 3000 seconds
+
+    const child_validity = try allocator.alloc(u8, bitmap_len);
+    defer allocator.free(child_validity);
+    @memset(child_validity, 0xFF);
+
+    var child_buffers = [_]?*anyopaque{ @ptrCast(child_validity.ptr), @ptrCast(child_data_mem.ptr) };
+    var child_arr_val = ArrowArray{
+        .length = 3, .null_count = 0, .offset = 0, .n_buffers = 2,
+        .n_children = 0, .buffers = &child_buffers, .children = null,
+        .dictionary = null, .release = null, .private_data = null,
+    };
+
+    var children_ptrs = [_]*ArrowArray{&child_arr_val};
+    var parent_buffers = [_]?*anyopaque{ @ptrCast(parent_validity.ptr), @ptrCast(offsets_mem.ptr) };
+    const list_arr = ArrowArray{
+        .length = 3, .null_count = 1, .offset = 0, .n_buffers = 2,
+        .n_children = 1, .buffers = &parent_buffers, .children = @ptrCast(&children_ptrs),
+        .dictionary = null, .release = null, .private_data = null,
+    };
+
+    const child_sch = ArrowSchema{
+        .format = "tss:UTC", .name = "item", .metadata = null,
+        .flags = arrow.ARROW_FLAG_NULLABLE, .n_children = 0, .children = null,
+        .dictionary = null, .release = null, .private_data = null,
+    };
+    var child_sch_ptrs = [_]*const ArrowSchema{&child_sch};
+    const list_sch = ArrowSchema{
+        .format = "+l", .name = "ts_list", .metadata = null,
+        .flags = arrow.ARROW_FLAG_NULLABLE, .n_children = 1,
+        .children = @constCast(@ptrCast(&child_sch_ptrs)),
+        .dictionary = null, .release = null, .private_data = null,
+    };
+
+    const arrays = [_]ArrowArray{list_arr};
+    const schemas = [_]ArrowSchema{list_sch};
+    try writeRowGroupFromArrow(&writer, allocator, &arrays, &schemas);
+    try writer.close();
+    const buf = try writer.toOwnedSlice();
+    defer allocator.free(buf);
+    writer.deinit();
+
+    // Read back
+    var dr = try api_reader_mod.openBufferDynamic(allocator, buf, .{});
+    defer dr.deinit();
+    var result = try readRowGroupAsArrow(allocator, dr.getSource(), dr.metadata, 0, null);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.arrays.len);
+    const read_list = &result.arrays[0];
+    try std.testing.expectEqual(@as(i64, 3), read_list.length);
+
+    // Check child values are scaled: 1000s -> 1000000ms, 2000s -> 2000000ms, 3000s -> 3000000ms
+    const read_children: [*]*ArrowArray = read_list.children.?;
+    const read_child = read_children[0];
+    const read_child_data: [*]const i64 = @ptrCast(@alignCast(read_child.buffers[1].?));
+    try std.testing.expectEqual(@as(i64, 1000000), read_child_data[0]);
+    try std.testing.expectEqual(@as(i64, 2000000), read_child_data[1]);
+    try std.testing.expectEqual(@as(i64, 3000000), read_child_data[2]);
+}
+
+test "round-trip: arrow write STRUCT with timestamp seconds field" {
+    const allocator = std.testing.allocator;
+
+    const struct_fields = [_]StructField{
+        .{ .name = "label", .type_ = .byte_array },
+        .{ .name = "ts", .type_ = .int64, .logical_type = .{ .timestamp = .{ .is_adjusted_to_utc = true, .unit = .millis } } },
+    };
+
+    const col_defs = [_]ColumnDef{
+        .{ .name = "event", .type_ = .byte_array, .optional = true, .is_struct = true, .struct_fields = &struct_fields },
+    };
+
+    var writer = try api_writer_mod.writeToBuffer(allocator, &col_defs);
+    const n: usize = 2;
+    const bitmap_len: usize = 1;
+
+    // Struct parent
+    const struct_validity = try allocator.alloc(u8, bitmap_len);
+    defer allocator.free(struct_validity);
+    @memset(struct_validity, 0xFF);
+
+    // Child 0: label (string)
+    const str_offsets_mem = try allocator.alloc(u8, (n + 1) * 4);
+    defer allocator.free(str_offsets_mem);
+    const str_offsets: [*]i32 = @ptrCast(@alignCast(str_offsets_mem.ptr));
+    str_offsets[0] = 0;
+    str_offsets[1] = 5; // "hello"
+    str_offsets[2] = 10; // "world"
+
+    const str_data = "helloworld";
+    const str_validity = try allocator.alloc(u8, bitmap_len);
+    defer allocator.free(str_validity);
+    @memset(str_validity, 0xFF);
+
+    var str_buffers = [_]?*anyopaque{ @ptrCast(str_validity.ptr), @ptrCast(str_offsets_mem.ptr), @ptrCast(@constCast(str_data.ptr)) };
+    var str_arr = ArrowArray{
+        .length = 2, .null_count = 0, .offset = 0, .n_buffers = 3,
+        .n_children = 0, .buffers = &str_buffers, .children = null,
+        .dictionary = null, .release = null, .private_data = null,
+    };
+
+    // Child 1: ts (timestamp seconds)
+    const ts_data_mem = try allocator.alloc(u8, n * 8);
+    defer allocator.free(ts_data_mem);
+    const ts_typed: [*]i64 = @ptrCast(@alignCast(ts_data_mem.ptr));
+    ts_typed[0] = 5000; // 5000 seconds
+    ts_typed[1] = 10000; // 10000 seconds
+
+    const ts_validity = try allocator.alloc(u8, bitmap_len);
+    defer allocator.free(ts_validity);
+    @memset(ts_validity, 0xFF);
+
+    var ts_buffers = [_]?*anyopaque{ @ptrCast(ts_validity.ptr), @ptrCast(ts_data_mem.ptr) };
+    var ts_arr = ArrowArray{
+        .length = 2, .null_count = 0, .offset = 0, .n_buffers = 2,
+        .n_children = 0, .buffers = &ts_buffers, .children = null,
+        .dictionary = null, .release = null, .private_data = null,
+    };
+
+    var struct_child_ptrs = [_]*ArrowArray{ &str_arr, &ts_arr };
+    var struct_buffers = [_]?*anyopaque{ @ptrCast(struct_validity.ptr), null };
+    const struct_arr = ArrowArray{
+        .length = 2, .null_count = 0, .offset = 0, .n_buffers = 2,
+        .n_children = 2, .buffers = &struct_buffers,
+        .children = @ptrCast(&struct_child_ptrs),
+        .dictionary = null, .release = null, .private_data = null,
+    };
+
+    const str_sch = ArrowSchema{
+        .format = "u", .name = "label", .metadata = null,
+        .flags = arrow.ARROW_FLAG_NULLABLE, .n_children = 0, .children = null,
+        .dictionary = null, .release = null, .private_data = null,
+    };
+    const ts_sch = ArrowSchema{
+        .format = "tss:UTC", .name = "ts", .metadata = null,
+        .flags = arrow.ARROW_FLAG_NULLABLE, .n_children = 0, .children = null,
+        .dictionary = null, .release = null, .private_data = null,
+    };
+    var struct_child_sch_ptrs = [_]*const ArrowSchema{ &str_sch, &ts_sch };
+    const struct_sch = ArrowSchema{
+        .format = "+s", .name = "event", .metadata = null,
+        .flags = arrow.ARROW_FLAG_NULLABLE, .n_children = 2,
+        .children = @constCast(@ptrCast(&struct_child_sch_ptrs)),
+        .dictionary = null, .release = null, .private_data = null,
+    };
+
+    const arr_slice = [_]ArrowArray{struct_arr};
+    const sch_slice = [_]ArrowSchema{struct_sch};
+    try writeRowGroupFromArrow(&writer, allocator, &arr_slice, &sch_slice);
+    try writer.close();
+    const buf = try writer.toOwnedSlice();
+    defer allocator.free(buf);
+    writer.deinit();
+
+    // Read back
+    var dr = try api_reader_mod.openBufferDynamic(allocator, buf, .{});
+    defer dr.deinit();
+    var result = try readRowGroupAsArrow(allocator, dr.getSource(), dr.metadata, 0, null);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.arrays.len);
+    const read_struct = &result.arrays[0];
+    try std.testing.expectEqual(@as(i64, 2), read_struct.n_children);
+
+    // Check timestamp field: 5000s -> 5000000ms, 10000s -> 10000000ms
+    const children: [*]*ArrowArray = read_struct.children.?;
+    const ts_child = children[1];
+    const read_ts: [*]const i64 = @ptrCast(@alignCast(ts_child.buffers[1].?));
+    try std.testing.expectEqual(@as(i64, 5000000), read_ts[0]);
+    try std.testing.expectEqual(@as(i64, 10000000), read_ts[1]);
+}
+
+// ============================================================================
+// Arrow write round-trip tests: type widening
+// ============================================================================
+
+test "round-trip: arrow write then read - widened integer types" {
+    const allocator = std.testing.allocator;
+    const n: usize = 3;
+    const bitmap_len = 1;
+
+    // i8 column (c -> i32)
+    const i8_validity = try allocator.alloc(u8, bitmap_len);
+    defer allocator.free(i8_validity);
+    @memset(i8_validity, 0xFF);
+
+    const i8_data = try allocator.alloc(u8, n);
+    defer allocator.free(i8_data);
+    const i8_typed: [*]i8 = @ptrCast(i8_data.ptr);
+    i8_typed[0] = -128;
+    i8_typed[1] = 0;
+    i8_typed[2] = 127;
+
+    var i8_buffers = [_]?*anyopaque{ @ptrCast(i8_validity.ptr), @ptrCast(i8_data.ptr) };
+    const i8_arr = ArrowArray{
+        .length = 3, .null_count = 0, .offset = 0, .n_buffers = 2,
+        .n_children = 0, .buffers = &i8_buffers, .children = null,
+        .dictionary = null, .release = null, .private_data = null,
+    };
+    const i8_sch = ArrowSchema{
+        .format = "c", .name = "i8_col", .metadata = null,
+        .flags = 0, .n_children = 0, .children = null,
+        .dictionary = null, .release = null, .private_data = null,
+    };
+
+    // u8 column (C -> i32)
+    const u8_validity = try allocator.alloc(u8, bitmap_len);
+    defer allocator.free(u8_validity);
+    @memset(u8_validity, 0xFF);
+
+    const u8_data = try allocator.alloc(u8, n);
+    defer allocator.free(u8_data);
+    u8_data[0] = 0;
+    u8_data[1] = 128;
+    u8_data[2] = 255;
+
+    var u8_buffers = [_]?*anyopaque{ @ptrCast(u8_validity.ptr), @ptrCast(u8_data.ptr) };
+    const u8_arr = ArrowArray{
+        .length = 3, .null_count = 0, .offset = 0, .n_buffers = 2,
+        .n_children = 0, .buffers = &u8_buffers, .children = null,
+        .dictionary = null, .release = null, .private_data = null,
+    };
+    const u8_sch = ArrowSchema{
+        .format = "C", .name = "u8_col", .metadata = null,
+        .flags = 0, .n_children = 0, .children = null,
+        .dictionary = null, .release = null, .private_data = null,
+    };
+
+    // u32 column (I -> i64)
+    const u32_validity = try allocator.alloc(u8, bitmap_len);
+    defer allocator.free(u32_validity);
+    @memset(u32_validity, 0xFF);
+
+    const u32_data = try allocator.alloc(u8, n * 4);
+    defer allocator.free(u32_data);
+    const u32_typed: [*]u32 = @ptrCast(@alignCast(u32_data.ptr));
+    u32_typed[0] = 0;
+    u32_typed[1] = 2147483648; // exceeds i32 max
+    u32_typed[2] = 4294967295; // u32 max
+
+    var u32_buffers = [_]?*anyopaque{ @ptrCast(u32_validity.ptr), @ptrCast(u32_data.ptr) };
+    const u32_arr = ArrowArray{
+        .length = 3, .null_count = 0, .offset = 0, .n_buffers = 2,
+        .n_children = 0, .buffers = &u32_buffers, .children = null,
+        .dictionary = null, .release = null, .private_data = null,
+    };
+    const u32_sch = ArrowSchema{
+        .format = "I", .name = "u32_col", .metadata = null,
+        .flags = 0, .n_children = 0, .children = null,
+        .dictionary = null, .release = null, .private_data = null,
+    };
+
+    // Write
+    const col_defs = [_]ColumnDef{
+        .{ .name = "i8_col", .type_ = .int32, .optional = false, .logical_type = .{ .int = .{ .bit_width = 8, .is_signed = true } } },
+        .{ .name = "u8_col", .type_ = .int32, .optional = false, .logical_type = .{ .int = .{ .bit_width = 8, .is_signed = false } } },
+        .{ .name = "u32_col", .type_ = .int64, .optional = false, .logical_type = .{ .int = .{ .bit_width = 32, .is_signed = false } } },
+    };
+
+    var writer = try api_writer_mod.writeToBuffer(allocator, &col_defs);
+    const arrays = [_]ArrowArray{ i8_arr, u8_arr, u32_arr };
+    const schemas = [_]ArrowSchema{ i8_sch, u8_sch, u32_sch };
+    try writeRowGroupFromArrow(&writer, allocator, &arrays, &schemas);
+    try writer.close();
+    const buf = try writer.toOwnedSlice();
+    defer allocator.free(buf);
+    writer.deinit();
+
+    // Read back
+    var dr = try api_reader_mod.openBufferDynamic(allocator, buf, .{});
+    defer dr.deinit();
+    var result = try readRowGroupAsArrow(allocator, dr.getSource(), dr.metadata, 0, null);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), result.arrays.len);
+
+    // i8 -> stored as i32
+    const read_i8: [*]const i32 = @ptrCast(@alignCast(result.arrays[0].buffers[1].?));
+    try std.testing.expectEqual(@as(i32, -128), read_i8[0]);
+    try std.testing.expectEqual(@as(i32, 0), read_i8[1]);
+    try std.testing.expectEqual(@as(i32, 127), read_i8[2]);
+
+    // u8 -> stored as i32
+    const read_u8: [*]const i32 = @ptrCast(@alignCast(result.arrays[1].buffers[1].?));
+    try std.testing.expectEqual(@as(i32, 0), read_u8[0]);
+    try std.testing.expectEqual(@as(i32, 128), read_u8[1]);
+    try std.testing.expectEqual(@as(i32, 255), read_u8[2]);
+
+    // u32 -> stored as i64
+    const read_u32: [*]const i64 = @ptrCast(@alignCast(result.arrays[2].buffers[1].?));
+    try std.testing.expectEqual(@as(i64, 0), read_u32[0]);
+    try std.testing.expectEqual(@as(i64, 2147483648), read_u32[1]);
+    try std.testing.expectEqual(@as(i64, 4294967295), read_u32[2]);
+}
+
+// ============================================================================
+// Arrow write round-trip tests: boolean
+// ============================================================================
+
+test "round-trip: arrow write then read - boolean" {
+    const allocator = std.testing.allocator;
+    const bitmap_len: usize = 1;
+
+    const validity = try allocator.alloc(u8, bitmap_len);
+    defer allocator.free(validity);
+    @memset(validity, 0xFF);
+    arrow.clearBit(validity, 2);
+
+    const bool_data = try allocator.alloc(u8, bitmap_len);
+    defer allocator.free(bool_data);
+    @memset(bool_data, 0);
+    arrow.setBit(bool_data, 0);
+    // index 1 = false
+    // index 2 = null
+    arrow.setBit(bool_data, 3);
+
+    var buffers = [_]?*anyopaque{ @ptrCast(validity.ptr), @ptrCast(bool_data.ptr) };
+    const bool_arr = ArrowArray{
+        .length = 4, .null_count = 1, .offset = 0, .n_buffers = 2,
+        .n_children = 0, .buffers = &buffers, .children = null,
+        .dictionary = null, .release = null, .private_data = null,
+    };
+    const bool_sch = ArrowSchema{
+        .format = "b", .name = "flag", .metadata = null,
+        .flags = arrow.ARROW_FLAG_NULLABLE, .n_children = 0, .children = null,
+        .dictionary = null, .release = null, .private_data = null,
+    };
+
+    const col_defs = [_]ColumnDef{
+        .{ .name = "flag", .type_ = .boolean, .optional = true },
+    };
+
+    var writer = try api_writer_mod.writeToBuffer(allocator, &col_defs);
+    const arrays = [_]ArrowArray{bool_arr};
+    const schemas = [_]ArrowSchema{bool_sch};
+    try writeRowGroupFromArrow(&writer, allocator, &arrays, &schemas);
+    try writer.close();
+    const buf = try writer.toOwnedSlice();
+    defer allocator.free(buf);
+    writer.deinit();
+
+    var dr = try api_reader_mod.openBufferDynamic(allocator, buf, .{});
+    defer dr.deinit();
+    var result = try readRowGroupAsArrow(allocator, dr.getSource(), dr.metadata, 0, null);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.arrays.len);
+    const read_arr = &result.arrays[0];
+    try std.testing.expectEqual(@as(i64, 4), read_arr.length);
+    try std.testing.expectEqual(@as(i64, 1), read_arr.null_count);
+
+    const read_data: [*]const u8 = @ptrCast(@alignCast(read_arr.buffers[1].?));
+    try std.testing.expect(arrow.getBit(read_data[0..1], 0)); // true
+    try std.testing.expect(!arrow.getBit(read_data[0..1], 1)); // false
+    try std.testing.expect(arrow.getBit(read_data[0..1], 3)); // true
+
+    const read_validity: [*]const u8 = @ptrCast(@alignCast(read_arr.buffers[0].?));
+    try std.testing.expect(!arrow.getBit(read_validity[0..1], 2)); // null
+}
+
+// ============================================================================
+// Arrow write round-trip tests: large string/binary
+// ============================================================================
+
+test "round-trip: arrow write then read - large utf8" {
+    const allocator = std.testing.allocator;
+    const n: usize = 3;
+    const bitmap_len: usize = 1;
+
+    const validity = try allocator.alloc(u8, bitmap_len);
+    defer allocator.free(validity);
+    @memset(validity, 0xFF);
+    arrow.clearBit(validity, 1);
+
+    // Large string uses i64 offsets
+    const offsets_mem = try allocator.alloc(u8, (n + 1) * 8);
+    defer allocator.free(offsets_mem);
+    const offsets: [*]i64 = @ptrCast(@alignCast(offsets_mem.ptr));
+    offsets[0] = 0;
+    offsets[1] = 5; // "hello"
+    offsets[2] = 5; // null
+    offsets[3] = 10; // "world"
+
+    const str_data = "helloworld";
+
+    var buffers = [_]?*anyopaque{ @ptrCast(validity.ptr), @ptrCast(offsets_mem.ptr), @ptrCast(@constCast(str_data.ptr)) };
+    const large_str_arr = ArrowArray{
+        .length = 3, .null_count = 1, .offset = 0, .n_buffers = 3,
+        .n_children = 0, .buffers = &buffers, .children = null,
+        .dictionary = null, .release = null, .private_data = null,
+    };
+    const large_str_sch = ArrowSchema{
+        .format = "U", .name = "text", .metadata = null,
+        .flags = arrow.ARROW_FLAG_NULLABLE, .n_children = 0, .children = null,
+        .dictionary = null, .release = null, .private_data = null,
+    };
+
+    const col_defs = [_]ColumnDef{
+        .{ .name = "text", .type_ = .byte_array, .optional = true, .logical_type = .string },
+    };
+
+    var writer = try api_writer_mod.writeToBuffer(allocator, &col_defs);
+    const arrays = [_]ArrowArray{large_str_arr};
+    const schemas = [_]ArrowSchema{large_str_sch};
+    try writeRowGroupFromArrow(&writer, allocator, &arrays, &schemas);
+    try writer.close();
+    const buf = try writer.toOwnedSlice();
+    defer allocator.free(buf);
+    writer.deinit();
+
+    var dr = try api_reader_mod.openBufferDynamic(allocator, buf, .{});
+    defer dr.deinit();
+    var result = try readRowGroupAsArrow(allocator, dr.getSource(), dr.metadata, 0, null);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.arrays.len);
+    const read_arr = &result.arrays[0];
+    try std.testing.expectEqual(@as(i64, 3), read_arr.length);
+    try std.testing.expectEqual(@as(i64, 1), read_arr.null_count);
+
+    const read_offsets: [*]const i32 = @ptrCast(@alignCast(read_arr.buffers[1].?));
+    const read_data: [*]const u8 = @ptrCast(@alignCast(read_arr.buffers[2].?));
+    const s0 = @as(usize, @intCast(read_offsets[0]));
+    const e0 = @as(usize, @intCast(read_offsets[1]));
+    try std.testing.expectEqualStrings("hello", read_data[s0..e0]);
+
+    const s2 = @as(usize, @intCast(read_offsets[2]));
+    const e2 = @as(usize, @intCast(read_offsets[3]));
+    try std.testing.expectEqualStrings("world", read_data[s2..e2]);
+
+    const read_validity: [*]const u8 = @ptrCast(@alignCast(read_arr.buffers[0].?));
+    try std.testing.expect(!arrow.getBit(read_validity[0..1], 1));
+}
+
+// ============================================================================
+// Arrow write round-trip tests: decimal
+// ============================================================================
+
+test "round-trip: arrow write then read - decimal int32 and int64 backed" {
+    const allocator = std.testing.allocator;
+    const n: usize = 3;
+    const bitmap_len: usize = 1;
+
+    // Decimal(9,2) backed by int32
+    const d9_validity = try allocator.alloc(u8, bitmap_len);
+    defer allocator.free(d9_validity);
+    @memset(d9_validity, 0xFF);
+    arrow.clearBit(d9_validity, 2);
+
+    const d9_data = try allocator.alloc(u8, n * 4);
+    defer allocator.free(d9_data);
+    const d9_typed: [*]i32 = @ptrCast(@alignCast(d9_data.ptr));
+    d9_typed[0] = 12345; // 123.45
+    d9_typed[1] = -99999; // -999.99
+    d9_typed[2] = 0; // null
+
+    var d9_buffers = [_]?*anyopaque{ @ptrCast(d9_validity.ptr), @ptrCast(d9_data.ptr) };
+    const d9_arr = ArrowArray{
+        .length = 3, .null_count = 1, .offset = 0, .n_buffers = 2,
+        .n_children = 0, .buffers = &d9_buffers, .children = null,
+        .dictionary = null, .release = null, .private_data = null,
+    };
+    const d9_sch = ArrowSchema{
+        .format = "d:9,2", .name = "price", .metadata = null,
+        .flags = arrow.ARROW_FLAG_NULLABLE, .n_children = 0, .children = null,
+        .dictionary = null, .release = null, .private_data = null,
+    };
+
+    // Decimal(18,4) backed by int64
+    const d18_validity = try allocator.alloc(u8, bitmap_len);
+    defer allocator.free(d18_validity);
+    @memset(d18_validity, 0xFF);
+
+    const d18_data = try allocator.alloc(u8, n * 8);
+    defer allocator.free(d18_data);
+    const d18_typed: [*]i64 = @ptrCast(@alignCast(d18_data.ptr));
+    d18_typed[0] = 123456789012345678;
+    d18_typed[1] = -1;
+    d18_typed[2] = 0;
+
+    var d18_buffers = [_]?*anyopaque{ @ptrCast(d18_validity.ptr), @ptrCast(d18_data.ptr) };
+    const d18_arr = ArrowArray{
+        .length = 3, .null_count = 0, .offset = 0, .n_buffers = 2,
+        .n_children = 0, .buffers = &d18_buffers, .children = null,
+        .dictionary = null, .release = null, .private_data = null,
+    };
+    const d18_sch = ArrowSchema{
+        .format = "d:18,4", .name = "amount", .metadata = null,
+        .flags = arrow.ARROW_FLAG_NULLABLE, .n_children = 0, .children = null,
+        .dictionary = null, .release = null, .private_data = null,
+    };
+
+    const col_defs = [_]ColumnDef{
+        .{ .name = "price", .type_ = .int32, .optional = true, .logical_type = .{ .decimal = .{ .precision = 9, .scale = 2 } } },
+        .{ .name = "amount", .type_ = .int64, .optional = true, .logical_type = .{ .decimal = .{ .precision = 18, .scale = 4 } } },
+    };
+
+    var writer = try api_writer_mod.writeToBuffer(allocator, &col_defs);
+    const arrays = [_]ArrowArray{ d9_arr, d18_arr };
+    const schemas = [_]ArrowSchema{ d9_sch, d18_sch };
+    try writeRowGroupFromArrow(&writer, allocator, &arrays, &schemas);
+    try writer.close();
+    const buf = try writer.toOwnedSlice();
+    defer allocator.free(buf);
+    writer.deinit();
+
+    var dr = try api_reader_mod.openBufferDynamic(allocator, buf, .{});
+    defer dr.deinit();
+    var result = try readRowGroupAsArrow(allocator, dr.getSource(), dr.metadata, 0, null);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), result.arrays.len);
+
+    // Decimal(9,2) -> int32
+    const read_d9: [*]const i32 = @ptrCast(@alignCast(result.arrays[0].buffers[1].?));
+    try std.testing.expectEqual(@as(i32, 12345), read_d9[0]);
+    try std.testing.expectEqual(@as(i32, -99999), read_d9[1]);
+    try std.testing.expectEqual(@as(i64, 1), result.arrays[0].null_count);
+
+    // Decimal(18,4) -> int64
+    const read_d18: [*]const i64 = @ptrCast(@alignCast(result.arrays[1].buffers[1].?));
+    try std.testing.expectEqual(@as(i64, 123456789012345678), read_d18[0]);
+    try std.testing.expectEqual(@as(i64, -1), read_d18[1]);
+    try std.testing.expectEqual(@as(i64, 0), read_d18[2]);
+}
+
+// ============================================================================
+// Arrow write round-trip tests: date64
+// ============================================================================
+
+test "round-trip: arrow write then read - date64" {
+    const allocator = std.testing.allocator;
+    const n: usize = 3;
+    const bitmap_len: usize = 1;
+
+    const validity = try allocator.alloc(u8, bitmap_len);
+    defer allocator.free(validity);
+    @memset(validity, 0xFF);
+    arrow.clearBit(validity, 1);
+
+    const data_mem = try allocator.alloc(u8, n * 8);
+    defer allocator.free(data_mem);
+    const typed: [*]i64 = @ptrCast(@alignCast(data_mem.ptr));
+    typed[0] = 1705363200000; // 2024-01-15 in millis = day 19738
+    typed[1] = 0; // null
+    typed[2] = 0; // epoch = day 0
+
+    var buffers = [_]?*anyopaque{ @ptrCast(validity.ptr), @ptrCast(data_mem.ptr) };
+    const d64_arr = ArrowArray{
+        .length = 3, .null_count = 1, .offset = 0, .n_buffers = 2,
+        .n_children = 0, .buffers = &buffers, .children = null,
+        .dictionary = null, .release = null, .private_data = null,
+    };
+    const d64_sch = ArrowSchema{
+        .format = "tdm", .name = "date_col", .metadata = null,
+        .flags = arrow.ARROW_FLAG_NULLABLE, .n_children = 0, .children = null,
+        .dictionary = null, .release = null, .private_data = null,
+    };
+
+    const col_defs = [_]ColumnDef{
+        .{ .name = "date_col", .type_ = .int32, .optional = true, .logical_type = .date },
+    };
+
+    var writer = try api_writer_mod.writeToBuffer(allocator, &col_defs);
+    const arrays = [_]ArrowArray{d64_arr};
+    const schemas = [_]ArrowSchema{d64_sch};
+    try writeRowGroupFromArrow(&writer, allocator, &arrays, &schemas);
+    try writer.close();
+    const buf = try writer.toOwnedSlice();
+    defer allocator.free(buf);
+    writer.deinit();
+
+    var dr = try api_reader_mod.openBufferDynamic(allocator, buf, .{});
+    defer dr.deinit();
+    var result = try readRowGroupAsArrow(allocator, dr.getSource(), dr.metadata, 0, null);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.arrays.len);
+    const read_arr = &result.arrays[0];
+    try std.testing.expectEqual(@as(i64, 3), read_arr.length);
+    try std.testing.expectEqual(@as(i64, 1), read_arr.null_count);
+
+    const read_data: [*]const i32 = @ptrCast(@alignCast(read_arr.buffers[1].?));
+    try std.testing.expectEqual(@as(i32, 19738), read_data[0]); // 1705276800000 / 86400000
+    try std.testing.expectEqual(@as(i32, 0), read_data[2]); // epoch
+}
+
+// ============================================================================
+// Arrow write round-trip tests: time32
+// ============================================================================
+
+test "round-trip: arrow write then read - time32 seconds and millis" {
+    const allocator = std.testing.allocator;
+    const n: usize = 3;
+    const bitmap_len: usize = 1;
+
+    // Time32 seconds (tts -> stored as millis)
+    const tts_validity = try allocator.alloc(u8, bitmap_len);
+    defer allocator.free(tts_validity);
+    @memset(tts_validity, 0xFF);
+
+    const tts_data = try allocator.alloc(u8, n * 4);
+    defer allocator.free(tts_data);
+    const tts_typed: [*]i32 = @ptrCast(@alignCast(tts_data.ptr));
+    tts_typed[0] = 3600; // 1 hour in seconds
+    tts_typed[1] = 0; // midnight
+    tts_typed[2] = 43200; // noon
+
+    var tts_buffers = [_]?*anyopaque{ @ptrCast(tts_validity.ptr), @ptrCast(tts_data.ptr) };
+    const tts_arr = ArrowArray{
+        .length = 3, .null_count = 0, .offset = 0, .n_buffers = 2,
+        .n_children = 0, .buffers = &tts_buffers, .children = null,
+        .dictionary = null, .release = null, .private_data = null,
+    };
+    const tts_sch = ArrowSchema{
+        .format = "tts", .name = "time_sec", .metadata = null,
+        .flags = arrow.ARROW_FLAG_NULLABLE, .n_children = 0, .children = null,
+        .dictionary = null, .release = null, .private_data = null,
+    };
+
+    // Time32 millis (ttm -> passthrough)
+    const ttm_validity = try allocator.alloc(u8, bitmap_len);
+    defer allocator.free(ttm_validity);
+    @memset(ttm_validity, 0xFF);
+    arrow.clearBit(ttm_validity, 2);
+
+    const ttm_data = try allocator.alloc(u8, n * 4);
+    defer allocator.free(ttm_data);
+    const ttm_typed: [*]i32 = @ptrCast(@alignCast(ttm_data.ptr));
+    ttm_typed[0] = 3600000; // 1 hour in millis
+    ttm_typed[1] = 0; // midnight
+    ttm_typed[2] = 0; // null
+
+    var ttm_buffers = [_]?*anyopaque{ @ptrCast(ttm_validity.ptr), @ptrCast(ttm_data.ptr) };
+    const ttm_arr = ArrowArray{
+        .length = 3, .null_count = 1, .offset = 0, .n_buffers = 2,
+        .n_children = 0, .buffers = &ttm_buffers, .children = null,
+        .dictionary = null, .release = null, .private_data = null,
+    };
+    const ttm_sch = ArrowSchema{
+        .format = "ttm", .name = "time_ms", .metadata = null,
+        .flags = arrow.ARROW_FLAG_NULLABLE, .n_children = 0, .children = null,
+        .dictionary = null, .release = null, .private_data = null,
+    };
+
+    const col_defs = [_]ColumnDef{
+        .{ .name = "time_sec", .type_ = .int32, .optional = true, .logical_type = .{ .time = .{ .is_adjusted_to_utc = false, .unit = .millis } } },
+        .{ .name = "time_ms", .type_ = .int32, .optional = true, .logical_type = .{ .time = .{ .is_adjusted_to_utc = false, .unit = .millis } } },
+    };
+
+    var writer = try api_writer_mod.writeToBuffer(allocator, &col_defs);
+    const arrays = [_]ArrowArray{ tts_arr, ttm_arr };
+    const schemas = [_]ArrowSchema{ tts_sch, ttm_sch };
+    try writeRowGroupFromArrow(&writer, allocator, &arrays, &schemas);
+    try writer.close();
+    const buf = try writer.toOwnedSlice();
+    defer allocator.free(buf);
+    writer.deinit();
+
+    var dr = try api_reader_mod.openBufferDynamic(allocator, buf, .{});
+    defer dr.deinit();
+    var result = try readRowGroupAsArrow(allocator, dr.getSource(), dr.metadata, 0, null);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), result.arrays.len);
+
+    // Time32 seconds -> millis (* 1000)
+    const read_tts: [*]const i32 = @ptrCast(@alignCast(result.arrays[0].buffers[1].?));
+    try std.testing.expectEqual(@as(i32, 3600000), read_tts[0]); // 3600 * 1000
+    try std.testing.expectEqual(@as(i32, 0), read_tts[1]);
+    try std.testing.expectEqual(@as(i32, 43200000), read_tts[2]); // 43200 * 1000
+
+    // Time32 millis passthrough
+    const read_ttm: [*]const i32 = @ptrCast(@alignCast(result.arrays[1].buffers[1].?));
+    try std.testing.expectEqual(@as(i32, 3600000), read_ttm[0]);
+    try std.testing.expectEqual(@as(i32, 0), read_ttm[1]);
+    try std.testing.expectEqual(@as(i64, 1), result.arrays[1].null_count);
 }

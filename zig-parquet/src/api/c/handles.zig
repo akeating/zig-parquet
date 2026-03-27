@@ -337,7 +337,7 @@ pub const WriterHandle = struct {
 
         const allocator = self.allocator;
         const col_defs = try arrow_batch.importSchemaFromArrow(allocator, schema);
-        errdefer allocator.free(col_defs);
+        errdefer arrow_batch.freeImportedColumnDefs(allocator, col_defs);
 
         // Dupe column names so they outlive the ArrowSchema
         var names = try allocator.alloc([:0]u8, col_defs.len);

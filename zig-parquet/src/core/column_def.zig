@@ -41,6 +41,8 @@ pub const ColumnDef = struct {
     is_struct: bool = false,
     /// For struct columns: child field definitions
     struct_fields: ?[]const StructField = null,
+    /// Whether struct_fields was heap-allocated and must be freed
+    struct_fields_owned: bool = false,
     /// For map columns: indicates this is a map type
     is_map: bool = false,
     /// For map columns: value type
@@ -167,6 +169,15 @@ pub const ColumnDef = struct {
     /// Create a MAP of INT64 to STRING
     pub fn mapInt64String(name: []const u8, value_optional: bool) ColumnDef {
         return map(name, .int64, .byte_array, value_optional);
+    }
+
+    /// Free heap-allocated struct_fields if owned by this ColumnDef.
+    pub fn freeStructFields(self: *ColumnDef, allocator: std.mem.Allocator) void {
+        if (self.struct_fields_owned) {
+            if (self.struct_fields) |sf| allocator.free(sf);
+            self.struct_fields = null;
+            self.struct_fields_owned = false;
+        }
     }
 
     /// Create a STRING column (BYTE_ARRAY with STRING annotation)
@@ -405,11 +416,11 @@ pub const ColumnDef = struct {
     /// This bridges the new recursive SchemaNode type to the flat ColumnDef
     /// representation. Supports primitives, optional wrappers, lists, maps,
     /// and structs (but not deeply nested compositions yet).
-    pub fn fromSchemaNode(name: []const u8, node: *const SchemaNode) !ColumnDef {
-        return try fromSchemaNodeRecursive(name, node, false);
+    pub fn fromSchemaNode(allocator: std.mem.Allocator, name: []const u8, node: *const SchemaNode) !ColumnDef {
+        return try fromSchemaNodeRecursive(allocator, name, node, false);
     }
 
-    fn fromSchemaNodeRecursive(name: []const u8, node: *const SchemaNode, is_optional: bool) !ColumnDef {
+    fn fromSchemaNodeRecursive(allocator: std.mem.Allocator, name: []const u8, node: *const SchemaNode, is_optional: bool) !ColumnDef {
         switch (node.*) {
             .boolean => return .{ .name = name, .type_ = .boolean, .optional = is_optional },
             .int32 => return .{ .name = name, .type_ = .int32, .optional = is_optional },
@@ -423,7 +434,7 @@ pub const ColumnDef = struct {
                 .optional = is_optional,
                 .type_length = try safe.castTo(i32, len),
             },
-            .optional => |child| return try fromSchemaNodeRecursive(name, child, true),
+            .optional => |child| return try fromSchemaNodeRecursive(allocator, name, child, true),
             .list => |element| {
                 // Get element type and optionality
                 const unwrapped = element.unwrapOptional();
@@ -452,15 +463,12 @@ pub const ColumnDef = struct {
                 };
             },
             .struct_ => |s| {
-                // Convert struct fields to StructField array
-                // Note: This requires allocating, but we use the slice directly
-                // assuming caller provides a stable pointer to fields
-                var struct_fields_buf: [32]StructField = undefined;
-                const field_count = @min(s.fields.len, struct_fields_buf.len);
-                for (s.fields[0..field_count], 0..) |f, i| {
+                const struct_fields = try allocator.alloc(StructField, s.fields.len);
+                errdefer allocator.free(struct_fields);
+                for (s.fields, 0..) |f, i| {
                     const unwrapped = f.node.unwrapOptional();
                     const field_optional = (f.node != unwrapped);
-                    struct_fields_buf[i] = .{
+                    struct_fields[i] = .{
                         .name = f.name,
                         .type_ = getPhysicalType(unwrapped),
                         .optional = field_optional,
@@ -471,7 +479,8 @@ pub const ColumnDef = struct {
                     .type_ = .int32, // placeholder
                     .optional = is_optional,
                     .is_struct = true,
-                    .struct_fields = struct_fields_buf[0..field_count],
+                    .struct_fields = struct_fields,
+                    .struct_fields_owned = true,
                 };
             },
         }

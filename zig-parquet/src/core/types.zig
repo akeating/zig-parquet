@@ -415,7 +415,6 @@ pub const DecimalValue = struct {
 /// Minimum FLBA byte length for a given decimal precision (Parquet spec).
 /// Formula: ceil((precision * log2(10) + 1) / 8)
 pub fn decimalByteLength(comptime precision: comptime_int) comptime_int {
-    // Lookup table for precisions 1-38
     const table = [38]comptime_int{
         1, 1, 2, 2, 3, 3, 4, 4, 4, // P1-P9
         5, 5, 6, 6, 6, 7, 7, 8, 8, // P10-P18
@@ -424,6 +423,19 @@ pub fn decimalByteLength(comptime precision: comptime_int) comptime_int {
     };
     if (precision < 1 or precision > 38) @compileError("Decimal precision must be 1-38");
     return table[precision - 1];
+}
+
+/// Runtime version of decimalByteLength for dynamic precision values.
+pub fn decimalByteLengthRuntime(precision: i32) usize {
+    const table = [38]usize{
+        1, 1, 2, 2, 3, 3, 4, 4, 4, // P1-P9
+        5, 5, 6, 6, 6, 7, 7, 8, 8, // P10-P18
+        9, 9, 9, 10, 10, 11, 11, 11, 12, 12, // P19-P28
+        13, 13, 13, 14, 14, 15, 15, 16, 16, 16, // P29-P38
+    };
+    if (precision < 1 or precision > 38) return 16;
+    const idx = safe.castTo(usize, precision - 1) catch unreachable; // precision is 1-38 after guard
+    return table[idx];
 }
 
 /// Parameterized Decimal type for RowWriter.

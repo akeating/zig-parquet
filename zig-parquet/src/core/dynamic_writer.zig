@@ -113,21 +113,10 @@ pub const TypeInfo = struct {
         } else if (precision <= 18) {
             return .{ .physical = .int64, .logical = logical, .type_length = null };
         } else {
-            const byte_len = decimalByteLengthRuntime(precision);
-            return .{ .physical = .fixed_bytes, .logical = logical, .type_length = byte_len };
+            const byte_len = types.decimalByteLengthRuntime(precision);
+            const type_len = safe.castTo(i32, byte_len) catch unreachable; // decimalByteLengthRuntime returns max 16
+            return .{ .physical = .fixed_bytes, .logical = logical, .type_length = type_len };
         }
-    }
-
-    fn decimalByteLengthRuntime(precision: i32) i32 {
-        const table = [38]i32{
-            1, 1, 2, 2, 3, 3, 4, 4, 4, // P1-P9
-            5, 5, 6, 6, 6, 7, 7, 8, 8, // P10-P18
-            9, 9, 9, 10, 10, 11, 11, 11, 12, 12, // P19-P28
-            13, 13, 13, 14, 14, 15, 15, 16, 16, 16, // P29-P38
-        };
-        if (precision < 1 or precision > 38) return 16;
-        const idx = safe.castTo(usize, precision - 1) catch unreachable; // precision is 1-38 after guard
-        return table[idx];
     }
 
     pub fn fixedBytes(len: i32) TypeInfo {

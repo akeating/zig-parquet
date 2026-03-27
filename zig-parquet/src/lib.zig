@@ -87,6 +87,7 @@ pub const ArrowArrayStream = arrow.ArrowArrayStream;
 const arrow_batch = @import("core/arrow_batch.zig");
 pub const exportSchemaAsArrow = arrow_batch.exportSchemaAsArrow;
 pub const importSchemaFromArrow = arrow_batch.importSchemaFromArrow;
+pub const freeImportedColumnDefs = arrow_batch.freeImportedColumnDefs;
 pub const readRowGroupAsArrow = arrow_batch.readRowGroupAsArrow;
 pub const writeRowGroupFromArrow = arrow_batch.writeRowGroupFromArrow;
 
