@@ -30,7 +30,7 @@ test "SchemaNode list of struct levels" {
     } };
     const list_node = SchemaNode{ .list = &struct_node };
 
-    const levels = list_node.computeLevels();
+    const levels = try list_node.computeLevels();
     try std.testing.expectEqual(@as(u8, 2), levels.max_def);
     try std.testing.expectEqual(@as(u8, 1), levels.max_rep);
     try std.testing.expectEqual(@as(usize, 2), list_node.countLeafColumns());
@@ -49,7 +49,7 @@ test "SchemaNode struct with list field levels" {
         },
     } };
 
-    const levels = struct_node.computeLevels();
+    const levels = try struct_node.computeLevels();
     try std.testing.expectEqual(@as(u8, 1), levels.max_def);
     try std.testing.expectEqual(@as(u8, 1), levels.max_rep);
     try std.testing.expectEqual(@as(usize, 2), struct_node.countLeafColumns());
@@ -63,7 +63,7 @@ test "SchemaNode map with list value levels" {
     const bare_map = SchemaNode{ .map = .{ .key = &key_node, .value = &value_node } };
     const map_node = SchemaNode{ .optional = &bare_map };
 
-    const levels = map_node.computeLevels();
+    const levels = try map_node.computeLevels();
     // optional(+1), map(+1 def, +1 rep), list(+1 def, +1 rep)
     try std.testing.expectEqual(@as(u8, 3), levels.max_def);
     try std.testing.expectEqual(@as(u8, 2), levels.max_rep);

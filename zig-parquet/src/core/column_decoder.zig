@@ -187,6 +187,10 @@ fn decodeColumnWithLevelsAndDeltaEncoding(
         }
         ctx.allocator.free(dynamic_result.values);
     }
+    errdefer {
+        if (dynamic_result.def_levels) |dl| ctx.allocator.free(dl);
+        if (dynamic_result.rep_levels) |rl| ctx.allocator.free(rl);
+    }
 
     const result = try ctx.allocator.alloc(Optional(T), ctx.num_values);
     errdefer {
@@ -1322,7 +1326,6 @@ fn decodeDynamicBoolV2(allocator: std.mem.Allocator, values_data: []const u8, nu
     // Validate data size: non_null_count booleans need (non_null_count + 7) / 8 bytes
     const required_bytes = (non_null_count + 7) / 8;
     if (values_data.len < required_bytes) {
-        allocator.free(values);
         return error.EndOfData;
     }
 
@@ -2140,6 +2143,26 @@ fn decodeDynamicFixedByteArray(
         // Dictionary-encoded: decode levels first, then look up values from dictionary
         var pos: usize = 0;
 
+        // Decode repetition levels first (per Parquet V1 spec: rep before def)
+        var rep_levels: ?[]u32 = null;
+        errdefer if (rep_levels) |rl| allocator.free(rl);
+
+        if (max_rep_level > 0) {
+            const rep_bit_width = format.computeBitWidth(max_rep_level);
+            if (rep_level_encoding == .bit_packed) {
+                if (pos > value_data.len) return error.EndOfData;
+                rep_levels = try rle.decodeBitPackedLevels(allocator, value_data[pos..], rep_bit_width, num_values);
+                pos += rle.bitPackedSize(num_values, rep_bit_width);
+            } else {
+                if (pos + 4 > value_data.len) return error.EndOfData;
+                const rep_len = std.mem.readInt(u32, value_data[pos..][0..4], .little);
+                pos += 4;
+                if (pos + rep_len > value_data.len) return error.EndOfData;
+                rep_levels = try rle.decodeLevels(allocator, value_data[pos..][0..rep_len], rep_bit_width, num_values);
+                pos += rep_len;
+            }
+        }
+
         // Decode definition levels
         var def_levels: ?[]u32 = null;
         errdefer if (def_levels) |dl| allocator.free(dl);
@@ -2148,15 +2171,14 @@ fn decodeDynamicFixedByteArray(
         if (max_def_level > 0) {
             const def_bit_width = format.computeBitWidth(max_def_level);
             if (def_level_encoding == .bit_packed) {
+                if (pos > value_data.len) return error.EndOfData;
                 def_levels = try rle.decodeBitPackedLevels(allocator, value_data[pos..], def_bit_width, num_values);
                 pos += rle.bitPackedSize(num_values, def_bit_width);
             } else {
-                // RLE with 4-byte length prefix
                 if (pos + 4 > value_data.len) return error.EndOfData;
-                if (value_data.len < pos + 4) return error.EndOfData;
-                if (value_data.len < pos + 4) return error.EndOfData;
                 const def_len = std.mem.readInt(u32, value_data[pos..][0..4], .little);
                 pos += 4;
+                if (pos + def_len > value_data.len) return error.EndOfData;
                 def_levels = try rle.decodeLevels(allocator, value_data[pos..][0..def_len], def_bit_width, num_values);
                 pos += def_len;
             }
@@ -2167,24 +2189,17 @@ fn decodeDynamicFixedByteArray(
             }
         }
 
-        // Skip repetition levels
-        var rep_levels: ?[]u32 = null;
-        errdefer if (rep_levels) |rl| allocator.free(rl);
-
-        if (max_rep_level > 0) {
-            const rep_bit_width = format.computeBitWidth(max_rep_level);
-            if (rep_level_encoding == .bit_packed) {
-                rep_levels = try rle.decodeBitPackedLevels(allocator, value_data[pos..], rep_bit_width, num_values);
-                pos += rle.bitPackedSize(num_values, rep_bit_width);
-            } else {
-                if (pos + 4 > value_data.len) return error.EndOfData;
-                if (value_data.len < pos + 4) return error.EndOfData;
-                if (value_data.len < pos + 4) return error.EndOfData;
-                const rep_len = std.mem.readInt(u32, value_data[pos..][0..4], .little);
-                pos += 4;
-                rep_levels = try rle.decodeLevels(allocator, value_data[pos..][0..rep_len], rep_bit_width, num_values);
-                pos += rep_len;
+        // Handle all-null case
+        if (non_null_count == 0) {
+            const values = try allocator.alloc(Value, num_values);
+            for (0..num_values) |i| {
+                values[i] = .{ .null_val = {} };
             }
+            return .{
+                .values = values,
+                .def_levels = def_levels,
+                .rep_levels = rep_levels,
+            };
         }
 
         // Decode dictionary indices

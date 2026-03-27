@@ -1665,6 +1665,7 @@ pub const Writer = struct {
             error.UnsupportedCompression => error.UnsupportedCompression,
             error.IntegerOverflow => error.IntegerOverflow,
             error.ValueTooLarge => error.ValueTooLarge,
+            error.NullInRequiredColumn => error.NullInRequiredColumn,
             error.UnsupportedEncoding => error.UnsupportedEncoding,
         };
     }

@@ -49,6 +49,7 @@ pub const ColumnWriteError = error{
     IntegerOverflow,
     ValueTooLarge,
     UnsupportedEncoding,
+    NullInRequiredColumn,
 };
 
 /// Result of writing a column chunk
@@ -136,7 +137,7 @@ pub fn writeColumnChunkDictOptionalWithPathArray(
     // Compute statistics using unified API
     var stats_builder = statistics.StatisticsBuilder(T){};
     stats_builder.updateOptional(values);
-    const stats = stats_builder.build(allocator) catch return error.OutOfMemory;
+    var stats = stats_builder.build(allocator) catch return error.OutOfMemory;
     errdefer if (stats) |s| freeStatistics(allocator, s);
 
     // Build dictionary from non-null values
@@ -173,6 +174,7 @@ pub fn writeColumnChunkDictOptionalWithPathArray(
                     const ratio = @as(f32, @floatFromInt(dict_values.items.len)) / @as(f32, @floatFromInt(idx));
                     if (ratio > threshold) {
                         if (stats) |s| freeStatistics(allocator, s);
+                        stats = null;
                         return writeColumnChunkOptionalWithPathArray(T, allocator, output, path_in_schema, values, is_optional, start_offset, codec, write_page_checksum);
                     }
                 }
@@ -187,6 +189,7 @@ pub fn writeColumnChunkDictOptionalWithPathArray(
     if (dictionary_size_limit) |limit| {
         if (dict_bytes > limit) {
             if (stats) |s| freeStatistics(allocator, s);
+            stats = null;
             return writeColumnChunkOptionalWithPathArray(T, allocator, output, path_in_schema, values, is_optional, start_offset, codec, write_page_checksum);
         }
     }
@@ -243,6 +246,7 @@ pub fn writeColumnChunkDictOptionalWithPathArray(
     output.writeAll(dict_compressed) catch return error.WriteError;
 
     var total_bytes_written: usize = dict_header_bytes.len + dict_compressed.len;
+    var total_uncompressed_written: usize = dict_header_bytes.len + dict_data.len;
     const dict_page_offset = start_offset;
     const data_page_offset = start_offset + try safe.castTo(i64, total_bytes_written);
 
@@ -342,6 +346,8 @@ pub fn writeColumnChunkDictOptionalWithPathArray(
 
         const page_bytes = std.math.add(usize, data_header_bytes.len, data_compressed.len) catch return error.IntegerOverflow;
         total_bytes_written = std.math.add(usize, total_bytes_written, page_bytes) catch return error.IntegerOverflow;
+        const uncompressed_page_bytes = std.math.add(usize, data_header_bytes.len, data_page_uncompressed.len) catch return error.IntegerOverflow;
+        total_uncompressed_written = std.math.add(usize, total_uncompressed_written, uncompressed_page_bytes) catch return error.IntegerOverflow;
         value_offset = page_end;
     }
 
@@ -363,7 +369,7 @@ pub fn writeColumnChunkDictOptionalWithPathArray(
             .path_in_schema = path,
             .codec = codec,
             .num_values = try safe.castTo(i64, values.len),
-            .total_uncompressed_size = try safe.castTo(i64, total_bytes_written),
+            .total_uncompressed_size = try safe.castTo(i64, total_uncompressed_written),
             .total_compressed_size = try safe.castTo(i64, total_bytes_written),
             .data_page_offset = data_page_offset,
             .index_page_offset = null,
@@ -401,8 +407,8 @@ pub fn writeColumnChunkByteArrayDictOptionalWithPathArray(
     // Compute statistics using unified API
     var stats_builder = statistics.ByteArrayStatisticsBuilder.init(allocator);
     stats_builder.updateOptional(values) catch return error.OutOfMemory;
-    const stats = stats_builder.build();
-    // Note: stats_builder.deinit() is NOT called here because build() transfers ownership
+    var stats = stats_builder.build();
+    errdefer if (stats) |s| freeStatistics(allocator, s);
 
     // Build dictionary from non-null values
     var unique_map = std.StringHashMap(u32).init(allocator);
@@ -439,12 +445,8 @@ pub fn writeColumnChunkByteArrayDictOptionalWithPathArray(
                 if (idx >= 1024) {
                     const ratio = @as(f32, @floatFromInt(dict_values.items.len)) / @as(f32, @floatFromInt(idx));
                     if (ratio > threshold) {
-                        if (stats) |s| {
-                            if (s.min) |m| allocator.free(m);
-                            if (s.max) |m| allocator.free(m);
-                            if (s.min_value) |m| allocator.free(m);
-                            if (s.max_value) |m| allocator.free(m);
-                        }
+                        if (stats) |s| freeStatistics(allocator, s);
+                        stats = null;
                         return writeColumnChunkByteArrayOptionalWithPathArray(allocator, output, path_in_schema, values, is_optional, start_offset, codec, write_page_checksum);
                     }
                 }
@@ -457,12 +459,8 @@ pub fn writeColumnChunkByteArrayDictOptionalWithPathArray(
     // Check dictionary size limit
     if (dictionary_size_limit) |limit| {
         if (dict_bytes > limit) {
-            if (stats) |s| {
-                if (s.min) |m| allocator.free(m);
-                if (s.max) |m| allocator.free(m);
-                if (s.min_value) |m| allocator.free(m);
-                if (s.max_value) |m| allocator.free(m);
-            }
+            if (stats) |s| freeStatistics(allocator, s);
+            stats = null;
             return writeColumnChunkByteArrayOptionalWithPathArray(allocator, output, path_in_schema, values, is_optional, start_offset, codec, write_page_checksum);
         }
     }
@@ -514,6 +512,7 @@ pub fn writeColumnChunkByteArrayDictOptionalWithPathArray(
     output.writeAll(dict_compressed) catch return error.WriteError;
 
     var total_bytes_written: usize = dict_header_bytes.len + dict_compressed.len;
+    var total_uncompressed_written: usize = dict_header_bytes.len + dict_data.len;
     const dict_page_offset = start_offset;
     const data_page_offset = start_offset + try safe.castTo(i64, total_bytes_written);
 
@@ -613,6 +612,8 @@ pub fn writeColumnChunkByteArrayDictOptionalWithPathArray(
 
         const page_bytes = std.math.add(usize, data_header_bytes.len, data_compressed.len) catch return error.IntegerOverflow;
         total_bytes_written = std.math.add(usize, total_bytes_written, page_bytes) catch return error.IntegerOverflow;
+        const uncompressed_page_bytes = std.math.add(usize, data_header_bytes.len, data_page_uncompressed.len) catch return error.IntegerOverflow;
+        total_uncompressed_written = std.math.add(usize, total_uncompressed_written, uncompressed_page_bytes) catch return error.IntegerOverflow;
         value_offset = page_end;
     }
 
@@ -634,7 +635,7 @@ pub fn writeColumnChunkByteArrayDictOptionalWithPathArray(
             .path_in_schema = path,
             .codec = codec,
             .num_values = try safe.castTo(i64, values.len),
-            .total_uncompressed_size = try safe.castTo(i64, total_bytes_written),
+            .total_uncompressed_size = try safe.castTo(i64, total_uncompressed_written),
             .total_compressed_size = try safe.castTo(i64, total_bytes_written),
             .data_page_offset = data_page_offset,
             .index_page_offset = null,
@@ -690,6 +691,7 @@ pub fn writeColumnChunkFixedByteArrayOptionalWithPathArrayAndEncoding(
         error.InvalidFixedLength => return error.InvalidFixedLength,
         error.IntegerOverflow => return error.IntegerOverflow,
         error.ValueTooLarge => return error.ValueTooLarge,
+        error.NullInRequiredColumn => return error.NullInRequiredColumn,
         error.UnsupportedEncoding => return error.UnsupportedEncoding,
     };
     defer page_result.deinit(allocator);
@@ -744,7 +746,7 @@ pub fn writeColumnChunkFixedByteArrayOptionalWithPathArrayAndEncoding(
             .encodings = encodings,
             .path_in_schema = path,
             .codec = codec,
-            .num_values = try safe.castTo(i32, page_result.num_values),
+            .num_values = try safe.castTo(i64, page_result.num_values),
             .total_uncompressed_size = try safe.castTo(i64, header_bytes.len + page_result.data.len),
             .total_compressed_size = try safe.castTo(i64, total_bytes_written),
             .data_page_offset = start_offset,
@@ -955,6 +957,7 @@ fn writeColumnChunkFromValuesTyped(
         error.InvalidFixedLength => return error.InvalidFixedLength,
         error.IntegerOverflow => return error.IntegerOverflow,
         error.ValueTooLarge => return error.ValueTooLarge,
+        error.NullInRequiredColumn => return error.NullInRequiredColumn,
         error.UnsupportedEncoding => return error.UnsupportedEncoding,
     };
     defer page_result.deinit(allocator);
@@ -1019,6 +1022,7 @@ fn writeColumnChunkFromValuesBytes(
         error.InvalidFixedLength => return error.InvalidFixedLength,
         error.IntegerOverflow => return error.IntegerOverflow,
         error.ValueTooLarge => return error.ValueTooLarge,
+        error.NullInRequiredColumn => return error.NullInRequiredColumn,
         error.UnsupportedEncoding => return error.UnsupportedEncoding,
     };
     defer page_result.deinit(allocator);
@@ -1080,6 +1084,7 @@ fn writeColumnChunkFromValuesFixedBytes(
         error.InvalidFixedLength => return error.InvalidFixedLength,
         error.IntegerOverflow => return error.IntegerOverflow,
         error.ValueTooLarge => return error.ValueTooLarge,
+        error.NullInRequiredColumn => return error.NullInRequiredColumn,
         error.UnsupportedEncoding => return error.UnsupportedEncoding,
     };
     defer page_result.deinit(allocator);
@@ -1129,6 +1134,7 @@ fn writeColumnChunkFromValuesBool(
         error.InvalidFixedLength => return error.InvalidFixedLength,
         error.IntegerOverflow => return error.IntegerOverflow,
         error.ValueTooLarge => return error.ValueTooLarge,
+        error.NullInRequiredColumn => return error.NullInRequiredColumn,
         error.UnsupportedEncoding => return error.UnsupportedEncoding,
     };
     defer page_result.deinit(allocator);
@@ -1247,6 +1253,7 @@ fn writeColumnChunkFromValuesTypedDict(
             error.InvalidFixedLength => return error.InvalidFixedLength,
             error.IntegerOverflow => return error.IntegerOverflow,
             error.ValueTooLarge => return error.ValueTooLarge,
+            error.NullInRequiredColumn => return error.NullInRequiredColumn,
             error.UnsupportedEncoding => return error.UnsupportedEncoding,
         };
         defer page_result.deinit(allocator);
@@ -1352,6 +1359,7 @@ fn writeColumnChunkFromValuesTypedDict(
     output.writeAll(dict_compressed) catch return error.WriteError;
 
     var total_bytes_written: usize = dict_header_bytes.len + dict_compressed.len;
+    var total_uncompressed_written: usize = dict_header_bytes.len + dict_data.len;
     const dict_page_offset = start_offset;
     const data_page_offset = start_offset + try safe.castTo(i64, total_bytes_written);
 
@@ -1429,6 +1437,8 @@ fn writeColumnChunkFromValuesTypedDict(
 
     const page_bytes = std.math.add(usize, data_header_bytes.len, data_compressed.len) catch return error.IntegerOverflow;
     total_bytes_written = std.math.add(usize, total_bytes_written, page_bytes) catch return error.IntegerOverflow;
+    const uncompressed_page_bytes = std.math.add(usize, data_header_bytes.len, data_page_uncompressed.len) catch return error.IntegerOverflow;
+    total_uncompressed_written = std.math.add(usize, total_uncompressed_written, uncompressed_page_bytes) catch return error.IntegerOverflow;
 
     const path = allocator.alloc([]const u8, path_in_schema.len) catch return error.OutOfMemory;
     for (path_in_schema, 0..) |segment, i| {
@@ -1452,7 +1462,7 @@ fn writeColumnChunkFromValuesTypedDict(
             .path_in_schema = path,
             .codec = codec,
             .num_values = try safe.castTo(i64, def_levels.len),
-            .total_uncompressed_size = try safe.castTo(i64, total_bytes_written),
+            .total_uncompressed_size = try safe.castTo(i64, total_uncompressed_written),
             .total_compressed_size = try safe.castTo(i64, total_bytes_written),
             .data_page_offset = data_page_offset,
             .index_page_offset = null,
@@ -1493,6 +1503,7 @@ fn writeColumnChunkFromValuesTypedPlainFallback(
         error.InvalidFixedLength => return error.InvalidFixedLength,
         error.IntegerOverflow => return error.IntegerOverflow,
         error.ValueTooLarge => return error.ValueTooLarge,
+        error.NullInRequiredColumn => return error.NullInRequiredColumn,
         error.UnsupportedEncoding => return error.UnsupportedEncoding,
     };
     defer page_result.deinit(allocator);
@@ -1531,6 +1542,7 @@ fn writeColumnChunkFromValuesBytesDict(
             error.InvalidFixedLength => return error.InvalidFixedLength,
             error.IntegerOverflow => return error.IntegerOverflow,
             error.ValueTooLarge => return error.ValueTooLarge,
+            error.NullInRequiredColumn => return error.NullInRequiredColumn,
             error.UnsupportedEncoding => return error.UnsupportedEncoding,
         };
         defer page_result.deinit(allocator);
@@ -1633,6 +1645,7 @@ fn writeColumnChunkFromValuesBytesDict(
     output.writeAll(dict_compressed) catch return error.WriteError;
 
     var total_bytes_written: usize = dict_header_bytes.len + dict_compressed.len;
+    var total_uncompressed_written: usize = dict_header_bytes.len + dict_data.len;
     const dict_page_offset = start_offset;
     const data_page_offset = start_offset + try safe.castTo(i64, total_bytes_written);
 
@@ -1709,6 +1722,8 @@ fn writeColumnChunkFromValuesBytesDict(
 
     const page_bytes = std.math.add(usize, data_header_bytes.len, data_compressed.len) catch return error.IntegerOverflow;
     total_bytes_written = std.math.add(usize, total_bytes_written, page_bytes) catch return error.IntegerOverflow;
+    const uncompressed_page_bytes = std.math.add(usize, data_header_bytes.len, data_page_uncompressed.len) catch return error.IntegerOverflow;
+    total_uncompressed_written = std.math.add(usize, total_uncompressed_written, uncompressed_page_bytes) catch return error.IntegerOverflow;
 
     const path = allocator.alloc([]const u8, path_in_schema.len) catch return error.OutOfMemory;
     for (path_in_schema, 0..) |segment, i| {
@@ -1733,7 +1748,7 @@ fn writeColumnChunkFromValuesBytesDict(
             .path_in_schema = path,
             .codec = codec,
             .num_values = try safe.castTo(i64, def_levels.len),
-            .total_uncompressed_size = try safe.castTo(i64, total_bytes_written),
+            .total_uncompressed_size = try safe.castTo(i64, total_uncompressed_written),
             .total_compressed_size = try safe.castTo(i64, total_bytes_written),
             .data_page_offset = data_page_offset,
             .index_page_offset = null,
@@ -1766,6 +1781,7 @@ fn writeColumnChunkFromValuesBytesPlainFallback(
         error.InvalidFixedLength => return error.InvalidFixedLength,
         error.IntegerOverflow => return error.IntegerOverflow,
         error.ValueTooLarge => return error.ValueTooLarge,
+        error.NullInRequiredColumn => return error.NullInRequiredColumn,
         error.UnsupportedEncoding => return error.UnsupportedEncoding,
     };
     defer page_result.deinit(allocator);
@@ -1926,6 +1942,7 @@ fn writeColumnChunkWithEncoding(
         error.InvalidFixedLength => return error.InvalidFixedLength,
         error.IntegerOverflow => return error.IntegerOverflow,
         error.ValueTooLarge => return error.ValueTooLarge,
+        error.NullInRequiredColumn => return error.NullInRequiredColumn,
         error.UnsupportedEncoding => return error.UnsupportedEncoding,
     };
     defer page_result.deinit(allocator);
@@ -1985,7 +2002,7 @@ fn writeColumnChunkWithEncoding(
             .encodings = encodings,
             .path_in_schema = path,
             .codec = codec,
-            .num_values = try safe.castTo(i32, page_result.num_values),
+            .num_values = try safe.castTo(i64, page_result.num_values),
             .total_uncompressed_size = try safe.castTo(i64, header_bytes.len + page_result.data.len),
             .total_compressed_size = try safe.castTo(i64, total_bytes_written),
             .data_page_offset = start_offset,
@@ -2031,6 +2048,7 @@ pub fn writeColumnChunkOptionalWithEncoding(
     const values_per_page = if (max_page_size) |mps| @max(1, mps / @sizeOf(T)) else values.len;
 
     var total_bytes_written: usize = 0;
+    var total_uncompressed_written: usize = 0;
     var total_values: usize = 0;
     var offset: usize = 0;
 
@@ -2044,6 +2062,7 @@ pub fn writeColumnChunkOptionalWithEncoding(
             error.InvalidFixedLength => return error.InvalidFixedLength,
             error.IntegerOverflow => return error.IntegerOverflow,
             error.ValueTooLarge => return error.ValueTooLarge,
+            error.NullInRequiredColumn => return error.NullInRequiredColumn,
             error.UnsupportedEncoding => return error.UnsupportedEncoding,
         };
         defer page_result.deinit(allocator);
@@ -2086,6 +2105,8 @@ pub fn writeColumnChunkOptionalWithEncoding(
 
         const page_bytes = std.math.add(usize, header_bytes.len, compressed_data.len) catch return error.IntegerOverflow;
         total_bytes_written = std.math.add(usize, total_bytes_written, page_bytes) catch return error.IntegerOverflow;
+        const uncompressed_page_bytes = std.math.add(usize, header_bytes.len, page_result.data.len) catch return error.IntegerOverflow;
+        total_uncompressed_written = std.math.add(usize, total_uncompressed_written, uncompressed_page_bytes) catch return error.IntegerOverflow;
         total_values += page_result.num_values;
         offset = chunk_end;
     }
@@ -2108,7 +2129,7 @@ pub fn writeColumnChunkOptionalWithEncoding(
             .path_in_schema = path,
             .codec = codec,
             .num_values = try safe.castTo(i64, total_values),
-            .total_uncompressed_size = try safe.castTo(i64, total_bytes_written),
+            .total_uncompressed_size = try safe.castTo(i64, total_uncompressed_written),
             .total_compressed_size = try safe.castTo(i64, total_bytes_written),
             .data_page_offset = start_offset,
             .index_page_offset = null,
@@ -2139,13 +2160,7 @@ pub fn writeColumnChunkByteArrayOptionalWithEncoding(
 ) ColumnWriteError!ColumnChunkResult {
     // Compute statistics from Optional values
     var stats_builder = statistics.ByteArrayStatisticsBuilder.init(allocator);
-    // Note: DO NOT call stats_builder.deinit() - build() transfers ownership of min/max
-    for (values) |v| {
-        if (v != .null_value) {
-            const single = [_][]const u8{v.value};
-            stats_builder.update(&single) catch return error.OutOfMemory;
-        }
-    }
+    stats_builder.updateOptional(values) catch return error.OutOfMemory;
     const stats = stats_builder.build();
     errdefer if (stats) |s| freeStatistics(allocator, s);
 
@@ -2154,6 +2169,7 @@ pub fn writeColumnChunkByteArrayOptionalWithEncoding(
     const values_per_page = if (max_page_size) |mps| @max(1, mps / avg_value_size) else values.len;
 
     var total_bytes_written: usize = 0;
+    var total_uncompressed_written: usize = 0;
     var total_values: usize = 0;
     var offset: usize = 0;
 
@@ -2167,6 +2183,7 @@ pub fn writeColumnChunkByteArrayOptionalWithEncoding(
             error.InvalidFixedLength => return error.InvalidFixedLength,
             error.IntegerOverflow => return error.IntegerOverflow,
             error.ValueTooLarge => return error.ValueTooLarge,
+            error.NullInRequiredColumn => return error.NullInRequiredColumn,
             error.UnsupportedEncoding => return error.UnsupportedEncoding,
         };
         defer page_result.deinit(allocator);
@@ -2209,6 +2226,8 @@ pub fn writeColumnChunkByteArrayOptionalWithEncoding(
 
         const page_bytes = std.math.add(usize, header_bytes.len, compressed_data.len) catch return error.IntegerOverflow;
         total_bytes_written = std.math.add(usize, total_bytes_written, page_bytes) catch return error.IntegerOverflow;
+        const uncompressed_page_bytes = std.math.add(usize, header_bytes.len, page_result.data.len) catch return error.IntegerOverflow;
+        total_uncompressed_written = std.math.add(usize, total_uncompressed_written, uncompressed_page_bytes) catch return error.IntegerOverflow;
         total_values += page_result.num_values;
         offset = chunk_end;
     }
@@ -2231,7 +2250,7 @@ pub fn writeColumnChunkByteArrayOptionalWithEncoding(
             .path_in_schema = path,
             .codec = codec,
             .num_values = try safe.castTo(i64, total_values),
-            .total_uncompressed_size = try safe.castTo(i64, total_bytes_written),
+            .total_uncompressed_size = try safe.castTo(i64, total_uncompressed_written),
             .total_compressed_size = try safe.castTo(i64, total_bytes_written),
             .data_page_offset = start_offset,
             .index_page_offset = null,
@@ -2300,6 +2319,7 @@ pub fn writeColumnChunkInt96OptionalWithPathArray(
         error.InvalidFixedLength => return error.InvalidFixedLength,
         error.IntegerOverflow => return error.IntegerOverflow,
         error.ValueTooLarge => return error.ValueTooLarge,
+        error.NullInRequiredColumn => return error.NullInRequiredColumn,
         error.UnsupportedEncoding => return error.UnsupportedEncoding,
     };
     defer page_result.deinit(allocator);
@@ -2360,7 +2380,7 @@ pub fn writeColumnChunkInt96OptionalWithPathArray(
             .encodings = encodings,
             .path_in_schema = path,
             .codec = codec,
-            .num_values = try safe.castTo(i32, page_result.num_values),
+            .num_values = try safe.castTo(i64, page_result.num_values),
             .total_uncompressed_size = try safe.castTo(i64, header_bytes.len + page_result.data.len),
             .total_compressed_size = try safe.castTo(i64, total_bytes_written),
             .data_page_offset = start_offset,
@@ -2514,5 +2534,72 @@ test "write column chunk with byte_stream_split encoding" {
     try std.testing.expectEqual(format.PhysicalType.float, result.metadata.type_);
     try std.testing.expectEqual(@as(i64, 5), result.metadata.num_values);
     try std.testing.expectEqual(format.Encoding.byte_stream_split, result.metadata.encodings[1]);
+}
+
+test "write nullable byte array column tracks null_count in statistics" {
+    const allocator = std.testing.allocator;
+
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+
+    const values = [_]Optional([]const u8){
+        .{ .value = "hello" },
+        .null_value,
+        .{ .value = "world" },
+        .null_value,
+        .null_value,
+    };
+    var result = try writeColumnChunkByteArrayOptionalWithPathArray(
+        allocator,
+        &aw.writer,
+        &.{"nullable_col"},
+        &values,
+        true,
+        4,
+        .uncompressed,
+        false,
+    );
+    defer result.deinit(allocator);
+
+    try std.testing.expect(result.metadata.statistics != null);
+    const stats = result.metadata.statistics.?;
+    try std.testing.expect(stats.null_count != null);
+    try std.testing.expectEqual(@as(i64, 3), stats.null_count.?);
+}
+
+test "compressed column tracks uncompressed vs compressed sizes separately" {
+    const allocator = std.testing.allocator;
+
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+
+    const values = [_]Optional(i32){
+        .{ .value = 1 },
+        .{ .value = 2 },
+        .{ .value = 3 },
+        .{ .value = 4 },
+        .{ .value = 5 },
+        .{ .value = 6 },
+        .{ .value = 7 },
+        .{ .value = 8 },
+    };
+    var result = try writeColumnChunkOptionalWithPathArray(
+        i32,
+        allocator,
+        &aw.writer,
+        &.{"compressed_col"},
+        &values,
+        false,
+        4,
+        .snappy,
+        false,
+    );
+    defer result.deinit(allocator);
+
+    try std.testing.expect(result.metadata.total_uncompressed_size > 0);
+    try std.testing.expect(result.metadata.total_compressed_size > 0);
+    // With compression, uncompressed and compressed sizes should differ
+    // (for small data snappy may expand, but the sizes must still be tracked independently)
+    try std.testing.expect(result.metadata.total_uncompressed_size != result.metadata.total_compressed_size);
 }
 

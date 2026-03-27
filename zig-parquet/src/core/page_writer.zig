@@ -2,8 +2,8 @@
 //!
 //! Creates data pages by combining definition levels with encoded values.
 //! For V1 data pages, the format is:
-//!   - Definition levels (RLE encoded, with 4-byte length prefix)
 //!   - Repetition levels (RLE encoded, with 4-byte length prefix) - not used for flat schemas
+//!   - Definition levels (RLE encoded, with 4-byte length prefix)
 //!   - Values (PLAIN encoded)
 
 const std = @import("std");
@@ -25,6 +25,7 @@ pub const PageWriteError = error{
     IntegerOverflow,
     ValueTooLarge,
     UnsupportedEncoding,
+    NullInRequiredColumn,
 };
 
 /// Result of writing a data page
@@ -67,6 +68,8 @@ pub fn writeDataPageFixedByteArrayOptionalWithEncoding(
             try non_null_values.append(allocator, v.value);
         }
     }
+
+    if (!is_optional and non_null_values.items.len != values.len) return error.NullInRequiredColumn;
 
     const encoded_values = try encodeFixedByteArraysWithEncoding(allocator, non_null_values.items, fixed_len, encoding);
     defer allocator.free(encoded_values);
@@ -597,7 +600,8 @@ pub fn writeDataPageOptionalWithEncoding(
         }
     }
 
-    // Definition levels based on schema (is_optional), not data
+    if (!is_optional and non_null_values.items.len != values.len) return error.NullInRequiredColumn;
+
     return writeDataPageTypedWithEncoding(
         allocator,
         T,
@@ -708,11 +712,12 @@ pub fn writeDataPageInt96Optional(
         }
     }
 
+    if (!is_optional and non_null_values.items.len != values.len) return error.NullInRequiredColumn;
+
     // Encode the non-null values as INT96
     const encoded_values = try encodeInt96Values(allocator, non_null_values.items);
     defer allocator.free(encoded_values);
 
-    // Definition levels based on schema (is_optional), not data
     if (!is_optional) {
         const result = try allocator.dupe(u8, encoded_values);
         return .{
@@ -798,11 +803,12 @@ pub fn writeDataPageByteArrayOptionalWithEncoding(
         }
     }
 
+    if (!is_optional and non_null_values.items.len != values.len) return error.NullInRequiredColumn;
+
     // Encode the non-null values with specified encoding
     const encoded_values = try encodeByteArraysWithEncoding(allocator, non_null_values.items, encoding);
     defer allocator.free(encoded_values);
 
-    // Definition levels based on schema (is_optional), not data
     if (!is_optional) {
         const result = try allocator.dupe(u8, encoded_values);
         return .{

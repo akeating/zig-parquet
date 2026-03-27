@@ -4276,3 +4276,35 @@ test "required column rejects unset addRow (DynamicWriter)" {
     const result = writer.addRow();
     try std.testing.expectError(error.InvalidArgument, result);
 }
+
+test "round-trip all-null optional UUID column with dictionary encoding (DynamicWriter)" {
+    const allocator = std.testing.allocator;
+
+    var writer = try parquet.createBufferDynamic(allocator);
+    defer writer.deinit();
+
+    try writer.addColumn("id", TypeInfo.uuid, .{});
+    try writer.begin();
+
+    try writer.setNull(0);
+    try writer.addRow();
+    try writer.setNull(0);
+    try writer.addRow();
+    try writer.setNull(0);
+    try writer.addRow();
+
+    try writer.close();
+    const buffer = try writer.toOwnedSlice();
+    defer allocator.free(buffer);
+
+    var reader = try parquet.openBufferDynamic(allocator, buffer, .{});
+    defer reader.deinit();
+
+    const rows = try reader.readAllRows(0);
+    defer deferFreeRows(allocator, rows);
+
+    try std.testing.expectEqual(@as(usize, 3), rows.len);
+    try std.testing.expect(rows[0].getColumn(0).?.isNull());
+    try std.testing.expect(rows[1].getColumn(0).?.isNull());
+    try std.testing.expect(rows[2].getColumn(0).?.isNull());
+}

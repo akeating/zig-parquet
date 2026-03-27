@@ -120,6 +120,7 @@ pub const DynamicReader = struct {
         // Free row groups
         for (self.metadata.row_groups) |rg| {
             for (rg.columns) |col| {
+                if (col.file_path) |fp| self.allocator.free(fp);
                 if (col.meta_data) |meta| {
                     self.allocator.free(meta.encodings);
                     for (meta.path_in_schema) |path| {
@@ -602,6 +603,7 @@ pub const DynamicReader = struct {
             // Skip non-data pages (neither V1 nor V2)
             if (page_header.data_page_header == null and page_header.data_page_header_v2 == null) {
                 const skip_size = try safePageSize(page_header.compressed_page_size);
+                if (pos + skip_size > page_data.len) return error.EndOfData;
                 pos += skip_size;
                 continue;
             }
@@ -896,11 +898,19 @@ pub const DynamicReader = struct {
 
         const num_output_cols = output_indices.len;
         const rows = try self.allocator.alloc(Row, num_rows);
-        errdefer self.allocator.free(rows);
+        var rows_initialized: usize = 0;
+        errdefer {
+            for (rows[0..rows_initialized]) |row| row.deinit();
+            self.allocator.free(rows);
+        }
 
         for (0..num_rows) |row_idx| {
             const values = try self.allocator.alloc(Value, num_output_cols);
-            errdefer self.allocator.free(values);
+            var vals_initialized: usize = 0;
+            errdefer {
+                for (values[0..vals_initialized]) |val| val.deinit(self.allocator);
+                self.allocator.free(values);
+            }
 
             for (output_indices, 0..) |col_idx, out_idx| {
                 if (row_idx < column_values[col_idx].len) {
@@ -908,9 +918,11 @@ pub const DynamicReader = struct {
                 } else {
                     values[out_idx] = .{ .null_val = {} };
                 }
+                vals_initialized += 1;
             }
 
             rows[row_idx] = .{ .values = values, .allocator = self.allocator };
+            rows_initialized += 1;
         }
         return rows;
     }
@@ -958,31 +970,52 @@ fn cloneValue(allocator: std.mem.Allocator, v: Value) !Value {
         .fixed_bytes_val => |b| .{ .fixed_bytes_val = try allocator.dupe(u8, b) },
         .list_val => |items| blk: {
             const cloned = try allocator.alloc(Value, items.len);
-            errdefer allocator.free(cloned);
-            for (items, 0..) |item, i| {
-                cloned[i] = try cloneValue(allocator, item);
+            var cloned_count: usize = 0;
+            errdefer {
+                for (cloned[0..cloned_count]) |cv| cv.deinit(allocator);
+                allocator.free(cloned);
+            }
+            for (items) |item| {
+                cloned[cloned_count] = try cloneValue(allocator, item);
+                cloned_count += 1;
             }
             break :blk .{ .list_val = cloned };
         },
         .map_val => |entries| blk: {
             const cloned = try allocator.alloc(Value.MapEntryValue, entries.len);
-            errdefer allocator.free(cloned);
-            for (entries, 0..) |entry, i| {
-                cloned[i] = .{
-                    .key = try cloneValue(allocator, entry.key),
-                    .value = try cloneValue(allocator, entry.value),
-                };
+            var cloned_count: usize = 0;
+            errdefer {
+                for (cloned[0..cloned_count]) |e| {
+                    e.key.deinit(allocator);
+                    e.value.deinit(allocator);
+                }
+                allocator.free(cloned);
+            }
+            for (entries) |entry| {
+                const key = try cloneValue(allocator, entry.key);
+                errdefer key.deinit(allocator);
+                const value = try cloneValue(allocator, entry.value);
+                cloned[cloned_count] = .{ .key = key, .value = value };
+                cloned_count += 1;
             }
             break :blk .{ .map_val = cloned };
         },
         .struct_val => |fields| blk: {
             const cloned = try allocator.alloc(Value.FieldValue, fields.len);
-            errdefer allocator.free(cloned);
-            for (fields, 0..) |field, i| {
-                cloned[i] = .{
-                    .name = try allocator.dupe(u8, field.name),
-                    .value = try cloneValue(allocator, field.value),
-                };
+            var cloned_count: usize = 0;
+            errdefer {
+                for (cloned[0..cloned_count]) |f| {
+                    allocator.free(f.name);
+                    f.value.deinit(allocator);
+                }
+                allocator.free(cloned);
+            }
+            for (fields) |field| {
+                const name = try allocator.dupe(u8, field.name);
+                errdefer allocator.free(name);
+                const value = try cloneValue(allocator, field.value);
+                cloned[cloned_count] = .{ .name = name, .value = value };
+                cloned_count += 1;
             }
             break :blk .{ .struct_val = cloned };
         },

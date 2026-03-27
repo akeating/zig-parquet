@@ -80,6 +80,7 @@ pub fn writeColumnChunkList(
         error.IntegerOverflow => return error.IntegerOverflow,
         error.ValueTooLarge => return error.ValueTooLarge,
         error.UnsupportedEncoding => return error.UnsupportedEncoding,
+        error.NullInRequiredColumn => return error.NullInRequiredColumn,
     };
     defer page_result.deinit(allocator);
 
@@ -137,6 +138,7 @@ pub fn writeColumnChunkListFixedByteArray(
         error.IntegerOverflow => return error.IntegerOverflow,
         error.ValueTooLarge => return error.ValueTooLarge,
         error.UnsupportedEncoding => return error.UnsupportedEncoding,
+        error.NullInRequiredColumn => return error.NullInRequiredColumn,
     };
     defer page_result.deinit(allocator);
 
@@ -1074,6 +1076,7 @@ pub fn writeColumnChunkNestedListFixedByteArrayWithPathArray(
         error.IntegerOverflow => return error.IntegerOverflow,
         error.ValueTooLarge => return error.ValueTooLarge,
         error.UnsupportedEncoding => return error.UnsupportedEncoding,
+        error.NullInRequiredColumn => return error.NullInRequiredColumn,
     };
     defer page_result.deinit(allocator);
 
@@ -1192,6 +1195,7 @@ pub fn writeColumnChunkWithLevelsAndFullPath(
         error.IntegerOverflow => return error.IntegerOverflow,
         error.ValueTooLarge => return error.ValueTooLarge,
         error.UnsupportedEncoding => return error.UnsupportedEncoding,
+        error.NullInRequiredColumn => return error.NullInRequiredColumn,
     };
     defer page_result.deinit(allocator);
 
@@ -1247,6 +1251,7 @@ pub fn writeColumnChunkFixedByteArrayWithLevelsAndFullPath(
         error.IntegerOverflow => return error.IntegerOverflow,
         error.ValueTooLarge => return error.ValueTooLarge,
         error.UnsupportedEncoding => return error.UnsupportedEncoding,
+        error.NullInRequiredColumn => return error.NullInRequiredColumn,
     };
     defer page_result.deinit(allocator);
 
@@ -1287,6 +1292,7 @@ pub fn writeColumnChunkListInt96WithPathArray(
         error.IntegerOverflow => return error.IntegerOverflow,
         error.ValueTooLarge => return error.ValueTooLarge,
         error.UnsupportedEncoding => return error.UnsupportedEncoding,
+        error.NullInRequiredColumn => return error.NullInRequiredColumn,
     };
     defer page_result.deinit(allocator);
 
@@ -1320,6 +1326,7 @@ pub fn writeColumnChunkInt96WithLevelsAndFullPath(
         error.IntegerOverflow => return error.IntegerOverflow,
         error.ValueTooLarge => return error.ValueTooLarge,
         error.UnsupportedEncoding => return error.UnsupportedEncoding,
+        error.NullInRequiredColumn => return error.NullInRequiredColumn,
     };
     defer page_result.deinit(allocator);
 

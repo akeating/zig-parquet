@@ -115,45 +115,47 @@ pub const SchemaNode = union(enum) {
     ///
     /// Definition levels track nullability depth, repetition levels track
     /// repeated field depth. These are needed for Parquet's level encoding.
-    pub fn computeLevels(self: *const SchemaNode) Levels {
+    pub fn computeLevels(self: *const SchemaNode) error{InvalidSchema}!Levels {
         var def: u8 = 0;
         var rep: u8 = 0;
-        computeLevelsRecursive(self, &def, &rep);
+        try computeLevelsRecursive(self, &def, &rep);
         return .{ .max_def = def, .max_rep = rep };
     }
 
-    fn computeLevelsRecursive(node: *const SchemaNode, def: *u8, rep: *u8) void {
+    fn computeLevelsRecursive(node: *const SchemaNode, def: *u8, rep: *u8) error{InvalidSchema}!void {
         switch (node.*) {
             .optional => |child| {
-                def.* += 1;
-                computeLevelsRecursive(child, def, rep);
+                def.* = std.math.add(u8, def.*, 1) catch return error.InvalidSchema;
+                try computeLevelsRecursive(child, def, rep);
             },
             .list => |element| {
-                def.* += 1; // list presence adds definition level
-                rep.* += 1; // list repetition adds repetition level
-                computeLevelsRecursive(element, def, rep);
+                def.* = std.math.add(u8, def.*, 1) catch return error.InvalidSchema;
+                rep.* = std.math.add(u8, rep.*, 1) catch return error.InvalidSchema;
+                try computeLevelsRecursive(element, def, rep);
             },
             .map => |m| {
-                def.* += 1; // map presence adds definition level
-                rep.* += 1; // map entry repetition adds repetition level
-                // For the value, we need to check if it adds more levels
-                // Keys are always required, so we compute levels for value
-                computeLevelsRecursive(m.value, def, rep);
+                def.* = std.math.add(u8, def.*, 1) catch return error.InvalidSchema;
+                rep.* = std.math.add(u8, rep.*, 1) catch return error.InvalidSchema;
+                var key_def = def.*;
+                var key_rep = rep.*;
+                try computeLevelsRecursive(m.key, &key_def, &key_rep);
+                var val_def = def.*;
+                var val_rep = rep.*;
+                try computeLevelsRecursive(m.value, &val_def, &val_rep);
+                if (key_def > def.*) def.* = key_def;
+                if (key_rep > rep.*) rep.* = key_rep;
+                if (val_def > def.*) def.* = val_def;
+                if (val_rep > rep.*) rep.* = val_rep;
             },
             .struct_ => |s| {
-                // Struct itself doesn't add levels, but its fields might
-                // For level computation, we'd typically compute per-leaf
-                // Here we just traverse to find max depth
                 for (s.fields) |f| {
                     var field_def = def.*;
                     var field_rep = rep.*;
-                    computeLevelsRecursive(f.node, &field_def, &field_rep);
-                    // Take the max across all fields
+                    try computeLevelsRecursive(f.node, &field_def, &field_rep);
                     if (field_def > def.*) def.* = field_def;
                     if (field_rep > rep.*) rep.* = field_rep;
                 }
             },
-            // Primitives are leaves, they don't add levels
             .boolean, .int32, .int64, .float, .double, .byte_array, .fixed_len_byte_array => {},
         }
     }
@@ -165,8 +167,9 @@ pub const SchemaNode = union(enum) {
     pub fn computeLeafLevels(self: *const SchemaNode, allocator: std.mem.Allocator) ![]Levels {
         const leaf_count = self.countLeafColumns();
         const result = try allocator.alloc(Levels, leaf_count);
+        errdefer allocator.free(result);
         var index: usize = 0;
-        computeLeafLevelsRecursive(self, 0, 0, result, &index);
+        try computeLeafLevelsRecursive(self, 0, 0, result, &index);
         return result;
     }
 
@@ -176,31 +179,32 @@ pub const SchemaNode = union(enum) {
         current_rep: u8,
         result: []Levels,
         index: *usize,
-    ) void {
+    ) error{InvalidSchema}!void {
         switch (node.*) {
             .optional => |child| {
-                computeLeafLevelsRecursive(child, current_def + 1, current_rep, result, index);
+                const new_def = std.math.add(u8, current_def, 1) catch return error.InvalidSchema;
+                try computeLeafLevelsRecursive(child, new_def, current_rep, result, index);
             },
             .list => |element| {
-                computeLeafLevelsRecursive(element, current_def + 1, current_rep + 1, result, index);
+                const new_def = std.math.add(u8, current_def, 1) catch return error.InvalidSchema;
+                const new_rep = std.math.add(u8, current_rep, 1) catch return error.InvalidSchema;
+                try computeLeafLevelsRecursive(element, new_def, new_rep, result, index);
             },
             .map => |m| {
-                // Map levels: key_value repeated group adds +1 def, +1 rep.
-                // The Parquet schema always marks map values as OPTIONAL, so add +1 def
-                // for value unless the node already has an .optional wrapper (which adds
-                // its own +1).
-                computeLeafLevelsRecursive(m.key, current_def + 1, current_rep + 1, result, index);
+                const new_def = std.math.add(u8, current_def, 1) catch return error.InvalidSchema;
+                const new_rep = std.math.add(u8, current_rep, 1) catch return error.InvalidSchema;
+                try computeLeafLevelsRecursive(m.key, new_def, new_rep, result, index);
                 const value_extra_def: u8 = if (m.value.* == .optional) 0 else 1;
-                computeLeafLevelsRecursive(m.value, current_def + 1 + value_extra_def, current_rep + 1, result, index);
+                const val_def = std.math.add(u8, new_def, value_extra_def) catch return error.InvalidSchema;
+                try computeLeafLevelsRecursive(m.value, val_def, new_rep, result, index);
             },
             .struct_ => |s| {
-                // Struct fields each get their own path, inheriting current levels
                 for (s.fields) |f| {
-                    computeLeafLevelsRecursive(f.node, current_def, current_rep, result, index);
+                    try computeLeafLevelsRecursive(f.node, current_def, current_rep, result, index);
                 }
             },
-            // Primitives are leaves - store the accumulated levels
             .boolean, .int32, .int64, .float, .double, .byte_array, .fixed_len_byte_array => {
+                if (index.* >= result.len) return error.InvalidSchema;
                 result[index.*] = .{ .max_def = current_def, .max_rep = current_rep };
                 index.* += 1;
             },
@@ -302,17 +306,17 @@ pub const SchemaNode = union(enum) {
 
     /// Create a DECIMAL column
     /// Uses int32 for precision <= 9, int64 for precision <= 18, otherwise fixed_len_byte_array
+    /// Precision must be 1-38, scale must be 0-precision (per Parquet spec).
     pub fn decimal(precision: i32, scale: i32) SchemaNode {
+        std.debug.assert(precision >= 1 and precision <= 38);
+        std.debug.assert(scale >= 0 and scale <= precision);
         const logical = LogicalType{ .decimal = .{ .precision = precision, .scale = scale } };
         if (precision <= 9) {
             return .{ .int32 = .{ .logical = logical } };
         } else if (precision <= 18) {
             return .{ .int64 = .{ .logical = logical } };
         } else {
-            // For larger precision, use fixed_len_byte_array
-            // Bytes needed = ceil((precision * log2(10)) / 8) ≈ ceil(precision * 0.415)
-            // Precision is naturally bounded; this will not exceed u32 limits
-            const bytes_needed: u32 = safe.castTo(u32, @divFloor(precision * 5, 12) + 1) catch unreachable; // precision is bounded; result fits u32
+            const bytes_needed: u32 = safe.castTo(u32, @divFloor(precision * 5, 12) + 1) catch unreachable; // precision bounded to 38; result fits u32
             return .{ .fixed_len_byte_array = .{ .len = bytes_needed, .logical = logical } };
         }
     }
@@ -419,11 +423,23 @@ pub const SchemaNode = union(enum) {
     /// Build a SchemaNode tree from a flat SchemaElement array starting at `idx`.
     /// The caller must free all allocated memory via the arena allocator.
     /// This is the inverse of Writer.generateSchemaFromNodeStatic.
+    const max_schema_depth: u16 = 128;
+
     pub fn buildFromElements(
         allocator: std.mem.Allocator,
         schema: []const format.SchemaElement,
         idx: usize,
     ) BuildError!BuildResult {
+        return buildFromElementsImpl(allocator, schema, idx, 0);
+    }
+
+    fn buildFromElementsImpl(
+        allocator: std.mem.Allocator,
+        schema: []const format.SchemaElement,
+        idx: usize,
+        depth: u16,
+    ) BuildError!BuildResult {
+        if (depth > max_schema_depth) return error.InvalidSchema;
         if (idx >= schema.len) return error.InvalidSchema;
         const elem = schema[idx];
 
@@ -431,7 +447,7 @@ pub const SchemaNode = union(enum) {
             return buildLeafNode(allocator, elem, idx);
         }
 
-        return buildGroupNode(allocator, schema, idx, elem);
+        return buildGroupNode(allocator, schema, idx, elem, depth);
     }
 
     fn isLeafElement(elem: format.SchemaElement) bool {
@@ -444,7 +460,8 @@ pub const SchemaNode = union(enum) {
         idx: usize,
     ) BuildError!BuildResult {
         const node = try allocator.create(SchemaNode);
-        node.* = physicalToSchemaNode(elem);
+        errdefer allocator.destroy(node);
+        node.* = try physicalToSchemaNode(elem);
 
         if (elem.repetition_type) |rt| {
             if (rt == .optional) {
@@ -456,7 +473,7 @@ pub const SchemaNode = union(enum) {
         return .{ .node = node, .next_idx = idx + 1 };
     }
 
-    fn physicalToSchemaNode(elem: format.SchemaElement) SchemaNode {
+    fn physicalToSchemaNode(elem: format.SchemaElement) BuildError!SchemaNode {
         const logical = elem.logical_type;
         const pt = elem.type_ orelse return .{ .byte_array = .{ .logical = logical } };
         return switch (pt) {
@@ -468,7 +485,7 @@ pub const SchemaNode = union(enum) {
             .double => .{ .double = .{ .logical = logical } },
             .byte_array => .{ .byte_array = .{ .logical = logical } },
             .fixed_len_byte_array => .{ .fixed_len_byte_array = .{
-                .len = if (elem.type_length) |tl| safe.castTo(u32, tl) catch 0 else 0,
+                .len = if (elem.type_length) |tl| safe.castTo(u32, tl) catch return error.InvalidSchema else return error.InvalidSchema,
                 .logical = logical,
             } },
         };
@@ -479,20 +496,21 @@ pub const SchemaNode = union(enum) {
         schema: []const format.SchemaElement,
         idx: usize,
         elem: format.SchemaElement,
+        depth: u16,
     ) BuildError!BuildResult {
         const nc = safe.castTo(usize, elem.num_children orelse return error.InvalidSchema) catch
             return error.InvalidSchema;
 
         if (elem.converted_type) |ct| {
             if (ct == format.ConvertedType.LIST) {
-                return buildListNode(allocator, schema, idx, elem, nc);
+                return buildListNode(allocator, schema, idx, elem, nc, depth);
             }
             if (ct == format.ConvertedType.MAP or ct == format.ConvertedType.MAP_KEY_VALUE) {
-                return buildMapNode(allocator, schema, idx, elem);
+                return buildMapNode(allocator, schema, idx, elem, depth);
             }
         }
 
-        return buildStructNode(allocator, schema, idx, elem, nc);
+        return buildStructNode(allocator, schema, idx, elem, nc, depth);
     }
 
     fn buildListNode(
@@ -501,8 +519,9 @@ pub const SchemaNode = union(enum) {
         idx: usize,
         container: format.SchemaElement,
         nc: usize,
+        depth: u16,
     ) BuildError!BuildResult {
-        _ = nc;
+        if (nc != 1) return error.InvalidSchema;
         // LIST schema: container(LIST) -> list(REPEATED) -> element
         var inner_idx = idx + 1;
         if (inner_idx >= schema.len) return error.InvalidSchema;
@@ -523,7 +542,7 @@ pub const SchemaNode = union(enum) {
             }
         }
 
-        const element_result = try buildFromElements(allocator, schema, inner_idx);
+        const element_result = try buildFromElementsImpl(allocator, schema, inner_idx, depth + 1);
         const end_idx = skipSubtree(schema, idx);
 
         const node = try allocator.create(SchemaNode);
@@ -544,16 +563,21 @@ pub const SchemaNode = union(enum) {
         schema: []const format.SchemaElement,
         idx: usize,
         container: format.SchemaElement,
+        depth: u16,
     ) BuildError!BuildResult {
         // MAP schema: container(MAP) -> key_value(REPEATED) -> key, value
         const kv_idx = idx + 1;
         if (kv_idx >= schema.len) return error.InvalidSchema;
 
+        const kv_nc = safe.castTo(usize, schema[kv_idx].num_children orelse return error.InvalidSchema) catch
+            return error.InvalidSchema;
+        if (kv_nc != 2) return error.InvalidSchema;
+
         const key_idx = kv_idx + 1;
         if (key_idx >= schema.len) return error.InvalidSchema;
 
-        const key_result = try buildFromElements(allocator, schema, key_idx);
-        const value_result = try buildFromElements(allocator, schema, key_result.next_idx);
+        const key_result = try buildFromElementsImpl(allocator, schema, key_idx, depth + 1);
+        const value_result = try buildFromElementsImpl(allocator, schema, key_result.next_idx, depth + 1);
         const end_idx = skipSubtree(schema, idx);
 
         const node = try allocator.create(SchemaNode);
@@ -575,6 +599,7 @@ pub const SchemaNode = union(enum) {
         idx: usize,
         container: format.SchemaElement,
         nc: usize,
+        depth: u16,
     ) BuildError!BuildResult {
         const fields = try allocator.alloc(Field, nc);
         var child_idx = idx + 1;
@@ -582,7 +607,7 @@ pub const SchemaNode = union(enum) {
         for (0..nc) |i| {
             if (child_idx >= schema.len) return error.InvalidSchema;
             const child_name = try allocator.dupe(u8, schema[child_idx].name);
-            const child_result = try buildFromElements(allocator, schema, child_idx);
+            const child_result = try buildFromElementsImpl(allocator, schema, child_idx, depth + 1);
             fields[i] = .{ .name = child_name, .node = child_result.node };
             child_idx = child_result.next_idx;
         }
@@ -606,7 +631,7 @@ pub const SchemaNode = union(enum) {
         while (to_visit > 0 and i < schema.len) {
             to_visit -= 1;
             if (schema[i].num_children) |nc| {
-                to_visit += safe.castTo(usize, nc) catch 0;
+                to_visit += safe.castTo(usize, nc) catch return schema.len;
             }
             i += 1;
         }
@@ -620,7 +645,7 @@ pub const SchemaNode = union(enum) {
 
 test "SchemaNode primitive levels" {
     const int_node = SchemaNode{ .int32 = .{} };
-    const levels = int_node.computeLevels();
+    const levels = try int_node.computeLevels();
     try std.testing.expectEqual(@as(u8, 0), levels.max_def);
     try std.testing.expectEqual(@as(u8, 0), levels.max_rep);
 }
@@ -628,7 +653,7 @@ test "SchemaNode primitive levels" {
 test "SchemaNode optional primitive levels" {
     const int_node = SchemaNode{ .int32 = .{} };
     const opt_node = SchemaNode{ .optional = &int_node };
-    const levels = opt_node.computeLevels();
+    const levels = try opt_node.computeLevels();
     try std.testing.expectEqual(@as(u8, 1), levels.max_def);
     try std.testing.expectEqual(@as(u8, 0), levels.max_rep);
 }
@@ -636,7 +661,7 @@ test "SchemaNode optional primitive levels" {
 test "SchemaNode list levels" {
     const int_node = SchemaNode{ .int32 = .{} };
     const list_node = SchemaNode{ .list = &int_node };
-    const levels = list_node.computeLevels();
+    const levels = try list_node.computeLevels();
     try std.testing.expectEqual(@as(u8, 1), levels.max_def);
     try std.testing.expectEqual(@as(u8, 1), levels.max_rep);
 }
@@ -650,7 +675,7 @@ test "SchemaNode optional list with optional elements" {
     const list_node = SchemaNode{ .list = &opt_int };
     const opt_list = SchemaNode{ .optional = &list_node };
 
-    const levels = opt_list.computeLevels();
+    const levels = try opt_list.computeLevels();
     try std.testing.expectEqual(@as(u8, 3), levels.max_def);
     try std.testing.expectEqual(@as(u8, 1), levels.max_rep);
 }
@@ -662,7 +687,7 @@ test "SchemaNode map levels" {
     const bare_map = SchemaNode{ .map = .{ .key = &key_node, .value = &opt_value } };
     const map_node = SchemaNode{ .optional = &bare_map };
 
-    const levels = map_node.computeLevels();
+    const levels = try map_node.computeLevels();
     // optional(+1), map(+1 def, +1 rep), optional value(+1)
     try std.testing.expectEqual(@as(u8, 3), levels.max_def);
     try std.testing.expectEqual(@as(u8, 1), levels.max_rep);
@@ -678,7 +703,7 @@ test "SchemaNode struct levels" {
         },
     } };
 
-    const levels = struct_node.computeLevels();
+    const levels = try struct_node.computeLevels();
     try std.testing.expectEqual(@as(u8, 0), levels.max_def);
     try std.testing.expectEqual(@as(u8, 0), levels.max_rep);
 }
@@ -696,7 +721,7 @@ test "SchemaNode list of struct levels" {
     } };
     const list_node = SchemaNode{ .list = &struct_node };
 
-    const levels = list_node.computeLevels();
+    const levels = try list_node.computeLevels();
     // list adds def=1, rep=1; optional name adds def=1
     try std.testing.expectEqual(@as(u8, 2), levels.max_def);
     try std.testing.expectEqual(@as(u8, 1), levels.max_rep);
@@ -975,6 +1000,68 @@ test "buildFromElements: empty schema" {
     const allocator = std.testing.allocator;
     const result = SchemaNode.buildFromElements(allocator, &elements, 0);
     try std.testing.expectError(error.InvalidSchema, result);
+}
+
+test "buildFromElements: deeply nested schema rejected" {
+    // Use arena since buildFromElements is designed for arena-based allocation;
+    // partial tree is cleaned up by arena.deinit().
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var elements: [151]format.SchemaElement = undefined;
+    elements[0] = .{ .name = "root", .num_children = 1, .repetition_type = .required };
+    for (1..150) |i| {
+        elements[i] = .{ .name = "group", .num_children = 1, .repetition_type = .optional };
+    }
+    elements[150] = .{ .name = "leaf", .type_ = .int32, .repetition_type = .required };
+
+    const result = SchemaNode.buildFromElements(allocator, &elements, 0);
+    try std.testing.expectError(error.InvalidSchema, result);
+}
+
+test "buildFromElements: LIST with num_children != 1 rejected" {
+    const allocator = std.testing.allocator;
+    const elements = [_]format.SchemaElement{
+        .{ .name = "my_list", .num_children = 2, .converted_type = format.ConvertedType.LIST, .repetition_type = .optional },
+        .{ .name = "list", .num_children = 1, .repetition_type = .repeated },
+        .{ .name = "element", .type_ = .int32, .repetition_type = .required },
+    };
+    const result = SchemaNode.buildFromElements(allocator, &elements, 0);
+    try std.testing.expectError(error.InvalidSchema, result);
+}
+
+test "buildFromElements: MAP key_value with num_children != 2 rejected" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const elements = [_]format.SchemaElement{
+        .{ .name = "my_map", .num_children = 1, .converted_type = format.ConvertedType.MAP, .repetition_type = .optional },
+        .{ .name = "key_value", .num_children = 1, .repetition_type = .repeated },
+        .{ .name = "key", .type_ = .byte_array, .repetition_type = .required },
+    };
+    const result = SchemaNode.buildFromElements(allocator, &elements, 0);
+    try std.testing.expectError(error.InvalidSchema, result);
+}
+
+test "buildFromElements: negative type_length rejected" {
+    const allocator = std.testing.allocator;
+    const elements = [_]format.SchemaElement{
+        .{ .name = "bad_flba", .type_ = .fixed_len_byte_array, .type_length = -5, .repetition_type = .required },
+    };
+    const result = SchemaNode.buildFromElements(allocator, &elements, 0);
+    try std.testing.expectError(error.InvalidSchema, result);
+}
+
+test "SchemaNode decimal max precision" {
+    const node = SchemaNode.decimal(38, 10);
+    switch (node) {
+        .fixed_len_byte_array => |flba| {
+            try std.testing.expect(flba.len > 0);
+            try std.testing.expect(flba.logical != null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 fn freeSchemaNode(allocator: std.mem.Allocator, node: *const SchemaNode) void {

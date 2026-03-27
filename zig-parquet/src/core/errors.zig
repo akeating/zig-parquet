@@ -86,6 +86,7 @@ pub const CallerError = error{
     RowCountMismatch,
     ValueTooLarge,
     TooManyRows,
+    NullInRequiredColumn,
 };
 
 /// Resource allocation errors.
