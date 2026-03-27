@@ -79,7 +79,8 @@ pub fn encodeByteArrays(allocator: std.mem.Allocator, values: []const []const u8
     var total_size: usize = 0;
     for (values) |value| {
         if (value.len > std.math.maxInt(i32)) return error.ValueTooLarge;
-        total_size += 4 + value.len; // 4-byte length + data
+        const entry_size = std.math.add(usize, 4, value.len) catch return error.OutOfMemory;
+        total_size = std.math.add(usize, total_size, entry_size) catch return error.OutOfMemory;
     }
 
     const result = try allocator.alloc(u8, total_size);

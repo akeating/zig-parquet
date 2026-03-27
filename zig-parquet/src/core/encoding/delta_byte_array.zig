@@ -70,7 +70,7 @@ pub fn decode(allocator: std.mem.Allocator, data: []const u8) Error!DecodeResult
         total_suffix_bytes += safe.castTo(usize, len) catch return error.InvalidSuffixLength;
     }
     
-    const suffix_data_start = prefix_decoder.pos + suffix_decoder.pos;
+    const suffix_data_start = std.math.add(usize, prefix_decoder.pos, suffix_decoder.pos) catch return error.InsufficientData;
     const suffix_data = data[suffix_data_start..];
     
     if (suffix_data.len < total_suffix_bytes) {
@@ -79,10 +79,9 @@ pub fn decode(allocator: std.mem.Allocator, data: []const u8) Error!DecodeResult
     
     // Build result values
     const result = allocator.alloc([]u8, num_values) catch return error.OutOfMemory;
+    var initialized: usize = 0;
     errdefer {
-        for (result) |slice| {
-            if (slice.len > 0) allocator.free(slice);
-        }
+        for (result[0..initialized]) |slice| allocator.free(slice);
         allocator.free(result);
     }
     
@@ -120,6 +119,7 @@ pub fn decode(allocator: std.mem.Allocator, data: []const u8) Error!DecodeResult
         }
         
         result[i] = value;
+        initialized += 1;
         last_value = value;
         suffix_offset += suffix_length;
     }
@@ -147,11 +147,8 @@ pub const DecodeResult = struct {
     
     pub fn deinit(self: *DecodeResult) void {
         for (self.values) |slice| {
-            if (slice.len > 0) {
-                // Need to cast away const to free
-                const mutable: []u8 = @constCast(slice);
-                self.allocator.free(mutable);
-            }
+            const mutable: []u8 = @constCast(slice);
+            self.allocator.free(mutable);
         }
         self.allocator.free(self.values);
     }
@@ -202,6 +199,38 @@ test "delta byte array decode simple" {
     try std.testing.expectEqualStrings("a", result.values[0]);
     try std.testing.expectEqualStrings("ab", result.values[1]);
     try std.testing.expectEqualStrings("abc", result.values[2]);
+}
+
+test "delta byte array decode with empty strings" {
+    const allocator = std.testing.allocator;
+
+    // Three empty strings: prefix_lengths all 0, suffix_lengths all 0
+    const data = [_]u8{
+        // Prefix lengths [0, 0, 0] - DELTA_BINARY_PACKED
+        0x80, 0x01, // block_size = 128
+        0x04, // num_mini_blocks = 4
+        0x03, // total = 3
+        0x00, // first = 0
+        0x00, // min_delta = 0
+        0x00, 0x00, 0x00, 0x00, // bit_widths all 0
+
+        // Suffix lengths [0, 0, 0] - DELTA_BINARY_PACKED
+        0x80, 0x01, // block_size = 128
+        0x04, // num_mini_blocks = 4
+        0x03, // total = 3
+        0x00, // first = 0
+        0x00, // min_delta = 0
+        0x00, 0x00, 0x00, 0x00, // bit_widths all 0
+        // No suffix bytes needed
+    };
+
+    var result = try decode(allocator, &data);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), result.values.len);
+    try std.testing.expectEqual(@as(usize, 0), result.values[0].len);
+    try std.testing.expectEqual(@as(usize, 0), result.values[1].len);
+    try std.testing.expectEqual(@as(usize, 0), result.values[2].len);
 }
 
 test "delta byte array decode empty" {

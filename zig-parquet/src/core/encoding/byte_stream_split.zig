@@ -45,7 +45,8 @@ fn decodeGenericInto(comptime T: type, data: []const u8, result: []T) !void {
     const byte_width = @sizeOf(T);
     const num_values = result.len;
     
-    if (data.len < num_values * byte_width) {
+    const required_generic = std.math.mul(usize, num_values, byte_width) catch return error.InsufficientData;
+    if (data.len < required_generic) {
         return error.InsufficientData;
     }
     
@@ -74,8 +75,9 @@ fn decodeGenericInto(comptime T: type, data: []const u8, result: []T) !void {
 /// Decode BYTE_STREAM_SPLIT for fixed-length byte arrays
 fn decodeFixedLenInto(data: []const u8, result: [][]u8, type_length: usize) !void {
     const num_values = result.len;
+    const required = std.math.mul(usize, num_values, type_length) catch return error.InsufficientData;
     
-    if (data.len < num_values * type_length) {
+    if (data.len < required) {
         return error.InsufficientData;
     }
     
@@ -126,7 +128,8 @@ pub fn decodeInt64Alloc(allocator: std.mem.Allocator, data: []const u8, num_valu
 
 /// Decode BYTE_STREAM_SPLIT encoded fixed-length byte arrays with allocation
 pub fn decodeFixedLenAlloc(allocator: std.mem.Allocator, data: []const u8, num_values: usize, type_length: usize) ![][]u8 {
-    if (data.len < num_values * type_length) {
+    const required = std.math.mul(usize, num_values, type_length) catch return error.InsufficientData;
+    if (data.len < required) {
         return error.InsufficientData;
     }
 

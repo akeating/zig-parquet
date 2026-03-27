@@ -70,7 +70,8 @@ pub fn encode(allocator: std.mem.Allocator, values: []const []const u8) Error![]
     defer allocator.free(encoded_suffixes);
 
     // Combine: prefix_lengths | suffix_lengths | suffix_bytes
-    const total_len = encoded_prefixes.len + encoded_suffixes.len + suffixes.items.len;
+    const partial = std.math.add(usize, encoded_prefixes.len, encoded_suffixes.len) catch return error.OutOfMemory;
+    const total_len = std.math.add(usize, partial, suffixes.items.len) catch return error.OutOfMemory;
     const result = allocator.alloc(u8, total_len) catch return error.OutOfMemory;
     errdefer allocator.free(result);
 

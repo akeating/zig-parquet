@@ -23,13 +23,18 @@ pub const StringDictionary = struct {
     /// Create a dictionary from PLAIN-encoded byte arrays
     pub fn fromPlain(allocator: std.mem.Allocator, data: []const u8, num_values: usize) !Self {
         var values = try allocator.alloc([]const u8, num_values);
-        errdefer allocator.free(values);
+        var initialized: usize = 0;
+        errdefer {
+            for (values[0..initialized]) |v| allocator.free(v);
+            allocator.free(values);
+        }
 
         var pos: usize = 0;
         for (0..num_values) |i| {
             if (pos + 4 > data.len) return error.EndOfData;
             const ba = try plain.decodeByteArray(data[pos..]);
             values[i] = try allocator.dupe(u8, ba.value);
+            initialized += 1;
             pos += ba.bytes_read;
         }
 
@@ -65,7 +70,8 @@ pub const Int32Dictionary = struct {
 
     /// Create a dictionary from PLAIN-encoded i32 values
     pub fn fromPlain(allocator: std.mem.Allocator, data: []const u8, num_values: usize) !Self {
-        if (data.len < num_values * 4) return error.EndOfData;
+        const required = std.math.mul(usize, num_values, 4) catch return error.EndOfData;
+        if (data.len < required) return error.EndOfData;
 
         var values = try allocator.alloc(i32, num_values);
         errdefer allocator.free(values);
@@ -100,7 +106,8 @@ pub const Int64Dictionary = struct {
 
     /// Create a dictionary from PLAIN-encoded i64 values
     pub fn fromPlain(allocator: std.mem.Allocator, data: []const u8, num_values: usize) !Self {
-        if (data.len < num_values * 8) return error.EndOfData;
+        const required = std.math.mul(usize, num_values, 8) catch return error.EndOfData;
+        if (data.len < required) return error.EndOfData;
 
         var values = try allocator.alloc(i64, num_values);
         errdefer allocator.free(values);
@@ -135,7 +142,8 @@ pub const Float32Dictionary = struct {
 
     /// Create a dictionary from PLAIN-encoded f32 values
     pub fn fromPlain(allocator: std.mem.Allocator, data: []const u8, num_values: usize) !Self {
-        if (data.len < num_values * 4) return error.EndOfData;
+        const required = std.math.mul(usize, num_values, 4) catch return error.EndOfData;
+        if (data.len < required) return error.EndOfData;
 
         var values = try allocator.alloc(f32, num_values);
         errdefer allocator.free(values);
@@ -170,7 +178,8 @@ pub const Float64Dictionary = struct {
 
     /// Create a dictionary from PLAIN-encoded f64 values
     pub fn fromPlain(allocator: std.mem.Allocator, data: []const u8, num_values: usize) !Self {
-        if (data.len < num_values * 8) return error.EndOfData;
+        const required = std.math.mul(usize, num_values, 8) catch return error.EndOfData;
+        if (data.len < required) return error.EndOfData;
 
         var values = try allocator.alloc(f64, num_values);
         errdefer allocator.free(values);
@@ -205,7 +214,8 @@ pub const Int96Dictionary = struct {
 
     /// Create a dictionary from PLAIN-encoded Int96 values (12 bytes each)
     pub fn fromPlain(allocator: std.mem.Allocator, data: []const u8, num_values: usize) !Self {
-        if (data.len < num_values * 12) return error.EndOfData;
+        const required = std.math.mul(usize, num_values, 12) catch return error.EndOfData;
+        if (data.len < required) return error.EndOfData;
 
         var values = try allocator.alloc([12]u8, num_values);
         errdefer allocator.free(values);
@@ -241,19 +251,20 @@ pub const FixedByteArrayDictionary = struct {
 
     /// Create a dictionary from PLAIN-encoded fixed-length byte arrays
     pub fn fromPlain(allocator: std.mem.Allocator, data: []const u8, num_values: usize, fixed_len: usize) !Self {
-        if (data.len < num_values * fixed_len) return error.EndOfData;
+        const required = std.math.mul(usize, num_values, fixed_len) catch return error.EndOfData;
+        if (data.len < required) return error.EndOfData;
 
         var values = try allocator.alloc([]const u8, num_values);
+        var initialized: usize = 0;
         errdefer {
-            for (values) |v| {
-                if (v.len > 0) allocator.free(v);
-            }
+            for (values[0..initialized]) |v| allocator.free(v);
             allocator.free(values);
         }
 
         for (0..num_values) |i| {
             const start = i * fixed_len;
             values[i] = try allocator.dupe(u8, safe.slice(data, start, fixed_len) catch return error.EndOfData);
+            initialized += 1;
         }
 
         return .{
@@ -314,4 +325,41 @@ test "Int32Dictionary basic" {
     try std.testing.expectEqual(@as(i32, 2), dict.get(1).?);
     try std.testing.expectEqual(@as(i32, 3), dict.get(2).?);
     try std.testing.expectEqual(@as(?i32, null), dict.get(3));
+}
+
+test "FixedByteArrayDictionary basic" {
+    const allocator = std.testing.allocator;
+
+    // 3 values of fixed_len=4: [0x01020304, 0x05060708, 0x090A0B0C]
+    const dict_data = [_]u8{
+        0x01, 0x02, 0x03, 0x04,
+        0x05, 0x06, 0x07, 0x08,
+        0x09, 0x0A, 0x0B, 0x0C,
+    };
+
+    var dict = try FixedByteArrayDictionary.fromPlain(allocator, &dict_data, 3, 4);
+    defer dict.deinit();
+
+    try std.testing.expectEqualSlices(u8, &.{ 0x01, 0x02, 0x03, 0x04 }, dict.get(0).?);
+    try std.testing.expectEqualSlices(u8, &.{ 0x05, 0x06, 0x07, 0x08 }, dict.get(1).?);
+    try std.testing.expectEqualSlices(u8, &.{ 0x09, 0x0A, 0x0B, 0x0C }, dict.get(2).?);
+    try std.testing.expectEqual(@as(?[]const u8, null), dict.get(3));
+}
+
+test "Dictionary truncated data returns EndOfData" {
+    const allocator = std.testing.allocator;
+
+    const short_data = [_]u8{ 0x01, 0x02 };
+
+    try std.testing.expectError(error.EndOfData, Int32Dictionary.fromPlain(allocator, &short_data, 100));
+    try std.testing.expectError(error.EndOfData, Int64Dictionary.fromPlain(allocator, &short_data, 100));
+    try std.testing.expectError(error.EndOfData, Float32Dictionary.fromPlain(allocator, &short_data, 100));
+    try std.testing.expectError(error.EndOfData, Float64Dictionary.fromPlain(allocator, &short_data, 100));
+    try std.testing.expectError(error.EndOfData, Int96Dictionary.fromPlain(allocator, &short_data, 100));
+    try std.testing.expectError(error.EndOfData, FixedByteArrayDictionary.fromPlain(allocator, &short_data, 100, 8));
+
+    // Overflow case: num_values so large that num_values * N overflows usize
+    const max = std.math.maxInt(usize);
+    try std.testing.expectError(error.EndOfData, Int32Dictionary.fromPlain(allocator, &short_data, max));
+    try std.testing.expectError(error.EndOfData, FixedByteArrayDictionary.fromPlain(allocator, &short_data, max, 8));
 }

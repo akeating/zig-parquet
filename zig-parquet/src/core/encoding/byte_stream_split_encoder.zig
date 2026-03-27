@@ -48,7 +48,8 @@ pub fn encodeFixedByteArray(allocator: std.mem.Allocator, values: []const []cons
         return try allocator.alloc(u8, 0);
     }
 
-    const result = try allocator.alloc(u8, num_values * type_length);
+    const total = std.math.mul(usize, num_values, type_length) catch return error.OutOfMemory;
+    const result = try allocator.alloc(u8, total);
     errdefer allocator.free(result);
 
     // For each value, split its bytes into separate streams
@@ -75,7 +76,8 @@ fn encodeGeneric(comptime T: type, allocator: std.mem.Allocator, values: []const
         return try allocator.alloc(u8, 0);
     }
 
-    const result = try allocator.alloc(u8, num_values * byte_width);
+    const total = std.math.mul(usize, num_values, byte_width) catch return error.OutOfMemory;
+    const result = try allocator.alloc(u8, total);
     errdefer allocator.free(result);
 
     // For each value, split its bytes into separate streams

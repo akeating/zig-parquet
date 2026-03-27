@@ -182,8 +182,8 @@ pub fn encodeLevelsWithLength(allocator: std.mem.Allocator, levels: []const u32,
     const encoded = try encodeLevels(allocator, levels, max_level);
     defer allocator.free(encoded);
 
-    // Prepend 4-byte length
-    const result = try allocator.alloc(u8, 4 + encoded.len);
+    const total = std.math.add(usize, 4, encoded.len) catch return error.OutOfMemory;
+    const result = try allocator.alloc(u8, total);
     std.mem.writeInt(u32, result[0..4], try safe.castTo(u32, encoded.len), .little);
     @memcpy(result[4..], encoded);
 
@@ -202,8 +202,8 @@ pub fn encodeDefLevelsWithLength(allocator: std.mem.Allocator, is_defined: []con
     const encoded = try encodeDefLevels(allocator, is_defined);
     defer allocator.free(encoded);
 
-    // Prepend 4-byte length
-    const result = try allocator.alloc(u8, 4 + encoded.len);
+    const total = std.math.add(usize, 4, encoded.len) catch return error.OutOfMemory;
+    const result = try allocator.alloc(u8, total);
     std.mem.writeInt(u32, result[0..4], try safe.castTo(u32, encoded.len), .little);
     @memcpy(result[4..], encoded);
 

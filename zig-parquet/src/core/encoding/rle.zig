@@ -39,7 +39,7 @@ pub fn decode(allocator: std.mem.Allocator, data: []const u8, bit_width: u5, num
             // Bit-packed run
             // indicator >> 1 = number of groups of 8 values
             const num_groups = indicator.value >> 1;
-            const num_packed_values = num_groups * 8;
+            const num_packed_values = std.math.mul(usize, num_groups, 8) catch return error.EndOfData;
 
             const values_to_read = @min(num_packed_values, num_values - out_idx);
             const out_slice = safe.sliceMutOf(u32, result, out_idx, values_to_read) catch return error.EndOfData;
@@ -47,7 +47,8 @@ pub fn decode(allocator: std.mem.Allocator, data: []const u8, bit_width: u5, num
             out_idx += values_to_read;
 
             // Advance position by the number of bytes used
-            const bytes_used = (num_packed_values * bit_width + 7) / 8;
+            const total_bits = std.math.mul(usize, num_packed_values, bit_width) catch return error.EndOfData;
+            const bytes_used = (total_bits + 7) / 8;
             pos += bytes_used;
         } else {
             // RLE run
@@ -242,4 +243,21 @@ test "RLE decode levels for nested types" {
     for (result) |v| {
         try std.testing.expectEqual(@as(u32, 3), v);
     }
+}
+
+test "RLE decode malicious indicator does not overflow" {
+    const allocator = std.testing.allocator;
+
+    // Craft a bit-packed indicator with a huge group count that would overflow
+    // num_groups * 8 or num_packed_values * bit_width.
+    // Varint encoding of 0x7FFFFFFF (max i32): 0xFF 0xFF 0xFF 0xFF 0x07
+    // LSB=1 means bit-packed, so num_groups = 0x7FFFFFFF >> 1 = 0x3FFFFFFF
+    // num_groups * 8 would overflow on 32-bit or produce a huge value on 64-bit.
+    // With insufficient backing data, decode should not panic.
+    const data = [_]u8{ 0xFF, 0xFF, 0xFF, 0xFF, 0x07 };
+    const result = try decode(allocator, &data, 8, 2);
+    defer allocator.free(result);
+
+    // Should gracefully produce partial/zero results rather than panicking
+    try std.testing.expect(result.len == 2);
 }

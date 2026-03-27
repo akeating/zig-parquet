@@ -34,7 +34,7 @@ pub fn encode(allocator: std.mem.Allocator, values: []const []const u8) Error![]
     for (values, 0..) |v, i| {
         if (v.len > std.math.maxInt(i32)) return error.ValueTooLarge;
         lengths[i] = safe.castTo(i32, v.len) catch return error.OutOfMemory;
-        total_bytes += v.len;
+        total_bytes = std.math.add(usize, total_bytes, v.len) catch return error.OutOfMemory;
     }
 
     // Encode lengths with DELTA_BINARY_PACKED
@@ -42,7 +42,8 @@ pub fn encode(allocator: std.mem.Allocator, values: []const []const u8) Error![]
     defer allocator.free(encoded_lengths);
 
     // Allocate result: encoded lengths + raw bytes
-    const result = allocator.alloc(u8, encoded_lengths.len + total_bytes) catch return error.OutOfMemory;
+    const result_len = std.math.add(usize, encoded_lengths.len, total_bytes) catch return error.OutOfMemory;
+    const result = allocator.alloc(u8, result_len) catch return error.OutOfMemory;
     errdefer allocator.free(result);
 
     // Copy encoded lengths
