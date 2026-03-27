@@ -65,10 +65,10 @@ pub const CompactReader = struct {
     /// Read an unsigned variable-length integer (varint)
     pub fn readVarInt(self: *Self) !u64 {
         var result: u64 = 0;
-        var shift: u6 = 0;
+        var shift: u7 = 0;
         while (true) {
             const b = try self.readByte();
-            result |= @as(u64, b & 0x7F) << shift;
+            result |= @as(u64, b & 0x7F) << @as(u6, std.math.cast(u6, shift) orelse return error.VarIntTooLong);
             if (b & 0x80 == 0) break;
             shift += 7;
             if (shift >= 64) return error.VarIntTooLong;
@@ -263,4 +263,11 @@ test "stop field" {
     var reader = CompactReader.init(&[_]u8{0x00});
     const field = try reader.readFieldHeader();
     try std.testing.expect(field == null);
+}
+
+test "malicious varint returns error instead of panicking" {
+    // 11 bytes all with continuation bit set — would overflow u6 shift without the fix
+    const bad_varint = [_]u8{0x80} ** 11;
+    var reader = CompactReader.init(&bad_varint);
+    try std.testing.expectError(error.VarIntTooLong, reader.readVarInt());
 }
