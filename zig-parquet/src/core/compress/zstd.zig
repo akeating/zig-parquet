@@ -24,16 +24,14 @@ pub fn compress(allocator: std.mem.Allocator, data: []const u8) Error![]u8 {
     const dst = allocator.alloc(u8, bound) catch return error.OutOfMemory;
     errdefer allocator.free(dst);
 
-    // Compress with default compression level (3)
     const result = c.ZSTD_compress(
         dst.ptr,
         dst.len,
         data.ptr,
         data.len,
-        3, // compression level
+        3,
     );
 
-    // Check for errors
     if (c.ZSTD_isError(result) != 0) {
         allocator.free(dst);
         return error.CompressionError;
