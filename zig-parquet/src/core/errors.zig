@@ -108,6 +108,7 @@ pub const WriterError = ResourceError || CallerError || CompressionError || erro
     WriteError,
     IntegerOverflow,
     UnsupportedEncoding,
+    InvalidSchema,
 };
 
 /// Composed error set for DynamicReader operations.

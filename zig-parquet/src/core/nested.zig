@@ -339,14 +339,16 @@ pub fn assembleValues(
     };
 
     const result = try allocator.alloc(Value, num_rows);
+    var initialized: usize = 0;
     errdefer {
-        for (result) |v| v.deinit(allocator);
+        for (result[0..initialized]) |v| v.deinit(allocator);
         allocator.free(result);
     }
 
     for (0..num_rows) |i| {
         ctx.column_index = 0;
         result[i] = try assembleRecursive(node, &ctx, 0, 0, 0);
+        initialized += 1;
     }
     return result;
 }
@@ -469,8 +471,10 @@ fn assembleRecursive(
                 }
 
                 const key = try assembleRecursive(m.key, ctx, def_threshold + 1, rep_threshold + 1, depth + 1);
+                errdefer key.deinit(ctx.allocator);
                 ctx.column_index += key_leaves;
                 const val = try assembleRecursive(m.value, ctx, def_threshold + 1, rep_threshold + 1, depth + 1);
+                errdefer val.deinit(ctx.allocator);
                 ctx.column_index -= key_leaves;
 
                 try entries.append(ctx.allocator, .{ .key = key, .value = val });
@@ -651,4 +655,52 @@ test "flatten and assemble struct" {
 
     try std.testing.expectEqual(@as(i64, 123), assembled.getField("id").?.asInt64().?);
     try std.testing.expectEqualStrings("test", assembled.getField("name").?.asBytes().?);
+}
+
+test "assembleValues multi-row round trip" {
+    const allocator = std.testing.allocator;
+
+    const schema = SchemaNode{ .int32 = .{} };
+
+    const values = [_]Value{ .{ .int32_val = 10 }, .{ .int32_val = 20 }, .{ .int32_val = 30 } };
+    const def_levels = [_]u32{ 0, 0, 0 };
+    const rep_levels = [_]u32{ 0, 0, 0 };
+
+    const slices = [_]FlatColumnSlice{
+        .{
+            .values = &values,
+            .def_levels = &def_levels,
+            .rep_levels = &rep_levels,
+        },
+    };
+
+    const result = try assembleValues(allocator, &schema, &slices, 3);
+    defer {
+        for (result) |v| v.deinit(allocator);
+        allocator.free(result);
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), result.len);
+    try std.testing.expectEqual(@as(i32, 10), result[0].asInt32().?);
+    try std.testing.expectEqual(@as(i32, 20), result[1].asInt32().?);
+    try std.testing.expectEqual(@as(i32, 30), result[2].asInt32().?);
+}
+
+test "assembleValues not enough columns returns error" {
+    const allocator = std.testing.allocator;
+
+    const id_node = SchemaNode{ .int64 = .{} };
+    const name_node = SchemaNode{ .byte_array = .{} };
+    const schema = SchemaNode{ .struct_ = .{
+        .fields = &[_]SchemaNode.Field{
+            .{ .name = "id", .node = &id_node },
+            .{ .name = "name", .node = &name_node },
+        },
+    } };
+
+    const slices = [_]FlatColumnSlice{
+        .{ .values = &.{}, .def_levels = &.{}, .rep_levels = &.{} },
+    };
+
+    try std.testing.expectError(error.NotEnoughColumns, assembleValues(allocator, &schema, &slices, 1));
 }

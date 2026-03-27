@@ -28,6 +28,7 @@ pub fn StatisticsBuilder(comptime T: type) type {
 
         /// Update statistics with a single value.
         fn updateValue(self: *Self, value: T) void {
+            if ((T == f32 or T == f64) and std.math.isNan(value)) return;
             if (!self.has_values) {
                 self.min = value;
                 self.max = value;
@@ -186,15 +187,21 @@ pub const ByteArrayStatisticsBuilder = struct {
     fn updateValue(self: *Self, value: []const u8) !void {
         if (!self.has_values) {
             self.min = try self.allocator.dupe(u8, value);
+            errdefer {
+                self.allocator.free(self.min.?);
+                self.min = null;
+            }
             self.max = try self.allocator.dupe(u8, value);
             self.has_values = true;
         } else {
             if (std.mem.order(u8, value, self.min.?) == .lt) {
                 self.allocator.free(self.min.?);
+                self.min = null;
                 self.min = try self.allocator.dupe(u8, value);
             }
             if (std.mem.order(u8, value, self.max.?) == .gt) {
                 self.allocator.free(self.max.?);
+                self.max = null;
                 self.max = try self.allocator.dupe(u8, value);
             }
         }
@@ -240,9 +247,8 @@ pub const ByteArrayStatisticsBuilder = struct {
             return null;
         }
 
-        // Transfer ownership - duplicate for deprecated fields
-        const min_bytes = self.min.?;
-        const max_bytes = self.max.?;
+        const min_bytes = self.min orelse return null;
+        const max_bytes = self.max orelse return null;
 
         // Duplicate for deprecated fields
         const min_deprecated = self.allocator.dupe(u8, min_bytes) catch return null;
@@ -615,4 +621,60 @@ test "ByteArrayStatisticsBuilder with Optional all values" {
     try std.testing.expectEqualStrings("apple", stats.min_value.?);
     try std.testing.expectEqualStrings("cherry", stats.max_value.?);
     try std.testing.expectEqual(@as(i64, 0), stats.null_count.?);
+}
+
+test "StatisticsBuilder f64 NaN values are excluded from min/max" {
+    const allocator = std.testing.allocator;
+
+    var builder = StatisticsBuilder(f64){};
+    builder.update(&[_]f64{ std.math.nan(f64), 3.14, std.math.nan(f64), 1.0, 5.0, std.math.nan(f64) });
+
+    const stats = (try builder.build(allocator)).?;
+    defer {
+        if (stats.min) |m| allocator.free(m);
+        if (stats.max) |m| allocator.free(m);
+        if (stats.min_value) |m| allocator.free(m);
+        if (stats.max_value) |m| allocator.free(m);
+    }
+
+    const min_bits = std.mem.readInt(u64, stats.min_value.?[0..8], .little);
+    const max_bits = std.mem.readInt(u64, stats.max_value.?[0..8], .little);
+    const min_val: f64 = @bitCast(min_bits);
+    const max_val: f64 = @bitCast(max_bits);
+
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), min_val, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 5.0), max_val, 0.001);
+}
+
+test "StatisticsBuilder f32 all NaN returns null stats" {
+    const allocator = std.testing.allocator;
+
+    var builder = StatisticsBuilder(f32){};
+    builder.update(&[_]f32{ std.math.nan(f32), std.math.nan(f32) });
+
+    const stats = try builder.build(allocator);
+    try std.testing.expect(stats == null);
+}
+
+test "ByteArrayStatisticsBuilder build called twice returns null" {
+    const allocator = std.testing.allocator;
+
+    var builder = ByteArrayStatisticsBuilder.init(allocator);
+    defer builder.deinit();
+
+    try builder.update(&[_][]const u8{ "hello", "world" });
+
+    const stats1 = builder.build().?;
+    defer {
+        if (stats1.min) |m| allocator.free(m);
+        if (stats1.max) |m| allocator.free(m);
+        if (stats1.min_value) |m| allocator.free(m);
+        if (stats1.max_value) |m| allocator.free(m);
+    }
+
+    try std.testing.expectEqualStrings("hello", stats1.min_value.?);
+    try std.testing.expectEqualStrings("world", stats1.max_value.?);
+
+    const stats2 = builder.build();
+    try std.testing.expect(stats2 == null);
 }

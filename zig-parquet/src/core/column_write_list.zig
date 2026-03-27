@@ -246,6 +246,7 @@ pub fn writeColumnChunkListWithPathArrayMultiPage(
 
     // Multi-page path: iterate over level slots
     var total_bytes_written: usize = 0;
+    var total_uncompressed_written: usize = 0;
     var slot_offset: usize = 0;
     var value_offset: usize = 0;
 
@@ -323,6 +324,8 @@ pub fn writeColumnChunkListWithPathArrayMultiPage(
 
         const page_bytes = std.math.add(usize, header_bytes.len, compressed_data.len) catch return error.IntegerOverflow;
         total_bytes_written = std.math.add(usize, total_bytes_written, page_bytes) catch return error.IntegerOverflow;
+        const uncompressed_page_bytes = std.math.add(usize, header_bytes.len, page_result.data.len) catch return error.IntegerOverflow;
+        total_uncompressed_written = std.math.add(usize, total_uncompressed_written, uncompressed_page_bytes) catch return error.IntegerOverflow;
         slot_offset = page_end;
     }
 
@@ -345,7 +348,7 @@ pub fn writeColumnChunkListWithPathArrayMultiPage(
             .path_in_schema = full_path,
             .codec = codec,
             .num_values = try safe.castTo(i64, def_levels.len),
-            .total_uncompressed_size = try safe.castTo(i64, total_bytes_written),
+            .total_uncompressed_size = try safe.castTo(i64, total_uncompressed_written),
             .total_compressed_size = try safe.castTo(i64, total_bytes_written),
             .data_page_offset = start_offset,
             .index_page_offset = null,
@@ -390,7 +393,7 @@ pub fn writeColumnChunkListDictWithPathArray(
         if (dl < max_def_level) null_count += 1;
     }
     stats_builder.addNulls(null_count);
-    const stats = stats_builder.build(allocator) catch return error.OutOfMemory;
+    var stats = stats_builder.build(allocator) catch return error.OutOfMemory;
     errdefer if (stats) |s| freeStatistics(allocator, s);
 
     // Step 1: Build dictionary (unique values -> indices)
@@ -419,6 +422,7 @@ pub fn writeColumnChunkListDictWithPathArray(
                 const ratio = @as(f32, @floatFromInt(dict_values.items.len)) / @as(f32, @floatFromInt(i + 1));
                 if (ratio > threshold) {
                     if (stats) |s| freeStatistics(allocator, s);
+                    stats = null;
                     return writeColumnChunkListWithPathArray(T, allocator, output, base_path, values, def_levels, rep_levels, max_def_level, max_rep_level, start_offset, codec);
                 }
             }
@@ -432,8 +436,8 @@ pub fn writeColumnChunkListDictWithPathArray(
     if (dictionary_size_limit) |limit| {
         if (dict_bytes > limit) {
             // Dictionary too large, fall back to plain encoding (which will compute its own statistics)
-            // Free our computed statistics since the fallback will create its own
             if (stats) |s| freeStatistics(allocator, s);
+            stats = null;
             return writeColumnChunkListWithPathArray(T, allocator, output, base_path, values, def_levels, rep_levels, max_def_level, max_rep_level, start_offset, codec);
         }
     }
@@ -448,6 +452,16 @@ pub fn writeColumnChunkListDictWithPathArray(
             std.mem.writeInt(i32, dict_data[i * 4 ..][0..4], v, .little);
         } else if (T == i64) {
             std.mem.writeInt(i64, dict_data[i * 8 ..][0..8], v, .little);
+        } else if (T == f32) {
+            const bits: u32 = @bitCast(v);
+            std.mem.writeInt(u32, dict_data[i * 4 ..][0..4], bits, .little);
+        } else if (T == f64) {
+            const bits: u64 = @bitCast(v);
+            std.mem.writeInt(u64, dict_data[i * 8 ..][0..8], bits, .little);
+        } else if (T == bool) {
+            dict_data[i] = if (v) 1 else 0;
+        } else {
+            @compileError("Unsupported type for dictionary encoding: " ++ @typeName(T));
         }
     }
 
@@ -1416,7 +1430,7 @@ fn writeColumnChunkWithPathOwnedAndEncoding(
             .encodings = encodings,
             .path_in_schema = path, // Transfer ownership
             .codec = codec,
-            .num_values = try safe.castTo(i32, num_values),
+            .num_values = try safe.castTo(i64, num_values),
             .total_uncompressed_size = try safe.castTo(i64, total_uncompressed_bytes),
             .total_compressed_size = try safe.castTo(i64, total_compressed_bytes),
             .data_page_offset = start_offset,
@@ -1499,7 +1513,7 @@ fn writeColumnChunkWithDataList(
             .encodings = encodings,
             .path_in_schema = path,
             .codec = codec,
-            .num_values = try safe.castTo(i32, num_values),
+            .num_values = try safe.castTo(i64, num_values),
             .total_uncompressed_size = try safe.castTo(i64, total_uncompressed_bytes),
             .total_compressed_size = try safe.castTo(i64, total_compressed_bytes),
             .data_page_offset = start_offset,

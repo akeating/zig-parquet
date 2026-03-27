@@ -482,6 +482,20 @@ pub const DynamicWriter = struct {
         self.target_writer = WriteTargetWriter.init(self.target);
         self.target_writer.target.write(format.PARQUET_MAGIC) catch return error.WriteError;
 
+        errdefer {
+            if (self.column_types.len > 0) allocator.free(self.column_types);
+            if (self.column_logical_types.len > 0) allocator.free(self.column_logical_types);
+            if (self.column_type_lengths.len > 0) allocator.free(self.column_type_lengths);
+            if (self.column_codecs.len > 0) allocator.free(self.column_codecs);
+            if (self.column_props.len > 0) allocator.free(self.column_props);
+            if (self.column_required.len > 0) allocator.free(self.column_required);
+            if (self.column_names_owned.len > 0) allocator.free(self.column_names_owned);
+            if (self.current_row.len > 0) allocator.free(self.current_row);
+            if (self.row_set.len > 0) allocator.free(self.row_set);
+            if (self.column_buffers.len > 0) allocator.free(self.column_buffers);
+            if (self.column_schema_nodes.len > 0) allocator.free(self.column_schema_nodes);
+            if (self.value_builders.len > 0) allocator.free(self.value_builders);
+        }
         self.column_types = allocator.alloc(ColumnType, n) catch return error.OutOfMemory;
         self.column_logical_types = allocator.alloc(?format.LogicalType, n) catch return error.OutOfMemory;
         self.column_type_lengths = allocator.alloc(?i32, n) catch return error.OutOfMemory;
@@ -601,7 +615,10 @@ pub const DynamicWriter = struct {
         if (!self.began) return error.InvalidState;
         if (col >= self.num_columns) return error.InvalidArgument;
         var frame = self.value_builders[col].pop() orelse return error.InvalidState;
-        if (frame.kind != .list) return error.InvalidState;
+        if (frame.kind != .list) {
+            self.value_builders[col].stack.appendAssumeCapacity(frame); // just popped, capacity guaranteed
+            return error.InvalidState;
+        }
         const arena_alloc = self.bytes_arena.allocator();
         const items = arena_alloc.dupe(Value, frame.items.items) catch return error.OutOfMemory;
         frame.items.deinit(self.allocator);
@@ -648,7 +665,10 @@ pub const DynamicWriter = struct {
         if (!self.began) return error.InvalidState;
         if (col >= self.num_columns) return error.InvalidArgument;
         var frame = self.value_builders[col].pop() orelse return error.InvalidState;
-        if (frame.kind != .struct_) return error.InvalidState;
+        if (frame.kind != .struct_) {
+            self.value_builders[col].stack.appendAssumeCapacity(frame); // just popped, capacity guaranteed
+            return error.InvalidState;
+        }
         const arena_alloc = self.bytes_arena.allocator();
         const fields = arena_alloc.dupe(Value.FieldValue, frame.struct_fields.items) catch return error.OutOfMemory;
         frame.struct_fields.deinit(self.allocator);
@@ -684,7 +704,10 @@ pub const DynamicWriter = struct {
         if (!self.began) return error.InvalidState;
         if (col >= self.num_columns) return error.InvalidArgument;
         var frame = self.value_builders[col].pop() orelse return error.InvalidState;
-        if (frame.kind != .map_entry) return error.InvalidState;
+        if (frame.kind != .map_entry) {
+            self.value_builders[col].stack.appendAssumeCapacity(frame); // just popped, capacity guaranteed
+            return error.InvalidState;
+        }
         if (frame.entry_key == null and frame.map_entries.items.len == 0) return error.InvalidState;
         const parent = self.value_builders[col].top() orelse return error.InvalidState;
         if (parent.kind != .map) return error.InvalidState;
@@ -703,7 +726,10 @@ pub const DynamicWriter = struct {
         if (!self.began) return error.InvalidState;
         if (col >= self.num_columns) return error.InvalidArgument;
         var frame = self.value_builders[col].pop() orelse return error.InvalidState;
-        if (frame.kind != .map) return error.InvalidState;
+        if (frame.kind != .map) {
+            self.value_builders[col].stack.appendAssumeCapacity(frame); // just popped, capacity guaranteed
+            return error.InvalidState;
+        }
         const arena_alloc = self.bytes_arena.allocator();
         const entries = arena_alloc.dupe(Value.MapEntryValue, frame.map_entries.items) catch return error.OutOfMemory;
         frame.map_entries.deinit(self.allocator);
@@ -838,7 +864,10 @@ pub const DynamicWriter = struct {
             .num_rows = safe.castTo(i64, n) catch return error.TooManyValues,
             .total_byte_size = total_byte_size,
             .file_offset = row_group_offset,
-        }) catch return error.OutOfMemory;
+        }) catch {
+            allocator.free(col_chunks);
+            return error.OutOfMemory;
+        };
 
         for (0..self.num_columns) |i| {
             self.column_buffers[i].clearRetainingCapacity();
@@ -1172,6 +1201,7 @@ pub const DynamicWriter = struct {
         for (self.kv_metadata.items) |*kv| {
             if (std.mem.eql(u8, kv.key, key)) {
                 if (kv.value) |old_v| allocator.free(old_v);
+                kv.value = null;
                 kv.value = if (val) |v| allocator.dupe(u8, v) catch return error.OutOfMemory else null;
                 return;
             }
@@ -1290,7 +1320,7 @@ pub const DynamicWriter = struct {
                 .sorting_columns = null,
                 .file_offset = rg.file_offset,
                 .total_compressed_size = rg.total_byte_size,
-                .ordinal = safe.castTo(i16, i) catch 0,
+                .ordinal = safe.castTo(i16, i) catch null, // Parquet spec limits ordinal to i16
             };
         }
 

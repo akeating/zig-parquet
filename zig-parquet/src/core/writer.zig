@@ -111,11 +111,20 @@ pub const Writer = struct {
         columns: []const ColumnDef,
         builders: *std.AutoHashMapUnmanaged(usize, *statistics.GeospatialStatisticsBuilder),
     ) !void {
+        errdefer {
+            var it = builders.iterator();
+            while (it.next()) |entry| {
+                entry.value_ptr.*.deinit();
+                allocator.destroy(entry.value_ptr.*);
+            }
+            builders.deinit(allocator);
+        }
         for (columns, 0..) |col, idx| {
             if (col.logical_type) |lt| {
                 switch (lt) {
                     .geometry, .geography => {
                         const builder = try allocator.create(statistics.GeospatialStatisticsBuilder);
+                        errdefer allocator.destroy(builder);
                         builder.* = statistics.GeospatialStatisticsBuilder.init(allocator);
                         try builders.put(allocator, idx, builder);
                     },
@@ -175,6 +184,7 @@ pub const Writer = struct {
         @memset(columns_written, false);
 
         const column_chunks = allocator.alloc(?format.ColumnChunk, num_physical) catch return error.OutOfMemory;
+        errdefer allocator.free(column_chunks);
         @memset(column_chunks, null);
 
         var geo_stats_builders: std.AutoHashMapUnmanaged(usize, *statistics.GeospatialStatisticsBuilder) = .empty;
@@ -815,8 +825,14 @@ pub const Writer = struct {
             if (col.values.items.len == 0) {
                 // Empty column - create minimal metadata with zero values
                 const path_copy = self.allocator.alloc([]const u8, path.len) catch return error.OutOfMemory;
+                var segs_copied: usize = 0;
+                errdefer {
+                    for (path_copy[0..segs_copied]) |seg| self.allocator.free(seg);
+                    self.allocator.free(path_copy);
+                }
                 for (path, 0..) |seg, j| {
                     path_copy[j] = self.allocator.dupe(u8, seg) catch return error.OutOfMemory;
+                    segs_copied += 1;
                 }
 
                 const encodings = self.allocator.alloc(format.Encoding, 1) catch return error.OutOfMemory;
@@ -1196,7 +1212,7 @@ pub const Writer = struct {
 
     fn recordColumnWrite(self: *Self, physical_column_index: usize, result: *column_writer.ColumnChunkResult, num_values: usize) WriterError!void {
         self.columns_written[physical_column_index] = true;
-        self.current_offset += try safe.castTo(i64, result.total_bytes);
+        self.current_offset = std.math.add(i64, self.current_offset, try safe.castTo(i64, result.total_bytes)) catch return error.IntegerOverflow;
 
         // Create column chunk
         self.column_chunks[physical_column_index] = .{
@@ -1251,6 +1267,7 @@ pub const Writer = struct {
             .list => |element| {
                 const num_element_children = try countStructChildren(element);
 
+                if (idx >= schema.len) return error.InvalidSchema;
                 schema[idx] = .{
                     .type_ = null,
                     .type_length = null,
@@ -1265,6 +1282,7 @@ pub const Writer = struct {
                 };
                 idx += 1;
 
+                if (idx >= schema.len) return error.InvalidSchema;
                 schema[idx] = .{
                     .type_ = null,
                     .type_length = null,
@@ -1282,6 +1300,7 @@ pub const Writer = struct {
                 idx = try generateSchemaFromNodeStatic(schema, idx, "element", element, .required);
             },
             .map => |m| {
+                if (idx >= schema.len) return error.InvalidSchema;
                 schema[idx] = .{
                     .type_ = null,
                     .type_length = null,
@@ -1296,6 +1315,7 @@ pub const Writer = struct {
                 };
                 idx += 1;
 
+                if (idx >= schema.len) return error.InvalidSchema;
                 schema[idx] = .{
                     .type_ = null,
                     .type_length = null,
@@ -1314,6 +1334,7 @@ pub const Writer = struct {
                 idx = try generateSchemaFromNodeStatic(schema, idx, "value", m.value, .optional);
             },
             .struct_ => |s| {
+                if (idx >= schema.len) return error.InvalidSchema;
                 schema[idx] = .{
                     .type_ = null,
                     .type_length = null,
@@ -1333,30 +1354,37 @@ pub const Writer = struct {
                 }
             },
             .boolean => |p| {
+                if (idx >= schema.len) return error.InvalidSchema;
                 schema[idx] = makePrimitiveElement(name, .boolean, null, rep_type, p.logical);
                 idx += 1;
             },
             .int32 => |p| {
+                if (idx >= schema.len) return error.InvalidSchema;
                 schema[idx] = makePrimitiveElement(name, .int32, null, rep_type, p.logical);
                 idx += 1;
             },
             .int64 => |p| {
+                if (idx >= schema.len) return error.InvalidSchema;
                 schema[idx] = makePrimitiveElement(name, .int64, null, rep_type, p.logical);
                 idx += 1;
             },
             .float => |p| {
+                if (idx >= schema.len) return error.InvalidSchema;
                 schema[idx] = makePrimitiveElement(name, .float, null, rep_type, p.logical);
                 idx += 1;
             },
             .double => |p| {
+                if (idx >= schema.len) return error.InvalidSchema;
                 schema[idx] = makePrimitiveElement(name, .double, null, rep_type, p.logical);
                 idx += 1;
             },
             .byte_array => |p| {
+                if (idx >= schema.len) return error.InvalidSchema;
                 schema[idx] = makePrimitiveElement(name, .byte_array, null, rep_type, p.logical);
                 idx += 1;
             },
             .fixed_len_byte_array => |f| {
+                if (idx >= schema.len) return error.InvalidSchema;
                 schema[idx] = makePrimitiveElement(name, .fixed_len_byte_array, try safe.castTo(i32, f.len), rep_type, f.logical);
                 idx += 1;
             },
