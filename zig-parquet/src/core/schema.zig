@@ -571,7 +571,13 @@ pub const SchemaNode = union(enum) {
 
         const kv_nc = safe.castTo(usize, schema[kv_idx].num_children orelse return error.InvalidSchema) catch
             return error.InvalidSchema;
-        if (kv_nc != 2) return error.InvalidSchema;
+        if (kv_nc < 1 or kv_nc > 2) return error.InvalidSchema;
+
+        // Key-only maps (sets) have no value column. Arrow doesn't support
+        // MAP without a value, so follow Arrow C++ and treat them as a list.
+        if (kv_nc == 1) {
+            return buildListNode(allocator, schema, idx, container, 1, depth);
+        }
 
         const key_idx = kv_idx + 1;
         if (key_idx >= schema.len) return error.InvalidSchema;
@@ -1031,17 +1037,45 @@ test "buildFromElements: LIST with num_children != 1 rejected" {
     try std.testing.expectError(error.InvalidSchema, result);
 }
 
-test "buildFromElements: MAP key_value with num_children != 2 rejected" {
+test "buildFromElements: MAP key_value with num_children 0 or 3 rejected" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const elements_zero = [_]format.SchemaElement{
+        .{ .name = "my_map", .num_children = 1, .converted_type = format.ConvertedType.MAP, .repetition_type = .optional },
+        .{ .name = "key_value", .num_children = 0, .repetition_type = .repeated },
+    };
+    try std.testing.expectError(error.InvalidSchema, SchemaNode.buildFromElements(allocator, &elements_zero, 0));
+
+    const elements_three = [_]format.SchemaElement{
+        .{ .name = "my_map", .num_children = 1, .converted_type = format.ConvertedType.MAP, .repetition_type = .optional },
+        .{ .name = "key_value", .num_children = 3, .repetition_type = .repeated },
+        .{ .name = "key", .type_ = .byte_array, .repetition_type = .required },
+        .{ .name = "value", .type_ = .int32, .repetition_type = .optional },
+        .{ .name = "extra", .type_ = .int32, .repetition_type = .optional },
+    };
+    try std.testing.expectError(error.InvalidSchema, SchemaNode.buildFromElements(allocator, &elements_three, 0));
+}
+
+test "buildFromElements: MAP with key only falls back to list" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
     const elements = [_]format.SchemaElement{
-        .{ .name = "my_map", .num_children = 1, .converted_type = format.ConvertedType.MAP, .repetition_type = .optional },
+        .{ .name = "my_set", .num_children = 1, .converted_type = format.ConvertedType.MAP, .repetition_type = .optional },
         .{ .name = "key_value", .num_children = 1, .repetition_type = .repeated },
         .{ .name = "key", .type_ = .byte_array, .repetition_type = .required },
     };
-    const result = SchemaNode.buildFromElements(allocator, &elements, 0);
-    try std.testing.expectError(error.InvalidSchema, result);
+    const result = try SchemaNode.buildFromElements(allocator, &elements, 0);
+    switch (result.node.*) {
+        .optional => |inner| switch (inner.*) {
+            .list => |elem| try std.testing.expect(elem.* == .byte_array),
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqual(@as(usize, 1), result.node.countLeafColumns());
 }
 
 test "buildFromElements: negative type_length rejected" {
