@@ -102,3 +102,7 @@ jobs:
       - name: Run tests
         working-directory: cli
         run: zig build test
+
+      - name: Validate wild test files
+        working-directory: cli
+        run: ./validate-wild.sh
