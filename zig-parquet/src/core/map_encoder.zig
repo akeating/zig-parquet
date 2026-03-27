@@ -93,7 +93,9 @@ pub fn flattenMap(
     value_max_def: u8,
 ) !FlattenedMap(K, V) {
 
-    // First pass: count total slots, keys, and values
+    std.debug.assert(value_max_def >= 2);
+
+    // First pass: count total slots, keys, and values (checked arithmetic)
     var num_slots: usize = 0;
     var num_keys: usize = 0;
     var num_values: usize = 0;
@@ -101,20 +103,19 @@ pub fn flattenMap(
     for (maps) |map_opt| {
         switch (map_opt) {
             .null_value => {
-                // Null map: 1 slot with def=0
-                num_slots += 1;
+                num_slots = std.math.add(usize, num_slots, 1) catch return error.OutOfMemory;
             },
             .value => |entries| {
                 if (entries.len == 0) {
-                    // Empty map: 1 slot with def=1
-                    num_slots += 1;
+                    num_slots = std.math.add(usize, num_slots, 1) catch return error.OutOfMemory;
                 } else {
-                    // Map with entries: 1 slot per entry
-                    num_slots += entries.len;
-                    num_keys += entries.len;
+                    num_slots = std.math.add(usize, num_slots, entries.len) catch return error.OutOfMemory;
+                    num_keys = std.math.add(usize, num_keys, entries.len) catch return error.OutOfMemory;
                     for (entries) |entry| {
                         switch (entry.value) {
-                            .value => num_values += 1,
+                            .value => {
+                                num_values = std.math.add(usize, num_values, 1) catch return error.OutOfMemory;
+                            },
                             .null_value => {},
                         }
                     }
@@ -134,17 +135,19 @@ pub fn flattenMap(
     errdefer allocator.free(rep_levels);
 
     var keys = try allocator.alloc(K, num_keys);
+    var keys_initialized: usize = 0;
     errdefer {
         if (K == []const u8) {
-            for (keys) |k| allocator.free(k);
+            for (keys[0..keys_initialized]) |k| allocator.free(k);
         }
         allocator.free(keys);
     }
 
     var values = try allocator.alloc(V, num_values);
+    var values_initialized: usize = 0;
     errdefer {
         if (V == []const u8) {
-            for (values) |v| allocator.free(v);
+            for (values[0..values_initialized]) |v| allocator.free(v);
         }
         allocator.free(values);
     }
@@ -180,6 +183,7 @@ pub fn flattenMap(
                         key_def_levels[slot_idx] = 2;
                         if (K == []const u8) {
                             keys[key_idx] = try allocator.dupe(u8, entry.key);
+                            keys_initialized += 1;
                         } else {
                             keys[key_idx] = entry.key;
                         }
@@ -188,14 +192,13 @@ pub fn flattenMap(
                         // Value may be null
                         switch (entry.value) {
                             .null_value => {
-                                // Null value: def=2
                                 value_def_levels[slot_idx] = 2;
                             },
                             .value => |v| {
-                                // Value present: def=max_def
                                 value_def_levels[slot_idx] = value_max_def;
                                 if (V == []const u8) {
                                     values[value_idx] = try allocator.dupe(u8, v);
+                                    values_initialized += 1;
                                 } else {
                                     values[value_idx] = v;
                                 }
@@ -365,4 +368,32 @@ test "flattenMap with null value" {
 
     // Check values
     try std.testing.expectEqualSlices(i32, &[_]i32{ 1, 3 }, result.values);
+}
+
+test "flattenMap with string keys and values" {
+    const allocator = std.testing.allocator;
+
+    const entries = [_]MapEntry([]const u8, []const u8){
+        .{ .key = "key1", .value = .{ .value = "val1" } },
+        .{ .key = "key2", .value = .{ .value = "val2" } },
+        .{ .key = "key3", .value = .null_value },
+    };
+
+    const maps = [_]Optional([]const MapEntry([]const u8, []const u8)){
+        .{ .value = &entries },
+    };
+
+    var result = try flattenMap([]const u8, []const u8, allocator, &maps, 3);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), result.num_slots);
+    try std.testing.expectEqual(@as(usize, 3), result.keys.len);
+    try std.testing.expectEqual(@as(usize, 2), result.values.len);
+
+    try std.testing.expectEqualStrings("key1", result.keys[0]);
+    try std.testing.expectEqualStrings("key2", result.keys[1]);
+    try std.testing.expectEqualStrings("key3", result.keys[2]);
+
+    try std.testing.expectEqualStrings("val1", result.values[0]);
+    try std.testing.expectEqualStrings("val2", result.values[1]);
 }

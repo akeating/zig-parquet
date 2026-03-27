@@ -62,26 +62,27 @@ pub fn flattenList(
     max_def_level: u8,
 ) !FlattenedList(T) {
 
-    // First pass: count total slots and values
+    if (max_def_level < 2) return error.OutOfMemory;
+
+    // First pass: count total slots and values (checked arithmetic)
     var num_slots: usize = 0;
     var num_values: usize = 0;
 
     for (lists) |list_opt| {
         switch (list_opt) {
             .null_value => {
-                // Null list: 1 slot with def=0
-                num_slots += 1;
+                num_slots = std.math.add(usize, num_slots, 1) catch return error.OutOfMemory;
             },
             .value => |elements| {
                 if (elements.len == 0) {
-                    // Empty list: 1 slot with def=1
-                    num_slots += 1;
+                    num_slots = std.math.add(usize, num_slots, 1) catch return error.OutOfMemory;
                 } else {
-                    // List with elements: 1 slot per element
-                    num_slots += elements.len;
+                    num_slots = std.math.add(usize, num_slots, elements.len) catch return error.OutOfMemory;
                     for (elements) |elem| {
                         switch (elem) {
-                            .value => num_values += 1,
+                            .value => {
+                                num_values = std.math.add(usize, num_values, 1) catch return error.OutOfMemory;
+                            },
                             .null_value => {},
                         }
                     }
@@ -98,17 +99,14 @@ pub fn flattenList(
     errdefer allocator.free(rep_levels);
 
     var values = try allocator.alloc(T, num_values);
+    var values_initialized: usize = 0;
     errdefer {
         if (T == []const u8) {
-            for (values) |v| allocator.free(v);
+            for (values[0..values_initialized]) |v| allocator.free(v);
         }
         allocator.free(values);
     }
 
-    // Compute def levels dynamically from max_def_level.
-    // Schema always has element as OPTIONAL, so:
-    //   max_def=2 (required list): empty_list=0, null_elem=1, value=2
-    //   max_def=3 (optional list): null_list=0, empty_list=1, null_elem=2, value=3
     const value_def: u32 = max_def_level;
     const null_elem_def: u32 = max_def_level - 1;
     const empty_list_def: u32 = max_def_level - 2;
@@ -141,6 +139,7 @@ pub fn flattenList(
                                 def_levels[slot_idx] = value_def;
                                 if (T == []const u8) {
                                     values[value_idx] = try allocator.dupe(u8, v);
+                                    values_initialized += 1;
                                 } else {
                                     values[value_idx] = v;
                                 }
@@ -272,4 +271,32 @@ test "flattenList with null elements" {
 
     // Check values
     try std.testing.expectEqualSlices(i32, &[_]i32{ 1, 3 }, result.values);
+}
+
+test "flattenList with string values" {
+    const allocator = std.testing.allocator;
+
+    const inner0 = [_]Optional([]const u8){
+        .{ .value = "hello" },
+        .{ .value = "world" },
+    };
+    const inner1 = [_]Optional([]const u8){
+        .{ .value = "foo" },
+        .null_value,
+    };
+
+    const lists = [_]Optional([]const Optional([]const u8)){
+        .{ .value = &inner0 },
+        .{ .value = &inner1 },
+    };
+
+    var result = try flattenList([]const u8, allocator, &lists, 3);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 4), result.num_slots);
+    try std.testing.expectEqual(@as(usize, 3), result.values.len);
+
+    try std.testing.expectEqualStrings("hello", result.values[0]);
+    try std.testing.expectEqualStrings("world", result.values[1]);
+    try std.testing.expectEqualStrings("foo", result.values[2]);
 }

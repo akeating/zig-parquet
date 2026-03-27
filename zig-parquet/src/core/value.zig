@@ -201,7 +201,12 @@ pub const Value = union(enum) {
         }
     }
 
-    /// Free all memory owned by this value recursively
+    /// Free all memory owned by this value recursively.
+    ///
+    /// Ownership contract: Values produced by DynamicReader own their memory
+    /// (bytes_val, fixed_bytes_val, struct field names, and all nested containers
+    /// are heap-allocated). Call deinit to free them. Values created from stack
+    /// or borrowed data must NOT be passed to deinit.
     pub fn deinit(self: Value, allocator: std.mem.Allocator) void {
         switch (self) {
             .null_val, .bool_val, .int32_val, .int64_val, .float_val, .double_val => {},

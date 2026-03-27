@@ -134,6 +134,8 @@ pub fn parseFooter(allocator: std.mem.Allocator, source: SeekableReader) ReaderE
 ///
 /// This reads the entire column chunk (including dictionary page if present)
 /// into a newly allocated buffer. The caller owns the returned data.
+/// Size is bounded by total_compressed_size from the column metadata and the file size;
+/// per-page allocation limits are applied when decoding individual pages.
 pub fn readColumnChunkData(
     allocator: std.mem.Allocator,
     source: SeekableReader,
@@ -257,7 +259,7 @@ pub const PageIterator = struct {
         };
         errdefer freePageHeaderContents(self.allocator, &header);
 
-        const header_end = self.pos + thrift_reader.pos;
+        const header_end = std.math.add(usize, self.pos, thrift_reader.pos) catch return error.IntegerOverflow;
 
         // Get the compressed body
         const compressed_size = safe.cast(header.compressed_page_size) catch return error.IntegerOverflow;
@@ -408,10 +410,12 @@ pub const DictionarySet = struct {
         } else dict_page_body;
         defer if (codec != .uncompressed) self.allocator.free(dict_data);
 
-        // Build appropriate dictionary based on physical type
+        // Build appropriate dictionary based on physical type.
+        // Guard against re-initialization which would leak the existing dictionary.
         if (physical_type) |pt| {
             switch (pt) {
                 .byte_array => {
+                    if (self.string_dict != null) return error.InvalidPageData;
                     self.string_dict = dictionary.StringDictionary.fromPlain(
                         self.allocator,
                         dict_data,
@@ -419,8 +423,10 @@ pub const DictionarySet = struct {
                     ) catch return error.OutOfMemory;
                 },
                 .fixed_len_byte_array => {
+                    // type_length == 0 is valid but meaningless for FLBA; skip silently
                     const fixed_len = safe.cast(type_length orelse 0) catch return error.IntegerOverflow;
                     if (fixed_len > 0) {
+                        if (self.fixed_byte_array_dict != null) return error.InvalidPageData;
                         self.fixed_byte_array_dict = dictionary.FixedByteArrayDictionary.fromPlain(
                             self.allocator,
                             dict_data,
@@ -430,6 +436,7 @@ pub const DictionarySet = struct {
                     }
                 },
                 .int32 => {
+                    if (self.int32_dict != null) return error.InvalidPageData;
                     self.int32_dict = dictionary.Int32Dictionary.fromPlain(
                         self.allocator,
                         dict_data,
@@ -437,6 +444,7 @@ pub const DictionarySet = struct {
                     ) catch return error.OutOfMemory;
                 },
                 .int64 => {
+                    if (self.int64_dict != null) return error.InvalidPageData;
                     self.int64_dict = dictionary.Int64Dictionary.fromPlain(
                         self.allocator,
                         dict_data,
@@ -444,6 +452,7 @@ pub const DictionarySet = struct {
                     ) catch return error.OutOfMemory;
                 },
                 .float => {
+                    if (self.float32_dict != null) return error.InvalidPageData;
                     self.float32_dict = dictionary.Float32Dictionary.fromPlain(
                         self.allocator,
                         dict_data,
@@ -451,6 +460,7 @@ pub const DictionarySet = struct {
                     ) catch return error.OutOfMemory;
                 },
                 .double => {
+                    if (self.float64_dict != null) return error.InvalidPageData;
                     self.float64_dict = dictionary.Float64Dictionary.fromPlain(
                         self.allocator,
                         dict_data,

@@ -678,3 +678,28 @@ test "ByteArrayStatisticsBuilder build called twice returns null" {
     const stats2 = builder.build();
     try std.testing.expect(stats2 == null);
 }
+
+test "StatisticsBuilder build called twice is safe" {
+    const allocator = std.testing.allocator;
+
+    var builder = StatisticsBuilder(i32){};
+    builder.update(&[_]i32{ 10, 20, 30 });
+
+    const stats1 = try builder.build(allocator);
+    try std.testing.expect(stats1 != null);
+    if (stats1) |s| {
+        if (s.min) |m| allocator.free(m);
+        if (s.max) |m| allocator.free(m);
+        if (s.min_value) |m| allocator.free(m);
+        if (s.max_value) |m| allocator.free(m);
+    }
+
+    const stats2 = try builder.build(allocator);
+    try std.testing.expect(stats2 != null);
+    if (stats2) |s| {
+        if (s.min) |m| allocator.free(m);
+        if (s.max) |m| allocator.free(m);
+        if (s.min_value) |m| allocator.free(m);
+        if (s.max_value) |m| allocator.free(m);
+    }
+}

@@ -8,6 +8,13 @@ const std = @import("std");
 const safe = @import("safe.zig");
 const parquet_format = @import("format.zig");
 
+/// Multiply two i64 values, saturating to maxInt/minInt on overflow instead of panicking.
+fn saturatingMul(a: i64, b: i64) i64 {
+    return std.math.mul(i64, a, b) catch {
+        return if ((a > 0) == (b > 0)) std.math.maxInt(i64) else std.math.minInt(i64);
+    };
+}
+
 // ============================================================================
 // Logical Type Wrappers for RowWriter
 // ============================================================================
@@ -55,7 +62,7 @@ pub fn Timestamp(comptime unit: TimeUnit) type {
         /// Create a timestamp from microseconds since Unix epoch
         pub fn fromMicros(micros: i64) Self {
             return .{ .value = switch (unit) {
-                .nanos => micros * 1000,
+                .nanos => saturatingMul(micros, 1000),
                 .micros => micros,
                 .millis => @divTrunc(micros, 1000),
             } };
@@ -64,8 +71,8 @@ pub fn Timestamp(comptime unit: TimeUnit) type {
         /// Create a timestamp from milliseconds since Unix epoch
         pub fn fromMillis(millis: i64) Self {
             return .{ .value = switch (unit) {
-                .nanos => millis * 1_000_000,
-                .micros => millis * 1000,
+                .nanos => saturatingMul(millis, 1_000_000),
+                .micros => saturatingMul(millis, 1000),
                 .millis => millis,
             } };
         }
@@ -73,9 +80,9 @@ pub fn Timestamp(comptime unit: TimeUnit) type {
         /// Create a timestamp from seconds since Unix epoch
         pub fn fromSeconds(secs: i64) Self {
             return .{ .value = switch (unit) {
-                .nanos => secs * 1_000_000_000,
-                .micros => secs * 1_000_000,
-                .millis => secs * 1000,
+                .nanos => saturatingMul(secs, 1_000_000_000),
+                .micros => saturatingMul(secs, 1_000_000),
+                .millis => saturatingMul(secs, 1000),
             } };
         }
     };
@@ -182,7 +189,7 @@ pub fn Time(comptime unit: TimeUnit) type {
         /// Create a time from microseconds since midnight
         pub fn fromMicros(micros: i64) Self {
             return .{ .value = switch (unit) {
-                .nanos => micros * 1000,
+                .nanos => saturatingMul(micros, 1000),
                 .micros => micros,
                 .millis => @divTrunc(micros, 1000),
             } };
@@ -191,8 +198,8 @@ pub fn Time(comptime unit: TimeUnit) type {
         /// Create a time from milliseconds since midnight
         pub fn fromMillis(millis: i64) Self {
             return .{ .value = switch (unit) {
-                .nanos => millis * 1_000_000,
-                .micros => millis * 1000,
+                .nanos => saturatingMul(millis, 1_000_000),
+                .micros => saturatingMul(millis, 1000),
                 .millis => millis,
             } };
         }
@@ -203,9 +210,9 @@ pub fn Time(comptime unit: TimeUnit) type {
                 @as(i64, minutes) * 60 +
                 @as(i64, seconds);
             return .{ .value = switch (unit) {
-                .nanos => base * 1_000_000_000 + @as(i64, subsec),
-                .micros => base * 1_000_000 + @as(i64, subsec),
-                .millis => base * 1_000 + @as(i64, subsec),
+                .nanos => saturatingMul(base, 1_000_000_000) +| @as(i64, subsec),
+                .micros => saturatingMul(base, 1_000_000) +| @as(i64, subsec),
+                .millis => saturatingMul(base, 1_000) +| @as(i64, subsec),
             } };
         }
     };
@@ -250,8 +257,11 @@ pub const Int96 = struct {
         else
             safe.castTo(i64, day_nanos) catch unreachable; // day_nanos <= max_i64 from check above
 
-        // Combine with saturating add
-        return std.math.add(i64, days_nanos, day_nanos_i64) catch max_i64;
+        // Combine with saturating add (day_nanos_i64 >= 0, so only positive overflow is possible,
+        // but use direction-aware saturation for robustness)
+        return std.math.add(i64, days_nanos, day_nanos_i64) catch {
+            return if (days_nanos > 0) max_i64 else min_i64;
+        };
     }
 
     /// Create from nanoseconds since Unix epoch
@@ -426,6 +436,8 @@ pub fn decimalByteLength(comptime precision: comptime_int) comptime_int {
 }
 
 /// Runtime version of decimalByteLength for dynamic precision values.
+/// Returns 16 (max FLBA size) for out-of-range precision as a safe fallback;
+/// callers should validate precision before calling if stricter behavior is needed.
 pub fn decimalByteLengthRuntime(precision: i32) usize {
     const table = [38]usize{
         1, 1, 2, 2, 3, 3, 4, 4, 4, // P1-P9
@@ -489,9 +501,18 @@ pub fn Decimal(comptime precision: comptime_int, comptime scale: comptime_int) t
 
         /// Create from an f64 value (applies scale).
         /// E.g. Decimal(9,2).fromF64(123.45) stores unscaled 12345
+        /// Saturates to max/min i128 for values too large to represent.
         pub fn fromF64(value: f64) Self {
             const multiplier = comptime std.math.pow(f64, 10.0, @floatFromInt(scale));
-            const unscaled: i128 = @intFromFloat(@round(value * multiplier));
+            const scaled = @round(value * multiplier);
+            const max_f: f64 = @floatFromInt(@as(i128, std.math.maxInt(i128)));
+            const min_f: f64 = @floatFromInt(@as(i128, std.math.minInt(i128)));
+            if (std.math.isNan(scaled) or scaled >= max_f) {
+                return fromUnscaled(std.math.maxInt(i128));
+            } else if (scaled <= min_f) {
+                return fromUnscaled(std.math.minInt(i128));
+            }
+            const unscaled: i128 = @intFromFloat(scaled);
             return fromUnscaled(unscaled);
         }
 
@@ -628,19 +649,22 @@ pub const Interval = struct {
         return .{ .months = 0, .days = 0, .millis = millis };
     }
 
-    /// Create an interval from hours (converted to milliseconds)
+    /// Create an interval from hours (converted to milliseconds).
+    /// Saturates to maxInt(u32) on overflow.
     pub fn fromHours(hours: u32) Interval {
-        return .{ .months = 0, .days = 0, .millis = hours * 3_600_000 };
+        return .{ .months = 0, .days = 0, .millis = std.math.mul(u32, hours, 3_600_000) catch std.math.maxInt(u32) };
     }
 
-    /// Create an interval from minutes (converted to milliseconds)
+    /// Create an interval from minutes (converted to milliseconds).
+    /// Saturates to maxInt(u32) on overflow.
     pub fn fromMinutes(minutes: u32) Interval {
-        return .{ .months = 0, .days = 0, .millis = minutes * 60_000 };
+        return .{ .months = 0, .days = 0, .millis = std.math.mul(u32, minutes, 60_000) catch std.math.maxInt(u32) };
     }
 
-    /// Create an interval from seconds (converted to milliseconds)
+    /// Create an interval from seconds (converted to milliseconds).
+    /// Saturates to maxInt(u32) on overflow.
     pub fn fromSeconds(seconds: u32) Interval {
-        return .{ .months = 0, .days = 0, .millis = seconds * 1000 };
+        return .{ .months = 0, .days = 0, .millis = std.math.mul(u32, seconds, 1000) catch std.math.maxInt(u32) };
     }
 
     /// Get total milliseconds (excluding months and days, as they have variable length)
@@ -1038,6 +1062,71 @@ test "decimalByteLength values" {
     try std.testing.expectEqual(@as(comptime_int, 8), decimalByteLength(18));
     try std.testing.expectEqual(@as(comptime_int, 16), decimalByteLength(38));
     try std.testing.expectEqual(@as(comptime_int, 1), decimalByteLength(1));
+}
+
+test "Timestamp overflow saturation" {
+    const TsNanos = Timestamp(.nanos);
+
+    // fromMicros with maxInt should saturate, not panic
+    const ts1 = TsNanos.fromMicros(std.math.maxInt(i64));
+    try std.testing.expectEqual(std.math.maxInt(i64), ts1.value);
+
+    // fromMillis with maxInt should saturate
+    const ts2 = TsNanos.fromMillis(std.math.maxInt(i64));
+    try std.testing.expectEqual(std.math.maxInt(i64), ts2.value);
+
+    // fromSeconds with maxInt should saturate
+    const ts3 = TsNanos.fromSeconds(std.math.maxInt(i64));
+    try std.testing.expectEqual(std.math.maxInt(i64), ts3.value);
+
+    // Negative overflow should saturate to minInt
+    const ts4 = TsNanos.fromMicros(std.math.minInt(i64));
+    try std.testing.expectEqual(std.math.minInt(i64), ts4.value);
+}
+
+test "Time overflow saturation" {
+    const TimeNanos = Time(.nanos);
+
+    const t1 = TimeNanos.fromMicros(std.math.maxInt(i64));
+    try std.testing.expectEqual(std.math.maxInt(i64), t1.value);
+
+    const t2 = TimeNanos.fromMillis(std.math.maxInt(i64));
+    try std.testing.expectEqual(std.math.maxInt(i64), t2.value);
+
+    const t3 = TimeNanos.fromMicros(std.math.minInt(i64));
+    try std.testing.expectEqual(std.math.minInt(i64), t3.value);
+}
+
+test "Interval overflow saturation" {
+    const iv1 = Interval.fromHours(std.math.maxInt(u32));
+    try std.testing.expectEqual(std.math.maxInt(u32), iv1.millis);
+
+    const iv2 = Interval.fromMinutes(std.math.maxInt(u32));
+    try std.testing.expectEqual(std.math.maxInt(u32), iv2.millis);
+
+    const iv3 = Interval.fromSeconds(std.math.maxInt(u32));
+    try std.testing.expectEqual(std.math.maxInt(u32), iv3.millis);
+}
+
+test "Decimal fromF64 huge value saturates instead of panicking" {
+    const D38_2 = Decimal(38, 2);
+
+    // These would panic with @intFromFloat without the bounds check
+    const d1 = D38_2.fromF64(1e100);
+    try std.testing.expectEqual(std.math.maxInt(i128), d1.toI128());
+
+    const d2 = D38_2.fromF64(-1e100);
+    try std.testing.expectEqual(std.math.minInt(i128), d2.toI128());
+
+    const d3 = D38_2.fromF64(std.math.inf(f64));
+    try std.testing.expectEqual(std.math.maxInt(i128), d3.toI128());
+
+    const d4 = D38_2.fromF64(-std.math.inf(f64));
+    try std.testing.expectEqual(std.math.minInt(i128), d4.toI128());
+
+    // NaN should also not panic
+    const d5 = D38_2.fromF64(std.math.nan(f64));
+    try std.testing.expectEqual(std.math.maxInt(i128), d5.toI128());
 }
 
 test "Int96.fromNanos extreme values saturate" {

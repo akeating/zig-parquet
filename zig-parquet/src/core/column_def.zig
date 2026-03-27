@@ -7,6 +7,7 @@ const std = @import("std");
 const format = @import("format.zig");
 const schema_mod = @import("schema.zig");
 const safe = @import("safe.zig");
+const types_mod = @import("types.zig");
 
 pub const SchemaNode = schema_mod.SchemaNode;
 
@@ -229,8 +230,11 @@ pub const ColumnDef = struct {
 
     /// Create a DECIMAL column
     /// Physical type: INT32 (precision <= 9), INT64 (precision <= 18), or FIXED_LEN_BYTE_ARRAY
+    /// Precision must be 1-38, scale must be 0-precision (per Parquet spec).
     pub fn decimal(name: []const u8, precision: i32, scale: i32, optional: bool) ColumnDef {
-        // Determine physical type based on precision
+        std.debug.assert(precision >= 1 and precision <= 38);
+        std.debug.assert(scale >= 0 and scale <= precision);
+
         if (precision <= 9) {
             return .{
                 .name = name,
@@ -246,10 +250,7 @@ pub const ColumnDef = struct {
                 .logical_type = .{ .decimal = .{ .precision = precision, .scale = scale } },
             };
         } else {
-            // For precision > 18, use FIXED_LEN_BYTE_ARRAY
-            // Number of bytes needed: ceil((precision * log2(10)) / 8) ≈ ceil(precision * 0.415)
-            // Simplified: (precision + 1) / 2 gives a reasonable approximation
-            const byte_len: i32 = @divTrunc(precision + 1, 2);
+            const byte_len = safe.castTo(i32, types_mod.decimalByteLengthRuntime(precision)) catch unreachable; // max 16 for precision 1-38
             return .{
                 .name = name,
                 .type_ = .fixed_len_byte_array,
@@ -501,3 +502,15 @@ pub const ColumnDef = struct {
         };
     }
 };
+
+test "decimal byte length matches types table" {
+    for (19..39) |p| {
+        const precision: i32 = @intCast(p);
+        const col = ColumnDef.decimal("x", precision, 0, false);
+        const expected = types_mod.decimalByteLengthRuntime(precision);
+        try std.testing.expectEqual(
+            @as(i32, safe.castTo(i32, expected) catch unreachable), // expected max 16
+            col.type_length.?,
+        );
+    }
+}

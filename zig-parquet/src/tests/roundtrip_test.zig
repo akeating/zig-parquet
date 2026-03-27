@@ -2581,9 +2581,9 @@ test "round-trip statistics fixed byte array logical types" {
     const f16_bytes_three: [2]u8 = @bitCast(f16_three);
     const f16_values = [_][]const u8{ &f16_bytes_one, &f16_bytes_half, &f16_bytes_three };
 
-    const dec_small = [_]u8{0} ** 18 ++ [_]u8{1};
-    const dec_medium = [_]u8{0} ** 18 ++ [_]u8{100};
-    const dec_large = [_]u8{0} ** 17 ++ [_]u8{ 1, 0 };
+    const dec_small = [_]u8{0} ** 15 ++ [_]u8{1};
+    const dec_medium = [_]u8{0} ** 15 ++ [_]u8{100};
+    const dec_large = [_]u8{0} ** 14 ++ [_]u8{ 1, 0 };
     const dec_values = [_][]const u8{ &dec_medium, &dec_small, &dec_large };
     const dec_expected_min = dec_small;
     const dec_expected_max = dec_large;

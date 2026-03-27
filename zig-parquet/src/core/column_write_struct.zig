@@ -61,6 +61,8 @@ pub fn writeColumnChunkStructMultiPage(
     codec: format.CompressionCodec,
     max_page_size: ?usize,
 ) ColumnWriteError!ColumnChunkResult {
+    if (rep_levels.len != def_levels.len) return error.InvalidFixedLength;
+
     // Compute statistics on values
     var stats_builder = statistics.StatisticsBuilder(T){};
     stats_builder.update(values);
@@ -118,6 +120,7 @@ pub fn writeColumnChunkStructMultiPage(
 
     // Multi-page path
     var total_bytes_written: usize = 0;
+    var total_uncompressed_written: usize = 0;
     var slot_offset: usize = 0;
     var value_offset: usize = 0;
 
@@ -126,7 +129,6 @@ pub fn writeColumnChunkStructMultiPage(
         const page_def_levels = def_levels[slot_offset..page_end];
         const page_rep_levels = rep_levels[slot_offset..page_end];
 
-        // Count values in this page (slots where def_level == max_def_level)
         var page_value_count: usize = 0;
         for (page_def_levels) |dl| {
             if (dl == max_def_level) page_value_count += 1;
@@ -148,9 +150,9 @@ pub fn writeColumnChunkStructMultiPage(
             error.InvalidFixedLength => return error.InvalidFixedLength,
             error.IntegerOverflow => return error.IntegerOverflow,
             error.ValueTooLarge => return error.ValueTooLarge,
-        error.UnsupportedEncoding => return error.UnsupportedEncoding,
-        error.NullInRequiredColumn => return error.NullInRequiredColumn,
-    };
+            error.UnsupportedEncoding => return error.UnsupportedEncoding,
+            error.NullInRequiredColumn => return error.NullInRequiredColumn,
+        };
         defer page_result.deinit(allocator);
 
         const compressed_data: []const u8 = if (codec == .uncompressed)
@@ -190,12 +192,16 @@ pub fn writeColumnChunkStructMultiPage(
 
         const page_bytes = std.math.add(usize, header_bytes.len, compressed_data.len) catch return error.IntegerOverflow;
         total_bytes_written = std.math.add(usize, total_bytes_written, page_bytes) catch return error.IntegerOverflow;
+        const uncompressed_page_bytes = std.math.add(usize, header_bytes.len, page_result.data.len) catch return error.IntegerOverflow;
+        total_uncompressed_written = std.math.add(usize, total_uncompressed_written, uncompressed_page_bytes) catch return error.IntegerOverflow;
         slot_offset = page_end;
     }
 
     // Build path_in_schema for struct: [struct_name, field_name]
     const path = allocator.alloc([]const u8, 2) catch return error.OutOfMemory;
+    errdefer allocator.free(path);
     path[0] = allocator.dupe(u8, struct_name) catch return error.OutOfMemory;
+    errdefer allocator.free(path[0]);
     path[1] = allocator.dupe(u8, field_name) catch return error.OutOfMemory;
 
     const encodings = allocator.alloc(format.Encoding, 2) catch return error.OutOfMemory;
@@ -209,7 +215,7 @@ pub fn writeColumnChunkStructMultiPage(
             .path_in_schema = path,
             .codec = codec,
             .num_values = try safe.castTo(i64, def_levels.len),
-            .total_uncompressed_size = try safe.castTo(i64, total_bytes_written),
+            .total_uncompressed_size = try safe.castTo(i64, total_uncompressed_written),
             .total_compressed_size = try safe.castTo(i64, total_bytes_written),
             .data_page_offset = start_offset,
             .index_page_offset = null,
@@ -251,6 +257,8 @@ pub fn writeColumnChunkStructByteArrayMultiPage(
     codec: format.CompressionCodec,
     max_page_size: ?usize,
 ) ColumnWriteError!ColumnChunkResult {
+    if (rep_levels.len != def_levels.len) return error.InvalidFixedLength;
+
     // Compute statistics on byte array values
     var stats_builder = statistics.ByteArrayStatisticsBuilder.init(allocator);
     stats_builder.update(values) catch return error.OutOfMemory;
@@ -313,6 +321,7 @@ pub fn writeColumnChunkStructByteArrayMultiPage(
 
     // Multi-page path
     var total_bytes_written: usize = 0;
+    var total_uncompressed_written: usize = 0;
     var slot_offset: usize = 0;
     var value_offset: usize = 0;
 
@@ -321,7 +330,6 @@ pub fn writeColumnChunkStructByteArrayMultiPage(
         const page_def_levels = def_levels[slot_offset..page_end];
         const page_rep_levels = rep_levels[slot_offset..page_end];
 
-        // Count values in this page
         var page_value_count: usize = 0;
         for (page_def_levels) |dl| {
             if (dl == max_def_level) page_value_count += 1;
@@ -342,9 +350,9 @@ pub fn writeColumnChunkStructByteArrayMultiPage(
             error.InvalidFixedLength => return error.InvalidFixedLength,
             error.IntegerOverflow => return error.IntegerOverflow,
             error.ValueTooLarge => return error.ValueTooLarge,
-        error.UnsupportedEncoding => return error.UnsupportedEncoding,
-        error.NullInRequiredColumn => return error.NullInRequiredColumn,
-    };
+            error.UnsupportedEncoding => return error.UnsupportedEncoding,
+            error.NullInRequiredColumn => return error.NullInRequiredColumn,
+        };
         defer page_result.deinit(allocator);
 
         const compressed_data: []const u8 = if (codec == .uncompressed)
@@ -384,12 +392,16 @@ pub fn writeColumnChunkStructByteArrayMultiPage(
 
         const page_bytes = std.math.add(usize, header_bytes.len, compressed_data.len) catch return error.IntegerOverflow;
         total_bytes_written = std.math.add(usize, total_bytes_written, page_bytes) catch return error.IntegerOverflow;
+        const uncompressed_page_bytes = std.math.add(usize, header_bytes.len, page_result.data.len) catch return error.IntegerOverflow;
+        total_uncompressed_written = std.math.add(usize, total_uncompressed_written, uncompressed_page_bytes) catch return error.IntegerOverflow;
         slot_offset = page_end;
     }
 
     // Build path_in_schema for struct
     const path = allocator.alloc([]const u8, 2) catch return error.OutOfMemory;
+    errdefer allocator.free(path);
     path[0] = allocator.dupe(u8, struct_name) catch return error.OutOfMemory;
+    errdefer allocator.free(path[0]);
     path[1] = allocator.dupe(u8, field_name) catch return error.OutOfMemory;
 
     const encodings = allocator.alloc(format.Encoding, 2) catch return error.OutOfMemory;
@@ -403,7 +415,7 @@ pub fn writeColumnChunkStructByteArrayMultiPage(
             .path_in_schema = path,
             .codec = codec,
             .num_values = try safe.castTo(i64, def_levels.len),
-            .total_uncompressed_size = try safe.castTo(i64, total_bytes_written),
+            .total_uncompressed_size = try safe.castTo(i64, total_uncompressed_written),
             .total_compressed_size = try safe.castTo(i64, total_bytes_written),
             .data_page_offset = start_offset,
             .index_page_offset = null,
@@ -466,18 +478,20 @@ fn writeColumnChunkWithDataStruct(
     output.writeAll(header_bytes) catch return error.WriteError;
     output.writeAll(compressed_data) catch return error.WriteError;
 
-    const total_compressed_bytes = header_bytes.len + compressed_data.len;
-    const total_uncompressed_bytes = header_bytes.len + page_data.len;
+    const total_compressed_bytes = std.math.add(usize, header_bytes.len, compressed_data.len) catch return error.IntegerOverflow;
+    const total_uncompressed_bytes = std.math.add(usize, header_bytes.len, page_data.len) catch return error.IntegerOverflow;
 
     // Build path_in_schema for struct: [struct_name, field_name]
     const path = allocator.alloc([]const u8, 2) catch return error.OutOfMemory;
+    errdefer allocator.free(path);
     path[0] = allocator.dupe(u8, struct_name) catch return error.OutOfMemory;
+    errdefer allocator.free(path[0]);
     path[1] = allocator.dupe(u8, field_name) catch return error.OutOfMemory;
 
     // Build encodings list
     const encodings = allocator.alloc(format.Encoding, 2) catch return error.OutOfMemory;
-    encodings[0] = .rle; // Levels
-    encodings[1] = .plain; // Values
+    encodings[0] = .rle;
+    encodings[1] = .plain;
 
     return .{
         .metadata = .{
@@ -485,7 +499,7 @@ fn writeColumnChunkWithDataStruct(
             .encodings = encodings,
             .path_in_schema = path,
             .codec = codec,
-            .num_values = try safe.castTo(i32, num_values),
+            .num_values = try safe.castTo(i64, num_values),
             .total_uncompressed_size = try safe.castTo(i64, total_uncompressed_bytes),
             .total_compressed_size = try safe.castTo(i64, total_compressed_bytes),
             .data_page_offset = start_offset,
