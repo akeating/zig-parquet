@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.3] - 2026-03-27
+
+### Fixed
+- Fix varint panic on malicious Thrift data in compact reader
+- Fix errdefer undefined behavior and add checked arithmetic in core encodings
+- Fix critical findings across multiple code review rounds (arrow_batch, column_decoder, column_writer, dynamic_reader, dynamic_writer)
+- Remove dead branch in DictHashContext hash function
+
+### Added
+- Arrow write round-trip tests for arrow_batch hardening
+
 ## [0.1.2] - 2026-03-26
 
 ### Added
@@ -52,6 +63,7 @@ Initial release.
 - Hardening: safe casting, bounds checking, no `@intCast` on external data
 - 219/219 pass rate on supported Apache parquet-testing files
 
+[0.1.3]: https://github.com/akeating/zig-parquet/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/akeating/zig-parquet/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/akeating/zig-parquet/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/akeating/zig-parquet/releases/tag/v0.1.0
