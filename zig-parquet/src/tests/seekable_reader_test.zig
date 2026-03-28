@@ -406,7 +406,7 @@ test "DynamicReader.initFromBuffer reads real Parquet file with row iteration" {
 }
 
 test "Reader.initFromBuffer with compressed file" {
-    if (build_options.no_compression) return;
+    if (!build_options.enable_zstd) return;
     const allocator = std.testing.allocator;
 
     // Read a zstd-compressed Parquet file into memory

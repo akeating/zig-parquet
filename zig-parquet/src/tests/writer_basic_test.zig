@@ -497,7 +497,6 @@ test "round-trip fixed_len_byte_array column" {
 }
 
 test "dictionary cardinality fallback" {
-    if (build_options.no_compression) return;
     const allocator = std.testing.allocator;
 
     var tmp_dir = std.testing.tmpDir(.{});

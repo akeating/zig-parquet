@@ -1,7 +1,7 @@
 # Freestanding WASM Example
 
 Build verification for `wasm32-freestanding` targets. This compiles the parquet
-library with `no_compression` and exposes the freestanding WASM API.
+library with `codecs=none` and exposes the freestanding WASM API.
 
 ## Build
 

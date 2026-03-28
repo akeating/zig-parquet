@@ -355,7 +355,7 @@ test "multi-page: list-of-struct column" {
 // =============================================================================
 
 test "multi-page: with zstd compression" {
-    if (build_options.no_compression) return;
+    if (!build_options.enable_zstd) return;
     const allocator = std.testing.allocator;
     const row_count = 500;
 
@@ -397,7 +397,7 @@ test "multi-page: with zstd compression" {
 }
 
 test "multi-page: list with snappy compression" {
-    if (build_options.no_compression) return;
+    if (!build_options.enable_snappy) return;
     const allocator = std.testing.allocator;
     const row_count = 100;
 
@@ -689,7 +689,7 @@ test "multi-page: nested list (list of list)" {
 // =============================================================================
 
 test "multi-page: large dataset (10K rows)" {
-    if (build_options.no_compression) return;
+    if (!build_options.enable_zstd) return;
     const allocator = std.testing.allocator;
     const row_count = 10_000;
 

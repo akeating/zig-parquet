@@ -7,6 +7,7 @@
 //! - Handle-state-after-error semantics
 
 const std = @import("std");
+const build_options = @import("build_options");
 const parquet = @import("../lib.zig");
 
 const c_err = parquet.c_api.err;
@@ -1122,6 +1123,7 @@ test "C ABI struct with bool field roundtrip" {
 }
 
 test "C ABI row writer options: compression, kv metadata" {
+    if (!build_options.enable_snappy) return;
     var w_handle: ?*anyopaque = null;
     try std.testing.expectEqual(c_err.ZP_OK, c_row_writer.zp_row_writer_open_memory(&w_handle));
 

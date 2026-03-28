@@ -15,6 +15,7 @@ const rle_encoder = @import("encoding/rle_encoder.zig");
 const plain = @import("encoding/plain.zig");
 const statistics = @import("statistics.zig");
 const safe = @import("safe.zig");
+const build_options = @import("build_options");
 const crc = std.hash.crc;
 
 const Optional = types.Optional;
@@ -2568,6 +2569,7 @@ test "write nullable byte array column tracks null_count in statistics" {
 }
 
 test "compressed column tracks uncompressed vs compressed sizes separately" {
+    if (!build_options.enable_snappy) return;
     const allocator = std.testing.allocator;
 
     var aw: std.Io.Writer.Allocating = .init(allocator);

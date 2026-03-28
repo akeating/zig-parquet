@@ -29,7 +29,7 @@ test "compression codec in ColumnDef" {
 }
 
 test "round-trip with zstd compression" {
-    if (build_options.no_compression) return;
+    if (!build_options.enable_zstd) return;
     const allocator = std.testing.allocator;
 
     var tmp_dir = std.testing.tmpDir(.{});
@@ -90,7 +90,7 @@ test "round-trip with zstd compression" {
 }
 
 test "round-trip zstd compression with byte arrays" {
-    if (build_options.no_compression) return;
+    if (!build_options.enable_zstd) return;
     const allocator = std.testing.allocator;
 
     var tmp_dir = std.testing.tmpDir(.{});
@@ -151,7 +151,7 @@ test "round-trip zstd compression with byte arrays" {
 }
 
 test "round-trip mixed compression (zstd and uncompressed)" {
-    if (build_options.no_compression) return;
+    if (!build_options.enable_zstd) return;
     const allocator = std.testing.allocator;
 
     var tmp_dir = std.testing.tmpDir(.{});
@@ -218,7 +218,7 @@ test "round-trip mixed compression (zstd and uncompressed)" {
 }
 
 test "round-trip with gzip compression" {
-    if (build_options.no_compression) return;
+    if (!build_options.enable_gzip) return;
     const allocator = std.testing.allocator;
 
     var tmp_dir = std.testing.tmpDir(.{});
@@ -279,7 +279,7 @@ test "round-trip with gzip compression" {
 }
 
 test "round-trip gzip compression with byte arrays" {
-    if (build_options.no_compression) return;
+    if (!build_options.enable_gzip) return;
     const allocator = std.testing.allocator;
 
     var tmp_dir = std.testing.tmpDir(.{});
@@ -340,7 +340,7 @@ test "round-trip gzip compression with byte arrays" {
 }
 
 test "round-trip with snappy compression" {
-    if (build_options.no_compression) return;
+    if (!build_options.enable_snappy) return;
     const allocator = std.testing.allocator;
 
     var tmp_dir = std.testing.tmpDir(.{});
@@ -401,7 +401,7 @@ test "round-trip with snappy compression" {
 }
 
 test "round-trip snappy compression with byte arrays" {
-    if (build_options.no_compression) return;
+    if (!build_options.enable_snappy) return;
     const allocator = std.testing.allocator;
 
     var tmp_dir = std.testing.tmpDir(.{});
@@ -462,7 +462,7 @@ test "round-trip snappy compression with byte arrays" {
 }
 
 test "round-trip with lz4_raw compression" {
-    if (build_options.no_compression) return;
+    if (!build_options.enable_lz4) return;
     const allocator = std.testing.allocator;
 
     var tmp_dir = std.testing.tmpDir(.{});
@@ -523,7 +523,7 @@ test "round-trip with lz4_raw compression" {
 }
 
 test "round-trip lz4_raw compression with byte arrays" {
-    if (build_options.no_compression) return;
+    if (!build_options.enable_lz4) return;
     const allocator = std.testing.allocator;
 
     var tmp_dir = std.testing.tmpDir(.{});
@@ -584,7 +584,7 @@ test "round-trip lz4_raw compression with byte arrays" {
 }
 
 test "round-trip with brotli compression" {
-    if (build_options.no_compression) return;
+    if (!build_options.enable_brotli) return;
     const allocator = std.testing.allocator;
 
     var tmp_dir = std.testing.tmpDir(.{});
@@ -645,7 +645,7 @@ test "round-trip with brotli compression" {
 }
 
 test "round-trip brotli compression with byte arrays" {
-    if (build_options.no_compression) return;
+    if (!build_options.enable_brotli) return;
     const allocator = std.testing.allocator;
 
     var tmp_dir = std.testing.tmpDir(.{});

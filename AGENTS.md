@@ -38,10 +38,12 @@ zig-parquet is a native Parquet library written in Zig 0.15.2. It provides read/
 ## Build & Test
 
 ```bash
-cd zig-parquet && zig build test   # Run library tests
-cd cli && zig build                # Build pqi CLI
-cd cli && ./validate-wild.sh       # Validate against wild test files (failures only)
-cd cli && ./validate-wild.sh --all # Show all results
+cd zig-parquet && zig build test                  # Run library tests (all codecs)
+cd zig-parquet && zig build test -Dcodecs=none    # Run non-compression tests only
+cd zig-parquet && zig build test -Dcodecs=zstd    # Run with zstd only
+cd cli && zig build                               # Build pqi CLI
+cd cli && ./validate-wild.sh                      # Validate against wild test files (failures only)
+cd cli && ./validate-wild.sh --all                # Show all results
 ```
 
 Zig 0.15 does NOT support `--test-filter`. Tests are discovered automatically via `@import`.
@@ -116,9 +118,23 @@ _ = arena.reset(.retain_capacity);
 
 ### Build Options (Conditional Compilation)
 
+Compression codecs are controlled via `-Dcodecs=` (default: all). Values: `all`, `none`, or comma-separated list of: `zstd,snappy,gzip,lz4,brotli`.
+
 ```zig
-// Conditional imports — use {} (void struct) as disabled branch, not null
-pub const zstd = if (no_compression) {} else @import("zstd.zig");
+// Per-codec conditional imports — use {} (void struct) as disabled branch
+pub const zstd = if (build_options.enable_zstd) @import("zstd.zig") else {};
+pub const snappy = if (build_options.enable_snappy) @import("snappy.zig") else {};
+```
+
+Available build_options flags: `enable_zstd`, `enable_snappy`, `enable_gzip`, `enable_lz4`, `enable_brotli`.
+
+In tests, guard codec-specific tests with the appropriate flag:
+
+```zig
+test "my zstd test" {
+    if (!build_options.enable_zstd) return;
+    // ...
+}
 ```
 
 ### WASM Targets

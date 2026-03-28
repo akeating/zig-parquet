@@ -26,7 +26,7 @@ Things that are explicitly **not supported** and will return errors:
 | Bloom filters | Read or write |
 | Page index | Read or write |
 | Predicate pushdown | Statistics-based row group skipping exists; page-level filtering does not |
-| Freestanding WASM + compression | Compression codecs require libc; freestanding builds use `no_compression` |
+| Freestanding WASM + compression | Compression codecs require libc; freestanding builds use `-Dcodecs=none` |
 
 ## Future
 

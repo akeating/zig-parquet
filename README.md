@@ -12,7 +12,7 @@ A native Parquet library built for portability, embeddability, and low deploymen
 - **Full Read/Write Support** - Read and write Parquet files with all physical and logical types
 - **All Standard Encodings** - PLAIN, RLE, DICTIONARY, DELTA_BINARY_PACKED, DELTA_LENGTH_BYTE_ARRAY, DELTA_BYTE_ARRAY, BYTE_STREAM_SPLIT
 - **Nested Types** - Lists, structs, maps, and arbitrary nesting depth
-- **Compression** - zstd, gzip, snappy, lz4, brotli (via C/C++ libraries)
+- **Compression** - zstd, gzip, snappy, lz4, brotli (via C/C++ libraries, individually selectable)
 - **Logical Types** - STRING, DATE, TIME, TIMESTAMP (millis/micros/nanos), DECIMAL, UUID, INT annotations, FLOAT16, ENUM, JSON, BSON, INTERVAL, GEOMETRY, GEOGRAPHY
 - **Dynamic Row API** - Runtime `DynamicWriter` / `DynamicReader` for all types and arbitrary nesting depth
 - **Schema-Agnostic Reading** - Read any Parquet file without knowing the schema at compile time
@@ -294,6 +294,20 @@ var writer = try parquet.createFileDynamic(allocator, file);
 writer.setCompression(.zstd);
 ```
 
+### Build-Time Codec Selection
+
+Control which compression codecs are compiled into your binary:
+
+```bash
+zig build                           # all codecs (default)
+zig build -Dcodecs=none             # no compression (smallest binary)
+zig build -Dcodecs=zstd,snappy      # only zstd and snappy
+zig build -Dcodecs=zstd             # just zstd
+zig build -Dcodecs=gzip,lz4,zstd    # specific mix
+```
+
+Disabled codecs return `UnsupportedCompression` at runtime. Dependencies are only fetched for enabled codecs.
+
 ### Per-Column and Per-Leaf Options
 
 Set options per column at definition time, or per leaf path for nested types:
@@ -426,8 +440,8 @@ See `examples/wasm_demo/` and `examples/wasm_freestanding/` for usage examples.
 ## Requirements
 
 - **Zig 0.15.2**
-- C compiler (for compression libraries)
-- C++ compiler (for Snappy)
+- C compiler (for compression libraries; not needed with `-Dcodecs=none`)
+- C++ compiler (for Snappy; not needed if snappy is excluded)
 
 ## License
 

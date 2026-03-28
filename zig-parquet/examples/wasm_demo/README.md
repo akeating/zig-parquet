@@ -12,7 +12,7 @@ Build from the zig-parquet root:
 zig build -Dwasm_wasi
 
 # Build without compression (smaller binary)
-zig build -Dwasm_wasi -Dno_compression
+zig build -Dwasm_wasi -Dcodecs=none
 ```
 
 Output: `zig-out/bin/parquet_wasi.wasm`
@@ -40,7 +40,7 @@ To run:
 ```bash
 # Build the WASM module first
 cd ../../  # back to zig-parquet root
-zig build -Dwasm_wasi -Dno_compression
+zig build -Dwasm_wasi -Dcodecs=none
 
 # Run the host example
 cd examples/wasm_demo

@@ -82,7 +82,7 @@ test "read dictionary_high_cardinality.parquet" {
 }
 
 test "read compression_zstd.parquet" {
-    if (build_options.no_compression) return;
+    if (!build_options.enable_zstd) return;
     const allocator = std.testing.allocator;
 
     const file = std.fs.cwd().openFile("../test-files-arrow/compression/compression_zstd.parquet", .{}) catch |err| {
@@ -118,7 +118,7 @@ test "read compression_zstd.parquet" {
 }
 
 test "read compression_gzip.parquet" {
-    if (build_options.no_compression) return;
+    if (!build_options.enable_gzip) return;
     const allocator = std.testing.allocator;
 
     const file = std.fs.cwd().openFile("../test-files-arrow/compression/compression_gzip.parquet", .{}) catch |err| {
@@ -234,7 +234,7 @@ test "read compression_none.parquet" {
 }
 
 test "read compression_snappy.parquet" {
-    if (build_options.no_compression) return;
+    if (!build_options.enable_snappy) return;
     const allocator = std.testing.allocator;
 
     const file = std.fs.cwd().openFile("../test-files-arrow/compression/compression_snappy.parquet", .{}) catch |err| {
@@ -268,7 +268,7 @@ test "read compression_snappy.parquet" {
 }
 
 test "read compression_lz4.parquet" {
-    if (build_options.no_compression) return;
+    if (!build_options.enable_lz4) return;
     const allocator = std.testing.allocator;
 
     const file = std.fs.cwd().openFile("../test-files-arrow/compression/compression_lz4.parquet", .{}) catch |err| {
@@ -302,7 +302,7 @@ test "read compression_lz4.parquet" {
 }
 
 test "read compression_brotli.parquet" {
-    if (build_options.no_compression) return;
+    if (!build_options.enable_brotli) return;
     const allocator = std.testing.allocator;
 
     const file = std.fs.cwd().openFile("../test-files-arrow/compression/compression_brotli.parquet", .{}) catch |err| {

@@ -8,7 +8,6 @@ const format = @import("../../core/format.zig");
 const CompressionCodec = format.CompressionCodec;
 
 const build_options = @import("build_options");
-const no_compression = build_options.no_compression;
 pub const version: [:0]const u8 = build_options.version[0..build_options.version.len :0];
 
 pub fn getVersion() [*:0]const u8 {
@@ -17,11 +16,13 @@ pub fn getVersion() [*:0]const u8 {
 
 pub fn isCodecSupported(codec: i32) i32 {
     const c = CompressionCodec.fromInt(codec) catch return 0;
-    if (no_compression) {
-        return if (c == .uncompressed) 1 else 0;
-    }
     return switch (c) {
-        .uncompressed, .snappy, .gzip, .brotli, .zstd, .lz4_raw => 1,
+        .uncompressed => 1,
+        .zstd => if (build_options.enable_zstd) 1 else 0,
+        .snappy => if (build_options.enable_snappy) 1 else 0,
+        .gzip => if (build_options.enable_gzip) 1 else 0,
+        .lz4_raw => if (build_options.enable_lz4) 1 else 0,
+        .brotli => if (build_options.enable_brotli) 1 else 0,
         .lzo, .lz4 => 0,
     };
 }

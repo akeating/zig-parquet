@@ -9,7 +9,7 @@ pub fn build(b: *std.Build) void {
             .os_tag = .freestanding,
         }),
         .optimize = optimize,
-        .no_compression = true,
+        .codecs = "none",
     });
 
     const exe = b.addExecutable(.{
