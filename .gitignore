@@ -1,7 +1,4 @@
-arrow
-parquet-go
-parquet-format
-parquet-java
+.dev
 .pylibs
 
 # Zig
@@ -14,7 +11,3 @@ zig-out/
 # Python
 __pycache__/
 *.py[cod]
-
-avro
-iceberg
-docs
