@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.4] - 2026-03-28
+
+### Changed
+- Replace `-Dno_compression` with per-codec `-Dcodecs=` build option — enable any combination of zstd, snappy, gzip, lz4, brotli (default: all)
+
+### Fixed
+- Fix key-only map regression: fall back to list (Arrow C++ approach)
+
+### Added
+- Add validate-wild step to CI pipeline
+
 ## [0.1.3] - 2026-03-27
 
 ### Fixed
@@ -63,6 +74,7 @@ Initial release.
 - Hardening: safe casting, bounds checking, no `@intCast` on external data
 - 219/219 pass rate on supported Apache parquet-testing files
 
+[0.1.4]: https://github.com/akeating/zig-parquet/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/akeating/zig-parquet/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/akeating/zig-parquet/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/akeating/zig-parquet/compare/v0.1.0...v0.1.1
