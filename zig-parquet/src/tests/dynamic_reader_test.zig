@@ -313,7 +313,7 @@ test "DynamicReader: multiple row groups" {
 // =============================================================================
 
 test "DynamicReader: compressed data roundtrip" {
-    if (!build_options.enable_zstd) return;
+    if (!build_options.supports_zstd) return;
     const allocator = std.testing.allocator;
 
     const tmp_path = "test_dynamic_compressed.parquet";

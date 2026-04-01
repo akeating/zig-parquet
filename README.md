@@ -12,7 +12,7 @@ A native Parquet library built for portability, embeddability, and low deploymen
 - **Full Read/Write Support** - Read and write Parquet files with all physical and logical types
 - **All Standard Encodings** - PLAIN, RLE, DICTIONARY, DELTA_BINARY_PACKED, DELTA_LENGTH_BYTE_ARRAY, DELTA_BYTE_ARRAY, BYTE_STREAM_SPLIT
 - **Nested Types** - Lists, structs, maps, and arbitrary nesting depth
-- **Compression** - zstd, gzip, snappy, lz4, brotli (via C/C++ libraries, individually selectable)
+- **Compression** - zstd, gzip, snappy, lz4, brotli (individually selectable; experimental pure Zig zstd available)
 - **Logical Types** - STRING, DATE, TIME, TIMESTAMP (millis/micros/nanos), DECIMAL, UUID, INT annotations, FLOAT16, ENUM, JSON, BSON, INTERVAL, GEOMETRY, GEOGRAPHY
 - **Dynamic Row API** - Runtime `DynamicWriter` / `DynamicReader` for all types and arbitrary nesting depth
 - **Schema-Agnostic Reading** - Read any Parquet file without knowing the schema at compile time
@@ -277,36 +277,30 @@ See `examples/basic/03_nested_types.zig` for a complete example.
 
 ## Compression
 
-All major Parquet compression codecs are supported:
+All major Parquet compression codecs are supported, individually selectable at build time:
 
-| Codec | Library | Notes |
-|-------|---------|-------|
-| zstd | libzstd 1.5.7 | Recommended default |
-| gzip | zlib 1.3.1 | Wide compatibility |
-| snappy | snappy 1.2.2 | Fast, moderate ratio |
-| lz4 | lz4 1.10.0 | Very fast |
-| brotli | brotli 1.2.0 | High ratio |
-
-Set compression on the writer:
+| Codec | Implementation | Notes |
+|-------|---------------|-------|
+| zstd | C libzstd 1.5.7 | Recommended default |
+| gzip | C zlib 1.3.1 | Wide compatibility |
+| snappy | C++ snappy 1.2.2 | Fast, moderate ratio |
+| lz4 | C lz4 1.10.0 | Very fast |
+| brotli | C brotli 1.2.0 | High ratio |
+| zig-zstd | Pure Zig (experimental) | No C dependency; level-1 compressor + stdlib decompressor |
 
 ```zig
 var writer = try parquet.createFileDynamic(allocator, file);
 writer.setCompression(.zstd);
 ```
 
-### Build-Time Codec Selection
-
-Control which compression codecs are compiled into your binary:
-
 ```bash
-zig build                           # all codecs (default)
+zig build                           # all codecs (default: C libs)
 zig build -Dcodecs=none             # no compression (smallest binary)
 zig build -Dcodecs=zstd,snappy      # only zstd and snappy
-zig build -Dcodecs=zstd             # just zstd
-zig build -Dcodecs=gzip,lz4,zstd    # specific mix
+zig build -Dcodecs=zig-only         # all pure Zig codecs (no C/C++ deps)
 ```
 
-Disabled codecs return `UnsupportedCompression` at runtime. Dependencies are only fetched for enabled codecs.
+See [zig-parquet/COMPRESSION.md](zig-parquet/COMPRESSION.md) for build sizes, API details, and the full set of build options.
 
 ### Per-Column and Per-Leaf Options
 
@@ -353,7 +347,7 @@ writer.setMaxPageSize(1_048_576);      // 1MB page size limit
 | UNCOMPRESSED | ✅ | |
 | SNAPPY | ✅ | Via C++ library |
 | GZIP | ✅ | Via zlib |
-| ZSTD | ✅ | Via libzstd |
+| ZSTD | ✅ | C libzstd (default) or pure Zig (experimental via `zig-zstd`) |
 | LZ4_RAW | ✅ | Via lz4 |
 | BROTLI | ✅ | Via brotli |
 | LZ4 (non-raw) | ❌ | Hadoop-specific framing format |
@@ -397,21 +391,7 @@ Files containing unsupported features return explicit errors rather than silentl
 
 ## WASM Support
 
-Binary sizes (`ReleaseSmall`, brotli-compressed):
-
-| | Plain | With Compression |
-|---|---|---|
-| **WASI** (`wasm32-wasi`) | 103 KB | 438 KB |
-| **Browser** (`wasm32-freestanding`) | 103 KB | — |
-
-Raw (uncompressed):
-
-| | Plain | With Compression |
-|---|---|---|
-| **WASI** | 517 KB | 1.7 MB |
-| **Browser** | 519 KB | — |
-
-Browser + compression is not currently supported
+Both `wasm32-wasi` and `wasm32-freestanding` targets are supported. WASI supports all codecs via `-Dcodecs=`; freestanding builds without compression. See [zig-parquet/COMPRESSION.md](zig-parquet/COMPRESSION.md) for per-codec WASM binary sizes.
 
 Build for WASI:
 
@@ -440,7 +420,7 @@ See `examples/wasm_demo/` and `examples/wasm_freestanding/` for usage examples.
 ## Requirements
 
 - **Zig 0.15.2**
-- C compiler (for compression libraries; not needed with `-Dcodecs=none`)
+- C compiler (for compression libraries; not needed with `-Dcodecs=none` or `-Dcodecs=zig-only`)
 - C++ compiler (for Snappy; not needed if snappy is excluded)
 
 ## License

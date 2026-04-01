@@ -29,7 +29,7 @@ test "compression codec in ColumnDef" {
 }
 
 test "round-trip with zstd compression" {
-    if (!build_options.enable_zstd) return;
+    if (!build_options.supports_zstd) return;
     const allocator = std.testing.allocator;
 
     var tmp_dir = std.testing.tmpDir(.{});
@@ -90,7 +90,7 @@ test "round-trip with zstd compression" {
 }
 
 test "round-trip zstd compression with byte arrays" {
-    if (!build_options.enable_zstd) return;
+    if (!build_options.supports_zstd) return;
     const allocator = std.testing.allocator;
 
     var tmp_dir = std.testing.tmpDir(.{});
@@ -151,7 +151,7 @@ test "round-trip zstd compression with byte arrays" {
 }
 
 test "round-trip mixed compression (zstd and uncompressed)" {
-    if (!build_options.enable_zstd) return;
+    if (!build_options.supports_zstd) return;
     const allocator = std.testing.allocator;
 
     var tmp_dir = std.testing.tmpDir(.{});

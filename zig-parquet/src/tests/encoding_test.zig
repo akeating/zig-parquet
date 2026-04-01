@@ -82,7 +82,7 @@ test "read dictionary_high_cardinality.parquet" {
 }
 
 test "read compression_zstd.parquet" {
-    if (!build_options.enable_zstd) return;
+    if (!build_options.supports_zstd) return;
     const allocator = std.testing.allocator;
 
     const file = std.fs.cwd().openFile("../test-files-arrow/compression/compression_zstd.parquet", .{}) catch |err| {

@@ -18,7 +18,7 @@ pub fn isCodecSupported(codec: i32) i32 {
     const c = CompressionCodec.fromInt(codec) catch return 0;
     return switch (c) {
         .uncompressed => 1,
-        .zstd => if (build_options.enable_zstd) 1 else 0,
+        .zstd => if (build_options.supports_zstd) 1 else 0,
         .snappy => if (build_options.enable_snappy) 1 else 0,
         .gzip => if (build_options.enable_gzip) 1 else 0,
         .lz4_raw => if (build_options.enable_lz4) 1 else 0,

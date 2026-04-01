@@ -16,7 +16,7 @@ const ALL_CODECS = blk: {
     var n: usize = 0;
     codecs[n] = .uncompressed;
     n += 1;
-    if (build_options.enable_zstd) {
+    if (build_options.supports_zstd) {
         codecs[n] = .zstd;
         n += 1;
     }
@@ -176,7 +176,7 @@ test "round-trip all codecs with mixed types" {
 }
 
 test "round-trip with nullable columns" {
-    if (!build_options.enable_zstd) return;
+    if (!build_options.supports_zstd) return;
     const allocator = std.testing.allocator;
 
     var tmp_dir = std.testing.tmpDir(.{});
@@ -467,7 +467,7 @@ test "round-trip logical types" {
 }
 
 test "round-trip validates compression actually works" {
-    if (!build_options.enable_zstd) return;
+    if (!build_options.supports_zstd) return;
     const allocator = std.testing.allocator;
 
     var tmp_dir = std.testing.tmpDir(.{});
@@ -2949,7 +2949,7 @@ test "round-trip optional nested list (DynamicWriter)" {
 }
 
 test "round-trip struct with per-leaf path properties (DynamicWriter)" {
-    if (!build_options.enable_snappy or !build_options.enable_zstd) return;
+    if (!build_options.enable_snappy or !build_options.supports_zstd) return;
     const allocator = std.testing.allocator;
 
     var writer = try parquet.createBufferDynamic(allocator);
@@ -3005,7 +3005,7 @@ test "round-trip struct with per-leaf path properties (DynamicWriter)" {
 }
 
 test "path properties with list column (items.list.element)" {
-    if (!build_options.enable_zstd) return;
+    if (!build_options.supports_zstd) return;
     const allocator = std.testing.allocator;
 
     var writer = try parquet.createBufferDynamic(allocator);
@@ -3059,7 +3059,7 @@ test "path properties with list column (items.list.element)" {
 }
 
 test "path properties override column-level properties" {
-    if (!build_options.enable_snappy or !build_options.enable_zstd) return;
+    if (!build_options.enable_snappy or !build_options.supports_zstd) return;
     const allocator = std.testing.allocator;
 
     var writer = try parquet.createBufferDynamic(allocator);
@@ -3160,7 +3160,7 @@ test "path properties with non-matching path are silently ignored" {
 }
 
 test "per-leaf compression verified in file metadata" {
-    if (!build_options.enable_gzip or !build_options.enable_snappy or !build_options.enable_zstd) return;
+    if (!build_options.enable_gzip or !build_options.enable_snappy or !build_options.supports_zstd) return;
     const allocator = std.testing.allocator;
 
     var writer = try parquet.createBufferDynamic(allocator);
