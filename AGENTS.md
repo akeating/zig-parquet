@@ -119,7 +119,7 @@ _ = arena.reset(.retain_capacity);
 
 ### Build Options (Conditional Compilation)
 
-Compression codecs are controlled via `-Dcodecs=` (default: all). Values: `all`, `none`, `zig-only`, or comma-separated list of: `zstd,zig-zstd,snappy,gzip,lz4,brotli`.
+Compression codecs are controlled via `-Dcodecs=` (default: all). Values: `all`, `none`, `zig-only`, or comma-separated list of: `zstd,zig-zstd,snappy,zig-snappy,gzip,lz4,brotli`.
 
 ```zig
 // Stable codecs at top level, experimental behind namespace
@@ -128,12 +128,13 @@ pub const snappy = if (build_options.enable_snappy) @import("snappy.zig") else {
 
 pub const experimental = struct {
     pub const zig_zstd = if (build_options.enable_zig_zstd) @import("zig_zstd.zig") else {};
+    pub const zig_snappy = if (build_options.enable_zig_snappy) @import("zig_snappy.zig") else {};
 };
 ```
 
 Build option flags:
-- Implementation-specific: `enable_zstd` (C), `enable_zig_zstd` (Zig), `enable_snappy`, `enable_gzip`, `enable_lz4`, `enable_brotli`
-- Category: `supports_zstd` (true if either C or Zig zstd is enabled)
+- Implementation-specific: `enable_zstd` (C), `enable_zig_zstd` (Zig), `enable_snappy` (C++), `enable_zig_snappy` (Zig), `enable_gzip`, `enable_lz4`, `enable_brotli`
+- Category: `supports_zstd` (true if either C or Zig zstd is enabled), `supports_snappy` (true if either C++ or Zig snappy is enabled)
 
 In tests, guard codec-specific tests with `supports_*` flags:
 

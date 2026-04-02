@@ -19,7 +19,7 @@ pub fn isCodecSupported(codec: i32) i32 {
     return switch (c) {
         .uncompressed => 1,
         .zstd => if (build_options.supports_zstd) 1 else 0,
-        .snappy => if (build_options.enable_snappy) 1 else 0,
+        .snappy => if (build_options.supports_snappy) 1 else 0,
         .gzip => if (build_options.enable_gzip) 1 else 0,
         .lz4_raw => if (build_options.enable_lz4) 1 else 0,
         .brotli => if (build_options.enable_brotli) 1 else 0,

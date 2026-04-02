@@ -287,6 +287,7 @@ All major Parquet compression codecs are supported, individually selectable at b
 | lz4 | C lz4 1.10.0 | Very fast |
 | brotli | C brotli 1.2.0 | High ratio |
 | zig-zstd | Pure Zig (experimental) | No C dependency; level-1 compressor + stdlib decompressor |
+| zig-snappy | Pure Zig (experimental) | No C/C++ dependency; full Snappy block format |
 
 ```zig
 var writer = try parquet.createFileDynamic(allocator, file);

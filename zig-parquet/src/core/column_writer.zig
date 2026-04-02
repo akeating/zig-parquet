@@ -2569,7 +2569,7 @@ test "write nullable byte array column tracks null_count in statistics" {
 }
 
 test "compressed column tracks uncompressed vs compressed sizes separately" {
-    if (!build_options.enable_snappy) return;
+    if (!build_options.supports_snappy) return;
     const allocator = std.testing.allocator;
 
     var aw: std.Io.Writer.Allocating = .init(allocator);

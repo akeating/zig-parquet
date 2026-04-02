@@ -1123,7 +1123,7 @@ test "C ABI struct with bool field roundtrip" {
 }
 
 test "C ABI row writer options: compression, kv metadata" {
-    if (!build_options.enable_snappy) return;
+    if (!build_options.supports_snappy) return;
     var w_handle: ?*anyopaque = null;
     try std.testing.expectEqual(c_err.ZP_OK, c_row_writer.zp_row_writer_open_memory(&w_handle));
 

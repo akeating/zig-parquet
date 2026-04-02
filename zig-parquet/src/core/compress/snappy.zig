@@ -12,6 +12,7 @@ pub const Error = error{
     CompressionError,
     DecompressionError,
     OutOfMemory,
+    InvalidSize,
 };
 
 /// Compress data using Snappy

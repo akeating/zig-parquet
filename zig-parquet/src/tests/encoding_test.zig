@@ -234,7 +234,7 @@ test "read compression_none.parquet" {
 }
 
 test "read compression_snappy.parquet" {
-    if (!build_options.enable_snappy) return;
+    if (!build_options.supports_snappy) return;
     const allocator = std.testing.allocator;
 
     const file = std.fs.cwd().openFile("../test-files-arrow/compression/compression_snappy.parquet", .{}) catch |err| {

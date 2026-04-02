@@ -340,7 +340,7 @@ test "round-trip gzip compression with byte arrays" {
 }
 
 test "round-trip with snappy compression" {
-    if (!build_options.enable_snappy) return;
+    if (!build_options.supports_snappy) return;
     const allocator = std.testing.allocator;
 
     var tmp_dir = std.testing.tmpDir(.{});
@@ -401,7 +401,7 @@ test "round-trip with snappy compression" {
 }
 
 test "round-trip snappy compression with byte arrays" {
-    if (!build_options.enable_snappy) return;
+    if (!build_options.supports_snappy) return;
     const allocator = std.testing.allocator;
 
     var tmp_dir = std.testing.tmpDir(.{});

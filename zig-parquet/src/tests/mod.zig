@@ -30,4 +30,5 @@ test {
     _ = @import("c_abi_test.zig");
     _ = @import("negative_test.zig");
     _ = @import("zstd_cross_test.zig");
+    _ = @import("snappy_cross_test.zig");
 }

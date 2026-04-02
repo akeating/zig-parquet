@@ -4,7 +4,7 @@
 //! compression and decompression for supported codecs.
 //!
 //! Use `-Dcodecs=` to control which codecs are included (default: all).
-//! Values: all, none, zig-only, or comma-separated list of: zstd,zig-zstd,snappy,gzip,lz4,brotli
+//! Values: all, none, zig-only, or comma-separated list of: zstd,zig-zstd,snappy,zig-snappy,gzip,lz4,brotli
 
 const build_options = @import("build_options");
 
@@ -16,6 +16,7 @@ pub const brotli = if (build_options.enable_brotli) @import("brotli.zig") else {
 
 pub const experimental = struct {
     pub const zig_zstd = if (build_options.enable_zig_zstd) @import("zig_zstd.zig") else {};
+    pub const zig_snappy = if (build_options.enable_zig_snappy) @import("zig_snappy.zig") else {};
 };
 
 const std = @import("std");
@@ -78,6 +79,14 @@ pub fn compress(
                     error.CompressionError => return error.CompressionError,
                     error.OutOfMemory => return error.OutOfMemory,
                     error.DecompressionError => return error.CompressionError,
+                    error.InvalidSize => return error.CompressionError,
+                };
+            } else if (build_options.enable_zig_snappy) {
+                return experimental.zig_snappy.compress(allocator, data) catch |e| switch (e) {
+                    error.CompressionError => return error.CompressionError,
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.DecompressionError => return error.CompressionError,
+                    error.InvalidSize => return error.CompressionError,
                 };
             }
             return error.UnsupportedCompression;
@@ -172,6 +181,14 @@ pub fn decompress(
                     error.DecompressionError => return error.DecompressionError,
                     error.OutOfMemory => return error.OutOfMemory,
                     error.CompressionError => return error.DecompressionError,
+                    error.InvalidSize => return error.DecompressionError,
+                };
+            } else if (build_options.enable_zig_snappy) {
+                return experimental.zig_snappy.decompress(allocator, compressed, uncompressed_size) catch |e| switch (e) {
+                    error.DecompressionError => return error.DecompressionError,
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.CompressionError => return error.DecompressionError,
+                    error.InvalidSize => return error.DecompressionError,
                 };
             }
             return error.UnsupportedCompression;

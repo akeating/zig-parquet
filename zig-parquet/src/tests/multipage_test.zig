@@ -397,7 +397,7 @@ test "multi-page: with zstd compression" {
 }
 
 test "multi-page: list with snappy compression" {
-    if (!build_options.enable_snappy) return;
+    if (!build_options.supports_snappy) return;
     const allocator = std.testing.allocator;
     const row_count = 100;
 
