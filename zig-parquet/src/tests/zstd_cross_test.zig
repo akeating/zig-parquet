@@ -488,3 +488,156 @@ test "edge: two bytes" {
 test "edge: three bytes" {
     try zigRoundTrip(std.testing.allocator, "ABC");
 }
+
+// =========================================================================
+// Write-path: literals header encoding boundaries
+// =========================================================================
+
+test "write-path: literal header boundary 31→32 bytes" {
+    const allocator = std.testing.allocator;
+    // 31 unique bytes + matchable suffix → 1-byte lit header
+    var data31: [31 + 8]u8 = undefined;
+    for (data31[0..31], 0..) |*b, i| b.* = @truncate(i +% 0x80);
+    @memcpy(data31[31..39], data31[0..8]);
+    try crossRoundTrip(allocator, &data31);
+
+    // 32 unique bytes + matchable suffix → 2-byte lit header
+    var data32: [32 + 8]u8 = undefined;
+    for (data32[0..32], 0..) |*b, i| b.* = @truncate(i +% 0x80);
+    @memcpy(data32[32..40], data32[0..8]);
+    try crossRoundTrip(allocator, &data32);
+}
+
+test "write-path: literal header boundary 4095→4096 bytes" {
+    const allocator = std.testing.allocator;
+    // 4095 unique literals before a match → 2-byte lit header
+    const size95 = 4095 + 8;
+    const d95 = try allocator.alloc(u8, size95);
+    defer allocator.free(d95);
+    var prng = std.Random.DefaultPrng.init(0xA0A0);
+    prng.random().bytes(d95[0..4095]);
+    @memcpy(d95[4095..][0..8], d95[0..8]);
+    try crossRoundTrip(allocator, d95);
+
+    // 4096 unique literals before a match → 3-byte lit header
+    const size96 = 4096 + 8;
+    const d96 = try allocator.alloc(u8, size96);
+    defer allocator.free(d96);
+    prng.random().bytes(d96[0..4096]);
+    @memcpy(d96[4096..][0..8], d96[0..8]);
+    try crossRoundTrip(allocator, d96);
+}
+
+// =========================================================================
+// Write-path: sequence count encoding boundaries
+// =========================================================================
+
+test "write-path: 128+ sequences (2-byte seq count header)" {
+    const allocator = std.testing.allocator;
+    // Pattern: 4-byte match, 4-byte unique filler → ~1 sequence per 8 bytes
+    // 130 * 8 = 1040 bytes should produce ~130 sequences
+    const n = 130;
+    var data: [n * 8]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(0xBBBB);
+    for (0..n) |i| {
+        @memcpy(data[i * 8 ..][0..4], "MTCH");
+        prng.random().bytes(data[i * 8 + 4 ..][0..4]);
+    }
+    try crossRoundTrip(allocator, &data);
+}
+
+// =========================================================================
+// Write-path: large LL/ML codes (formula path)
+// =========================================================================
+
+test "write-path: large literal length >= 64 (getLLCode formula path)" {
+    const allocator = std.testing.allocator;
+    // 80 unique bytes, then a matchable pattern — forces lit_length=80 which uses the formula
+    var data: [200]u8 = undefined;
+    for (data[0..80], 0..) |*b, i| b.* = @truncate(i *% 3 +% 0x41);
+    @memcpy(data[80..120], data[0..40]);
+    @memcpy(data[120..160], data[0..40]);
+    @memcpy(data[160..200], data[0..40]);
+    try crossRoundTrip(allocator, &data);
+}
+
+test "write-path: large match length >= 131 (getMLCode formula path)" {
+    const allocator = std.testing.allocator;
+    // Unique prefix, then a 200-byte repeating pattern that creates a long match
+    var data: [608]u8 = undefined;
+    // 8-byte unique header
+    @memcpy(data[0..8], "UNIQUEHD");
+    // 200-byte pattern
+    for (0..200) |i| data[8 + i] = @truncate(i *% 7 +% 11);
+    // Repeat same 200-byte pattern → match_length=200 (>131)
+    @memcpy(data[208..408], data[8..208]);
+    // And once more
+    @memcpy(data[408..608], data[8..208]);
+    try crossRoundTrip(allocator, &data);
+}
+
+// =========================================================================
+// Write-path: large offset codes
+// =========================================================================
+
+test "write-path: match at large distance (high offset code)" {
+    const allocator = std.testing.allocator;
+    // Place a pattern at start, fill 40KB of random, then repeat the pattern
+    const gap = 40 * 1024;
+    const size = 16 + gap + 16;
+    const data = try allocator.alloc(u8, size);
+    defer allocator.free(data);
+    @memcpy(data[0..16], "DISTANT_PATTERN!");
+    var prng = std.Random.DefaultPrng.init(0xFACE);
+    prng.random().bytes(data[16..][0..gap]);
+    @memcpy(data[16 + gap ..][0..16], "DISTANT_PATTERN!");
+    try crossRoundTrip(allocator, data);
+}
+
+// =========================================================================
+// Write-path: mixed compressed/raw blocks in same frame
+// =========================================================================
+
+test "write-path: mixed compressed and raw blocks" {
+    const allocator = std.testing.allocator;
+    // Block 1 (128KB): highly compressible
+    // Block 2 (128KB): random/incompressible → raw block fallback
+    const block = 1 << 17;
+    const data = try allocator.alloc(u8, 2 * block);
+    defer allocator.free(data);
+    @memset(data[0..block], 'A');
+    var prng = std.Random.DefaultPrng.init(0xDEAD);
+    prng.random().bytes(data[block..]);
+    try crossRoundTrip(allocator, data);
+}
+
+// =========================================================================
+// Write-path: single-sequence block (no reverse loop)
+// =========================================================================
+
+test "write-path: single match in block (1 sequence, no reverse loop)" {
+    const allocator = std.testing.allocator;
+    // Unique data then one match at the end — produces exactly 1 sequence
+    var data: [64]u8 = undefined;
+    for (data[0..56], 0..) |*b, i| b.* = @truncate(i +% 0x30);
+    @memcpy(data[56..64], data[0..8]);
+    try crossRoundTrip(allocator, &data);
+}
+
+// =========================================================================
+// Write-path: rep[0] with 1-byte literal gap
+// =========================================================================
+
+test "write-path: rep[0] match with single literal byte gap" {
+    const allocator = std.testing.allocator;
+    // Pattern: match at offset 8, then 1 filler byte, then rep[0] should fire
+    var data: [4000]u8 = undefined;
+    @memcpy(data[0..8], "ABCDEFGH");
+    var pos: usize = 8;
+    while (pos + 9 <= data.len) {
+        data[pos] = @truncate(pos); // 1 literal byte
+        @memcpy(data[pos + 1 ..][0..8], "ABCDEFGH");
+        pos += 9;
+    }
+    try crossRoundTrip(allocator, data[0..pos]);
+}
