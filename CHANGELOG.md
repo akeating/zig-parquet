@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.5] - 2026-03-27
+
+### Added
+- Dual codec system: stable C/C++ implementations alongside experimental pure Zig compressors
+- Experimental pure Zig zstd compressor (level 1, raw literals, predefined FSE tables)
+- Experimental pure Zig snappy compressor and decompressor (full block format)
+- `-Dcodecs=zig-zstd`, `-Dcodecs=zig-snappy`, `-Dcodecs=zig-only` build options
+- `compress.experimental` API namespace for Zig codec implementations
+- Cross-implementation test suites validating C↔Zig interoperability for zstd and snappy
+- Write-path targeted tests for Zig zstd compressor (literals header boundaries, sequence count encoding, large LL/ML codes, large offsets, mixed block types, rep[0] gaps)
+- COMPRESSION.md with codec details, build sizes, and API documentation
+
+### Changed
+- Stable C/C++ codecs remain default; dispatch falls back to Zig when stable is unavailable
+- `supports_zstd` / `supports_snappy` build flags now cover both implementations
+
 ## [0.1.4] - 2026-03-28
 
 ### Changed
@@ -74,6 +90,7 @@ Initial release.
 - Hardening: safe casting, bounds checking, no `@intCast` on external data
 - 219/219 pass rate on supported Apache parquet-testing files
 
+[0.1.5]: https://github.com/akeating/zig-parquet/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/akeating/zig-parquet/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/akeating/zig-parquet/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/akeating/zig-parquet/compare/v0.1.1...v0.1.2
