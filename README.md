@@ -300,7 +300,7 @@ zig build -Dcodecs=zstd,snappy      # only zstd and snappy
 zig build -Dcodecs=zig-only         # all pure Zig codecs (no C/C++ deps)
 ```
 
-See [zig-parquet/COMPRESSION.md](zig-parquet/COMPRESSION.md) for build sizes, API details, and the full set of build options.
+See [COMPRESSION.md](COMPRESSION.md) for build sizes, API details, and the full set of build options.
 
 ### Per-Column and Per-Leaf Options
 
@@ -391,7 +391,7 @@ Files containing unsupported features return explicit errors rather than silentl
 
 ## WASM Support
 
-Both `wasm32-wasi` and `wasm32-freestanding` targets are supported. WASI supports all codecs via `-Dcodecs=`; freestanding builds without compression. See [zig-parquet/COMPRESSION.md](zig-parquet/COMPRESSION.md) for per-codec WASM binary sizes.
+Both `wasm32-wasi` and `wasm32-freestanding` targets are supported. WASI supports all codecs via `-Dcodecs=`; freestanding builds without compression. See [COMPRESSION.md](COMPRESSION.md) for per-codec WASM binary sizes.
 
 Build for WASI:
 
