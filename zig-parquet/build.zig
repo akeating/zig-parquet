@@ -8,7 +8,7 @@ pub fn build(b: *std.Build) void {
     const codecs_str = b.option(
         []const u8,
         "codecs",
-        "Compression codecs (default: all). Values: all, stable, none, zig-only, or comma-separated list of: zstd,zig-zstd,snappy,zig-snappy,gzip,lz4,brotli",
+        "Compression codecs (default: all). Values: all, stable, none, zig-only, or comma-separated list of: zstd,zig-zstd,snappy,zig-snappy,gzip,zig-gzip,lz4,brotli",
     ) orelse "all";
 
     const codecs = parseCodecs(codecs_str);
@@ -21,6 +21,8 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "enable_zig_snappy", codecs.zig_snappy);
     build_options.addOption(bool, "supports_snappy", codecs.snappy or codecs.zig_snappy);
     build_options.addOption(bool, "enable_gzip", codecs.gzip);
+    build_options.addOption(bool, "enable_zig_gzip", codecs.zig_gzip);
+    build_options.addOption(bool, "supports_gzip", codecs.gzip or codecs.zig_gzip);
     build_options.addOption(bool, "enable_lz4", codecs.lz4);
     build_options.addOption(bool, "enable_brotli", codecs.brotli);
     build_options.addOption([]const u8, "version", zon.version);
@@ -84,6 +86,8 @@ pub fn build(b: *std.Build) void {
         wasm_opts.addOption(bool, "enable_zig_snappy", codecs.zig_snappy);
         wasm_opts.addOption(bool, "supports_snappy", codecs.snappy or codecs.zig_snappy);
         wasm_opts.addOption(bool, "enable_gzip", codecs.gzip);
+        wasm_opts.addOption(bool, "enable_zig_gzip", codecs.zig_gzip);
+        wasm_opts.addOption(bool, "supports_gzip", codecs.gzip or codecs.zig_gzip);
         wasm_opts.addOption(bool, "enable_lz4", codecs.lz4);
         wasm_opts.addOption(bool, "enable_brotli", codecs.brotli);
         wasm_opts.addOption([]const u8, "version", zon.version);
@@ -124,6 +128,8 @@ pub fn build(b: *std.Build) void {
         freestanding_opts.addOption(bool, "enable_zig_snappy", false);
         freestanding_opts.addOption(bool, "supports_snappy", false);
         freestanding_opts.addOption(bool, "enable_gzip", false);
+        freestanding_opts.addOption(bool, "enable_zig_gzip", false);
+        freestanding_opts.addOption(bool, "supports_gzip", false);
         freestanding_opts.addOption(bool, "enable_lz4", false);
         freestanding_opts.addOption(bool, "enable_brotli", false);
         freestanding_opts.addOption([]const u8, "version", zon.version);
@@ -189,6 +195,8 @@ pub fn build(b: *std.Build) void {
         wasi_opts.addOption(bool, "enable_zig_snappy", false);
         wasi_opts.addOption(bool, "supports_snappy", false);
         wasi_opts.addOption(bool, "enable_gzip", false);
+        wasi_opts.addOption(bool, "enable_zig_gzip", false);
+        wasi_opts.addOption(bool, "supports_gzip", false);
         wasi_opts.addOption(bool, "enable_lz4", false);
         wasi_opts.addOption(bool, "enable_brotli", false);
         wasi_opts.addOption([]const u8, "version", zon.version);
@@ -216,6 +224,8 @@ pub fn build(b: *std.Build) void {
         free_opts.addOption(bool, "enable_zig_snappy", false);
         free_opts.addOption(bool, "supports_snappy", false);
         free_opts.addOption(bool, "enable_gzip", false);
+        free_opts.addOption(bool, "enable_zig_gzip", false);
+        free_opts.addOption(bool, "supports_gzip", false);
         free_opts.addOption(bool, "enable_lz4", false);
         free_opts.addOption(bool, "enable_brotli", false);
         free_opts.addOption([]const u8, "version", zon.version);
@@ -245,6 +255,7 @@ const Codecs = struct {
     snappy: bool, // C++ snappy
     zig_snappy: bool, // pure Zig snappy (experimental)
     gzip: bool,
+    zig_gzip: bool, // pure Zig gzip (experimental)
     lz4: bool,
     brotli: bool,
 
@@ -254,16 +265,17 @@ const Codecs = struct {
 };
 
 fn parseCodecs(str: []const u8) Codecs {
-    if (std.mem.eql(u8, str, "all")) return .{ .zstd = true, .zig_zstd = true, .snappy = true, .zig_snappy = true, .gzip = true, .lz4 = true, .brotli = true };
-    if (std.mem.eql(u8, str, "stable")) return .{ .zstd = true, .zig_zstd = false, .snappy = true, .zig_snappy = false, .gzip = true, .lz4 = true, .brotli = true };
-    if (std.mem.eql(u8, str, "none")) return .{ .zstd = false, .zig_zstd = false, .snappy = false, .zig_snappy = false, .gzip = false, .lz4 = false, .brotli = false };
-    if (std.mem.eql(u8, str, "zig-only")) return .{ .zstd = false, .zig_zstd = true, .snappy = false, .zig_snappy = true, .gzip = false, .lz4 = false, .brotli = false };
+    if (std.mem.eql(u8, str, "all")) return .{ .zstd = true, .zig_zstd = true, .snappy = true, .zig_snappy = true, .gzip = true, .zig_gzip = true, .lz4 = true, .brotli = true };
+    if (std.mem.eql(u8, str, "stable")) return .{ .zstd = true, .zig_zstd = false, .snappy = true, .zig_snappy = false, .gzip = true, .zig_gzip = false, .lz4 = true, .brotli = true };
+    if (std.mem.eql(u8, str, "none")) return .{ .zstd = false, .zig_zstd = false, .snappy = false, .zig_snappy = false, .gzip = false, .zig_gzip = false, .lz4 = false, .brotli = false };
+    if (std.mem.eql(u8, str, "zig-only")) return .{ .zstd = false, .zig_zstd = true, .snappy = false, .zig_snappy = true, .gzip = false, .zig_gzip = true, .lz4 = false, .brotli = false };
     return .{
         .zstd = containsCodec(str, "zstd"),
         .zig_zstd = containsCodec(str, "zig-zstd"),
         .snappy = containsCodec(str, "snappy"),
         .zig_snappy = containsCodec(str, "zig-snappy"),
         .gzip = containsCodec(str, "gzip"),
+        .zig_gzip = containsCodec(str, "zig-gzip"),
         .lz4 = containsCodec(str, "lz4"),
         .brotli = containsCodec(str, "brotli"),
     };
