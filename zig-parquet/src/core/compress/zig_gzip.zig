@@ -273,6 +273,16 @@ const HuffmanTree = struct {
         self.len.deinit(self.allocator);
     }
 
+    fn findMinPos(nodes: []const HuffmanNode, heap: []const usize) usize {
+        var min_pos: usize = 0;
+        for (1..heap.len) |i| {
+            if (nodes[heap[i]].freq < nodes[heap[min_pos]].freq) {
+                min_pos = i;
+            }
+        }
+        return min_pos;
+    }
+
     fn build(self: *HuffmanTree, max_bits: u5) !void {
         var nodes: std.ArrayList(HuffmanNode) = .empty;
         defer nodes.deinit(self.allocator);
@@ -299,42 +309,27 @@ const HuffmanTree = struct {
             try heap.append(self.allocator, nodes.items.len - 1);
         }
 
-        // Build tree via min-heap merging
+        // Build tree via min-heap merging (correct heap extraction)
         while (heap.items.len > 1) {
-            // Find two smallest
-            var min_idx1: usize = 0;
-            var min_idx2: usize = 1;
-            if (nodes.items[heap.items[min_idx2]].freq < nodes.items[heap.items[min_idx1]].freq) {
-                std.mem.swap(usize, &heap.items[min_idx1], &heap.items[min_idx2]);
-            }
+            // Extract minimum 1
+            const p1 = findMinPos(nodes.items, heap.items);
+            const left = heap.items[p1];
+            heap.items[p1] = heap.items[heap.items.len - 1];
+            _ = heap.pop();
 
-            for (heap.items[2..], 2..) |_, i| {
-                const freq = nodes.items[heap.items[i]].freq;
-                if (freq < nodes.items[heap.items[min_idx1]].freq) {
-                    min_idx2 = min_idx1;
-                    min_idx1 = i;
-                } else if (freq < nodes.items[heap.items[min_idx2]].freq) {
-                    min_idx2 = i;
-                }
-            }
+            // Extract minimum 2 (heap is now 1 shorter)
+            const p2 = findMinPos(nodes.items, heap.items);
+            const right = heap.items[p2];
+            heap.items[p2] = heap.items[heap.items.len - 1];
+            _ = heap.pop();
 
-            const left = heap.items[min_idx1];
-            const right = heap.items[min_idx2];
-            const parent_freq = nodes.items[left].freq +| nodes.items[right].freq;
-
+            // Merge and push parent
             try nodes.append(self.allocator, .{
-                .freq = parent_freq,
+                .freq = nodes.items[left].freq +| nodes.items[right].freq,
                 .left = left,
                 .right = right,
             });
-
-            // Swap with end and pop
-            const new_node_idx = nodes.items.len - 1;
-            if (min_idx1 > min_idx2) {
-                std.mem.swap(usize, &heap.items[min_idx1], &heap.items[min_idx2]);
-            }
-            heap.items[min_idx2] = new_node_idx;
-            _ = heap.pop();
+            try heap.append(self.allocator, nodes.items.len - 1);
         }
 
         // Assign code lengths by tree traversal
