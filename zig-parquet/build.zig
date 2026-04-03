@@ -8,7 +8,7 @@ pub fn build(b: *std.Build) void {
     const codecs_str = b.option(
         []const u8,
         "codecs",
-        "Compression codecs (default: all). Values: all, none, zig-only, or comma-separated list of: zstd,zig-zstd,snappy,zig-snappy,gzip,lz4,brotli",
+        "Compression codecs (default: all). Values: all, stable, none, zig-only, or comma-separated list of: zstd,zig-zstd,snappy,zig-snappy,gzip,lz4,brotli",
     ) orelse "all";
 
     const codecs = parseCodecs(codecs_str);
@@ -254,7 +254,8 @@ const Codecs = struct {
 };
 
 fn parseCodecs(str: []const u8) Codecs {
-    if (std.mem.eql(u8, str, "all")) return .{ .zstd = true, .zig_zstd = false, .snappy = true, .zig_snappy = false, .gzip = true, .lz4 = true, .brotli = true };
+    if (std.mem.eql(u8, str, "all")) return .{ .zstd = true, .zig_zstd = true, .snappy = true, .zig_snappy = true, .gzip = true, .lz4 = true, .brotli = true };
+    if (std.mem.eql(u8, str, "stable")) return .{ .zstd = true, .zig_zstd = false, .snappy = true, .zig_snappy = false, .gzip = true, .lz4 = true, .brotli = true };
     if (std.mem.eql(u8, str, "none")) return .{ .zstd = false, .zig_zstd = false, .snappy = false, .zig_snappy = false, .gzip = false, .lz4 = false, .brotli = false };
     if (std.mem.eql(u8, str, "zig-only")) return .{ .zstd = false, .zig_zstd = true, .snappy = false, .zig_snappy = true, .gzip = false, .lz4 = false, .brotli = false };
     return .{

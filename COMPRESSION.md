@@ -50,19 +50,36 @@ The `wasm32-freestanding` target hardcodes all codecs to disabled and produces a
 
 ## Build Options
 
+Presets:
+
 ```bash
-zig build                           # all codecs (default: C libs)
+zig build                           # all codecs (C + Zig, default for library)
+zig build -Dcodecs=stable           # stable C/C++ only (no experimental Zig)
 zig build -Dcodecs=none             # no compression
-zig build -Dcodecs=zstd,snappy      # only zstd and snappy
-zig build -Dcodecs=zstd             # C libzstd
-zig build -Dcodecs=zig-zstd         # experimental pure Zig zstd (no C deps)
 zig build -Dcodecs=zig-only         # all available pure Zig codecs
-zig build -Dcodecs=zig-snappy        # experimental pure Zig snappy (no C++ deps)
+```
+
+Custom combinations:
+
+```bash
+zig build -Dcodecs=zstd,snappy      # only zstd and snappy (C versions)
+zig build -Dcodecs=zstd             # C libzstd only
+zig build -Dcodecs=zig-zstd         # pure Zig zstd only (no C deps)
+zig build -Dcodecs=zig-snappy       # pure Zig snappy only (no C++ deps)
 zig build -Dcodecs=zstd,zig-zstd    # both zstd implementations (enables cross-impl tests)
 zig build -Dcodecs=snappy,zig-snappy # both snappy implementations (enables cross-impl tests)
 ```
 
 Disabled codecs return `UnsupportedCompression` at runtime. C dependencies are only fetched for enabled C codecs.
+
+### Preset Definitions
+
+| Preset | Zstd | Snappy | Gzip | LZ4 | Brotli | Zig Zstd | Zig Snappy | Use Case |
+|--------|------|--------|------|-----|--------|----------|------------|----------|
+| `all` | ✓ C | ✓ C | ✓ C | ✓ C | ✓ C | ✓ Zig | ✓ Zig | Maximum codec coverage (library testing) |
+| `stable` | ✓ C | ✓ C | ✓ C | ✓ C | ✓ C | ✗ | ✗ | Production use (pqi CLI, proven codecs only) |
+| `zig-only` | ✓ Zig | ✓ Zig | ✗ | ✗ | ✗ | ✓ Zig | ✓ Zig | No C/C++ dependencies |
+| `none` | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | Minimum binary |
 
 ## API
 

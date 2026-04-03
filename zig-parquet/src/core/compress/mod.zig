@@ -4,7 +4,7 @@
 //! compression and decompression for supported codecs.
 //!
 //! Use `-Dcodecs=` to control which codecs are included (default: all).
-//! Values: all, none, zig-only, or comma-separated list of: zstd,zig-zstd,snappy,zig-snappy,gzip,lz4,brotli
+//! Values: all, stable, none, zig-only, or comma-separated list of: zstd,zig-zstd,snappy,zig-snappy,gzip,lz4,brotli
 
 const build_options = @import("build_options");
 

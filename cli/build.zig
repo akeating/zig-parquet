@@ -6,9 +6,11 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     // Get the parquet library from the dependency
+    // Use stable codecs (C/C++ only, no experimental Zig implementations)
     const parquet_dep = b.dependency("parquet", .{
         .target = target,
         .optimize = optimize,
+        .codecs = "stable",
     });
 
     const build_options = b.addOptions();
