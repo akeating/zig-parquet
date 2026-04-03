@@ -242,6 +242,7 @@ fn distanceExtra(code: u8) u5 {
 
 const HuffmanNode = struct {
     freq: u32,
+    symbol: usize = 0,
     left: ?usize = null,
     right: ?usize = null,
 };
@@ -280,21 +281,22 @@ const HuffmanTree = struct {
         var heap: std.ArrayList(usize) = .empty;
         defer heap.deinit(self.allocator);
 
-        for (self.freq.items) |f| {
+        for (self.freq.items, 0..) |f, i| {
             if (f > 0) {
-                try nodes.append(self.allocator, .{ .freq = f });
+                try nodes.append(self.allocator, .{ .freq = f, .symbol = i });
                 try heap.append(self.allocator, nodes.items.len - 1);
             }
         }
 
         // Ensure at least 2 nodes (pkzip requirement)
+        const max_sym = self.len.items.len;
         if (heap.items.len == 0) {
-            try nodes.append(self.allocator, .{ .freq = 1 });
+            try nodes.append(self.allocator, .{ .freq = 1, .symbol = max_sym });
             try heap.append(self.allocator, 0);
         }
         if (heap.items.len == 1) {
-            try nodes.append(self.allocator, .{ .freq = 1 });
-            try heap.append(self.allocator, 1);
+            try nodes.append(self.allocator, .{ .freq = 1, .symbol = max_sym });
+            try heap.append(self.allocator, nodes.items.len - 1);
         }
 
         // Build tree via min-heap merging
@@ -318,7 +320,7 @@ const HuffmanTree = struct {
 
             const left = heap.items[min_idx1];
             const right = heap.items[min_idx2];
-            const parent_freq = nodes.items[left].freq + nodes.items[right].freq;
+            const parent_freq = nodes.items[left].freq +| nodes.items[right].freq;
 
             try nodes.append(self.allocator, .{
                 .freq = parent_freq,
@@ -351,7 +353,7 @@ const HuffmanTree = struct {
 
         if (node.left == null and node.right == null) {
             // Leaf node (symbol)
-            const sym_idx = node_idx;
+            const sym_idx = node.symbol;
             if (sym_idx < self.len.items.len and self.freq.items[sym_idx] > 0) {
                 self.len.items[sym_idx] = @intCast(@min(depth, max_bits));
                 if (depth <= max_bits) {
@@ -369,16 +371,22 @@ const HuffmanTree = struct {
     }
 
     fn genCodes(self: *HuffmanTree) void {
-        var next_code = [_]u32{0} ** 16;
-        var code: u32 = 0;
-
+        // RFC 1951 §3.2.2 canonical Huffman code assignment
+        // Step 1: count symbols per bit-length
+        var bl_count = [_]u32{0} ** 16;
         for (self.len.items) |len| {
-            if (len > 0) {
-                code = (code + 1) << 1;
-                next_code[len] = code;
-            }
+            if (len > 0) bl_count[len] += 1;
         }
 
+        // Step 2: compute starting code for each bit-length
+        var next_code = [_]u32{0} ** 16;
+        var code: u32 = 0;
+        for (1..16) |bits| {
+            code = (code + bl_count[bits - 1]) << 1;
+            next_code[bits] = code;
+        }
+
+        // Step 3: assign canonical codes, bit-reversed for LSB-first deflate
         for (self.len.items, 0..) |len, i| {
             if (len > 0) {
                 self.code.items[i] = bitReverse(next_code[len], len);
@@ -544,6 +552,108 @@ const Deflater = struct {
 };
 
 // =========================================================================
+// RLE Tree Descriptor Encoder
+// =========================================================================
+
+const BL_ORDER = [19]u8{ 16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15 };
+
+fn sendAllTrees(
+    allocator: std.mem.Allocator,
+    bw: *BitWriter,
+    lit_tree: *HuffmanTree,
+    dist_tree: *HuffmanTree,
+    nlit: usize,
+    ndist: usize,
+) !void {
+    // 1. Collect all bit-lengths to RLE-encode
+    var lens = std.ArrayList(u8).empty;
+    defer lens.deinit(allocator);
+    for (lit_tree.len.items[0..nlit]) |l| try lens.append(allocator, l);
+    for (dist_tree.len.items[0..ndist]) |l| try lens.append(allocator, l);
+
+    // 2. RLE encode into (code, extra_bits, extra_val) triples
+    const RleEntry = struct { code: u8, extra_bits: u5, extra_val: u32 };
+    var rle = std.ArrayList(RleEntry).empty;
+    defer rle.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < lens.items.len) {
+        const cur = lens.items[i];
+        // Count run length
+        var run: usize = 1;
+        while (i + run < lens.items.len and lens.items[i + run] == cur and run < 138) {
+            run += 1;
+        }
+        if (cur == 0) {
+            // Zero run: use code 17 (3-10) or 18 (11-138)
+            var j: usize = 0;
+            while (j < run) {
+                if (run - j >= 11) {
+                    const n = @min(run - j, 138);
+                    try rle.append(allocator, .{ .code = 18, .extra_bits = 7, .extra_val = @intCast(n - 11) });
+                    j += n;
+                } else if (run - j >= 3) {
+                    const n = @min(run - j, 10);
+                    try rle.append(allocator, .{ .code = 17, .extra_bits = 3, .extra_val = @intCast(n - 3) });
+                    j += n;
+                } else {
+                    try rle.append(allocator, .{ .code = 0, .extra_bits = 0, .extra_val = 0 });
+                    j += 1;
+                }
+            }
+        } else {
+            // Non-zero: emit first literally, then code 16 for repeats
+            try rle.append(allocator, .{ .code = cur, .extra_bits = 0, .extra_val = 0 });
+            var j: usize = 1;
+            while (j < run) {
+                const n = @min(run - j, 6);
+                if (n >= 3) {
+                    try rle.append(allocator, .{ .code = 16, .extra_bits = 2, .extra_val = @intCast(n - 3) });
+                    j += n;
+                } else {
+                    try rle.append(allocator, .{ .code = cur, .extra_bits = 0, .extra_val = 0 });
+                    j += 1;
+                }
+            }
+        }
+        i += run;
+    }
+
+    // 3. Count CL symbol frequencies and build bl_tree
+    var bl_tree = try HuffmanTree.init(allocator, BL_CODES);
+    defer bl_tree.deinit();
+    for (rle.items) |e| bl_tree.freq.items[e.code] += 1;
+    try bl_tree.build(MAX_BL_BITS);
+    bl_tree.genCodes();
+
+    // 4. Determine HCLEN: last non-zero in BL_ORDER (minimum 4)
+    var nblcodes: usize = 4;
+    var k: usize = BL_CODES;
+    while (k > 4) : (k -= 1) {
+        if (bl_tree.len.items[BL_ORDER[k - 1]] > 0) {
+            nblcodes = k;
+            break;
+        }
+    }
+
+    // 5. Write HCLEN and the CL alphabet lengths
+    try bw.writeBits(@intCast(nblcodes - 4), 4);
+    for (BL_ORDER[0..nblcodes]) |sym| {
+        try bw.writeBits(bl_tree.len.items[sym], 3);
+    }
+
+    // 6. Write RLE-encoded bit-length sequences
+    for (rle.items) |e| {
+        const code_val = bl_tree.code.items[e.code];
+        const code_bits = bl_tree.len.items[e.code];
+        try bw.writeBits(code_val, code_bits);
+        if (e.extra_bits > 0) {
+            try bw.writeBits(e.extra_val, e.extra_bits);
+        }
+    }
+}
+
+// =========================================================================
 // Block Encoder
 // =========================================================================
 
@@ -586,20 +696,46 @@ fn encodeBlock(allocator: std.mem.Allocator, bw: *BitWriter, tokens: []const Tok
     var dist_tree = try HuffmanTree.init(allocator, DISTANCES);
     defer dist_tree.deinit();
     @memcpy(dist_tree.freq.items, dist_freq.items);
+    // Guard: ensure at least one distance symbol (RFC 1951 requires HDIST >= 0, so >= 1 code)
+    var dist_sum: u32 = 0;
+    for (dist_freq.items) |f| dist_sum += f;
+    if (dist_sum == 0) {
+        dist_tree.freq.items[0] = 1;
+    }
     try dist_tree.build(15);
     dist_tree.genCodes();
 
-    // Write block header
-    const hlit = (countNonZero(lit_tree.len.items) -| 1);
-    const hdist = (countNonZero(dist_tree.len.items) -| 1);
+    // Compute nlit and ndist: highest used code indices (minimum required counts)
+    var nlit: usize = 257;
+    {
+        var j: usize = LIT_LEN_CODES;
+        while (j > 257) : (j -= 1) {
+            if (lit_tree.len.items[j - 1] > 0) {
+                nlit = j;
+                break;
+            }
+        }
+    }
 
+    var ndist: usize = 1;
+    {
+        var j: usize = DISTANCES;
+        while (j > 1) : (j -= 1) {
+            if (dist_tree.len.items[j - 1] > 0) {
+                ndist = j;
+                break;
+            }
+        }
+    }
+
+    // Write block header
     try bw.writeBits(if (is_final) 1 else 0, 1); // BFINAL
     try bw.writeBits(2, 2); // BTYPE = 10 (dynamic)
-    try bw.writeBits(@intCast(hlit), 5);
-    try bw.writeBits(@intCast(hdist), 5);
+    try bw.writeBits(@intCast(nlit - 257), 5); // HLIT
+    try bw.writeBits(@intCast(ndist - 1), 5); // HDIST
 
-    // Simplified: write codes directly for now
-    // TODO: Implement RLE tree descriptor encoding
+    // Send Huffman tree descriptors with RLE encoding
+    try sendAllTrees(allocator, bw, &lit_tree, &dist_tree, nlit, ndist);
 
     // Encode tokens
     for (tokens) |token| {
@@ -617,7 +753,7 @@ fn encodeBlock(allocator: std.mem.Allocator, bw: *BitWriter, tokens: []const Tok
 
                 const extra_len_bits = lengthExtra(len_code);
                 if (extra_len_bits > 0) {
-                    const extra_len = m.length - lengthBase(len_code);
+                    const extra_len = m.length -| lengthBase(len_code);
                     try bw.writeBits(@intCast(extra_len), extra_len_bits);
                 }
 
