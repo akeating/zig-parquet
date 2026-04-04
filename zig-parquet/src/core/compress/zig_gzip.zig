@@ -137,28 +137,28 @@ fn lengthCode(len: u16) u9 {
 }
 
 fn lengthBase(code: u9) u16 {
+    // RFC 1951 §3.2.5: codes 257-264 have 0 extra bits (bases 3-10)
     return switch (code) {
-        257...260 => 3 + @as(u16, code - 257),
-        261...264 => 11 + @as(u16, (code - 261) * 2),
-        265...268 => 19 + @as(u16, (code - 265) * 4),
-        269...272 => 35 + @as(u16, (code - 269) * 8),
-        273...276 => 67 + @as(u16, (code - 273) * 16),
-        277...280 => 131 + @as(u16, (code - 277) * 32),
-        281...284 => 258 + @as(u16, (code - 281) * 64),
+        257...264 => 3 + @as(u16, code - 257),
+        265...268 => 11 + @as(u16, (code - 265) * 2),
+        269...272 => 19 + @as(u16, (code - 269) * 4),
+        273...276 => 35 + @as(u16, (code - 273) * 8),
+        277...280 => 67 + @as(u16, (code - 277) * 16),
+        281...284 => 131 + @as(u16, (code - 281) * 32),
         285 => 258,
         else => 0,
     };
 }
 
 fn lengthExtra(code: u9) u5 {
+    // RFC 1951 §3.2.5: codes 257-264 have 0 extra bits
     return switch (code) {
-        257...260 => 0,
-        261...264 => 1,
-        265...268 => 2,
-        269...272 => 3,
-        273...276 => 4,
-        277...280 => 5,
-        281...284 => 6,
+        257...264 => 0,
+        265...268 => 1,
+        269...272 => 2,
+        273...276 => 3,
+        277...280 => 4,
+        281...284 => 5,
         285 => 0,
         else => 0,
     };
@@ -263,6 +263,7 @@ const HuffmanTree = struct {
         try tree.freq.resize(allocator, max_symbols);
         try tree.code.resize(allocator, max_symbols);
         try tree.len.resize(allocator, max_symbols);
+        @memset(tree.freq.items, 0);
         @memset(tree.len.items, 0);
         return tree;
     }
@@ -392,6 +393,7 @@ const HuffmanTree = struct {
         }
     }
 
+
     fn bitReverse(val: u32, nbits: u5) u32 {
         var result: u32 = 0;
         var v = val;
@@ -440,8 +442,8 @@ const Deflater = struct {
         return d;
     }
 
-    fn insertString(d: *Deflater, s: u32) u16 {
-        if (s + MIN_MATCH > d.window.len) return 0;
+    fn insertString(d: *Deflater, s: u32, data_len: u32) u16 {
+        if (s + MIN_MATCH > data_len) return 0;
         d.ins_h = updateHash(d.ins_h, d.window[s + MIN_MATCH - 1]);
         const h = d.ins_h;
         const head = d.head[h];
@@ -450,26 +452,29 @@ const Deflater = struct {
         return head;
     }
 
-    fn longestMatch(d: *Deflater, cur_match: u16, max_chain: u16) Match {
+    fn longestMatch(d: *Deflater, cur_match: u16, max_chain: u16, lookahead: u32) Match {
         var best_len: u32 = MIN_MATCH - 1;
         var best_dist: u32 = 0;
         var chain_len: u16 = max_chain;
         var match_idx = cur_match;
+        const max_len = @min(@as(u32, MAX_MATCH), lookahead);
+
+        if (max_len < MIN_MATCH) return .{ .length = 0, .distance = 0 };
 
         while (chain_len > 0 and match_idx > 0) {
             const dist = d.strstart - match_idx;
             if (dist > MAX_DIST) break;
 
-            // Quick length check (last byte)
-            if (d.window[match_idx + best_len] != d.window[d.strstart + best_len]) {
+            // Quick length check (last byte of current best)
+            if (best_len < max_len and d.window[match_idx + best_len] != d.window[d.strstart + best_len]) {
                 chain_len -= 1;
                 match_idx = d.prev[match_idx & WMASK];
                 continue;
             }
 
-            // Full match check
+            // Full match check (bounded to remaining data)
             var len: u32 = 0;
-            while (len < MAX_MATCH and d.window[match_idx + len] == d.window[d.strstart + len]) {
+            while (len < max_len and d.window[match_idx + len] == d.window[d.strstart + len]) {
                 len += 1;
             }
 
@@ -477,7 +482,7 @@ const Deflater = struct {
                 best_len = len;
                 best_dist = dist;
 
-                if (len >= 32) break; // good_length
+                if (len >= 32 or len == max_len) break; // good_length or max reached
             }
 
             chain_len -= 1;
@@ -489,21 +494,23 @@ const Deflater = struct {
 
     fn compressLazy(d: *Deflater, allocator: std.mem.Allocator, data: []const u8) !std.ArrayList(Token) {
         var tokens: std.ArrayList(Token) = .empty;
+        const data_len: u32 = @intCast(@min(data.len, WINDOW_SIZE));
 
         const max_chain: u16 = 4096;
         d.prev_length = MIN_MATCH - 1;
         d.prev_match = 0;
         d.match_available = false;
 
-        var pos: u32 = 0;
-        while (pos < @min(data.len, WINDOW_SIZE)) : (pos += 1) {
-            const hash_head = d.insertString(@intCast(d.strstart));
+        while (d.strstart < data_len) {
+            const hash_head = d.insertString(d.strstart, data_len);
             var len: u32 = MIN_MATCH - 1;
+            var match_dist: u32 = 0;
 
-            if (hash_head > 0 and d.strstart - hash_head <= MAX_DIST) {
-                const m = d.longestMatch(hash_head, max_chain);
+            const lookahead = data_len - d.strstart;
+            if (hash_head > 0 and d.strstart > hash_head and d.strstart - hash_head <= MAX_DIST and lookahead >= MIN_MATCH) {
+                const m = d.longestMatch(hash_head, max_chain, lookahead);
                 len = m.length;
-                d.match_start = hash_head;
+                match_dist = m.distance;
             }
 
             // Lazy evaluation
@@ -513,28 +520,32 @@ const Deflater = struct {
                     .distance = @intCast(d.prev_match),
                 } });
 
-                // Insert intermediate strings
+                // Insert intermediate strings (match starts at strstart-1, covers prev_length bytes)
                 var i: u32 = 2;
-                while (i <= d.prev_length) : (i += 1) {
+                while (i < d.prev_length) : (i += 1) {
                     d.strstart += 1;
-                    if (d.strstart < data.len) {
-                        _ = d.insertString(@intCast(d.strstart));
+                    if (d.strstart < data_len) {
+                        _ = d.insertString(d.strstart, data_len);
                     }
                 }
                 d.match_available = false;
+                // Reset: len/match_dist are stale (computed at old strstart)
+                d.prev_length = MIN_MATCH - 1;
             } else if (d.match_available) {
                 try tokens.append(allocator, .{ .literal = d.window[d.strstart - 1] });
+                d.prev_length = len;
+                if (len >= MIN_MATCH) {
+                    d.prev_match = match_dist;
+                }
             } else {
                 d.match_available = true;
+                d.prev_length = len;
+                if (len >= MIN_MATCH) {
+                    d.prev_match = match_dist;
+                }
             }
 
-            d.prev_length = len;
-            if (len > MIN_MATCH - 1) {
-                d.prev_match = d.match_start;
-            }
             d.strstart += 1;
-
-            if (d.strstart >= data.len) break;
         }
 
         // Flush held literal
@@ -906,3 +917,4 @@ test "gzip large data" {
 
     try std.testing.expectEqualSlices(u8, &buf, decompressed);
 }
+
