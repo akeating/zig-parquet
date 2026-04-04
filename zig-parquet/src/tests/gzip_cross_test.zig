@@ -144,6 +144,65 @@ test "cross-impl: magic bytes (0x1f 0x8b)" {
     try std.testing.expectEqual(@as(u8, 0x8b), zig_compressed[1]);
 }
 
+test "cross-impl: concatenated gzip streams" {
+    if (!both_enabled) return;
+    const allocator = std.testing.allocator;
+
+    const part1 = "First gzip member data. " ** 50;
+    const part2 = "Second gzip member data. " ** 50;
+    const total_len = part1.len + part2.len;
+
+    // Concatenate two independently compressed streams (C compressor)
+    const c1 = try c_gzip.compress(allocator, part1);
+    defer allocator.free(c1);
+    const c2 = try c_gzip.compress(allocator, part2);
+    defer allocator.free(c2);
+
+    const concatenated = try allocator.alloc(u8, c1.len + c2.len);
+    defer allocator.free(concatenated);
+    @memcpy(concatenated[0..c1.len], c1);
+    @memcpy(concatenated[c1.len..], c2);
+
+    // Zig decompressor must handle concatenated members
+    const decompressed = try zig_gzip.decompress(allocator, concatenated, total_len);
+    defer allocator.free(decompressed);
+    try std.testing.expectEqualStrings(part1 ++ part2, decompressed);
+
+    // C decompressor should also handle it (baseline)
+    const c_decompressed = try c_gzip.decompress(allocator, concatenated, total_len);
+    defer allocator.free(c_decompressed);
+    try std.testing.expectEqualStrings(part1 ++ part2, c_decompressed);
+}
+
+test "cross-impl: concatenated Zig-compressed streams via C decompress" {
+    if (!both_enabled) return;
+    const allocator = std.testing.allocator;
+
+    const part1 = "Zig compressed part one. " ** 40;
+    const part2 = "Zig compressed part two. " ** 40;
+    const total_len = part1.len + part2.len;
+
+    const z1 = try zig_gzip.compress(allocator, part1);
+    defer allocator.free(z1);
+    const z2 = try zig_gzip.compress(allocator, part2);
+    defer allocator.free(z2);
+
+    const concatenated = try allocator.alloc(u8, z1.len + z2.len);
+    defer allocator.free(concatenated);
+    @memcpy(concatenated[0..z1.len], z1);
+    @memcpy(concatenated[z1.len..], z2);
+
+    // C decompressor handles concatenated Zig-compressed members
+    const c_decompressed = try c_gzip.decompress(allocator, concatenated, total_len);
+    defer allocator.free(c_decompressed);
+    try std.testing.expectEqualStrings(part1 ++ part2, c_decompressed);
+
+    // Zig decompressor round-trip
+    const z_decompressed = try zig_gzip.decompress(allocator, concatenated, total_len);
+    defer allocator.free(z_decompressed);
+    try std.testing.expectEqualStrings(part1 ++ part2, z_decompressed);
+}
+
 // =========================================================================
 // Edge-case tests (Zig implementation, cross-validate if C available)
 // =========================================================================
