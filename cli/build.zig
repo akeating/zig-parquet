@@ -5,12 +5,16 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // Get the parquet library from the dependency
-    // Use stable codecs (C/C++ only, no experimental Zig implementations)
+    // Compression codecs: defaults to "stable" (C/C++ only).
+    // Pass -Dcodecs=all to include experimental Zig implementations.
+    const codecs = b.option([]const u8, "codecs", "Compression codecs (default: stable). See zig-parquet for values.") orelse "stable";
+    const prefer_zig = b.option(bool, "prefer-zig", "Prefer Zig implementations over C when both are enabled (default: false)") orelse false;
+
     const parquet_dep = b.dependency("parquet", .{
         .target = target,
         .optimize = optimize,
-        .codecs = "stable",
+        .codecs = codecs,
+        .@"prefer-zig" = prefer_zig,
     });
 
     const build_options = b.addOptions();

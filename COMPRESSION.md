@@ -77,6 +77,16 @@ zig build -Dcodecs=gzip,zig-gzip    # both gzip implementations (enables cross-i
 
 Disabled codecs return `UnsupportedCompression` at runtime. C dependencies are only fetched for enabled C codecs.
 
+### Implementation preference
+
+When both C and Zig implementations of a codec are enabled (e.g. `-Dcodecs=all`), the C version is used by default. Pass `-Dprefer-zig` to use the Zig implementation instead, with C as fallback for codecs without a Zig version (lz4, brotli):
+
+```bash
+zig build -Dcodecs=all -Dprefer-zig   # use Zig for zstd/gzip/snappy, C for lz4/brotli
+```
+
+This is a compile-time flag resolved at build time with no runtime overhead.
+
 ### Preset Definitions
 
 | Preset | Zstd | Snappy | Gzip | LZ4 | Brotli | Zig Zstd | Zig Snappy | Zig Gzip | Use Case |

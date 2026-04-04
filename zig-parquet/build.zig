@@ -13,6 +13,12 @@ pub fn build(b: *std.Build) void {
 
     const codecs = parseCodecs(codecs_str);
 
+    const prefer_zig = b.option(
+        bool,
+        "prefer-zig",
+        "When both C and Zig implementations are enabled, prefer Zig (default: false, prefers C)",
+    ) orelse false;
+
     const build_options = b.addOptions();
     build_options.addOption(bool, "enable_zstd", codecs.zstd);
     build_options.addOption(bool, "enable_zig_zstd", codecs.zig_zstd);
@@ -25,6 +31,7 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "supports_gzip", codecs.gzip or codecs.zig_gzip);
     build_options.addOption(bool, "enable_lz4", codecs.lz4);
     build_options.addOption(bool, "enable_brotli", codecs.brotli);
+    build_options.addOption(bool, "prefer_zig", prefer_zig);
     build_options.addOption([]const u8, "version", zon.version);
 
     const deps = resolveDeps(b, codecs);
@@ -90,6 +97,7 @@ pub fn build(b: *std.Build) void {
         wasm_opts.addOption(bool, "supports_gzip", codecs.gzip or codecs.zig_gzip);
         wasm_opts.addOption(bool, "enable_lz4", codecs.lz4);
         wasm_opts.addOption(bool, "enable_brotli", codecs.brotli);
+        wasm_opts.addOption(bool, "prefer_zig", prefer_zig);
         wasm_opts.addOption([]const u8, "version", zon.version);
 
         const wasi_mod = b.addModule("parquet_wasi", .{
@@ -132,6 +140,7 @@ pub fn build(b: *std.Build) void {
         freestanding_opts.addOption(bool, "supports_gzip", false);
         freestanding_opts.addOption(bool, "enable_lz4", false);
         freestanding_opts.addOption(bool, "enable_brotli", false);
+        freestanding_opts.addOption(bool, "prefer_zig", false);
         freestanding_opts.addOption([]const u8, "version", zon.version);
 
         const freestanding_mod = b.addModule("parquet_freestanding", .{
@@ -199,6 +208,7 @@ pub fn build(b: *std.Build) void {
         wasi_opts.addOption(bool, "supports_gzip", false);
         wasi_opts.addOption(bool, "enable_lz4", false);
         wasi_opts.addOption(bool, "enable_brotli", false);
+        wasi_opts.addOption(bool, "prefer_zig", false);
         wasi_opts.addOption([]const u8, "version", zon.version);
         const wasi_mod = b.addModule("parquet_wasi_smoke", .{
             .root_source_file = b.path("src/lib.zig"),
@@ -228,6 +238,7 @@ pub fn build(b: *std.Build) void {
         free_opts.addOption(bool, "supports_gzip", false);
         free_opts.addOption(bool, "enable_lz4", false);
         free_opts.addOption(bool, "enable_brotli", false);
+        free_opts.addOption(bool, "prefer_zig", false);
         free_opts.addOption([]const u8, "version", zon.version);
         const free_mod = b.addModule("parquet_free_smoke", .{
             .root_source_file = b.path("src/lib.zig"),
