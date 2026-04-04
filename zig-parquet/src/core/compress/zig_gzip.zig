@@ -831,24 +831,25 @@ pub fn compress(allocator: std.mem.Allocator, data: []const u8) Error![]u8 {
 
 pub fn decompress(allocator: std.mem.Allocator, compressed: []const u8, uncompressed_size: usize) Error![]u8 {
     if (uncompressed_size > MAX_DECOMPRESS_SIZE) return error.InvalidSize;
-    if (compressed.len < 10) return error.DecompressionError;
-
-    // Verify gzip header
-    if (compressed[0] != 0x1f or compressed[1] != 0x8b) return error.DecompressionError;
-    if (compressed[2] != GZIP_METHOD) return error.DecompressionError;
 
     var out: std.io.Writer.Allocating = std.io.Writer.Allocating.initCapacity(allocator, uncompressed_size) catch return error.OutOfMemory;
     errdefer out.deinit();
 
-    // Skip gzip header (10+ bytes depending on flags)
-    const pos: usize = 10;
-    if (pos > compressed.len) return error.DecompressionError;
+    // Handle concatenated gzip members (RFC 1952 §2.2)
+    // Use .gzip container mode so std.compress.flate handles header/footer parsing.
+    var in: std.io.Reader = .fixed(compressed);
 
-    // Decompress deflate stream
-    var in: std.io.Reader = .fixed(compressed[pos..]);
-    var gz: std.compress.flate.Decompress = .init(&in, .raw, &[_]u8{});
+    while (true) {
+        // Check if there's another gzip member (need at least magic + method = 3 bytes)
+        if (in.seek >= in.end) break;
+        const remaining = compressed[in.seek..];
+        if (remaining.len < 10) break;
+        if (remaining[0] != 0x1f or remaining[1] != 0x8b) break;
 
-    _ = gz.reader.streamRemaining(&out.writer) catch return error.DecompressionError;
+        // Decompress one gzip member (header + deflate + footer handled by .gzip mode)
+        var gz: std.compress.flate.Decompress = .init(&in, .gzip, &[_]u8{});
+        _ = gz.reader.streamRemaining(&out.writer) catch return error.DecompressionError;
+    }
 
     const result = out.toOwnedSlice() catch return error.OutOfMemory;
 
@@ -916,5 +917,28 @@ test "gzip large data" {
     defer allocator.free(decompressed);
 
     try std.testing.expectEqualSlices(u8, &buf, decompressed);
+}
+
+test "gzip concatenated streams" {
+    const allocator = std.testing.allocator;
+    const part1 = "Hello, World!";
+    const part2 = " This is part two.";
+
+    const compressed1 = try compress(allocator, part1);
+    defer allocator.free(compressed1);
+    const compressed2 = try compress(allocator, part2);
+    defer allocator.free(compressed2);
+
+    // Concatenate two gzip streams
+    const concatenated = try allocator.alloc(u8, compressed1.len + compressed2.len);
+    defer allocator.free(concatenated);
+    @memcpy(concatenated[0..compressed1.len], compressed1);
+    @memcpy(concatenated[compressed1.len..], compressed2);
+
+    const total_len = part1.len + part2.len;
+    const decompressed = try decompress(allocator, concatenated, total_len);
+    defer allocator.free(decompressed);
+
+    try std.testing.expectEqualSlices(u8, part1 ++ part2, decompressed);
 }
 
