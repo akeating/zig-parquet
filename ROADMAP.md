@@ -8,7 +8,7 @@ Full read/write support for the Apache Parquet format:
 - **Writing:** All physical types, all standard encodings, dictionary encoding with cardinality-based fallback, multi-page columns, column statistics (min/max/null_count), CRC32 page checksums
 - **Logical types:** STRING, DATE, TIME, TIMESTAMP (millis/micros/nanos), DECIMAL, UUID, INT annotations, FLOAT16, ENUM, JSON, BSON, INTERVAL, GEOMETRY, GEOGRAPHY
 - **Nested types:** LIST, MAP, STRUCT with arbitrary nesting depth
-- **Compression:** ZSTD (C + experimental Zig), GZIP, Snappy (C++ + experimental Zig), LZ4_RAW, Brotli (read and write)
+- **Compression:** ZSTD (C + experimental Zig), GZIP (C + experimental Zig), Snappy (C++ + experimental Zig), LZ4_RAW, Brotli (read and write)
 - **APIs:** Zig native, C ABI, WASM (wasm32-wasi and wasm32-freestanding)
 - **Hardening:** Zero `@intCast` on external data, bounds-checked slicing, safe casting throughout
 
@@ -34,7 +34,7 @@ Possible development directions, roughly ordered by likely impact. No timeline c
 
 - **Bloom filters** — Write Bloom filter pages; read and apply for row group skipping. Useful for high-cardinality string columns (e.g., UUIDs, URLs).
 - **Page index** — Write column/offset indexes; use them for fine-grained page skipping. Biggest win for large files with sorted columns.
-- **Native Zig compression (in progress)** — Pure Zig implementations of compression codecs (currently: zig-zstd level-1 compressor + decompressor, zig-snappy read/write). Enables no-C/C++ builds, reduces binary size. Experimental versions available via `-Dcodecs=zig-only` or individually. Cross-implementation tests validate interoperability. When mature, Zig implementations graduate to replace C versions as default.
+- **Native Zig compression (in progress)** — Pure Zig implementations of compression codecs (currently: zig-zstd level-1 compressor + decompressor, zig-snappy read/write, zig-gzip level-9 compressor + decompressor). Enables no-C/C++ builds, reduces binary size. Experimental versions available via `-Dcodecs=zig-only` or individually. Cross-implementation tests validate interoperability. When mature, Zig implementations graduate to replace C versions as default.
 - **DATA_PAGE_V2 write** — Optional; some engines prefer V2 for its split decompression model.
 - **Predicate pushdown** — Push filter expressions down to page level using page index + statistics. Requires page index support first.
 - **VARIANT type** — Semi-structured data (Parquet spec addition). Currently reads as its underlying physical type.

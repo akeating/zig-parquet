@@ -12,6 +12,7 @@ zig-parquet supports all major Parquet compression codecs. Codecs are individual
 | lz4 | C lz4 1.10.0 | Very fast |
 | brotli | C brotli 1.2.0 | High ratio, largest binary cost |
 | zig-zstd | Pure Zig (experimental) | No C dependency; level-1 compressor + stdlib decompressor |
+| zig-gzip | Pure Zig (experimental) | No C dependency; level-9 deflate compressor + stdlib decompressor |
 | zig-snappy | Pure Zig (experimental) | No C/C++ dependency; full Snappy block format |
 
 ## Build Sizes
@@ -22,8 +23,9 @@ Static library (`libparquet.a`) sizes with `ReleaseSmall`, measured on macOS arm
 |-------------|-------------|---------------|----------------|
 | `none` | 806 KB | -- | No |
 | `zig-snappy` | 834 KB | +28 KB | No |
+| `zig-gzip` | 870 KB | +64 KB | No |
 | `zig-zstd` | 910 KB | +104 KB | No |
-| `zig-only` | 913 KB | +107 KB | No |
+| `zig-only` | 952 KB | +146 KB | No |
 | `snappy` | 876 KB | +70 KB | C++ |
 | `lz4` | 896 KB | +90 KB | C |
 | `gzip` | 897 KB | +91 KB | C |
@@ -37,8 +39,9 @@ Static library (`libparquet.a`) sizes with `ReleaseSmall`, measured on macOS arm
 |-------------|------------|-------------------|---------------|
 | `none` | 620 KB | 116 KB | -- |
 | `zig-snappy` | 633 KB | 117 KB | +1 KB |
+| `zig-gzip` | 658 KB | 125 KB | +9 KB |
 | `zig-zstd` | 695 KB | 134 KB | +18 KB |
-| `zig-only` | 697 KB | 135 KB | +19 KB |
+| `zig-only` | 722 KB | 138 KB | +22 KB |
 | `snappy` | 671 KB | 130 KB | +14 KB |
 | `lz4` | 673 KB | 126 KB | +10 KB |
 | `gzip` | 681 KB | 134 KB | +18 KB |
@@ -66,20 +69,22 @@ zig build -Dcodecs=zstd,snappy      # only zstd and snappy (C versions)
 zig build -Dcodecs=zstd             # C libzstd only
 zig build -Dcodecs=zig-zstd         # pure Zig zstd only (no C deps)
 zig build -Dcodecs=zig-snappy       # pure Zig snappy only (no C++ deps)
+zig build -Dcodecs=zig-gzip          # pure Zig gzip only (no C deps)
 zig build -Dcodecs=zstd,zig-zstd    # both zstd implementations (enables cross-impl tests)
 zig build -Dcodecs=snappy,zig-snappy # both snappy implementations (enables cross-impl tests)
+zig build -Dcodecs=gzip,zig-gzip    # both gzip implementations (enables cross-impl tests)
 ```
 
 Disabled codecs return `UnsupportedCompression` at runtime. C dependencies are only fetched for enabled C codecs.
 
 ### Preset Definitions
 
-| Preset | Zstd | Snappy | Gzip | LZ4 | Brotli | Zig Zstd | Zig Snappy | Use Case |
-|--------|------|--------|------|-----|--------|----------|------------|----------|
-| `all` | ✓ C | ✓ C | ✓ C | ✓ C | ✓ C | ✓ Zig | ✓ Zig | Maximum codec coverage (library testing) |
-| `stable` | ✓ C | ✓ C | ✓ C | ✓ C | ✓ C | ✗ | ✗ | Production use (pqi CLI, proven codecs only) |
-| `zig-only` | ✓ Zig | ✓ Zig | ✗ | ✗ | ✗ | ✓ Zig | ✓ Zig | No C/C++ dependencies |
-| `none` | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | Minimum binary |
+| Preset | Zstd | Snappy | Gzip | LZ4 | Brotli | Zig Zstd | Zig Snappy | Zig Gzip | Use Case |
+|--------|------|--------|------|-----|--------|----------|------------|----------|----------|
+| `all` | ✓ C | ✓ C | ✓ C | ✓ C | ✓ C | ✓ Zig | ✓ Zig | ✓ Zig | Maximum codec coverage (library testing) |
+| `stable` | ✓ C | ✓ C | ✓ C | ✓ C | ✓ C | ✗ | ✗ | ✗ | Production use (pqi CLI, proven codecs only) |
+| `zig-only` | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ Zig | ✓ Zig | ✓ Zig | No C/C++ dependencies |
+| `none` | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | Minimum binary |
 
 ## API
 
@@ -101,6 +106,7 @@ const c_level5 = try compress.zstd.compressWithLevel(allocator, data, 5);
 // Experimental (Zig)
 const zig_compressed = try compress.experimental.zig_zstd.compress(allocator, data);
 const zig_snappy_out = try compress.experimental.zig_snappy.compress(allocator, data);
+const zig_gzip_out = try compress.experimental.zig_gzip.compress(allocator, data);
 ```
 
 ### Build option flags
@@ -113,7 +119,9 @@ const zig_snappy_out = try compress.experimental.zig_snappy.compress(allocator, 
 | `enable_snappy` | C++ snappy compiled in |
 | `enable_zig_snappy` | Pure Zig snappy compiled in |
 | `supports_snappy` | Either snappy implementation available |
-| `enable_gzip` | Gzip compiled in |
+| `enable_gzip` | C zlib gzip compiled in |
+| `enable_zig_gzip` | Pure Zig gzip compiled in |
+| `supports_gzip` | Either gzip implementation available |
 | `enable_lz4` | LZ4 compiled in |
 | `enable_brotli` | Brotli compiled in |
 
@@ -139,6 +147,19 @@ The `zig-snappy` codec is a pure Zig implementation of the Snappy block format w
 Graduation follows the same path as zstd: when mature, the contents of `zig_snappy.zig` replace `snappy.zig`.
 
 Cross-implementation tests validate interoperability between C++ snappy and the Zig implementation. Build with `-Dcodecs=snappy,zig-snappy` to enable them.
+
+### Pure Zig gzip
+
+The `zig-gzip` codec is a pure Zig implementation of gzip (RFC 1952) with deflate compression (RFC 1951) and no C dependencies.
+
+**Compressor** -- targets level-9 quality:
+- Dynamic Huffman trees with canonical code assignment
+- Lazy LZ77 matching with hash chains (max_chain=4096, good_length=32)
+- RLE-encoded tree descriptors per RFC 1951
+
+**Decompressor** -- uses `std.compress.flate` from Zig's standard library. Handles all compression levels.
+
+Cross-implementation tests validate interoperability between C zlib and the Zig implementation. Build with `-Dcodecs=gzip,zig-gzip` to enable them.
 
 ### Pure Zig zstd
 
