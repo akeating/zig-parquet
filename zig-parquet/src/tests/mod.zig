@@ -33,4 +33,5 @@ test {
     _ = @import("snappy_cross_test.zig");
     _ = @import("gzip_cross_test.zig");
     _ = @import("lz4_cross_test.zig");
+    _ = @import("brotli_cross_test.zig");
 }

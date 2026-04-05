@@ -6,8 +6,8 @@
 
 const std = @import("std");
 const build_options = @import("build_options");
-const c_brotli = @import("../core/compress/brotli.zig");
-const zig_brotli = @import("../core/compress/zig_brotli.zig");
+const c_brotli = if (build_options.enable_brotli) @import("../core/compress/brotli.zig") else struct {};
+const zig_brotli = if (build_options.enable_zig_brotli) @import("../core/compress/zig_brotli.zig") else struct {};
 
 const both_enabled = build_options.enable_brotli and build_options.enable_zig_brotli;
 
@@ -258,16 +258,16 @@ test "cross-impl: C-compress large repeated pattern (quality-11)" {
     // Generate data that mimics parquet column encoding for 10K rows of "AAAAAAAAAA"
     // This is the kind of data brotli sees after parquet encoding
     const count = 10000;
-    var data = std.ArrayList(u8).init(allocator);
-    defer data.deinit();
+    var data: std.ArrayListUnmanaged(u8) = .empty;
+    defer data.deinit(allocator);
 
     // Simulated RLE/plain header
-    try data.appendSlice(&[_]u8{ 0x04, 0x00, 0x00, 0x00, 0xa0, 0x9c, 0x01, 0x01 });
+    try data.appendSlice(allocator,&[_]u8{ 0x04, 0x00, 0x00, 0x00, 0xa0, 0x9c, 0x01, 0x01 });
 
     for (0..count) |_| {
         // Length-prefixed "AAAAAAAAAA" (10 bytes)
-        try data.appendSlice(&[_]u8{ 0x0a, 0x00, 0x00, 0x00 });
-        try data.appendSlice("AAAAAAAAAA");
+        try data.appendSlice(allocator,&[_]u8{ 0x0a, 0x00, 0x00, 0x00 });
+        try data.appendSlice(allocator,"AAAAAAAAAA");
     }
 
     const c_compressed = try c_brotli.compress(allocator, data.items);
@@ -284,18 +284,18 @@ test "cross-impl: parquet-like repeated strings with length prefixes" {
 
     // Simulate the actual pattern from compression_brotli.parquet:
     // repeated "AAAAAAAAAA" strings with 4-byte length prefixes + sequential i64 values
-    var data = std.ArrayList(u8).init(allocator);
-    defer data.deinit();
+    var data: std.ArrayListUnmanaged(u8) = .empty;
+    defer data.deinit(allocator);
     for (0..10000) |i| {
         // Length prefix (4 bytes LE) + string "AAAAAAAAAA"
         const str = "AAAAAAAAAA";
         const len_bytes: [4]u8 = @bitCast(@as(u32, @intCast(str.len)));
-        try data.appendSlice(&len_bytes);
-        try data.appendSlice(str);
+        try data.appendSlice(allocator,&len_bytes);
+        try data.appendSlice(allocator,str);
         // Also add an i64 value (sequential)
         const val: i64 = @intCast(i);
         const val_bytes: [8]u8 = @bitCast(val);
-        try data.appendSlice(&val_bytes);
+        try data.appendSlice(allocator,&val_bytes);
     }
     const slice = data.items;
 
