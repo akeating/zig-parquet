@@ -196,7 +196,6 @@ const HuffmanTable = struct {
         if (primary_idx >= self.entries.len) return error.DecompressionError;
 
         const entry = self.entries[primary_idx];
-        if (entry.bits == 0) return error.DecompressionError;
 
         if (entry.bits <= PRIMARY_TABLE_BITS) {
             if (entry.bits <= peek_bits) {
@@ -207,15 +206,17 @@ const HuffmanTable = struct {
             return entry.value;
         }
 
-        // Secondary table lookup
+        // Secondary table lookup: entry.bits = secondary_table_bits + PRIMARY_TABLE_BITS,
+        // entry.value = absolute offset to secondary table start.
         reader.dropBits(PRIMARY_TABLE_BITS);
-        const secondary_bits: u5 = @intCast(entry.bits - PRIMARY_TABLE_BITS);
-        const secondary_idx = try reader.readBits(secondary_bits);
+        const secondary_table_bits: u5 = @intCast(entry.bits - PRIMARY_TABLE_BITS);
+        const secondary_idx = try reader.peekBits(secondary_table_bits);
         const table_offset = entry.value;
         const final_idx = table_offset + secondary_idx;
         if (final_idx >= self.entries.len) return error.DecompressionError;
         const secondary_entry = self.entries[final_idx];
-        if (secondary_entry.bits == 0) return error.DecompressionError;
+        // Drop only the actual code length's secondary bits, not the full table width
+        reader.dropBits(@intCast(secondary_entry.bits));
         return secondary_entry.value;
     }
 };
@@ -246,7 +247,7 @@ fn buildHuffmanTable(allocator: std.mem.Allocator, code_lengths: []const u8, alp
         // All zero code lengths — single symbol tables
         const entries = allocator.alloc(HuffmanEntry, PRIMARY_TABLE_SIZE) catch return error.OutOfMemory;
         for (entries) |*e| {
-            e.* = .{ .bits = 1, .value = 0 };
+            e.* = .{ .bits = 0, .value = 0 };
         }
         return .{ .entries = entries, .allocator = allocator };
     }
@@ -265,34 +266,30 @@ fn buildHuffmanTable(allocator: std.mem.Allocator, code_lengths: []const u8, alp
         // Single symbol — fill entire table with it, consuming 0 bits
         const entries = allocator.alloc(HuffmanEntry, PRIMARY_TABLE_SIZE) catch return error.OutOfMemory;
         for (entries) |*e| {
-            e.* = .{ .bits = code_lengths[single_sym], .value = single_sym };
+            e.* = .{ .bits = 0, .value = single_sym };
         }
         return .{ .entries = entries, .allocator = allocator };
     }
 
-    // Calculate table size
+    // Compute per-primary-key secondary table bit widths
+    var secondary_table_bits: [PRIMARY_TABLE_SIZE]u8 = .{0} ** PRIMARY_TABLE_SIZE;
     var table_size: usize = PRIMARY_TABLE_SIZE;
     if (max_bits > PRIMARY_TABLE_BITS) {
-        // Need secondary tables
-        // Assign codes and figure out secondary table sizes
         var temp_codes: [16]u32 = next_code;
-        var secondary_sizes: [PRIMARY_TABLE_SIZE]u16 = .{0} ** PRIMARY_TABLE_SIZE;
-        for (code_lengths, 0..) |cl, sym| {
-            _ = sym;
+        for (code_lengths) |cl| {
             if (cl > PRIMARY_TABLE_BITS) {
                 const c2 = temp_codes[cl];
                 temp_codes[cl] += 1;
                 const reversed = reverseBits(c2, cl);
                 const primary = reversed & (PRIMARY_TABLE_SIZE - 1);
-                const secondary_bits = cl - PRIMARY_TABLE_BITS;
-                const needed: u16 = @as(u16, 1) << @intCast(secondary_bits);
-                if (needed > secondary_sizes[primary]) {
-                    secondary_sizes[primary] = needed;
+                const sec_bits: u8 = @intCast(cl - PRIMARY_TABLE_BITS);
+                if (sec_bits > secondary_table_bits[primary]) {
+                    secondary_table_bits[primary] = sec_bits;
                 }
             }
         }
-        for (secondary_sizes) |s| {
-            table_size += s;
+        for (secondary_table_bits) |sb| {
+            table_size += @as(usize, 1) << @intCast(sb);
         }
     }
 
@@ -306,24 +303,9 @@ fn buildHuffmanTable(allocator: std.mem.Allocator, code_lengths: []const u8, alp
     var secondary_offsets: [PRIMARY_TABLE_SIZE]u16 = .{0} ** PRIMARY_TABLE_SIZE;
     if (max_bits > PRIMARY_TABLE_BITS) {
         var offset: u16 = @intCast(PRIMARY_TABLE_SIZE);
-        var temp_codes2: [16]u32 = next_code;
-        var secondary_sizes2: [PRIMARY_TABLE_SIZE]u16 = .{0} ** PRIMARY_TABLE_SIZE;
-        for (code_lengths) |cl| {
-            if (cl > PRIMARY_TABLE_BITS) {
-                const c2 = temp_codes2[cl];
-                temp_codes2[cl] += 1;
-                const reversed = reverseBits(c2, cl);
-                const primary = reversed & (PRIMARY_TABLE_SIZE - 1);
-                const secondary_bits = cl - PRIMARY_TABLE_BITS;
-                const needed: u16 = @as(u16, 1) << @intCast(secondary_bits);
-                if (needed > secondary_sizes2[primary]) {
-                    secondary_sizes2[primary] = needed;
-                }
-            }
-        }
         for (0..PRIMARY_TABLE_SIZE) |i| {
             secondary_offsets[i] = offset;
-            offset += secondary_sizes2[i];
+            offset += @as(u16, 1) << @intCast(secondary_table_bits[i]);
         }
     }
 
@@ -348,28 +330,28 @@ fn buildHuffmanTable(allocator: std.mem.Allocator, code_lengths: []const u8, alp
         } else {
             // Secondary table entry
             const primary = reversed & (PRIMARY_TABLE_SIZE - 1);
-            // Set primary entry to point to secondary table
-            const secondary_bits: u8 = @intCast(cl - PRIMARY_TABLE_BITS);
-            entries[primary] = .{ .bits = @intCast(cl), .value = secondary_offsets[primary] };
+            const stb = secondary_table_bits[primary];
+            // Primary entry: bits = secondary table width + PRIMARY_TABLE_BITS,
+            // value = absolute offset to secondary table start
+            entries[primary] = .{ .bits = @intCast(stb + PRIMARY_TABLE_BITS), .value = secondary_offsets[primary] };
 
+            // Replicate this symbol across the secondary table
+            const sym_sec_bits: u8 = @intCast(cl - PRIMARY_TABLE_BITS);
             const secondary_idx = reversed >> PRIMARY_TABLE_BITS;
-            const step = @as(usize, 1) << @intCast(secondary_bits);
+            const step = @as(usize, 1) << @intCast(sym_sec_bits);
             const base = secondary_offsets[primary];
-            const table_end = if (primary + 1 < PRIMARY_TABLE_SIZE) secondary_offsets[primary + 1] else @as(u16, @intCast(table_size));
-            _ = table_end;
+            const sec_table_size = @as(usize, 1) << @intCast(stb);
             var idx: usize = secondary_idx;
-            const sec_table_size = @as(usize, 1) << @intCast(cl - PRIMARY_TABLE_BITS);
             while (idx < sec_table_size) : (idx += step) {
                 const final_idx = base + idx;
                 if (final_idx < entries.len) {
-                    entries[final_idx] = .{ .bits = @intCast(cl - PRIMARY_TABLE_BITS), .value = @intCast(sym) };
+                    entries[final_idx] = .{ .bits = @intCast(sym_sec_bits), .value = @intCast(sym) };
                 }
             }
         }
     }
 
     // Replicate reduced table to fill the full PRIMARY_TABLE_SIZE
-    // (matches C BrotliBuildHuffmanTable memcpy replication at lines 224-228)
     if (effective_table_size < PRIMARY_TABLE_SIZE) {
         var size = effective_table_size;
         while (size < PRIMARY_TABLE_SIZE) {
@@ -404,7 +386,7 @@ fn buildSimpleHuffmanTable(allocator: std.mem.Allocator, symbols: []const u16, n
     switch (nsym) {
         1 => {
             for (entries) |*e| {
-                e.* = .{ .bits = 1, .value = symbols[0] };
+                e.* = .{ .bits = 0, .value = symbols[0] };
             }
         },
         2 => {
@@ -432,13 +414,21 @@ fn buildSimpleHuffmanTable(allocator: std.mem.Allocator, symbols: []const u16, n
             }
         },
         4 => {
-            // Read 1 bit for tree shape
-            // Actually for simple code with 4 symbols:
-            // code lengths: s0=2, s1=2, s2=2, s3=2
+            // 4 symbols, all 2-bit codes (tree_select=0)
+            // Canonical codes: 00→sym[0], 01→sym[1], 10→sym[2], 11→sym[3]
+            // LSB-first reversed: 00→sym[0], 10→sym[1], 01→sym[2], 11→sym[3]
+            // So table indices: 0→sym[0], 1→sym[2], 2→sym[1], 3→sym[3]
             var i: usize = 0;
             while (i < PRIMARY_TABLE_SIZE) : (i += 1) {
                 const idx2 = i & 3;
-                entries[i] = .{ .bits = 2, .value = symbols[idx2] };
+                const sym_idx: usize = switch (idx2) {
+                    0 => 0,
+                    1 => 2,
+                    2 => 1,
+                    3 => 3,
+                    else => unreachable,
+                };
+                entries[i] = .{ .bits = 2, .value = symbols[sym_idx] };
             }
         },
         else => return error.DecompressionError,
@@ -457,129 +447,150 @@ const CONTEXT_MSB6: u2 = 1;
 const CONTEXT_UTF8: u2 = 2;
 const CONTEXT_SIGNED: u2 = 3;
 
-// Precomputed context lookup table (4 modes x 512 entries)
-// kBrotliContextLookupTable from the reference implementation
-const kContextLookup: [2048]u8 = blk: {
-    @setEvalBranchQuota(20000);
-    var table: [2048]u8 = .{0} ** 2048;
-
-    // Mode 0: CONTEXT_LSB6 — p1 part: p1 & 0x3f
-    for (0..256) |i| {
-        table[0 * 512 + i] = @intCast(i & 0x3f);
-    }
-    // Mode 0: p2 part: 0
-    for (0..256) |_| {}
-
-    // Mode 1: CONTEXT_MSB6 — p1 part: p1 >> 2
-    for (0..256) |i| {
-        table[1 * 512 + i] = @intCast(i >> 2);
-    }
-    // Mode 1: p2 part: 0
-
-    // Mode 2: CONTEXT_UTF8
-    // p1 part
-    for (0..256) |i| {
-        if (i < 0x80) {
-            // ASCII
-            if (i == 0) {
-                table[2 * 512 + i] = 0;
-            } else if (i < 0x20) {
-                // Control chars
-                table[2 * 512 + i] = 1;
-            } else if (i == 0x20) {
-                // Space
-                table[2 * 512 + i] = 2;
-            } else if (i >= 0x30 and i <= 0x39) {
-                // Digits
-                table[2 * 512 + i] = 3;
-            } else if (i >= 0x41 and i <= 0x5a) {
-                // Uppercase letters
-                table[2 * 512 + i] = 4;
-            } else if (i >= 0x61 and i <= 0x7a) {
-                // Lowercase letters
-                table[2 * 512 + i] = 5;
-            } else {
-                // Other ASCII punctuation
-                table[2 * 512 + i] = 6;
-            }
-        } else if (i < 0xc0) {
-            // Continuation byte
-            table[2 * 512 + i] = 7;
-        } else if (i < 0xe0) {
-            // 2-byte lead
-            table[2 * 512 + i] = 8;
-        } else if (i < 0xf0) {
-            // 3-byte lead
-            table[2 * 512 + i] = 9;
-        } else {
-            // 4-byte lead
-            table[2 * 512 + i] = 10;
-        }
-    }
-    // p2 part for UTF8
-    for (0..256) |i| {
-        if (i < 0x80) {
-            if (i == 0) {
-                table[2 * 512 + 256 + i] = 0;
-            } else if (i < 0x20) {
-                table[2 * 512 + 256 + i] = 0;
-            } else if (i == 0x20) {
-                table[2 * 512 + 256 + i] = 0;
-            } else if (i >= 0x30 and i <= 0x39) {
-                table[2 * 512 + 256 + i] = 0;
-            } else if (i >= 0x41 and i <= 0x5a) {
-                table[2 * 512 + 256 + i] = 0;
-            } else if (i >= 0x61 and i <= 0x7a) {
-                table[2 * 512 + 256 + i] = 0;
-            } else {
-                table[2 * 512 + 256 + i] = 0;
-            }
-        } else if (i < 0xc0) {
-            // Continuation: contributes 6-bit offset
-            table[2 * 512 + 256 + i] = @intCast((i & 0x3f) >> 2);
-        } else {
-            table[2 * 512 + 256 + i] = 0;
-        }
-    }
-
-    // Mode 3: CONTEXT_SIGNED
-    // p1 part
-    for (0..256) |i| {
-        // Number of leading bits the same as the sign bit
-        const val: u8 = @intCast(i);
-        if (val < 2) {
-            table[3 * 512 + i] = @intCast(val * 4);
-        } else if (val < 0x80) {
-            // Count leading zeros of byte
-            var shift: u8 = 7;
-            const tmp: u8 = val;
-            while (shift > 0) : (shift -= 1) {
-                if (tmp >= (@as(u8, 1) << @intCast(shift))) break;
-            }
-            const lz = 6 - shift;
-            table[3 * 512 + i] = @intCast(lz);
-        } else {
-            // Negative: count leading ones
-            const inv = ~val;
-            if (inv == 0) {
-                table[3 * 512 + i] = 4;
-            } else {
-                var shift: u8 = 7;
-                const tmp: u8 = inv;
-                while (shift > 0) : (shift -= 1) {
-                    if (tmp >= (@as(u8, 1) << @intCast(shift))) break;
-                }
-                const lz = 6 - shift;
-                table[3 * 512 + i] = @intCast(lz);
-            }
-        }
-    }
-    // p2 part for signed: same as p1
-    for (0..256) |i| {
-        table[3 * 512 + 256 + i] = table[3 * 512 + i];
-    }
-
-    break :blk table;
+// Context lookup table — exact copy of _kBrotliContextLookupTable from the C reference.
+// 4 modes x 512 entries (256 for p1, 256 for p2). Context ID = table[mode*512 + p1] | table[mode*512 + 256 + p2].
+const kContextLookup = [2048]u8{
+    // CONTEXT_LSB6, p1 part
+     0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15,
+    16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
+    32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47,
+    48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63,
+     0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15,
+    16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
+    32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47,
+    48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63,
+     0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15,
+    16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
+    32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47,
+    48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63,
+     0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15,
+    16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
+    32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47,
+    48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63,
+    // CONTEXT_LSB6, p2 part (all zeros)
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    // CONTEXT_MSB6, p1 part
+     0,  0,  0,  0,  1,  1,  1,  1,  2,  2,  2,  2,  3,  3,  3,  3,
+     4,  4,  4,  4,  5,  5,  5,  5,  6,  6,  6,  6,  7,  7,  7,  7,
+     8,  8,  8,  8,  9,  9,  9,  9, 10, 10, 10, 10, 11, 11, 11, 11,
+    12, 12, 12, 12, 13, 13, 13, 13, 14, 14, 14, 14, 15, 15, 15, 15,
+    16, 16, 16, 16, 17, 17, 17, 17, 18, 18, 18, 18, 19, 19, 19, 19,
+    20, 20, 20, 20, 21, 21, 21, 21, 22, 22, 22, 22, 23, 23, 23, 23,
+    24, 24, 24, 24, 25, 25, 25, 25, 26, 26, 26, 26, 27, 27, 27, 27,
+    28, 28, 28, 28, 29, 29, 29, 29, 30, 30, 30, 30, 31, 31, 31, 31,
+    32, 32, 32, 32, 33, 33, 33, 33, 34, 34, 34, 34, 35, 35, 35, 35,
+    36, 36, 36, 36, 37, 37, 37, 37, 38, 38, 38, 38, 39, 39, 39, 39,
+    40, 40, 40, 40, 41, 41, 41, 41, 42, 42, 42, 42, 43, 43, 43, 43,
+    44, 44, 44, 44, 45, 45, 45, 45, 46, 46, 46, 46, 47, 47, 47, 47,
+    48, 48, 48, 48, 49, 49, 49, 49, 50, 50, 50, 50, 51, 51, 51, 51,
+    52, 52, 52, 52, 53, 53, 53, 53, 54, 54, 54, 54, 55, 55, 55, 55,
+    56, 56, 56, 56, 57, 57, 57, 57, 58, 58, 58, 58, 59, 59, 59, 59,
+    60, 60, 60, 60, 61, 61, 61, 61, 62, 62, 62, 62, 63, 63, 63, 63,
+    // CONTEXT_MSB6, p2 part (all zeros)
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    // CONTEXT_UTF8, p1 part
+     0,  0,  0,  0,  0,  0,  0,  0,  0,  4,  4,  0,  0,  4,  0,  0,
+     0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
+     8, 12, 16, 12, 12, 20, 12, 16, 24, 28, 12, 12, 32, 12, 36, 12,
+    44, 44, 44, 44, 44, 44, 44, 44, 44, 44, 32, 32, 24, 40, 28, 12,
+    12, 48, 52, 52, 52, 48, 52, 52, 52, 48, 52, 52, 52, 52, 52, 48,
+    52, 52, 52, 52, 52, 48, 52, 52, 52, 52, 52, 24, 12, 28, 12, 12,
+    12, 56, 60, 60, 60, 56, 60, 60, 60, 56, 60, 60, 60, 60, 60, 56,
+    60, 60, 60, 60, 60, 56, 60, 60, 60, 60, 60, 24, 12, 28, 12,  0,
+    // UTF8 continuation byte range
+    0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1,
+    0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1,
+    0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1,
+    0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1,
+    // UTF8 lead byte range
+    2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3,
+    2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3,
+    2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3,
+    2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3,
+    // CONTEXT_UTF8, p2 part
+    // ASCII range
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1,
+    1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+    2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1,
+    1, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
+    3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 1, 1, 1, 1, 0,
+    // UTF8 continuation byte range
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    // UTF8 lead byte range
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+    2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+    // CONTEXT_SIGNED, p1 part
+     0, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
+    16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16,
+    16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16,
+    16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16,
+    24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24,
+    24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24,
+    24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24,
+    24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24,
+    32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+    32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+    32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+    32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+    40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40,
+    40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40,
+    40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40,
+    48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 56,
+    // CONTEXT_SIGNED, p2 part
+    0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+    2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+    2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+    3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
+    3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
+    3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
+    3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
+    4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+    4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+    4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+    4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+    5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+    5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+    5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+    6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 7,
 };
 
 fn getContextId(mode: u2, p1: u8, p2: u8) u8 {
@@ -952,8 +963,16 @@ fn readHuffmanCode(allocator: std.mem.Allocator, reader: *BitReader, alphabet_si
         const nsym: u8 = @intCast(nsym_minus1 + 1);
         var symbols: [4]u16 = .{0} ** 4;
 
-        // Number of bits per symbol depends on alphabet size
-        const sym_bits: u5 = if (alphabet_size <= 2) 1 else if (alphabet_size <= 4) 2 else if (alphabet_size <= 8) 3 else if (alphabet_size <= 16) 4 else if (alphabet_size <= 32) 5 else if (alphabet_size <= 64) 6 else if (alphabet_size <= 128) 7 else if (alphabet_size <= 256) 8 else if (alphabet_size <= 512) 9 else if (alphabet_size <= 1024) 10 else if (alphabet_size <= 2048) 11 else if (alphabet_size <= 4096) 12 else if (alphabet_size <= 8192) 13 else if (alphabet_size <= 16384) 14 else 15;
+        // Number of bits per symbol: Log2Floor(alphabet_size - 1), matching C reference
+        // C's Log2Floor counts right-shifts until 0, i.e. ceil(log2(x+1)) = number of bits needed
+        const sym_bits: u5 = blk: {
+            var n: u16 = alphabet_size - 1;
+            var bits: u5 = 0;
+            while (n != 0) : (n >>= 1) {
+                bits += 1;
+            }
+            break :blk bits;
+        };
 
         for (0..nsym) |i| {
             if (sym_bits <= 25) {
@@ -1065,60 +1084,63 @@ fn readComplexHuffmanCodeWithSkip(allocator: std.mem.Allocator, reader: *BitRead
     var cl_table = try buildHuffmanTable(allocator, &cl_code_lengths, 18);
     defer cl_table.deinit();
 
-    // Decode the actual code lengths
+    // Decode the actual code lengths using the same repeat accumulation as C reference
     const code_lengths = allocator.alloc(u8, alphabet_size) catch return error.OutOfMemory;
     defer allocator.free(code_lengths);
     @memset(code_lengths, 0);
 
     var sym_idx: usize = 0;
     var prev_code_len: u8 = 8;
-    var repeat_count: u32 = 0;
-    var repeat_value: u8 = 0;
+    var repeat: u32 = 0;
+    var repeat_code_len: u8 = 0;
     var code_space: i32 = 32768;
     if (space != 0 and num_codes != 1) return error.DecompressionError;
 
-    while (sym_idx < alphabet_size) {
+    while (sym_idx < alphabet_size and code_space > 0) {
         const code = try cl_table.lookup(reader);
         if (code < 16) {
-            // Literal code length
+            // Literal code length — reset repeat
+            repeat = 0;
             code_lengths[sym_idx] = @intCast(code);
             if (code != 0) {
                 prev_code_len = @intCast(code);
                 code_space -= @as(i32, 32768) >> @intCast(code);
             }
             sym_idx += 1;
-            repeat_count = 0;
-        } else if (code == 16) {
-            // Repeat previous code length 3-6 times
-            const extra = try reader.readBits(2);
-            var total: u32 = 3 + extra;
-            if (repeat_count > 0 and repeat_value == prev_code_len) {
-                total = total + repeat_count - 2;
-                sym_idx -= @intCast(repeat_count);
-            }
-            repeat_count = total;
-            repeat_value = prev_code_len;
-            while (total > 0 and sym_idx < alphabet_size) : (total -= 1) {
-                code_lengths[sym_idx] = prev_code_len;
-                code_space -= @as(i32, 32768) >> @intCast(prev_code_len);
-                sym_idx += 1;
-            }
         } else {
-            // code == 17: repeat zero 3-10 times
-            const extra = try reader.readBits(3);
-            var total: u32 = 3 + extra;
-            if (repeat_count > 0 and repeat_value == 0) {
-                total = total + repeat_count - 2;
-                sym_idx -= @intCast(repeat_count);
+            // code == 16: repeat prev_code_len, extra_bits=2
+            // code == 17: repeat zero, extra_bits=3
+            const new_len: u8 = if (code == 16) prev_code_len else 0;
+            const extra_bits: u5 = if (code == 16) 2 else 3;
+            const repeat_delta = try reader.readBits(extra_bits);
+
+            // Reset repeat if switching repeat type
+            if (repeat_code_len != new_len) {
+                repeat = 0;
+                repeat_code_len = new_len;
             }
-            repeat_count = total;
-            repeat_value = 0;
-            while (total > 0 and sym_idx < alphabet_size) : (total -= 1) {
-                code_lengths[sym_idx] = 0;
+
+            // Exponential repeat accumulation (matches C ProcessRepeatedCodeLength)
+            const old_repeat = repeat;
+            if (repeat > 0) {
+                repeat = (repeat - 2) << extra_bits;
+            }
+            repeat += repeat_delta + 3;
+            var delta = repeat - old_repeat;
+
+            if (sym_idx + delta > alphabet_size) {
+                delta = @intCast(alphabet_size - sym_idx);
+            }
+
+            if (new_len != 0) {
+                code_space -= @as(i32, @intCast(delta)) * (@as(i32, 32768) >> @intCast(new_len));
+            }
+
+            while (delta > 0 and sym_idx < alphabet_size) : (delta -= 1) {
+                code_lengths[sym_idx] = new_len;
                 sym_idx += 1;
             }
         }
-        if (code_space <= 0) break;
     }
 
     return buildHuffmanTable(allocator, code_lengths, alphabet_size);
@@ -1305,6 +1327,7 @@ pub fn decompress(allocator: std.mem.Allocator, compressed: []const u8, uncompre
             dist_block_count = @intCast(meta_block_len);
         }
 
+
         // Read NPOSTFIX and NDIRECT
         const npostfix = try reader.readBits(2);
         const ndirect_raw = try reader.readBits(4);
@@ -1316,6 +1339,7 @@ pub fn decompress(allocator: std.mem.Allocator, compressed: []const u8, uncompre
         for (0..lit_block_types) |ci| {
             context_modes[ci] = @intCast(try reader.readBits(2));
         }
+
 
         // Context maps
         const lit_context_map_size = lit_block_types * 64;
@@ -1357,6 +1381,7 @@ pub fn decompress(allocator: std.mem.Allocator, compressed: []const u8, uncompre
             cmd_htrees_init = hi + 1;
         }
 
+
         // Distance trees
         const num_dist_codes: u16 = @intCast(16 + ndirect + (@as(u32, 48) << @as(u5, @intCast(npostfix))));
         const dist_htrees = allocator.alloc(HuffmanTable, num_dist_htrees) catch return error.OutOfMemory;
@@ -1371,6 +1396,7 @@ pub fn decompress(allocator: std.mem.Allocator, compressed: []const u8, uncompre
             dist_htrees[hi] = try readHuffmanCode(allocator, &reader, num_dist_codes);
             dist_htrees_init = hi + 1;
         }
+
 
         // Command loop
         var meta_bytes_remaining: usize = meta_block_len;

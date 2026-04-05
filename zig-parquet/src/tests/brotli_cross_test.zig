@@ -228,3 +228,59 @@ test "edge: two bytes" {
 test "edge: three bytes" {
     try zigRoundTrip(std.testing.allocator, "ABC");
 }
+
+test "cross-impl: C-compress large repeated pattern (quality-11)" {
+    if (!both_enabled) return;
+    const allocator = std.testing.allocator;
+
+    // Generate data that mimics parquet column encoding for 10K rows of "AAAAAAAAAA"
+    // This is the kind of data brotli sees after parquet encoding
+    const count = 10000;
+    var data = std.ArrayList(u8).init(allocator);
+    defer data.deinit();
+
+    // Simulated RLE/plain header
+    try data.appendSlice(&[_]u8{ 0x04, 0x00, 0x00, 0x00, 0xa0, 0x9c, 0x01, 0x01 });
+
+    for (0..count) |_| {
+        // Length-prefixed "AAAAAAAAAA" (10 bytes)
+        try data.appendSlice(&[_]u8{ 0x0a, 0x00, 0x00, 0x00 });
+        try data.appendSlice("AAAAAAAAAA");
+    }
+
+    const c_compressed = try c_brotli.compress(allocator, data.items);
+    defer allocator.free(c_compressed);
+
+    const zig_decompressed = try zig_brotli.decompress(allocator, c_compressed, data.items.len);
+    defer allocator.free(zig_decompressed);
+    try std.testing.expectEqualSlices(u8, data.items, zig_decompressed);
+}
+
+test "cross-impl: parquet-like repeated strings with length prefixes" {
+    if (!both_enabled) return;
+    const allocator = std.testing.allocator;
+
+    // Simulate the actual pattern from compression_brotli.parquet:
+    // repeated "AAAAAAAAAA" strings with 4-byte length prefixes + sequential i64 values
+    var data = std.ArrayList(u8).init(allocator);
+    defer data.deinit();
+    for (0..10000) |i| {
+        // Length prefix (4 bytes LE) + string "AAAAAAAAAA"
+        const str = "AAAAAAAAAA";
+        const len_bytes: [4]u8 = @bitCast(@as(u32, @intCast(str.len)));
+        try data.appendSlice(&len_bytes);
+        try data.appendSlice(str);
+        // Also add an i64 value (sequential)
+        const val: i64 = @intCast(i);
+        const val_bytes: [8]u8 = @bitCast(val);
+        try data.appendSlice(&val_bytes);
+    }
+    const slice = data.items;
+
+    const c_compressed = try c_brotli.compress(allocator, slice);
+    defer allocator.free(c_compressed);
+
+    const zig_decompressed = try zig_brotli.decompress(allocator, c_compressed, slice.len);
+    defer allocator.free(zig_decompressed);
+    try std.testing.expectEqualSlices(u8, slice, zig_decompressed);
+}
