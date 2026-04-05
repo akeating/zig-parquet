@@ -1,6 +1,6 @@
 .{
     .name = .parquet,
-    .version = "0.1.5",
+    .version = "0.1.6",
     .description = "Native Parquet reader/writer for Zig with C ABI, all standard encodings, nested types, and compression support",
     .fingerprint = 0xffe52780a478c7e9,
     .dependencies = .{

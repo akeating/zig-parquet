@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.6] - 2026-04-04
+
+### Added
+- Experimental pure Zig gzip codec (`zig-gzip`) with full deflate encoder and cross-implementation testing
+- Level-9 deflate encoder with LZ77 compression, Huffman tree building, and RLE tree descriptor encoding
+- Concatenated gzip member support in the zig_gzip decompressor
+- `-Dprefer-zig` build flag to select Zig codec implementations over C when both are available
+- Cross-impl tests for concatenated gzip streams (C↔Zig interoperability)
+
+### Changed
+- Codec presets split: `all` includes experimental Zig implementations; `stable` for production use
+
 ## [0.1.5] - 2026-04-02
 
 ### Added
@@ -90,6 +102,7 @@ Initial release.
 - Hardening: safe casting, bounds checking, no `@intCast` on external data
 - 219/219 pass rate on supported Apache parquet-testing files
 
+[0.1.6]: https://github.com/akeating/zig-parquet/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/akeating/zig-parquet/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/akeating/zig-parquet/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/akeating/zig-parquet/compare/v0.1.2...v0.1.3
