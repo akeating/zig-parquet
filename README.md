@@ -12,7 +12,7 @@ A native Parquet library built for portability, embeddability, and low deploymen
 - **Full Read/Write Support** - Read and write Parquet files with all physical and logical types
 - **All Standard Encodings** - PLAIN, RLE, DICTIONARY, DELTA_BINARY_PACKED, DELTA_LENGTH_BYTE_ARRAY, DELTA_BYTE_ARRAY, BYTE_STREAM_SPLIT
 - **Nested Types** - Lists, structs, maps, and arbitrary nesting depth
-- **Compression** - zstd, gzip, snappy, lz4, brotli (individually selectable; experimental pure Zig zstd, gzip, snappy available)
+- **Compression** - zstd, gzip, snappy, lz4, brotli (individually selectable; experimental pure Zig zstd, gzip, snappy, lz4 available)
 - **Logical Types** - STRING, DATE, TIME, TIMESTAMP (millis/micros/nanos), DECIMAL, UUID, INT annotations, FLOAT16, ENUM, JSON, BSON, INTERVAL, GEOMETRY, GEOGRAPHY
 - **Dynamic Row API** - Runtime `DynamicWriter` / `DynamicReader` for all types and arbitrary nesting depth
 - **Schema-Agnostic Reading** - Read any Parquet file without knowing the schema at compile time
@@ -289,6 +289,7 @@ All major Parquet compression codecs are supported, individually selectable at b
 | zig-zstd | Pure Zig (experimental) | No C dependency; level-1 compressor + stdlib decompressor |
 | zig-gzip | Pure Zig (experimental) | No C dependency; level-9 deflate compressor + stdlib decompressor |
 | zig-snappy | Pure Zig (experimental) | No C/C++ dependency; full Snappy block format |
+| zig-lz4 | Pure Zig (experimental) | No C dependency; full LZ4 raw block format |
 
 ```zig
 var writer = try parquet.createFileDynamic(allocator, file);
@@ -347,10 +348,10 @@ writer.setMaxPageSize(1_048_576);      // 1MB page size limit
 | BYTE_STREAM_SPLIT | ✅ | Float/double/int/fixed columns |
 | **Compression** | | |
 | UNCOMPRESSED | ✅ | |
-| SNAPPY | ✅ | Via C++ library |
+| SNAPPY | ✅ | C++ snappy (default) or pure Zig (experimental via `zig-snappy`) |
 | GZIP | ✅ | C zlib (default) or pure Zig (experimental via `zig-gzip`) |
 | ZSTD | ✅ | C libzstd (default) or pure Zig (experimental via `zig-zstd`) |
-| LZ4_RAW | ✅ | Via lz4 |
+| LZ4_RAW | ✅ | C lz4 (default) or pure Zig (experimental via `zig-lz4`) |
 | BROTLI | ✅ | Via brotli |
 | LZ4 (non-raw) | ❌ | Hadoop-specific framing format |
 | LZO | ❌ | Not implemented |

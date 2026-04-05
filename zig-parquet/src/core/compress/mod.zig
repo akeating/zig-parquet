@@ -4,7 +4,7 @@
 //! compression and decompression for supported codecs.
 //!
 //! Use `-Dcodecs=` to control which codecs are included (default: all).
-//! Values: all, stable, none, zig-only, or comma-separated list of: zstd,zig-zstd,snappy,zig-snappy,gzip,zig-gzip,lz4,brotli
+//! Values: all, stable, none, zig-only, or comma-separated list of: zstd,zig-zstd,snappy,zig-snappy,gzip,zig-gzip,lz4,zig-lz4,brotli
 
 const build_options = @import("build_options");
 
@@ -18,6 +18,7 @@ pub const experimental = struct {
     pub const zig_zstd = if (build_options.enable_zig_zstd) @import("zig_zstd.zig") else {};
     pub const zig_snappy = if (build_options.enable_zig_snappy) @import("zig_snappy.zig") else {};
     pub const zig_gzip = if (build_options.enable_zig_gzip) @import("zig_gzip.zig") else {};
+    pub const zig_lz4 = if (build_options.enable_zig_lz4) @import("zig_lz4.zig") else {};
 };
 
 const std = @import("std");
@@ -121,11 +122,25 @@ pub fn compress(
             return error.UnsupportedCompression;
         },
         .lz4_raw => {
-            if (build_options.enable_lz4) {
+            if (build_options.prefer_zig and build_options.enable_zig_lz4) {
+                return experimental.zig_lz4.compress(allocator, data) catch |e| switch (e) {
+                    error.CompressionError => return error.CompressionError,
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.DecompressionError => return error.CompressionError,
+                    error.InvalidSize => return error.CompressionError,
+                };
+            } else if (build_options.enable_lz4) {
                 return lz4.compress(allocator, data) catch |e| switch (e) {
                     error.CompressionError => return error.CompressionError,
                     error.OutOfMemory => return error.OutOfMemory,
                     error.DecompressionError => return error.CompressionError,
+                };
+            } else if (build_options.enable_zig_lz4) {
+                return experimental.zig_lz4.compress(allocator, data) catch |e| switch (e) {
+                    error.CompressionError => return error.CompressionError,
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.DecompressionError => return error.CompressionError,
+                    error.InvalidSize => return error.CompressionError,
                 };
             }
             return error.UnsupportedCompression;
@@ -206,11 +221,25 @@ pub fn decompress(
             return error.UnsupportedCompression;
         },
         .lz4_raw => {
-            if (build_options.enable_lz4) {
+            if (build_options.prefer_zig and build_options.enable_zig_lz4) {
+                return experimental.zig_lz4.decompress(allocator, compressed, uncompressed_size) catch |e| switch (e) {
+                    error.DecompressionError => return error.DecompressionError,
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.CompressionError => return error.DecompressionError,
+                    error.InvalidSize => return error.DecompressionError,
+                };
+            } else if (build_options.enable_lz4) {
                 return lz4.decompress(allocator, compressed, uncompressed_size) catch |e| switch (e) {
                     error.DecompressionError => return error.DecompressionError,
                     error.OutOfMemory => return error.OutOfMemory,
                     error.CompressionError => return error.DecompressionError,
+                };
+            } else if (build_options.enable_zig_lz4) {
+                return experimental.zig_lz4.decompress(allocator, compressed, uncompressed_size) catch |e| switch (e) {
+                    error.DecompressionError => return error.DecompressionError,
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.CompressionError => return error.DecompressionError,
+                    error.InvalidSize => return error.DecompressionError,
                 };
             }
             return error.UnsupportedCompression;
