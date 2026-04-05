@@ -302,7 +302,7 @@ test "read compression_lz4.parquet" {
 }
 
 test "read compression_brotli.parquet" {
-    if (!build_options.enable_brotli) return;
+    if (!build_options.supports_brotli) return;
     const allocator = std.testing.allocator;
 
     const file = std.fs.cwd().openFile("../test-files-arrow/compression/compression_brotli.parquet", .{}) catch |err| {

@@ -229,6 +229,28 @@ test "edge: three bytes" {
     try zigRoundTrip(std.testing.allocator, "ABC");
 }
 
+test "cross-impl: decompress actual parquet brotli stream" {
+    if (!both_enabled) return;
+    const allocator = std.testing.allocator;
+
+    // Exact 28-byte brotli stream from compression_brotli.parquet column 0
+    const compressed = [_]u8{
+        0x5b, 0xe7, 0x22, 0x02, 0x40, 0x88, 0x26, 0x77,
+        0xbf, 0x3d, 0xa5, 0x16, 0x88, 0x07, 0xd5, 0x41,
+        0x87, 0x15, 0x42, 0xb9, 0xf8, 0x4b, 0x06, 0x2b,
+        0xa3, 0x86, 0xc0, 0x00,
+    };
+    const uncompressed_size: usize = 140008;
+
+    const c_result = try c_brotli.decompress(allocator, &compressed, uncompressed_size);
+    defer allocator.free(c_result);
+
+    const zig_result = try zig_brotli.decompress(allocator, &compressed, uncompressed_size);
+    defer allocator.free(zig_result);
+
+    try std.testing.expectEqualSlices(u8, c_result, zig_result);
+}
+
 test "cross-impl: C-compress large repeated pattern (quality-11)" {
     if (!both_enabled) return;
     const allocator = std.testing.allocator;
