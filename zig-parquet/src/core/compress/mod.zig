@@ -19,6 +19,7 @@ pub const experimental = struct {
     pub const zig_snappy = if (build_options.enable_zig_snappy) @import("zig_snappy.zig") else {};
     pub const zig_gzip = if (build_options.enable_zig_gzip) @import("zig_gzip.zig") else {};
     pub const zig_lz4 = if (build_options.enable_zig_lz4) @import("zig_lz4.zig") else {};
+    pub const zig_brotli = if (build_options.enable_zig_brotli) @import("zig_brotli.zig") else {};
 };
 
 const std = @import("std");
@@ -146,11 +147,25 @@ pub fn compress(
             return error.UnsupportedCompression;
         },
         .brotli => {
-            if (build_options.enable_brotli) {
+            if (build_options.prefer_zig and build_options.enable_zig_brotli) {
+                return experimental.zig_brotli.compress(allocator, data) catch |e| switch (e) {
+                    error.CompressionError => return error.CompressionError,
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.DecompressionError => return error.CompressionError,
+                    error.InvalidSize => return error.CompressionError,
+                };
+            } else if (build_options.enable_brotli) {
                 return brotli.compress(allocator, data) catch |e| switch (e) {
                     error.CompressionError => return error.CompressionError,
                     error.OutOfMemory => return error.OutOfMemory,
                     error.DecompressionError => return error.CompressionError,
+                };
+            } else if (build_options.enable_zig_brotli) {
+                return experimental.zig_brotli.compress(allocator, data) catch |e| switch (e) {
+                    error.CompressionError => return error.CompressionError,
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.DecompressionError => return error.CompressionError,
+                    error.InvalidSize => return error.CompressionError,
                 };
             }
             return error.UnsupportedCompression;
@@ -245,11 +260,25 @@ pub fn decompress(
             return error.UnsupportedCompression;
         },
         .brotli => {
-            if (build_options.enable_brotli) {
+            if (build_options.prefer_zig and build_options.enable_zig_brotli) {
+                return experimental.zig_brotli.decompress(allocator, compressed, uncompressed_size) catch |e| switch (e) {
+                    error.DecompressionError => return error.DecompressionError,
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.CompressionError => return error.DecompressionError,
+                    error.InvalidSize => return error.DecompressionError,
+                };
+            } else if (build_options.enable_brotli) {
                 return brotli.decompress(allocator, compressed, uncompressed_size) catch |e| switch (e) {
                     error.DecompressionError => return error.DecompressionError,
                     error.OutOfMemory => return error.OutOfMemory,
                     error.CompressionError => return error.DecompressionError,
+                };
+            } else if (build_options.enable_zig_brotli) {
+                return experimental.zig_brotli.decompress(allocator, compressed, uncompressed_size) catch |e| switch (e) {
+                    error.DecompressionError => return error.DecompressionError,
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.CompressionError => return error.DecompressionError,
+                    error.InvalidSize => return error.DecompressionError,
                 };
             }
             return error.UnsupportedCompression;
