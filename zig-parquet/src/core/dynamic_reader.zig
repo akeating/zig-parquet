@@ -139,6 +139,7 @@ pub const DynamicReader = struct {
                     }
                 }
             }
+            if (rg.sorting_columns) |sc| self.allocator.free(sc);
             self.allocator.free(rg.columns);
         }
         self.allocator.free(self.metadata.row_groups);

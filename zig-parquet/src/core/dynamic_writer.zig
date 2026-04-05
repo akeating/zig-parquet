@@ -271,6 +271,8 @@ pub const DynamicWriter = struct {
     row_groups: std.ArrayListUnmanaged(RowGroupMeta) = .empty,
     current_offset: i64 = 4, // after PAR1 magic
 
+    sorting_columns: ?[]const format.SortingColumn = null,
+
     row_group_row_limit: ?usize = null,
     rows_in_current_group: usize = 0,
     kv_metadata: std.ArrayListUnmanaged(format.KeyValue) = .empty,
@@ -1317,7 +1319,7 @@ pub const DynamicWriter = struct {
                 .columns = rg.columns,
                 .total_byte_size = rg.total_byte_size,
                 .num_rows = rg.num_rows,
-                .sorting_columns = null,
+                .sorting_columns = self.sorting_columns,
                 .file_offset = rg.file_offset,
                 .total_compressed_size = rg.total_byte_size,
                 .ordinal = safe.castTo(i16, i) catch null, // Parquet spec limits ordinal to i16

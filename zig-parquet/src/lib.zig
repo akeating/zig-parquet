@@ -106,6 +106,7 @@ pub const WriteTargetWriter = write_target_mod.WriteTargetWriter;
 // Format types (Thrift-decoded Parquet structures)
 pub const format = @import("core/format.zig");
 pub const CompressionCodec = format.CompressionCodec;
+pub const SortingColumn = format.SortingColumn;
 
 // Dynamic Writer (runtime row-oriented writing)
 const writer_module = @import("core/writer_mod.zig");

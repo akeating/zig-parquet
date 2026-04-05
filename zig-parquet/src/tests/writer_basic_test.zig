@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const parquet = @import("../lib.zig");
+const format = parquet.format;
 const build_options = @import("build_options");
 
 test "round-trip i64 column" {
@@ -547,5 +548,154 @@ test "dictionary cardinality fallback" {
             if (val.isNull()) return error.UnexpectedNull;
             try std.testing.expectEqual(@as(i64, @intCast(i)), val.asInt64().?);
         }
+    }
+}
+
+test "round-trip sorting_columns metadata via DynamicWriter" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const file_path = "roundtrip_sorting_columns.parquet";
+
+    const sorting_cols = [_]format.SortingColumn{
+        .{ .column_idx = 0, .descending = false, .nulls_first = false },
+        .{ .column_idx = 1, .descending = true, .nulls_first = true },
+    };
+
+    // Write
+    {
+        const file = try tmp_dir.dir.createFile(file_path, .{});
+        defer file.close();
+
+        var writer = parquet.createFileDynamic(allocator, file) catch |e| {
+            std.debug.print("createFileDynamic error: {any}\n", .{e});
+            return e;
+        };
+        defer writer.deinit();
+
+        writer.sorting_columns = &sorting_cols;
+
+        try writer.addColumn("id", parquet.TypeInfo.int64, .{});
+        try writer.addColumn("name", parquet.TypeInfo.string, .{});
+        try writer.begin();
+
+        try writer.setInt64(0, 1);
+        try writer.setBytes(1, "alice");
+        try writer.addRow();
+
+        try writer.setInt64(0, 2);
+        try writer.setBytes(1, "bob");
+        try writer.addRow();
+
+        try writer.close();
+    }
+
+    // Read back and verify sorting_columns metadata
+    {
+        const file = try tmp_dir.dir.openFile(file_path, .{});
+        defer file.close();
+
+        var reader = try parquet.openFileDynamic(allocator, file, .{});
+        defer reader.deinit();
+
+        try std.testing.expectEqual(@as(usize, 1), reader.metadata.row_groups.len);
+
+        const sc = reader.metadata.row_groups[0].sorting_columns orelse
+            return error.TestExpectedEqual;
+        try std.testing.expectEqual(@as(usize, 2), sc.len);
+
+        try std.testing.expectEqual(@as(i32, 0), sc[0].column_idx);
+        try std.testing.expectEqual(false, sc[0].descending);
+        try std.testing.expectEqual(false, sc[0].nulls_first);
+
+        try std.testing.expectEqual(@as(i32, 1), sc[1].column_idx);
+        try std.testing.expectEqual(true, sc[1].descending);
+        try std.testing.expectEqual(true, sc[1].nulls_first);
+    }
+}
+
+test "round-trip sorting_columns metadata via Writer" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const file_path = "roundtrip_sorting_columns_writer.parquet";
+
+    const sorting_cols = [_]format.SortingColumn{
+        .{ .column_idx = 0, .descending = true, .nulls_first = false },
+    };
+
+    // Write
+    {
+        const file = try tmp_dir.dir.createFile(file_path, .{});
+        defer file.close();
+
+        const columns = [_]parquet.ColumnDef{
+            .{ .name = "value", .type_ = .int64, .optional = false },
+        };
+
+        var writer = try parquet.writeToFile(allocator, file, &columns);
+        defer writer.deinit();
+
+        writer.sorting_columns = &sorting_cols;
+
+        const values = [_]i64{ 100, 50, 10 };
+        try writer.writeColumn(i64, 0, &values);
+        try writer.close();
+    }
+
+    // Read back
+    {
+        const file = try tmp_dir.dir.openFile(file_path, .{});
+        defer file.close();
+
+        var reader = try parquet.openFileDynamic(allocator, file, .{});
+        defer reader.deinit();
+
+        const sc = reader.metadata.row_groups[0].sorting_columns orelse
+            return error.TestExpectedEqual;
+        try std.testing.expectEqual(@as(usize, 1), sc.len);
+
+        try std.testing.expectEqual(@as(i32, 0), sc[0].column_idx);
+        try std.testing.expectEqual(true, sc[0].descending);
+        try std.testing.expectEqual(false, sc[0].nulls_first);
+    }
+}
+
+test "sorting_columns defaults to null" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const file_path = "roundtrip_no_sorting.parquet";
+
+    // Write without setting sorting_columns
+    {
+        const file = try tmp_dir.dir.createFile(file_path, .{});
+        defer file.close();
+
+        var writer = parquet.createFileDynamic(allocator, file) catch |e| return e;
+        defer writer.deinit();
+
+        try writer.addColumn("id", parquet.TypeInfo.int64, .{});
+        try writer.begin();
+        try writer.setInt64(0, 1);
+        try writer.addRow();
+        try writer.close();
+    }
+
+    // Read back — sorting_columns should be null
+    {
+        const file = try tmp_dir.dir.openFile(file_path, .{});
+        defer file.close();
+
+        var reader = try parquet.openFileDynamic(allocator, file, .{});
+        defer reader.deinit();
+
+        try std.testing.expectEqual(@as(?[]const format.SortingColumn, null), reader.metadata.row_groups[0].sorting_columns);
     }
 }

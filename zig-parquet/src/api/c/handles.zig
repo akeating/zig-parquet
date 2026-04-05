@@ -224,6 +224,7 @@ pub const ReaderHandle = struct {
                     }
                 }
             }
+            if (rg.sorting_columns) |sc| allocator.free(sc);
             allocator.free(rg.columns);
         }
         allocator.free(self.metadata.row_groups);

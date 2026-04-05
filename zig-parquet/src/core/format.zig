@@ -38,6 +38,7 @@ pub const GeospatialStatistics = statistics.GeospatialStatistics;
 pub const ColumnMetaData = column.ColumnMetaData;
 pub const ColumnChunk = column.ColumnChunk;
 pub const RowGroup = row_group.RowGroup;
+pub const SortingColumn = row_group.SortingColumn;
 pub const KeyValue = row_group.KeyValue;
 pub const FileMetaData = metadata.FileMetaData;
 pub const PageHeader = page.PageHeader;

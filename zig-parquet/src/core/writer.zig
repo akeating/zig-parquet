@@ -79,6 +79,8 @@ pub const Writer = struct {
 
     geo_stats_builders: std.AutoHashMapUnmanaged(usize, *statistics.GeospatialStatisticsBuilder),
 
+    sorting_columns: ?[]const format.SortingColumn = null,
+
     _backend_cleanup: ?BackendCleanup = null,
     _to_owned_slice_fn: ?*const fn (*anyopaque) error{OutOfMemory}![]u8 = null,
     _to_owned_slice_ctx: ?*anyopaque = null,
@@ -1037,7 +1039,7 @@ pub const Writer = struct {
             .columns = column_chunks,
             .total_byte_size = total_byte_size,
             .num_rows = self.num_rows orelse 0,
-            .sorting_columns = null,
+            .sorting_columns = self.sorting_columns,
             .file_offset = 4, // After PAR1
             .total_compressed_size = total_byte_size,
             .ordinal = 0,

@@ -12,7 +12,7 @@ pub const RowGroup = struct {
     columns: []ColumnChunk = &.{},
     total_byte_size: i64 = 0,
     num_rows: i64 = 0,
-    sorting_columns: ?[]const u8 = null, // Skip detailed parsing for now
+    sorting_columns: ?[]const SortingColumn = null,
     file_offset: ?i64 = null,
     total_compressed_size: ?i64 = null,
     ordinal: ?i16 = null,
@@ -36,6 +36,14 @@ pub const RowGroup = struct {
                 },
                 2 => rg.total_byte_size = try reader.readI64(),
                 3 => rg.num_rows = try reader.readI64(),
+                4 => {
+                    const list_header = try reader.readListHeader();
+                    var sorting_list = try allocator.alloc(SortingColumn, list_header.size);
+                    for (0..list_header.size) |i| {
+                        sorting_list[i] = try SortingColumn.parse(reader);
+                    }
+                    rg.sorting_columns = sorting_list;
+                },
                 5 => rg.file_offset = try reader.readI64(),
                 6 => rg.total_compressed_size = try reader.readI64(),
                 7 => rg.ordinal = try reader.readI16(),
@@ -64,6 +72,14 @@ pub const RowGroup = struct {
         try writer.writeFieldHeader(3, .i64);
         try writer.writeI64(self.num_rows);
 
+        if (self.sorting_columns) |sc| {
+            try writer.writeFieldHeader(4, .list);
+            try writer.writeListHeader(.struct_, safe.castTo(u32, sc.len) catch return error.IntegerOverflow);
+            for (sc) |*col| {
+                try col.serialize(writer);
+            }
+        }
+
         if (self.file_offset) |fo| {
             try writer.writeFieldHeader(5, .i64);
             try writer.writeI64(fo);
@@ -78,6 +94,45 @@ pub const RowGroup = struct {
             try writer.writeFieldHeader(7, .i16);
             try writer.writeI16(ord);
         }
+
+        try writer.writeStructEnd();
+        writer.restoreFieldId(saved);
+    }
+};
+
+/// Sort order within a RowGroup of a leaf column
+pub const SortingColumn = struct {
+    column_idx: i32 = 0,
+    descending: bool = false,
+    nulls_first: bool = false,
+
+    pub fn parse(reader: *thrift.CompactReader) !SortingColumn {
+        var sc = SortingColumn{};
+        const saved_field_id = reader.last_field_id;
+        reader.resetFieldTracking();
+
+        while (try reader.readFieldHeader()) |field| {
+            switch (field.field_id) {
+                1 => sc.column_idx = try reader.readI32(),
+                2 => sc.descending = field.field_type == .bool_true,
+                3 => sc.nulls_first = field.field_type == .bool_true,
+                else => try reader.skip(field.field_type),
+            }
+        }
+
+        reader.last_field_id = saved_field_id;
+        return sc;
+    }
+
+    pub fn serialize(self: *const SortingColumn, writer: *thrift.CompactWriter) !void {
+        const saved = writer.saveFieldId();
+        writer.resetFieldTracking();
+
+        try writer.writeFieldHeader(1, .i32);
+        try writer.writeI32(self.column_idx);
+
+        try writer.writeBoolField(2, self.descending);
+        try writer.writeBoolField(3, self.nulls_first);
 
         try writer.writeStructEnd();
         writer.restoreFieldId(saved);
