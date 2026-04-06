@@ -28,7 +28,8 @@ Static library (`libparquet.a`) sizes with `ReleaseSmall`, measured on macOS arm
 | `zig-snappy` | 835 KB | +28 KB | No |
 | `zig-gzip` | 872 KB | +65 KB | No |
 | `zig-zstd` | 910 KB | +103 KB | No |
-| `zig-only` | 955 KB | +148 KB | No |
+| `zig-brotli` | 985 KB | +178 KB | No |
+| `zig-only` | 1,110 KB | +303 KB | No |
 | `snappy` | 877 KB | +70 KB | C++ |
 | `lz4` | 896 KB | +89 KB | C |
 | `gzip` | 898 KB | +91 KB | C |
@@ -44,8 +45,9 @@ Static library (`libparquet.a`) sizes with `ReleaseSmall`, measured on macOS arm
 | `zig-lz4` | 633 KB | 117 KB | +1 KB |
 | `zig-snappy` | 634 KB | 117 KB | +1 KB |
 | `zig-gzip` | 659 KB | 125 KB | +9 KB |
-| `zig-zstd` | 696 KB | 134 KB | +18 KB |
-| `zig-only` | 725 KB | 139 KB | +23 KB |
+| `zig-zstd` | 695 KB | 134 KB | +18 KB |
+| `zig-brotli` | 792 KB | 156 KB | +40 KB |
+| `zig-only` | 886 KB | 184 KB | +68 KB |
 | `snappy` | 671 KB | 130 KB | +14 KB |
 | `lz4` | 673 KB | 126 KB | +10 KB |
 | `gzip` | 681 KB | 134 KB | +18 KB |
@@ -191,6 +193,8 @@ The `zig-brotli` codec is a pure Zig implementation of Brotli (RFC 7932) with no
 - Uncompressed meta-block encoding (valid Brotli bitstream, no LZ77 compression)
 - Multi-block support (blocks up to 64KB)
 
+**Why quality 0:** The C binding compresses at quality 11 (maximum). A quality-11 encoder is ~25,000 lines of C (Zopfli-style optimal parsing, binary tree hashers, block splitting, context modeling) — larger than all other Zig codecs combined. Quality 0 is a self-contained ~500-line one-pass encoder that produces valid streams any decoder can read. Compression ratios are reasonable for typical Parquet data, trailing quality 11 by 4–10 percentage points (e.g., timestamps: 50% vs 40%, dictionary indices: 30% vs 21%). Users needing maximum compression can use the C backend (`-Dcodecs=brotli`); the Zig backend is for environments where no-C-dependency matters more than ratio.
+
 **Decompressor** -- full RFC 7932 decoder handling all Brotli features:
 - All block types (uncompressed, compressed, metadata)
 - Complex and simple prefix (Huffman) codes with two-level lookup tables
@@ -224,6 +228,8 @@ The `zig-zstd` codec is a pure Zig implementation with no C dependencies.
 - Raw literals (no Huffman encoding)
 - Predefined FSE tables for sequence encoding
 - Multi-block support (blocks up to 128KB)
+
+**Why level 1:** Zstd level 1 already delivers strong compression on Parquet's columnar data — repetitive values, run-length patterns, and dictionary-encoded columns compress well even with greedy matching. Level 1 is the default for Apache Arrow's C++ and Go Parquet writers (DuckDB and Spark default to level 3). Higher levels add Huffman-coded literals, optimal parsing, and longer match searches for diminishing returns on typical Parquet pages.
 
 **Decompressor** -- uses `std.compress.zstd` from Zig's standard library. Handles all compression levels.
 

@@ -12,7 +12,7 @@ A native Parquet library built for portability, embeddability, and low deploymen
 - **Full Read/Write Support** - Read and write Parquet files with all physical and logical types
 - **All Standard Encodings** - PLAIN, RLE, DICTIONARY, DELTA_BINARY_PACKED, DELTA_LENGTH_BYTE_ARRAY, DELTA_BYTE_ARRAY, BYTE_STREAM_SPLIT
 - **Nested Types** - Lists, structs, maps, and arbitrary nesting depth
-- **Compression** - zstd, gzip, snappy, lz4, brotli (individually selectable; experimental pure Zig zstd, gzip, snappy, lz4, brotli available)
+- **Compression** - zstd, gzip, snappy, lz4, brotli — all five have pure Zig implementations (no C/C++ required), plus C backends for production use
 - **Logical Types** - STRING, DATE, TIME, TIMESTAMP (millis/micros/nanos), DECIMAL, UUID, INT annotations, FLOAT16, ENUM, JSON, BSON, INTERVAL, GEOMETRY, GEOGRAPHY
 - **Dynamic Row API** - Runtime `DynamicWriter` / `DynamicReader` for all types and arbitrary nesting depth
 - **Schema-Agnostic Reading** - Read any Parquet file without knowing the schema at compile time
@@ -24,7 +24,7 @@ A native Parquet library built for portability, embeddability, and low deploymen
 - **Hardened Against Malformed Input** - Designed for safe casting, bounds checking, and no undefined behavior on untrusted data
 - **C ABI with Arrow C Data Interface** - Call from C, C++, and other languages via ArrowSchema, ArrowArray, and ArrowArrayStream
 - **Portable Deployment** - Native library and CLI for desktops, servers, edge devices, and serverless jobs
-- **WASM Compatible** - 103 KB plain or 438 KB with all compression codecs (brotli-compressed)
+- **WASM Compatible** - 103 KB plain, 184 KB with all pure Zig codecs, or 446 KB with C codecs (brotli-compressed)
 - **CLI Tool** - `pqi` for inspecting and validating Parquet files
 
 ## CLI Tool
