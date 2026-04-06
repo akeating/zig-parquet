@@ -26,17 +26,27 @@ fn zigRoundTrip(allocator: std.mem.Allocator, data: []const u8) !void {
     try std.testing.expectEqualSlices(u8, data, decompressed);
 }
 
+/// Round-trip through both compressors: Zig→C, Zig→Zig, C→Zig.
 fn crossRoundTrip(allocator: std.mem.Allocator, data: []const u8) !void {
     if (!build_options.enable_zig_snappy) return;
     const zig_compressed = try zig_snappy.compress(allocator, data);
     defer allocator.free(zig_compressed);
 
     if (both_enabled) {
+        // Zig compress → C decompress
         const zc = try c_snappy.decompress(allocator, zig_compressed, data.len);
         defer allocator.free(zc);
         try std.testing.expectEqualSlices(u8, data, zc);
+
+        // C compress → Zig decompress
+        const c_compressed = try c_snappy.compress(allocator, data);
+        defer allocator.free(c_compressed);
+        const cz = try zig_snappy.decompress(allocator, c_compressed, data.len);
+        defer allocator.free(cz);
+        try std.testing.expectEqualSlices(u8, data, cz);
     }
 
+    // Zig compress → Zig decompress
     const decompressed = try zig_snappy.decompress(allocator, zig_compressed, data.len);
     defer allocator.free(decompressed);
     try std.testing.expectEqualSlices(u8, data, decompressed);
