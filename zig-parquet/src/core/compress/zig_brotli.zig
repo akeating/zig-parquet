@@ -185,13 +185,10 @@ const HuffmanTable = struct {
     }
 
     fn lookup(self: *const HuffmanTable, reader: *BitReader) Error!u16 {
-        // Peek 8 bits for primary table
+        // Peek up to 8 bits for primary table index
         const available = reader.bitsAvailable();
-        if (available == 0) return error.DecompressionError;
         const peek_bits: u5 = if (available >= PRIMARY_TABLE_BITS) PRIMARY_TABLE_BITS else @intCast(available);
-        const idx = try reader.peekBits(peek_bits);
-
-        // If we couldn't peek full 8 bits, pad with zeros
+        const idx = if (peek_bits > 0) try reader.peekBits(peek_bits) else 0;
         const primary_idx = if (peek_bits < PRIMARY_TABLE_BITS) idx else idx;
         if (primary_idx >= self.entries.len) return error.DecompressionError;
 

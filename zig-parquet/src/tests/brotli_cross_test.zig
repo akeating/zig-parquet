@@ -251,6 +251,17 @@ test "cross-impl: decompress actual parquet brotli stream" {
     try std.testing.expectEqualSlices(u8, c_result, zig_result);
 }
 
+test "cross-impl: C compress ABCDEFGH repeated" {
+    if (!both_enabled) return;
+    const allocator = std.testing.allocator;
+    const original = "ABCDEFGH" ** 200;
+    const c_compressed = try c_brotli.compress(allocator, original);
+    defer allocator.free(c_compressed);
+    const zig_result = try zig_brotli.decompress(allocator, c_compressed, original.len);
+    defer allocator.free(zig_result);
+    try std.testing.expectEqualStrings(original, zig_result);
+}
+
 test "cross-impl: C-compress large repeated pattern (quality-11)" {
     if (!both_enabled) return;
     const allocator = std.testing.allocator;
