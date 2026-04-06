@@ -952,7 +952,9 @@ fn decodeContextMap(allocator: std.mem.Allocator, reader: *BitReader, context_ma
                 i += 1;
             }
         } else {
-            context_map[i] = @intCast(code - max_rle_prefix);
+            const htree_val = code - max_rle_prefix;
+            if (htree_val > std.math.maxInt(u8)) return error.DecompressionError;
+            context_map[i] = @intCast(htree_val);
             i += 1;
         }
     }
@@ -1454,6 +1456,7 @@ pub fn decompress(allocator: std.mem.Allocator, compressed: []const u8, uncompre
                     cmd_prev_block_type = cmd_block_type;
                     cmd_block_type = (cmd_block_type + 1) % cmd_block_types;
                 } else {
+                    if (new_type - 2 >= cmd_block_types) return error.DecompressionError;
                     cmd_prev_block_type = cmd_block_type;
                     cmd_block_type = new_type - 2;
                 }
@@ -1493,6 +1496,7 @@ pub fn decompress(allocator: std.mem.Allocator, compressed: []const u8, uncompre
                         lit_prev_block_type = lit_block_type;
                         lit_block_type = (lit_block_type + 1) % lit_block_types;
                     } else {
+                        if (new_type - 2 >= lit_block_types) return error.DecompressionError;
                         lit_prev_block_type = lit_block_type;
                         lit_block_type = new_type - 2;
                     }
@@ -1505,6 +1509,7 @@ pub fn decompress(allocator: std.mem.Allocator, compressed: []const u8, uncompre
                 const context_id = getContextId(context_modes[lit_block_type], p1, p2);
                 const cm_idx = lit_block_type * 64 + context_id;
                 const htree_idx = if (cm_idx < lit_context_map.len) lit_context_map[cm_idx] else 0;
+                if (htree_idx >= num_lit_htrees) return error.DecompressionError;
                 const literal = try lit_htrees[htree_idx].lookup(&reader);
 
                 const byte: u8 = @intCast(literal & 0xff);
@@ -1541,6 +1546,7 @@ pub fn decompress(allocator: std.mem.Allocator, compressed: []const u8, uncompre
                         dist_prev_block_type = dist_block_type;
                         dist_block_type = (dist_block_type + 1) % dist_block_types;
                     } else {
+                        if (new_type - 2 >= dist_block_types) return error.DecompressionError;
                         dist_prev_block_type = dist_block_type;
                         dist_block_type = new_type - 2;
                     }
@@ -1551,6 +1557,7 @@ pub fn decompress(allocator: std.mem.Allocator, compressed: []const u8, uncompre
                 const dist_context = cmd.context;
                 const dcm_idx = dist_block_type * 4 + dist_context;
                 const dist_htree_idx = if (dcm_idx < dist_context_map.len) dist_context_map[dcm_idx] else 0;
+                if (dist_htree_idx >= num_dist_htrees) return error.DecompressionError;
                 const dist_code = try dist_htrees[dist_htree_idx].lookup(&reader);
 
                 distance = try resolveDistance(dist_code, &dist_rb, &dist_rb_idx, npostfix, ndirect, &reader);
@@ -1647,6 +1654,7 @@ fn resolveDistance(dist_code: u16, dist_rb: *[4]usize, dist_rb_idx: *usize, npos
         const postfix_mask = (@as(u32, 1) << @intCast(npostfix)) - 1;
         const hcode = code >> @intCast(npostfix);
         const lcode = code & postfix_mask;
+        if (hcode >> 1 >= 31) return error.DecompressionError;
         const nbits: u5 = @intCast(1 + (hcode >> 1));
         const offset2: u32 = ((2 + (hcode & 1)) << nbits) - 4;
         const extra = try reader.readBits(nbits);
