@@ -1620,7 +1620,6 @@ fn resolveDistance(dist_code: u16, dist_rb: *[4]usize, dist_rb_idx: *usize, npos
         const base = dist_rb[rb_idx];
         const result = @as(i64, @intCast(base)) + @as(i64, sc.delta);
         if (result <= 0) {
-            // C reference sets to 0x7FFFFFFF; this will cause a dictionary error later
             return 0x7FFFFFFF;
         }
         return @intCast(result);
