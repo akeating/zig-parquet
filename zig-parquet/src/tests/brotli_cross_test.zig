@@ -301,12 +301,12 @@ test "cross-impl: parquet-like repeated strings with length prefixes" {
         // Length prefix (4 bytes LE) + string "AAAAAAAAAA"
         const str = "AAAAAAAAAA";
         const len_bytes: [4]u8 = @bitCast(@as(u32, @intCast(str.len)));
-        try data.appendSlice(allocator,&len_bytes);
-        try data.appendSlice(allocator,str);
+        try data.appendSlice(allocator, &len_bytes);
+        try data.appendSlice(allocator, str);
         // Also add an i64 value (sequential)
         const val: i64 = @intCast(i);
         const val_bytes: [8]u8 = @bitCast(val);
-        try data.appendSlice(allocator,&val_bytes);
+        try data.appendSlice(allocator, &val_bytes);
     }
     const slice = data.items;
 

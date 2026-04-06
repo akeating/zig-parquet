@@ -669,15 +669,15 @@ const BlockLengthPrefixEntry = struct {
 };
 
 const kBlockLengthPrefixCode = [26]BlockLengthPrefixEntry{
-    .{ .offset = 1, .nbits = 2 },    .{ .offset = 5, .nbits = 2 },    .{ .offset = 9, .nbits = 2 },
-    .{ .offset = 13, .nbits = 2 },   .{ .offset = 17, .nbits = 3 },   .{ .offset = 25, .nbits = 3 },
-    .{ .offset = 33, .nbits = 3 },   .{ .offset = 41, .nbits = 3 },   .{ .offset = 49, .nbits = 4 },
-    .{ .offset = 65, .nbits = 4 },   .{ .offset = 81, .nbits = 5 },   .{ .offset = 97, .nbits = 5 },
-    .{ .offset = 113, .nbits = 7 },  .{ .offset = 129, .nbits = 8 },  .{ .offset = 193, .nbits = 9 },
-    .{ .offset = 257, .nbits = 10 }, .{ .offset = 321, .nbits = 11 }, .{ .offset = 385, .nbits = 12 },
-    .{ .offset = 449, .nbits = 13 }, .{ .offset = 513, .nbits = 14 }, .{ .offset = 577, .nbits = 15 },
-    .{ .offset = 641, .nbits = 16 }, .{ .offset = 705, .nbits = 17 }, .{ .offset = 769, .nbits = 18 },
-    .{ .offset = 833, .nbits = 19 }, .{ .offset = 897, .nbits = 20 },
+    .{ .offset = 1, .nbits = 2 },     .{ .offset = 5, .nbits = 2 },     .{ .offset = 9, .nbits = 2 },
+    .{ .offset = 13, .nbits = 2 },    .{ .offset = 17, .nbits = 3 },    .{ .offset = 25, .nbits = 3 },
+    .{ .offset = 33, .nbits = 3 },    .{ .offset = 41, .nbits = 3 },    .{ .offset = 49, .nbits = 4 },
+    .{ .offset = 65, .nbits = 4 },    .{ .offset = 81, .nbits = 4 },    .{ .offset = 97, .nbits = 4 },
+    .{ .offset = 113, .nbits = 5 },   .{ .offset = 145, .nbits = 5 },   .{ .offset = 177, .nbits = 5 },
+    .{ .offset = 209, .nbits = 5 },   .{ .offset = 241, .nbits = 6 },   .{ .offset = 305, .nbits = 6 },
+    .{ .offset = 369, .nbits = 7 },   .{ .offset = 497, .nbits = 8 },   .{ .offset = 753, .nbits = 9 },
+    .{ .offset = 1265, .nbits = 10 }, .{ .offset = 2289, .nbits = 11 }, .{ .offset = 4337, .nbits = 12 },
+    .{ .offset = 8433, .nbits = 13 }, .{ .offset = 16625, .nbits = 24 },
 };
 
 fn readBlockLength(reader: *BitReader, table: *const HuffmanTable) Error!u32 {
@@ -1021,9 +1021,16 @@ fn readHuffmanCode(allocator: std.mem.Allocator, reader: *BitReader, alphabet_si
             // Read tree-select bit
             const tree_select = try reader.readBits(1);
             if (tree_select != 0) {
-                // 2,2,2,2 -> already handled in buildSimpleHuffmanTable
+                // Shape 1,2,3,3: only sort the two 3-bit symbols (indices 2,3).
+                // Symbols 0 and 1 keep their stream order (matching C case 4).
+                if (symbols[2] > symbols[3]) {
+                    const tmp = symbols[2];
+                    symbols[2] = symbols[3];
+                    symbols[3] = tmp;
+                }
+                return buildSimple4SymbolHuffmanTableDeep(allocator, &symbols);
             }
-            // Sort symbols
+            // Shape 2,2,2,2: full sort all 4 symbols (matching C case 3)
             if (symbols[0] > symbols[1]) {
                 const tmp = symbols[0];
                 symbols[0] = symbols[1];
@@ -1048,10 +1055,6 @@ fn readHuffmanCode(allocator: std.mem.Allocator, reader: *BitReader, alphabet_si
                 const tmp = symbols[1];
                 symbols[1] = symbols[2];
                 symbols[2] = tmp;
-            }
-            if (tree_select != 0) {
-                // Shape: 1,2,3,3
-                return buildSimple4SymbolHuffmanTableDeep(allocator, &symbols);
             }
         }
 
@@ -1520,6 +1523,10 @@ pub fn decompress(allocator: std.mem.Allocator, compressed: []const u8, uncompre
             var distance: usize = 0;
             const distance_code = cmd.distance_code;
 
+            // Save dist_rb_idx before distance resolution; dictionary references
+            // restore it (C compensates with distance_context instead of updating).
+            const saved_dist_rb_idx = dist_rb_idx;
+
             if (distance_code < 0) {
                 // Use distance code from stream
                 // Check/switch distance block type
@@ -1554,12 +1561,12 @@ pub fn decompress(allocator: std.mem.Allocator, compressed: []const u8, uncompre
                 distance = dist_rb[dist_rb_idx & 3];
             }
 
-            // Update distance ring buffer (matches C line 2304-2305, done after every copy)
-            dist_rb[dist_rb_idx & 3] = distance;
-            dist_rb_idx +%= 1;
 
             // Copy from ring buffer or dictionary
             if (distance <= ring_pos) {
+                // Update distance ring buffer (C line 2304-2305, only for normal copies)
+                dist_rb[dist_rb_idx & 3] = distance;
+                dist_rb_idx +%= 1;
                 // Copy from ring buffer
                 for (0..copy_len) |_| {
                     const src_pos = (ring_pos -% distance) % window_size;
@@ -1573,7 +1580,9 @@ pub fn decompress(allocator: std.mem.Allocator, compressed: []const u8, uncompre
                     meta_bytes_remaining -|= 1;
                 }
             } else {
-                // Static dictionary reference
+                // Static dictionary reference — restore dist_rb_idx
+                // (C compensates via distance_context; no ring buffer write)
+                dist_rb_idx = saved_dist_rb_idx;
                 const dict_distance = distance - ring_pos - 1;
                 const copy_length = copy_len;
                 const word_len = copy_length;
@@ -1621,6 +1630,12 @@ fn resolveDistance(dist_code: u16, dist_rb: *[4]usize, dist_rb_idx: *usize, npos
         const result = @as(i64, @intCast(base)) + @as(i64, sc.delta);
         if (result <= 0) {
             return 0x7FFFFFFF;
+        }
+        // Match C's TakeDistanceFromRingBuffer: for code 0, decrement dist_rb_idx
+        // so the caller's unconditional ring buffer update becomes a no-op.
+        // C uses: dist_rb_idx -= (1 >> distance_code), which is 1 for code 0, 0 otherwise.
+        if (dist_code == 0) {
+            dist_rb_idx.* -%= 1;
         }
         return @intCast(result);
     } else if (dist_code < 16 + ndirect) {
