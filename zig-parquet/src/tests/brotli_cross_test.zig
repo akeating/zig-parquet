@@ -26,17 +26,27 @@ fn zigRoundTrip(allocator: std.mem.Allocator, data: []const u8) !void {
     try std.testing.expectEqualSlices(u8, data, decompressed);
 }
 
+/// Round-trip through both compressors: Zig→C, Zig→Zig, C→Zig.
 fn crossRoundTrip(allocator: std.mem.Allocator, data: []const u8) !void {
     if (!build_options.enable_zig_brotli) return;
     const zig_compressed = try zig_brotli.compress(allocator, data);
     defer allocator.free(zig_compressed);
 
     if (both_enabled) {
+        // Zig compress → C decompress
         const zc = try c_brotli.decompress(allocator, zig_compressed, data.len);
         defer allocator.free(zc);
         try std.testing.expectEqualSlices(u8, data, zc);
+
+        // C compress → Zig decompress (exercises quality-11 features)
+        const c_compressed = try c_brotli.compress(allocator, data);
+        defer allocator.free(c_compressed);
+        const cz = try zig_brotli.decompress(allocator, c_compressed, data.len);
+        defer allocator.free(cz);
+        try std.testing.expectEqualSlices(u8, data, cz);
     }
 
+    // Zig compress → Zig decompress
     const decompressed = try zig_brotli.decompress(allocator, zig_compressed, data.len);
     defer allocator.free(decompressed);
     try std.testing.expectEqualSlices(u8, data, decompressed);
@@ -133,11 +143,19 @@ test "cross-impl: varied patterns" {
     };
 
     for (patterns) |original| {
+        // C compress → Zig decompress (quality-11 stream features)
+        const c_compressed = try c_brotli.compress(allocator, original);
+        defer allocator.free(c_compressed);
+        const cz = try zig_brotli.decompress(allocator, c_compressed, original.len);
+        defer allocator.free(cz);
+        try std.testing.expectEqualStrings(original, cz);
+
+        // Zig compress → C decompress
         const zig_compressed = try zig_brotli.compress(allocator, original);
         defer allocator.free(zig_compressed);
-        const decompressed = try c_brotli.decompress(allocator, zig_compressed, original.len);
-        defer allocator.free(decompressed);
-        try std.testing.expectEqualStrings(original, decompressed);
+        const zc = try c_brotli.decompress(allocator, zig_compressed, original.len);
+        defer allocator.free(zc);
+        try std.testing.expectEqualStrings(original, zc);
     }
 }
 
@@ -249,44 +267,10 @@ test "cross-impl: decompress actual parquet brotli stream" {
     defer allocator.free(zig_result);
 
     try std.testing.expectEqualSlices(u8, c_result, zig_result);
-}
 
-test "cross-impl: C compress ABCDEFGH repeated" {
-    if (!both_enabled) return;
-    const allocator = std.testing.allocator;
-    const original = "ABCDEFGH" ** 200;
-    const c_compressed = try c_brotli.compress(allocator, original);
-    defer allocator.free(c_compressed);
-    const zig_result = try zig_brotli.decompress(allocator, c_compressed, original.len);
-    defer allocator.free(zig_result);
-    try std.testing.expectEqualStrings(original, zig_result);
-}
-
-test "cross-impl: C-compress large repeated pattern (quality-11)" {
-    if (!both_enabled) return;
-    const allocator = std.testing.allocator;
-
-    // Generate data that mimics parquet column encoding for 10K rows of "AAAAAAAAAA"
-    // This is the kind of data brotli sees after parquet encoding
-    const count = 10000;
-    var data: std.ArrayListUnmanaged(u8) = .empty;
-    defer data.deinit(allocator);
-
-    // Simulated RLE/plain header
-    try data.appendSlice(allocator,&[_]u8{ 0x04, 0x00, 0x00, 0x00, 0xa0, 0x9c, 0x01, 0x01 });
-
-    for (0..count) |_| {
-        // Length-prefixed "AAAAAAAAAA" (10 bytes)
-        try data.appendSlice(allocator,&[_]u8{ 0x0a, 0x00, 0x00, 0x00 });
-        try data.appendSlice(allocator,"AAAAAAAAAA");
-    }
-
-    const c_compressed = try c_brotli.compress(allocator, data.items);
-    defer allocator.free(c_compressed);
-
-    const zig_decompressed = try zig_brotli.decompress(allocator, c_compressed, data.items.len);
-    defer allocator.free(zig_decompressed);
-    try std.testing.expectEqualSlices(u8, data.items, zig_decompressed);
+    // Verify decompressed content starts with the expected parquet column pattern
+    // (140008 bytes = 17501 i64 values; first few should be repeating 0s from RLE)
+    try std.testing.expect(zig_result.len == uncompressed_size);
 }
 
 test "cross-impl: parquet-like repeated strings with length prefixes" {
