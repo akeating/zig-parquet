@@ -390,26 +390,31 @@ fn buildSimpleHuffmanTable(allocator: std.mem.Allocator, symbols: []const u16, n
             }
         },
         2 => {
-            // 1-bit code: symbol[0]=0, symbol[1]=1
+            // 1-bit code: smaller symbol gets bit 0, larger gets bit 1 (matching C)
+            const s0 = if (symbols[0] < symbols[1]) symbols[0] else symbols[1];
+            const s1 = if (symbols[0] < symbols[1]) symbols[1] else symbols[0];
             var i: usize = 0;
             while (i < PRIMARY_TABLE_SIZE) : (i += 1) {
                 if (i & 1 == 0) {
-                    entries[i] = .{ .bits = 1, .value = symbols[0] };
+                    entries[i] = .{ .bits = 1, .value = s0 };
                 } else {
-                    entries[i] = .{ .bits = 1, .value = symbols[1] };
+                    entries[i] = .{ .bits = 1, .value = s1 };
                 }
             }
         },
         3 => {
-            // symbols[0] has 1-bit code 0, symbols[1] and symbols[2] have 2-bit codes 10, 11
+            // symbols[0] has 1-bit code, symbols[1] and symbols[2] have 2-bit codes
+            // Sort symbols[1] and symbols[2] so smaller gets first 2-bit code (matching C)
+            const s1 = if (symbols[1] < symbols[2]) symbols[1] else symbols[2];
+            const s2 = if (symbols[1] < symbols[2]) symbols[2] else symbols[1];
             var i: usize = 0;
             while (i < PRIMARY_TABLE_SIZE) : (i += 1) {
                 if (i & 1 == 0) {
                     entries[i] = .{ .bits = 1, .value = symbols[0] };
                 } else if (i & 3 == 1) {
-                    entries[i] = .{ .bits = 2, .value = symbols[1] };
+                    entries[i] = .{ .bits = 2, .value = s1 };
                 } else {
-                    entries[i] = .{ .bits = 2, .value = symbols[2] };
+                    entries[i] = .{ .bits = 2, .value = s2 };
                 }
             }
         },
@@ -689,8 +694,38 @@ fn readBlockLength(reader: *BitReader, table: *const HuffmanTable) Error!u32 {
 // Distance Short Codes
 // =========================================================================
 
-const dist_short_code_index_offset = [16]u8{ 0, 3, 2, 1, 0, 0, 0, 0, 0, 0, 3, 3, 3, 3, 3, 3 };
-const dist_short_code_value_offset = [16]i8{ 0, 0, 0, 0, -1, 1, -2, 2, -3, 3, -1, 1, -2, 2, -3, 3 };
+// Distance short code lookup table, matching C TakeDistanceFromRingBuffer.
+// For codes 0-3: index into dist_rb relative to dist_rb_idx.
+// For codes 4-15: index_delta and value delta packed from C's 0x605142 magic.
+// These are computed at comptime to match the C reference exactly.
+const DistShortCode = struct { index_offset: i8, delta: i8 };
+const dist_short_codes: [16]DistShortCode = blk: {
+    var codes: [16]DistShortCode = undefined;
+    // Codes 0-3: access dist_rb[(dist_rb_idx + offset) & 3] with offset derived from C
+    // Code 0: offset = 3 (last distance)
+    // Code 1: offset = 2 (second-to-last)
+    // Code 2: offset = 1 (third-to-last)
+    // Code 3: offset = 0 (fourth-to-last)
+    codes[0] = .{ .index_offset = 3, .delta = 0 };
+    codes[1] = .{ .index_offset = 2, .delta = 0 };
+    codes[2] = .{ .index_offset = 1, .delta = 0 };
+    codes[3] = .{ .index_offset = 0, .delta = 0 };
+    // Codes 4-9: index_delta=3, delta from 0x605142 nibbles
+    // C: base = code - 4, delta = ((0x605142 >> (4*base)) & 0xF) - 3
+    for (4..10) |c| {
+        const base = c - 4;
+        const nibble: i8 = @intCast((0x605142 >> @intCast(4 * base)) & 0xF);
+        codes[c] = .{ .index_offset = 3, .delta = nibble - 3 };
+    }
+    // Codes 10-15: index_delta=2, delta from 0x605142 nibbles
+    // C: base = code - 10, delta = ((0x605142 >> (4*base)) & 0xF) - 3
+    for (10..16) |c| {
+        const base = c - 10;
+        const nibble: i8 = @intCast((0x605142 >> @intCast(4 * base)) & 0xF);
+        codes[c] = .{ .index_offset = 2, .delta = nibble - 3 };
+    }
+    break :blk codes;
+};
 
 // =========================================================================
 // Static Dictionary
@@ -908,9 +943,10 @@ fn decodeContextMap(allocator: std.mem.Allocator, reader: *BitReader, context_ma
             context_map[i] = 0;
             i += 1;
         } else if (code <= max_rle_prefix) {
-            // RLE of zeros
+            // RLE of zeros: base is (1 << code), plus `code` extra bits
             const rle_bits: u5 = @intCast(code);
-            const rle_len = @as(u32, 1) << rle_bits;
+            const rle_extra = try reader.readBits(rle_bits);
+            const rle_len = (@as(u32, 1) << rle_bits) + rle_extra;
             var j: u32 = 0;
             while (j < rle_len and i < context_map_size) : (j += 1) {
                 context_map[i] = 0;
@@ -1218,6 +1254,7 @@ pub fn decompress(allocator: std.mem.Allocator, compressed: []const u8, uncompre
     var out_pos: usize = 0;
     var ring_pos: usize = 0;
     var dist_rb = [4]usize{ 16, 15, 11, 4 }; // distance ring buffer, initialized per spec
+    var dist_rb_idx: usize = 0; // rolling index, matches C reference
 
     // Main meta-block loop
     var is_last = false;
@@ -1510,11 +1547,17 @@ pub fn decompress(allocator: std.mem.Allocator, compressed: []const u8, uncompre
                 const dist_htree_idx = if (dcm_idx < dist_context_map.len) dist_context_map[dcm_idx] else 0;
                 const dist_code = try dist_htrees[dist_htree_idx].lookup(&reader);
 
-                distance = try resolveDistance(dist_code, &dist_rb, npostfix, ndirect, &reader);
+                distance = try resolveDistance(dist_code, &dist_rb, &dist_rb_idx, npostfix, ndirect, &reader);
             } else {
-                // distance_code == 0 means use last distance
-                distance = dist_rb[0];
+                // Implicit distance: use last distance without reading from stream
+                // Match C: --dist_rb_idx then read dist_rb[dist_rb_idx & 3]
+                dist_rb_idx -%= 1;
+                distance = dist_rb[dist_rb_idx & 3];
             }
+
+            // Update distance ring buffer (matches C line 2304-2305, done after every copy)
+            dist_rb[dist_rb_idx & 3] = distance;
+            dist_rb_idx +%= 1;
 
             // Copy from ring buffer or dictionary
             if (distance <= ring_pos) {
@@ -1570,31 +1613,21 @@ pub fn decompress(allocator: std.mem.Allocator, compressed: []const u8, uncompre
     return output;
 }
 
-fn resolveDistance(dist_code: u16, dist_rb: *[4]usize, npostfix: u32, ndirect: u32, reader: *BitReader) Error!usize {
+fn resolveDistance(dist_code: u16, dist_rb: *[4]usize, dist_rb_idx: *usize, npostfix: u32, ndirect: u32, reader: *BitReader) Error!usize {
     if (dist_code < 16) {
-        // Short code
-        const idx = dist_short_code_index_offset[dist_code];
-        const offset = dist_short_code_value_offset[dist_code];
-        const base = dist_rb[idx];
-        const result = @as(i64, @intCast(base)) + @as(i64, offset);
-        if (result <= 0) return error.DecompressionError;
-        const dist: usize = @intCast(result);
-        // Update ring buffer
-        if (dist_code > 0) {
-            dist_rb[3] = dist_rb[2];
-            dist_rb[2] = dist_rb[1];
-            dist_rb[1] = dist_rb[0];
-            dist_rb[0] = dist;
+        // Short code — lookup from ring buffer using rolling index
+        const sc = dist_short_codes[dist_code];
+        const rb_idx = (dist_rb_idx.* +% @as(usize, @intCast(sc.index_offset))) & 3;
+        const base = dist_rb[rb_idx];
+        const result = @as(i64, @intCast(base)) + @as(i64, sc.delta);
+        if (result <= 0) {
+            // C reference sets to 0x7FFFFFFF; this will cause a dictionary error later
+            return 0x7FFFFFFF;
         }
-        return dist;
+        return @intCast(result);
     } else if (dist_code < 16 + ndirect) {
         // Direct distance
-        const dist = dist_code - 16 + 1;
-        dist_rb[3] = dist_rb[2];
-        dist_rb[2] = dist_rb[1];
-        dist_rb[1] = dist_rb[0];
-        dist_rb[0] = dist;
-        return dist;
+        return dist_code - 16 + 1;
     } else {
         // Distance with extra bits
         const code = dist_code - 16 - ndirect;
@@ -1604,12 +1637,7 @@ fn resolveDistance(dist_code: u16, dist_rb: *[4]usize, npostfix: u32, ndirect: u
         const nbits: u5 = @intCast(1 + (hcode >> 1));
         const offset2: u32 = ((2 + (hcode & 1)) << nbits) - 4;
         const extra = try reader.readBits(nbits);
-        const dist: usize = ((offset2 + extra) << @intCast(npostfix)) + lcode + ndirect + 1;
-        dist_rb[3] = dist_rb[2];
-        dist_rb[2] = dist_rb[1];
-        dist_rb[1] = dist_rb[0];
-        dist_rb[0] = dist;
-        return dist;
+        return ((offset2 + extra) << @intCast(npostfix)) + lcode + ndirect + 1;
     }
 }
 
