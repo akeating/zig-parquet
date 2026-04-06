@@ -289,7 +289,7 @@ fn buildHuffmanTable(allocator: std.mem.Allocator, code_lengths: []const u8, alp
             }
         }
         for (secondary_table_bits) |sb| {
-            table_size += @as(usize, 1) << @intCast(sb);
+            if (sb > 0) table_size += @as(usize, 1) << @intCast(sb);
         }
     }
 
@@ -305,7 +305,9 @@ fn buildHuffmanTable(allocator: std.mem.Allocator, code_lengths: []const u8, alp
         var offset: u16 = @intCast(PRIMARY_TABLE_SIZE);
         for (0..PRIMARY_TABLE_SIZE) |i| {
             secondary_offsets[i] = offset;
-            offset += @as(u16, 1) << @intCast(secondary_table_bits[i]);
+            if (secondary_table_bits[i] > 0) {
+                offset += @as(u16, 1) << @intCast(secondary_table_bits[i]);
+            }
         }
     }
 
@@ -2813,6 +2815,81 @@ test "brotli zig round-trip repeated data" {
     const decompressed = try decompress(allocator, compressed_data, original.len);
     defer allocator.free(decompressed);
     try std.testing.expectEqualStrings(original, decompressed);
+}
+
+
+test "buildHuffmanTable: lookup correctness" {
+    const allocator = std.testing.allocator;
+
+    // Test 1: 8-symbol alphabet {1,2,3,4,5,5,5,5}
+    {
+        var cl = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 7 };
+        var table = try buildHuffmanTable(allocator, &cl, 8);
+        defer table.deinit();
+        // sym 0: 1-bit code
+        var d0 = [_]u8{0b00000000};
+        var r0 = BitReader.init(&d0);
+        try std.testing.expectEqual(@as(u16, 0), try table.lookup(&r0));
+        try std.testing.expectEqual(@as(usize, 1), r0.pos);
+        // sym 1: 2-bit code
+        var d1 = [_]u8{0b00000001};
+        var r1 = BitReader.init(&d1);
+        try std.testing.expectEqual(@as(u16, 1), try table.lookup(&r1));
+        try std.testing.expectEqual(@as(usize, 2), r1.pos);
+        // sym 2: 3-bit code
+        var d2 = [_]u8{0b00000011};
+        var r2 = BitReader.init(&d2);
+        try std.testing.expectEqual(@as(u16, 2), try table.lookup(&r2));
+        try std.testing.expectEqual(@as(usize, 3), r2.pos);
+    }
+
+    // Test 2: codes > 8 bits (secondary tables)
+    {
+        var cl: [300]u8 = .{0} ** 300;
+        cl[0] = 1;
+        for (1..10) |i| cl[i] = 9;
+        var table = try buildHuffmanTable(allocator, &cl, 300);
+        defer table.deinit();
+        // sym 0: 1-bit code
+        var d0 = [_]u8{ 0, 0 };
+        var r0 = BitReader.init(&d0);
+        try std.testing.expectEqual(@as(u16, 0), try table.lookup(&r0));
+        try std.testing.expectEqual(@as(usize, 1), r0.pos);
+        // sym 1: 9-bit code (reversed(256,9)=1, low8=0x01, bit8=0)
+        var d1 = [_]u8{ 0x01, 0x00 };
+        var r1 = BitReader.init(&d1);
+        try std.testing.expectEqual(@as(u16, 1), try table.lookup(&r1));
+        try std.testing.expectEqual(@as(usize, 9), r1.pos);
+        // sym 2: 9-bit code (reversed(257,9)=257, low8=0x01, bit8=1)
+        var d2 = [_]u8{ 0x01, 0x01 };
+        var r2 = BitReader.init(&d2);
+        try std.testing.expectEqual(@as(u16, 2), try table.lookup(&r2));
+        try std.testing.expectEqual(@as(usize, 9), r2.pos);
+    }
+
+    // Test 3: mixed short (2,4-bit) and long (9-bit)
+    {
+        var cl: [704]u8 = .{0} ** 704;
+        cl[0] = 2; cl[1] = 2; cl[2] = 4; cl[3] = 4; cl[4] = 4; cl[5] = 4;
+        cl[6] = 9; cl[7] = 9; cl[8] = 9; cl[9] = 9;
+        var table = try buildHuffmanTable(allocator, &cl, 704);
+        defer table.deinit();
+        // sym 0: 2-bit
+        var d0 = [_]u8{0b00000000};
+        var r0 = BitReader.init(&d0);
+        try std.testing.expectEqual(@as(u16, 0), try table.lookup(&r0));
+        try std.testing.expectEqual(@as(usize, 2), r0.pos);
+        // sym 1: 2-bit
+        var d1 = [_]u8{0b00000010};
+        var r1 = BitReader.init(&d1);
+        try std.testing.expectEqual(@as(u16, 1), try table.lookup(&r1));
+        try std.testing.expectEqual(@as(usize, 2), r1.pos);
+        // sym 2: 4-bit
+        var d2 = [_]u8{0b00000001};
+        var r2 = BitReader.init(&d2);
+        try std.testing.expectEqual(@as(u16, 2), try table.lookup(&r2));
+        try std.testing.expectEqual(@as(usize, 4), r2.pos);
+    }
 }
 
 test "brotli zig round-trip large data" {
