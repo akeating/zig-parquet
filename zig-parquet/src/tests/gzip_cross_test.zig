@@ -6,7 +6,7 @@
 
 const std = @import("std");
 const build_options = @import("build_options");
-const c_gzip = @import("../core/compress/gzip.zig");
+const c_gzip = @import("../core/compress/c_gzip.zig");
 const zig_gzip = @import("../core/compress/zig_gzip.zig");
 
 const both_enabled = build_options.enable_gzip and build_options.enable_zig_gzip;

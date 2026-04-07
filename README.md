@@ -299,7 +299,7 @@ zig build                           # all codecs, Zig implementations used by de
 zig build -Dcodecs=none             # no compression (smallest binary)
 zig build -Dcodecs=zig-only         # pure Zig codecs only (no C/C++ deps at all)
 zig build -Dcodecs=c-only           # C/C++ codecs only (opt-in)
-zig build -Dcodecs=zstd,zig-zstd    # both zstd implementations (cross-impl testing)
+zig build -Dcodecs=c-zstd,zig-zstd    # both zstd implementations (cross-impl testing)
 ```
 
 See [COMPRESSION.md](COMPRESSION.md) for build sizes, API details, and the full set of build options.
@@ -347,11 +347,11 @@ writer.setMaxPageSize(1_048_576);      // 1MB page size limit
 | BYTE_STREAM_SPLIT | ✅ | Float/double/int/fixed columns |
 | **Compression** | | |
 | UNCOMPRESSED | ✅ | |
-| SNAPPY | ✅ | Pure Zig (default); C++ backend via `-Dcodecs=snappy` or `c-only` |
-| GZIP | ✅ | Pure Zig (default); C backend via `-Dcodecs=gzip` or `c-only` |
-| ZSTD | ✅ | Pure Zig (default); C backend via `-Dcodecs=zstd` or `c-only` |
-| LZ4_RAW | ✅ | Pure Zig (default); C backend via `-Dcodecs=lz4` or `c-only` |
-| BROTLI | ✅ | Pure Zig (default); C backend via `-Dcodecs=brotli` or `c-only` |
+| SNAPPY | ✅ | Pure Zig (default); C++ backend via `-Dcodecs=c-snappy` or `c-only` |
+| GZIP | ✅ | Pure Zig (default); C backend via `-Dcodecs=c-gzip` or `c-only` |
+| ZSTD | ✅ | Pure Zig (default); C backend via `-Dcodecs=c-zstd` or `c-only` |
+| LZ4_RAW | ✅ | Pure Zig (default); C backend via `-Dcodecs=c-lz4` or `c-only` |
+| BROTLI | ✅ | Pure Zig (default); C backend via `-Dcodecs=c-brotli` or `c-only` |
 | LZ4 (non-raw) | ❌ | Hadoop-specific framing format |
 | LZO | ❌ | Not implemented |
 | **Logical Types** | | |
@@ -423,7 +423,7 @@ See `examples/wasm_demo/` and `examples/wasm_freestanding/` for usage examples.
 
 - **Zig 0.15.2**
 - No C compiler required for the default build (`-Dcodecs=all` uses pure Zig implementations)
-- C compiler only needed when opting into C codecs via `-Dcodecs=c-only` or individual codec names (e.g. `-Dcodecs=zstd`)
+- C compiler only needed when opting into C codecs via `-Dcodecs=c-only` or individual codec names (e.g. `-Dcodecs=c-zstd`)
 - C++ compiler only needed for the C Snappy backend
 
 ## License

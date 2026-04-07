@@ -4,15 +4,15 @@
 //! compression and decompression for supported codecs.
 //!
 //! Use `-Dcodecs=` to control which codecs are included (default: all).
-//! Values: all, c-only, none, zig-only, or comma-separated list of: zstd,zig-zstd,snappy,zig-snappy,gzip,zig-gzip,lz4,zig-lz4,brotli
+//! Values: all, c-only, none, zig-only, or comma-separated list of: c-zstd,zig-zstd,c-snappy,zig-snappy,c-gzip,zig-gzip,c-lz4,zig-lz4,c-brotli,zig-brotli
 
 const build_options = @import("build_options");
 
-pub const zstd = if (build_options.enable_zstd) @import("zstd.zig") else {};
-pub const snappy = if (build_options.enable_snappy) @import("snappy.zig") else {};
-pub const gzip = if (build_options.enable_gzip) @import("gzip.zig") else {};
-pub const lz4 = if (build_options.enable_lz4) @import("lz4.zig") else {};
-pub const brotli = if (build_options.enable_brotli) @import("brotli.zig") else {};
+pub const zstd = if (build_options.enable_zstd) @import("c_zstd.zig") else {};
+pub const snappy = if (build_options.enable_snappy) @import("c_snappy.zig") else {};
+pub const gzip = if (build_options.enable_gzip) @import("c_gzip.zig") else {};
+pub const lz4 = if (build_options.enable_lz4) @import("c_lz4.zig") else {};
+pub const brotli = if (build_options.enable_brotli) @import("c_brotli.zig") else {};
 
 pub const zig_zstd = if (build_options.enable_zig_zstd) @import("zig_zstd.zig") else {};
 pub const zig_snappy = if (build_options.enable_zig_snappy) @import("zig_snappy.zig") else {};

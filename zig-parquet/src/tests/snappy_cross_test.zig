@@ -6,7 +6,7 @@
 
 const std = @import("std");
 const build_options = @import("build_options");
-const c_snappy = @import("../core/compress/snappy.zig");
+const c_snappy = @import("../core/compress/c_snappy.zig");
 const zig_snappy = @import("../core/compress/zig_snappy.zig");
 
 const both_enabled = build_options.enable_snappy and build_options.enable_zig_snappy;

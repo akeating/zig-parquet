@@ -8,7 +8,7 @@ pub fn build(b: *std.Build) void {
     const codecs_str = b.option(
         []const u8,
         "codecs",
-        "Compression codecs (default: all). Values: all, c-only, none, zig-only, or comma-separated list of: zstd,zig-zstd,snappy,zig-snappy,gzip,zig-gzip,lz4,zig-lz4,brotli,zig-brotli",
+        "Compression codecs (default: all). Values: all, c-only, none, zig-only, or comma-separated list of: c-zstd,zig-zstd,c-snappy,zig-snappy,c-gzip,zig-gzip,c-lz4,zig-lz4,c-brotli,zig-brotli",
     ) orelse "all";
 
     const codecs = parseCodecs(codecs_str);
@@ -292,15 +292,15 @@ fn parseCodecs(str: []const u8) Codecs {
     if (std.mem.eql(u8, str, "none")) return .{ .zstd = false, .zig_zstd = false, .snappy = false, .zig_snappy = false, .gzip = false, .zig_gzip = false, .lz4 = false, .zig_lz4 = false, .brotli = false, .zig_brotli = false };
     if (std.mem.eql(u8, str, "zig-only")) return .{ .zstd = false, .zig_zstd = true, .snappy = false, .zig_snappy = true, .gzip = false, .zig_gzip = true, .lz4 = false, .zig_lz4 = true, .brotli = false, .zig_brotli = true };
     return .{
-        .zstd = containsCodec(str, "zstd"),
+        .zstd = containsCodec(str, "c-zstd"),
         .zig_zstd = containsCodec(str, "zig-zstd"),
-        .snappy = containsCodec(str, "snappy"),
+        .snappy = containsCodec(str, "c-snappy"),
         .zig_snappy = containsCodec(str, "zig-snappy"),
-        .gzip = containsCodec(str, "gzip"),
+        .gzip = containsCodec(str, "c-gzip"),
         .zig_gzip = containsCodec(str, "zig-gzip"),
-        .lz4 = containsCodec(str, "lz4"),
+        .lz4 = containsCodec(str, "c-lz4"),
         .zig_lz4 = containsCodec(str, "zig-lz4"),
-        .brotli = containsCodec(str, "brotli"),
+        .brotli = containsCodec(str, "c-brotli"),
         .zig_brotli = containsCodec(str, "zig-brotli"),
     };
 }

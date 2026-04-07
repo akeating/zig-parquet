@@ -41,7 +41,7 @@ zig-parquet is a native Parquet library written in Zig 0.15.2. It provides read/
 cd zig-parquet && zig build test                  # Run library tests (all codecs, Zig used by default)
 cd zig-parquet && zig build test -Dcodecs=c-only  # Run with C/C++ codecs only
 cd zig-parquet && zig build test -Dcodecs=none    # Run non-compression tests only
-cd zig-parquet && zig build test -Dcodecs=zstd    # Run with C zstd only
+cd zig-parquet && zig build test -Dcodecs=c-zstd    # Run with C zstd only
 cd zig-parquet && zig build test -Dcodecs=zig-only # Run with pure Zig codecs only (no C deps)
 cd cli && zig build                               # Build pqi CLI
 cd cli && ./validate-wild.sh                      # Validate against wild test files (failures only)
@@ -122,7 +122,7 @@ _ = arena.reset(.retain_capacity);
 
 Compression codecs are controlled via `-Dcodecs=` (default: `all`).
 
-Presets: `all` (C + Zig, Zig used by default), `c-only` (C/C++ only), `zig-only` (no C deps), `none`, or comma-separated list: `zstd,zig-zstd,snappy,zig-snappy,gzip,lz4,brotli`.
+Presets: `all` (C + Zig, Zig used by default), `c-only` (C/C++ only), `zig-only` (no C deps), `none`, or comma-separated list: `c-zstd,zig-zstd,c-snappy,zig-snappy,c-gzip,zig-gzip,c-lz4,zig-lz4,c-brotli,zig-brotli`.
 
 - **`all`** — All implementations compiled in; Zig used by default, C available for cross-impl testing.
 - **`zig-only`** — Pure Zig codecs only (no C/C++ dependencies).

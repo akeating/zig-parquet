@@ -6,7 +6,7 @@
 
 const std = @import("std");
 const build_options = @import("build_options");
-const c_lz4 = @import("../core/compress/lz4.zig");
+const c_lz4 = @import("../core/compress/c_lz4.zig");
 const zig_lz4 = @import("../core/compress/zig_lz4.zig");
 
 const both_enabled = build_options.enable_lz4 and build_options.enable_zig_lz4;
