@@ -7,7 +7,7 @@
 const std = @import("std");
 const build_options = @import("build_options");
 const c_brotli = if (build_options.enable_brotli) @import("../core/compress/c_brotli.zig") else struct {};
-const zig_brotli = if (build_options.enable_zig_brotli) @import("../core/compress/zig_brotli.zig") else struct {};
+const zig_brotli = if (build_options.enable_zig_brotli) @import("../core/compress/brotli.zig") else struct {};
 
 const both_enabled = build_options.enable_brotli and build_options.enable_zig_brotli;
 

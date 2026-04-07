@@ -299,7 +299,7 @@ zig build                           # all codecs, Zig implementations used by de
 zig build -Dcodecs=none             # no compression (smallest binary)
 zig build -Dcodecs=zig-only         # pure Zig codecs only (no C/C++ deps at all)
 zig build -Dcodecs=c-only           # C/C++ codecs only (opt-in)
-zig build -Dcodecs=c-zstd,zig-zstd    # both zstd implementations (cross-impl testing)
+zig build -Dcodecs=c-zstd,zstd    # both zstd implementations (cross-impl testing)
 ```
 
 See [COMPRESSION.md](COMPRESSION.md) for build sizes, API details, and the full set of build options.

@@ -122,18 +122,18 @@ _ = arena.reset(.retain_capacity);
 
 Compression codecs are controlled via `-Dcodecs=` (default: `all`).
 
-Presets: `all` (C + Zig, Zig used by default), `c-only` (C/C++ only), `zig-only` (no C deps), `none`, or comma-separated list: `c-zstd,zig-zstd,c-snappy,zig-snappy,c-gzip,zig-gzip,c-lz4,zig-lz4,c-brotli,zig-brotli`.
+Presets: `all` (C + Zig, Zig used by default), `c-only` (C/C++ only), `zig-only` (no C deps), `none`, or comma-separated list: `c-zstd,zstd,c-snappy,snappy,c-gzip,gzip,c-lz4,lz4,c-brotli,brotli`.
 
 - **`all`** — All implementations compiled in; Zig used by default, C available for cross-impl testing.
 - **`zig-only`** — Pure Zig codecs only (no C/C++ dependencies).
 - **`c-only`** — C/C++ codecs only (opt-in).
 
 ```zig
-// Both Zig and C implementations at top level; Zig preferred when both compiled in
-pub const zig_zstd = if (build_options.enable_zig_zstd) @import("zig_zstd.zig") else {};
-pub const zig_snappy = if (build_options.enable_zig_snappy) @import("zig_snappy.zig") else {};
-pub const zstd = if (build_options.enable_zstd) @import("zstd.zig") else {};
-pub const snappy = if (build_options.enable_snappy) @import("snappy.zig") else {};
+// Zig implementations (default); C implementations opt-in via c-only or c-<codec>
+pub const zig_zstd = if (build_options.enable_zig_zstd) @import("zstd.zig") else {};
+pub const zig_snappy = if (build_options.enable_zig_snappy) @import("snappy.zig") else {};
+pub const zstd = if (build_options.enable_zstd) @import("c_zstd.zig") else {};
+pub const snappy = if (build_options.enable_snappy) @import("c_snappy.zig") else {};
 ```
 
 Build option flags:

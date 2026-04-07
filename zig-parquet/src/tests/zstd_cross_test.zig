@@ -7,7 +7,7 @@
 const std = @import("std");
 const build_options = @import("build_options");
 const c_zstd = @import("../core/compress/c_zstd.zig");
-const zig_zstd = @import("../core/compress/zig_zstd.zig");
+const zig_zstd = @import("../core/compress/zstd.zig");
 
 const both_enabled = build_options.enable_zstd and build_options.enable_zig_zstd;
 

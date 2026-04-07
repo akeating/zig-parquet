@@ -19,11 +19,11 @@ Static library (`libparquet.a`) sizes with `ReleaseSmall`, measured on macOS arm
 | `-Dcodecs=` | ReleaseSmall | Delta vs none | C/C++ required |
 |-------------|-------------|---------------|----------------|
 | `none` | 807 KB | -- | No |
-| `zig-lz4` | 833 KB | +26 KB | No |
-| `zig-snappy` | 835 KB | +28 KB | No |
-| `zig-gzip` | 872 KB | +65 KB | No |
-| `zig-zstd` | 910 KB | +103 KB | No |
-| `zig-brotli` | 985 KB | +178 KB | No |
+| `lz4` | 833 KB | +26 KB | No |
+| `snappy` | 835 KB | +28 KB | No |
+| `gzip` | 872 KB | +65 KB | No |
+| `zstd` | 910 KB | +103 KB | No |
+| `brotli` | 985 KB | +178 KB | No |
 | `zig-only` | 1,110 KB | +303 KB | No |
 | `c-snappy` | 877 KB | +70 KB | C++ |
 | `c-lz4` | 896 KB | +89 KB | C |
@@ -37,11 +37,11 @@ Static library (`libparquet.a`) sizes with `ReleaseSmall`, measured on macOS arm
 | `-Dcodecs=` | Raw `.wasm` | Brotli compressed | Delta vs none |
 |-------------|------------|-------------------|---------------|
 | `none` | 621 KB | 116 KB | -- |
-| `zig-lz4` | 633 KB | 117 KB | +1 KB |
-| `zig-snappy` | 634 KB | 117 KB | +1 KB |
-| `zig-gzip` | 659 KB | 125 KB | +9 KB |
-| `zig-zstd` | 695 KB | 134 KB | +18 KB |
-| `zig-brotli` | 792 KB | 156 KB | +40 KB |
+| `lz4` | 633 KB | 117 KB | +1 KB |
+| `snappy` | 634 KB | 117 KB | +1 KB |
+| `gzip` | 659 KB | 125 KB | +9 KB |
+| `zstd` | 695 KB | 134 KB | +18 KB |
+| `brotli` | 792 KB | 156 KB | +40 KB |
 | `zig-only` | 886 KB | 184 KB | +68 KB |
 | `c-snappy` | 671 KB | 130 KB | +14 KB |
 | `c-lz4` | 673 KB | 126 KB | +10 KB |
@@ -66,17 +66,17 @@ zig build -Dcodecs=none             # no compression
 Custom combinations:
 
 ```bash
-zig build -Dcodecs=zig-zstd         # pure Zig zstd only
-zig build -Dcodecs=zig-snappy       # pure Zig snappy only
-zig build -Dcodecs=zig-gzip         # pure Zig gzip only
-zig build -Dcodecs=zig-lz4          # pure Zig LZ4 only
-zig build -Dcodecs=zig-brotli       # pure Zig brotli only
+zig build -Dcodecs=zstd         # pure Zig zstd only
+zig build -Dcodecs=snappy       # pure Zig snappy only
+zig build -Dcodecs=gzip         # pure Zig gzip only
+zig build -Dcodecs=lz4          # pure Zig LZ4 only
+zig build -Dcodecs=brotli       # pure Zig brotli only
 zig build -Dcodecs=c-zstd             # C libzstd only
-zig build -Dcodecs=c-zstd,zig-zstd    # both zstd implementations (cross-impl testing)
-zig build -Dcodecs=c-snappy,zig-snappy # both snappy implementations (cross-impl testing)
-zig build -Dcodecs=c-gzip,zig-gzip    # both gzip implementations (cross-impl testing)
-zig build -Dcodecs=c-lz4,zig-lz4      # both LZ4 implementations (cross-impl testing)
-zig build -Dcodecs=c-brotli,zig-brotli # both brotli implementations (cross-impl testing)
+zig build -Dcodecs=c-zstd,zstd    # both zstd implementations (cross-impl testing)
+zig build -Dcodecs=c-snappy,snappy # both snappy implementations (cross-impl testing)
+zig build -Dcodecs=c-gzip,gzip    # both gzip implementations (cross-impl testing)
+zig build -Dcodecs=c-lz4,lz4      # both LZ4 implementations (cross-impl testing)
+zig build -Dcodecs=c-brotli,brotli # both brotli implementations (cross-impl testing)
 ```
 
 Disabled codecs return `UnsupportedCompression` at runtime. C dependencies are only fetched for enabled C codecs.
@@ -154,7 +154,7 @@ Pure Zig implementation of the Snappy block format with no C/C++ dependencies.
 - Copy (match) and literal element encoding per Snappy spec
 - 64KB block size matching the reference compressor
 
-Cross-implementation tests validate interoperability between C++ snappy and the Zig implementation. Build with `-Dcodecs=c-snappy,zig-snappy` to enable them.
+Cross-implementation tests validate interoperability between C++ snappy and the Zig implementation. Build with `-Dcodecs=c-snappy,snappy` to enable them.
 
 ### Pure Zig LZ4
 
@@ -165,7 +165,7 @@ Pure Zig implementation of the LZ4 raw block format with no C dependencies.
 - Proper end-of-block literal handling (MFLIMIT/LASTLITERALS constraints)
 - Overlapping match copy support (offset < match_len)
 
-Cross-implementation tests validate interoperability between C libLZ4 and the Zig implementation. Build with `-Dcodecs=c-lz4,zig-lz4` to enable them.
+Cross-implementation tests validate interoperability between C libLZ4 and the Zig implementation. Build with `-Dcodecs=c-lz4,lz4` to enable them.
 
 ### Pure Zig brotli
 
@@ -185,7 +185,7 @@ Pure Zig implementation of Brotli (RFC 7932) with no C dependencies.
 - Static dictionary (120KB, 121 transforms) via `@embedFile`
 - Distance ring buffer with short codes, direct codes, and parametric codes
 
-Cross-implementation tests validate interoperability between C libbrotli and the Zig implementation. Build with `-Dcodecs=c-brotli,zig-brotli` to enable them.
+Cross-implementation tests validate interoperability between C libbrotli and the Zig implementation. Build with `-Dcodecs=c-brotli,brotli` to enable them.
 
 ### Pure Zig gzip
 
@@ -198,7 +198,7 @@ Pure Zig implementation of gzip (RFC 1952) with deflate compression (RFC 1951) a
 
 **Decompressor** -- uses `std.compress.flate` from Zig's standard library. Handles all compression levels.
 
-Cross-implementation tests validate interoperability between C zlib and the Zig implementation. Build with `-Dcodecs=c-gzip,zig-gzip` to enable them.
+Cross-implementation tests validate interoperability between C zlib and the Zig implementation. Build with `-Dcodecs=c-gzip,gzip` to enable them.
 
 ### Pure Zig zstd
 
@@ -217,7 +217,7 @@ Pure Zig implementation with no C dependencies.
 
 ### Testing
 
-Cross-implementation tests validate interoperability between C libzstd and the Zig compressor. Build with `-Dcodecs=c-zstd,zig-zstd` to enable them.
+Cross-implementation tests validate interoperability between C libzstd and the Zig compressor. Build with `-Dcodecs=c-zstd,zstd` to enable them.
 
 Coverage includes:
 - Bidirectional round-trips (C compress / Zig decompress and vice versa)
