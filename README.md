@@ -77,7 +77,7 @@ If you need Parquet support inside a native application, zig-parquet is a straig
 Add `zig-parquet` to your project using `zig fetch`. This will automatically download the package and update your `build.zig.zon` with the correct cryptographic hash:
 
 ```bash
-zig fetch --save https://github.com/akeating/zig-parquet/releases/download/v0.1.6/zig-parquet-v0.1.6.tar.gz
+zig fetch --save https://github.com/akeating/zig-parquet/releases/download/v0.2.0/zig-parquet-v0.2.0.tar.gz
 ```
 
 Then in your `build.zig`:

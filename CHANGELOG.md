@@ -2,6 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.0] - 2026-04-07
+
+### Changed
+- **Pure Zig compression is now the default.** All five codecs (zstd, gzip, snappy, lz4, brotli) use pure Zig implementations out of the box. C/C++ backends are opt-in via `-Dcodecs=c-only` or individual `c-<codec>` tokens.
+- `-Dcodecs=` token rename: Zig codecs are now plain `zstd`, `snappy`, `gzip`, `lz4`, `brotli`; C codecs are `c-zstd`, `c-snappy`, `c-gzip`, `c-lz4`, `c-brotli`
+- Removed `-Dprefer-zig` build flag — Zig always wins when compiled in
+- Dissolved `compress.experimental` namespace — Zig codec modules are now top-level
+- Renamed `stable` codec preset to `c-only`
+- Renamed codec source files: `zig_*.zig` → `*.zig`, `*.zig` (C) → `c_*.zig`
+
+### Fixed
+- All five Zig decompressors now treat `uncompressed_size` as a capacity hint only; actual decompressed bytes are returned regardless of hint value. Fixes decompression of files with bogus metadata hints (e.g. `large_string_map.brotli.parquet`)
+- Brotli decompressor converted to `ArrayListUnmanaged` output — no longer pre-allocates to hint size
+- Fixed pre-existing double-free in lz4 decompressor (errdefer + explicit free)
+- Fixed `large_file` example: column count check compared physical schema leaves against logical columns (incorrect for nested types)
+
+### Added
+- Pure Zig LZ4 raw block codec with cross-implementation testing
+- Pure Zig Brotli codec: full RFC 7932 decompressor + quality-0 compressor, with cross-implementation testing
+- SortingColumn support: parse, serialize, and expose in writer API
+- C→Zig direction added to all five codec cross-implementation round-trip tests
+- Oversized hint test added to all five Zig decompressors
+
 ## [0.1.6] - 2026-04-04
 
 ### Added
@@ -102,6 +125,7 @@ Initial release.
 - Hardening: safe casting, bounds checking, no `@intCast` on external data
 - 219/219 pass rate on supported Apache parquet-testing files
 
+[0.1.7]: https://github.com/akeating/zig-parquet/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/akeating/zig-parquet/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/akeating/zig-parquet/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/akeating/zig-parquet/compare/v0.1.3...v0.1.4
