@@ -4,7 +4,7 @@
 //! compression and decompression for supported codecs.
 //!
 //! Use `-Dcodecs=` to control which codecs are included (default: all).
-//! Values: all, stable, none, zig-only, or comma-separated list of: zstd,zig-zstd,snappy,zig-snappy,gzip,zig-gzip,lz4,zig-lz4,brotli
+//! Values: all, c-only, none, zig-only, or comma-separated list of: zstd,zig-zstd,snappy,zig-snappy,gzip,zig-gzip,lz4,zig-lz4,brotli
 
 const build_options = @import("build_options");
 
@@ -14,13 +14,11 @@ pub const gzip = if (build_options.enable_gzip) @import("gzip.zig") else {};
 pub const lz4 = if (build_options.enable_lz4) @import("lz4.zig") else {};
 pub const brotli = if (build_options.enable_brotli) @import("brotli.zig") else {};
 
-pub const experimental = struct {
-    pub const zig_zstd = if (build_options.enable_zig_zstd) @import("zig_zstd.zig") else {};
-    pub const zig_snappy = if (build_options.enable_zig_snappy) @import("zig_snappy.zig") else {};
-    pub const zig_gzip = if (build_options.enable_zig_gzip) @import("zig_gzip.zig") else {};
-    pub const zig_lz4 = if (build_options.enable_zig_lz4) @import("zig_lz4.zig") else {};
-    pub const zig_brotli = if (build_options.enable_zig_brotli) @import("zig_brotli.zig") else {};
-};
+pub const zig_zstd = if (build_options.enable_zig_zstd) @import("zig_zstd.zig") else {};
+pub const zig_snappy = if (build_options.enable_zig_snappy) @import("zig_snappy.zig") else {};
+pub const zig_gzip = if (build_options.enable_zig_gzip) @import("zig_gzip.zig") else {};
+pub const zig_lz4 = if (build_options.enable_zig_lz4) @import("zig_lz4.zig") else {};
+pub const zig_brotli = if (build_options.enable_zig_brotli) @import("zig_brotli.zig") else {};
 
 const std = @import("std");
 const format = @import("../format.zig");
@@ -48,8 +46,8 @@ pub fn compress(
             return allocator.dupe(u8, data) catch return error.OutOfMemory;
         },
         .zstd => {
-            if (build_options.prefer_zig and build_options.enable_zig_zstd) {
-                return experimental.zig_zstd.compress(allocator, data) catch |e| switch (e) {
+            if (build_options.enable_zig_zstd) {
+                return zig_zstd.compress(allocator, data) catch |e| switch (e) {
                     error.CompressionError => return error.CompressionError,
                     error.OutOfMemory => return error.OutOfMemory,
                     error.DecompressionError => return error.CompressionError,
@@ -62,19 +60,12 @@ pub fn compress(
                     error.DecompressionError => return error.CompressionError,
                     error.InvalidSize => return error.CompressionError,
                 };
-            } else if (build_options.enable_zig_zstd) {
-                return experimental.zig_zstd.compress(allocator, data) catch |e| switch (e) {
-                    error.CompressionError => return error.CompressionError,
-                    error.OutOfMemory => return error.OutOfMemory,
-                    error.DecompressionError => return error.CompressionError,
-                    error.InvalidSize => return error.CompressionError,
-                };
             }
             return error.UnsupportedCompression;
         },
         .gzip => {
-            if (build_options.prefer_zig and build_options.enable_zig_gzip) {
-                return experimental.zig_gzip.compress(allocator, data) catch |e| switch (e) {
+            if (build_options.enable_zig_gzip) {
+                return zig_gzip.compress(allocator, data) catch |e| switch (e) {
                     error.CompressionError => return error.CompressionError,
                     error.OutOfMemory => return error.OutOfMemory,
                     error.DecompressionError => return error.CompressionError,
@@ -87,19 +78,12 @@ pub fn compress(
                     error.DecompressionError => return error.CompressionError,
                     error.InvalidSize => return error.CompressionError,
                 };
-            } else if (build_options.enable_zig_gzip) {
-                return experimental.zig_gzip.compress(allocator, data) catch |e| switch (e) {
-                    error.CompressionError => return error.CompressionError,
-                    error.OutOfMemory => return error.OutOfMemory,
-                    error.DecompressionError => return error.CompressionError,
-                    error.InvalidSize => return error.CompressionError,
-                };
             }
             return error.UnsupportedCompression;
         },
         .snappy => {
-            if (build_options.prefer_zig and build_options.enable_zig_snappy) {
-                return experimental.zig_snappy.compress(allocator, data) catch |e| switch (e) {
+            if (build_options.enable_zig_snappy) {
+                return zig_snappy.compress(allocator, data) catch |e| switch (e) {
                     error.CompressionError => return error.CompressionError,
                     error.OutOfMemory => return error.OutOfMemory,
                     error.DecompressionError => return error.CompressionError,
@@ -112,19 +96,12 @@ pub fn compress(
                     error.DecompressionError => return error.CompressionError,
                     error.InvalidSize => return error.CompressionError,
                 };
-            } else if (build_options.enable_zig_snappy) {
-                return experimental.zig_snappy.compress(allocator, data) catch |e| switch (e) {
-                    error.CompressionError => return error.CompressionError,
-                    error.OutOfMemory => return error.OutOfMemory,
-                    error.DecompressionError => return error.CompressionError,
-                    error.InvalidSize => return error.CompressionError,
-                };
             }
             return error.UnsupportedCompression;
         },
         .lz4_raw => {
-            if (build_options.prefer_zig and build_options.enable_zig_lz4) {
-                return experimental.zig_lz4.compress(allocator, data) catch |e| switch (e) {
+            if (build_options.enable_zig_lz4) {
+                return zig_lz4.compress(allocator, data) catch |e| switch (e) {
                     error.CompressionError => return error.CompressionError,
                     error.OutOfMemory => return error.OutOfMemory,
                     error.DecompressionError => return error.CompressionError,
@@ -136,19 +113,12 @@ pub fn compress(
                     error.OutOfMemory => return error.OutOfMemory,
                     error.DecompressionError => return error.CompressionError,
                 };
-            } else if (build_options.enable_zig_lz4) {
-                return experimental.zig_lz4.compress(allocator, data) catch |e| switch (e) {
-                    error.CompressionError => return error.CompressionError,
-                    error.OutOfMemory => return error.OutOfMemory,
-                    error.DecompressionError => return error.CompressionError,
-                    error.InvalidSize => return error.CompressionError,
-                };
             }
             return error.UnsupportedCompression;
         },
         .brotli => {
-            if (build_options.prefer_zig and build_options.enable_zig_brotli) {
-                return experimental.zig_brotli.compress(allocator, data) catch |e| switch (e) {
+            if (build_options.enable_zig_brotli) {
+                return zig_brotli.compress(allocator, data) catch |e| switch (e) {
                     error.CompressionError => return error.CompressionError,
                     error.OutOfMemory => return error.OutOfMemory,
                     error.DecompressionError => return error.CompressionError,
@@ -159,13 +129,6 @@ pub fn compress(
                     error.CompressionError => return error.CompressionError,
                     error.OutOfMemory => return error.OutOfMemory,
                     error.DecompressionError => return error.CompressionError,
-                };
-            } else if (build_options.enable_zig_brotli) {
-                return experimental.zig_brotli.compress(allocator, data) catch |e| switch (e) {
-                    error.CompressionError => return error.CompressionError,
-                    error.OutOfMemory => return error.OutOfMemory,
-                    error.DecompressionError => return error.CompressionError,
-                    error.InvalidSize => return error.CompressionError,
                 };
             }
             return error.UnsupportedCompression;
@@ -186,8 +149,8 @@ pub fn decompress(
             return allocator.dupe(u8, compressed) catch return error.OutOfMemory;
         },
         .zstd => {
-            if (build_options.prefer_zig and build_options.enable_zig_zstd) {
-                return experimental.zig_zstd.decompress(allocator, compressed, uncompressed_size) catch |e| switch (e) {
+            if (build_options.enable_zig_zstd) {
+                return zig_zstd.decompress(allocator, compressed, uncompressed_size) catch |e| switch (e) {
                     error.DecompressionError => return error.DecompressionError,
                     error.OutOfMemory => return error.OutOfMemory,
                     error.CompressionError => return error.DecompressionError,
@@ -200,19 +163,12 @@ pub fn decompress(
                     error.CompressionError => return error.DecompressionError,
                     error.InvalidSize => return error.DecompressionError,
                 };
-            } else if (build_options.enable_zig_zstd) {
-                return experimental.zig_zstd.decompress(allocator, compressed, uncompressed_size) catch |e| switch (e) {
-                    error.DecompressionError => return error.DecompressionError,
-                    error.OutOfMemory => return error.OutOfMemory,
-                    error.CompressionError => return error.DecompressionError,
-                    error.InvalidSize => return error.DecompressionError,
-                };
             }
             return error.UnsupportedCompression;
         },
         .gzip => {
-            if (build_options.prefer_zig and build_options.enable_zig_gzip) {
-                return experimental.zig_gzip.decompress(allocator, compressed, uncompressed_size) catch |e| switch (e) {
+            if (build_options.enable_zig_gzip) {
+                return zig_gzip.decompress(allocator, compressed, uncompressed_size) catch |e| switch (e) {
                     error.DecompressionError => return error.DecompressionError,
                     error.OutOfMemory => return error.OutOfMemory,
                     error.CompressionError => return error.DecompressionError,
@@ -225,19 +181,12 @@ pub fn decompress(
                     error.CompressionError => return error.DecompressionError,
                     error.InvalidSize => return error.DecompressionError,
                 };
-            } else if (build_options.enable_zig_gzip) {
-                return experimental.zig_gzip.decompress(allocator, compressed, uncompressed_size) catch |e| switch (e) {
-                    error.DecompressionError => return error.DecompressionError,
-                    error.OutOfMemory => return error.OutOfMemory,
-                    error.CompressionError => return error.DecompressionError,
-                    error.InvalidSize => return error.DecompressionError,
-                };
             }
             return error.UnsupportedCompression;
         },
         .lz4_raw => {
-            if (build_options.prefer_zig and build_options.enable_zig_lz4) {
-                return experimental.zig_lz4.decompress(allocator, compressed, uncompressed_size) catch |e| switch (e) {
+            if (build_options.enable_zig_lz4) {
+                return zig_lz4.decompress(allocator, compressed, uncompressed_size) catch |e| switch (e) {
                     error.DecompressionError => return error.DecompressionError,
                     error.OutOfMemory => return error.OutOfMemory,
                     error.CompressionError => return error.DecompressionError,
@@ -249,19 +198,12 @@ pub fn decompress(
                     error.OutOfMemory => return error.OutOfMemory,
                     error.CompressionError => return error.DecompressionError,
                 };
-            } else if (build_options.enable_zig_lz4) {
-                return experimental.zig_lz4.decompress(allocator, compressed, uncompressed_size) catch |e| switch (e) {
-                    error.DecompressionError => return error.DecompressionError,
-                    error.OutOfMemory => return error.OutOfMemory,
-                    error.CompressionError => return error.DecompressionError,
-                    error.InvalidSize => return error.DecompressionError,
-                };
             }
             return error.UnsupportedCompression;
         },
         .brotli => {
-            if (build_options.prefer_zig and build_options.enable_zig_brotli) {
-                return experimental.zig_brotli.decompress(allocator, compressed, uncompressed_size) catch |e| switch (e) {
+            if (build_options.enable_zig_brotli) {
+                return zig_brotli.decompress(allocator, compressed, uncompressed_size) catch |e| switch (e) {
                     error.DecompressionError => return error.DecompressionError,
                     error.OutOfMemory => return error.OutOfMemory,
                     error.CompressionError => return error.DecompressionError,
@@ -273,19 +215,12 @@ pub fn decompress(
                     error.OutOfMemory => return error.OutOfMemory,
                     error.CompressionError => return error.DecompressionError,
                 };
-            } else if (build_options.enable_zig_brotli) {
-                return experimental.zig_brotli.decompress(allocator, compressed, uncompressed_size) catch |e| switch (e) {
-                    error.DecompressionError => return error.DecompressionError,
-                    error.OutOfMemory => return error.OutOfMemory,
-                    error.CompressionError => return error.DecompressionError,
-                    error.InvalidSize => return error.DecompressionError,
-                };
             }
             return error.UnsupportedCompression;
         },
         .snappy => {
-            if (build_options.prefer_zig and build_options.enable_zig_snappy) {
-                return experimental.zig_snappy.decompress(allocator, compressed, uncompressed_size) catch |e| switch (e) {
+            if (build_options.enable_zig_snappy) {
+                return zig_snappy.decompress(allocator, compressed, uncompressed_size) catch |e| switch (e) {
                     error.DecompressionError => return error.DecompressionError,
                     error.OutOfMemory => return error.OutOfMemory,
                     error.CompressionError => return error.DecompressionError,
@@ -293,13 +228,6 @@ pub fn decompress(
                 };
             } else if (build_options.enable_snappy) {
                 return snappy.decompress(allocator, compressed, uncompressed_size) catch |e| switch (e) {
-                    error.DecompressionError => return error.DecompressionError,
-                    error.OutOfMemory => return error.OutOfMemory,
-                    error.CompressionError => return error.DecompressionError,
-                    error.InvalidSize => return error.DecompressionError,
-                };
-            } else if (build_options.enable_zig_snappy) {
-                return experimental.zig_snappy.decompress(allocator, compressed, uncompressed_size) catch |e| switch (e) {
                     error.DecompressionError => return error.DecompressionError,
                     error.OutOfMemory => return error.OutOfMemory,
                     error.CompressionError => return error.DecompressionError,

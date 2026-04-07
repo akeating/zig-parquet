@@ -38,12 +38,12 @@ zig-parquet is a native Parquet library written in Zig 0.15.2. It provides read/
 ## Build & Test
 
 ```bash
-cd zig-parquet && zig build test                  # Run library tests (all codecs: C + Zig)
-cd zig-parquet && zig build test -Dcodecs=stable  # Run with stable C/C++ codecs only
+cd zig-parquet && zig build test                  # Run library tests (all codecs, Zig used by default)
+cd zig-parquet && zig build test -Dcodecs=c-only  # Run with C/C++ codecs only
 cd zig-parquet && zig build test -Dcodecs=none    # Run non-compression tests only
 cd zig-parquet && zig build test -Dcodecs=zstd    # Run with C zstd only
-cd zig-parquet && zig build test -Dcodecs=zig-only # Run with pure Zig codecs only
-cd cli && zig build                               # Build pqi CLI (uses stable codecs)
+cd zig-parquet && zig build test -Dcodecs=zig-only # Run with pure Zig codecs only (no C deps)
+cd cli && zig build                               # Build pqi CLI
 cd cli && ./validate-wild.sh                      # Validate against wild test files (failures only)
 cd cli && ./validate-wild.sh --all                # Show all results
 ```
@@ -122,21 +122,18 @@ _ = arena.reset(.retain_capacity);
 
 Compression codecs are controlled via `-Dcodecs=` (default: `all`).
 
-Presets: `all` (C + Zig), `stable` (C/C++ only), `none`, `zig-only`, or comma-separated list: `zstd,zig-zstd,snappy,zig-snappy,gzip,lz4,brotli`.
+Presets: `all` (C + Zig, Zig used by default), `c-only` (C/C++ only), `zig-only` (no C deps), `none`, or comma-separated list: `zstd,zig-zstd,snappy,zig-snappy,gzip,lz4,brotli`.
 
-- **`all`** — All available codecs (C and experimental Zig). For library testing & validation.
-- **`stable`** — Stable C/C++ codecs only. Default for pqi CLI.
+- **`all`** — All implementations compiled in; Zig used by default, C available for cross-impl testing.
 - **`zig-only`** — Pure Zig codecs only (no C/C++ dependencies).
+- **`c-only`** — C/C++ codecs only (opt-in).
 
 ```zig
-// Stable codecs at top level, experimental behind namespace
+// Both Zig and C implementations at top level; Zig preferred when both compiled in
+pub const zig_zstd = if (build_options.enable_zig_zstd) @import("zig_zstd.zig") else {};
+pub const zig_snappy = if (build_options.enable_zig_snappy) @import("zig_snappy.zig") else {};
 pub const zstd = if (build_options.enable_zstd) @import("zstd.zig") else {};
 pub const snappy = if (build_options.enable_snappy) @import("snappy.zig") else {};
-
-pub const experimental = struct {
-    pub const zig_zstd = if (build_options.enable_zig_zstd) @import("zig_zstd.zig") else {};
-    pub const zig_snappy = if (build_options.enable_zig_snappy) @import("zig_snappy.zig") else {};
-};
 ```
 
 Build option flags:

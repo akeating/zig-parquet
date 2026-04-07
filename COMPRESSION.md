@@ -4,18 +4,13 @@ zig-parquet supports all major Parquet compression codecs. Codecs are individual
 
 ## Codecs
 
-| Codec | Implementation | Notes |
-|-------|---------------|-------|
-| zstd | C libzstd 1.5.7 | Recommended default; configurable compression level (1-22) |
-| gzip | C zlib 1.3.1 | Wide compatibility |
-| snappy | C++ snappy 1.2.2 | Fast, moderate ratio |
-| lz4 | C lz4 1.10.0 | Very fast |
-| brotli | C brotli 1.2.0 | High ratio, largest binary cost |
-| zig-zstd | Pure Zig (experimental) | No C dependency; level-1 compressor + stdlib decompressor |
-| zig-gzip | Pure Zig (experimental) | No C dependency; level-9 deflate compressor + stdlib decompressor |
-| zig-snappy | Pure Zig (experimental) | No C/C++ dependency; full Snappy block format |
-| zig-lz4 | Pure Zig (experimental) | No C dependency; full LZ4 raw block format |
-| zig-brotli | Pure Zig (experimental) | No C dependency; quality-0 compressor + full decompressor |
+| Codec | Default | C Backend | Notes |
+|-------|---------|-----------|-------|
+| zstd | Pure Zig | libzstd 1.5.7 | Zig: level-1 compressor + stdlib decompressor; C: levels 1–22 |
+| gzip | Pure Zig | zlib 1.3.1 | Zig: level-9 deflate compressor + stdlib decompressor |
+| snappy | Pure Zig | snappy 1.2.2 (C++) | Full Snappy block format |
+| lz4 | Pure Zig | lz4 1.10.0 | Full LZ4 raw block format |
+| brotli | Pure Zig | brotli 1.2.0 | Zig: quality-0 compressor + full RFC 7932 decompressor; C: quality 11 |
 
 ## Build Sizes
 
@@ -62,73 +57,62 @@ The `wasm32-freestanding` target hardcodes all codecs to disabled and produces a
 Presets:
 
 ```bash
-zig build                           # all codecs (C + Zig, default for library)
-zig build -Dcodecs=stable           # stable C/C++ only (no experimental Zig)
+zig build                           # all codecs, Zig implementations used by default
+zig build -Dcodecs=zig-only         # pure Zig codecs only (no C/C++ deps at all)
+zig build -Dcodecs=c-only           # C/C++ codecs only (opt-in)
 zig build -Dcodecs=none             # no compression
-zig build -Dcodecs=zig-only         # all available pure Zig codecs
 ```
 
 Custom combinations:
 
 ```bash
-zig build -Dcodecs=zstd,snappy      # only zstd and snappy (C versions)
+zig build -Dcodecs=zig-zstd         # pure Zig zstd only
+zig build -Dcodecs=zig-snappy       # pure Zig snappy only
+zig build -Dcodecs=zig-gzip         # pure Zig gzip only
+zig build -Dcodecs=zig-lz4          # pure Zig LZ4 only
+zig build -Dcodecs=zig-brotli       # pure Zig brotli only
 zig build -Dcodecs=zstd             # C libzstd only
-zig build -Dcodecs=zig-zstd         # pure Zig zstd only (no C deps)
-zig build -Dcodecs=zig-snappy       # pure Zig snappy only (no C++ deps)
-zig build -Dcodecs=zig-gzip          # pure Zig gzip only (no C deps)
-zig build -Dcodecs=zstd,zig-zstd    # both zstd implementations (enables cross-impl tests)
-zig build -Dcodecs=snappy,zig-snappy # both snappy implementations (enables cross-impl tests)
-zig build -Dcodecs=gzip,zig-gzip    # both gzip implementations (enables cross-impl tests)
-zig build -Dcodecs=zig-lz4          # pure Zig LZ4 only (no C deps)
-zig build -Dcodecs=lz4,zig-lz4     # both LZ4 implementations (enables cross-impl tests)
-zig build -Dcodecs=zig-brotli       # pure Zig brotli only (no C deps)
-zig build -Dcodecs=brotli,zig-brotli # both brotli implementations (enables cross-impl tests)
+zig build -Dcodecs=zstd,zig-zstd    # both zstd implementations (cross-impl testing)
+zig build -Dcodecs=snappy,zig-snappy # both snappy implementations (cross-impl testing)
+zig build -Dcodecs=gzip,zig-gzip    # both gzip implementations (cross-impl testing)
+zig build -Dcodecs=lz4,zig-lz4      # both LZ4 implementations (cross-impl testing)
+zig build -Dcodecs=brotli,zig-brotli # both brotli implementations (cross-impl testing)
 ```
 
 Disabled codecs return `UnsupportedCompression` at runtime. C dependencies are only fetched for enabled C codecs.
-
-### Implementation preference
-
-When both C and Zig implementations of a codec are enabled (e.g. `-Dcodecs=all`), the C version is used by default. Pass `-Dprefer-zig` to use the Zig implementation instead:
-
-```bash
-zig build -Dcodecs=all -Dprefer-zig   # use Zig for all codecs (zstd/gzip/snappy/lz4/brotli)
-```
-
-This is a compile-time flag resolved at build time with no runtime overhead.
 
 ### Preset Definitions
 
 | Preset | Zstd | Snappy | Gzip | LZ4 | Brotli | Zig Zstd | Zig Snappy | Zig Gzip | Zig LZ4 | Zig Brotli | Use Case |
 |--------|------|--------|------|-----|--------|----------|------------|----------|---------|------------|----------|
-| `all` | ✓ C | ✓ C | ✓ C | ✓ C | ✓ C | ✓ Zig | ✓ Zig | ✓ Zig | ✓ Zig | ✓ Zig | Maximum codec coverage (library testing) |
-| `stable` | ✓ C | ✓ C | ✓ C | ✓ C | ✓ C | ✗ | ✗ | ✗ | ✗ | ✗ | Production use (pqi CLI, proven codecs only) |
-| `zig-only` | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ Zig | ✓ Zig | ✓ Zig | ✓ Zig | ✓ Zig | No C/C++ dependencies |
+| `all` | ✓ C | ✓ C | ✓ C | ✓ C | ✓ C | ✓ Zig | ✓ Zig | ✓ Zig | ✓ Zig | ✓ Zig | All implementations; Zig used by default, C available for cross-impl testing |
+| `zig-only` | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ Zig | ✓ Zig | ✓ Zig | ✓ Zig | ✓ Zig | Pure Zig, zero C/C++ dependencies |
+| `c-only` | ✓ C | ✓ C | ✓ C | ✓ C | ✓ C | ✗ | ✗ | ✗ | ✗ | ✗ | C/C++ backends only (opt-in) |
 | `none` | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | Minimum binary |
 
 ## API
 
 ### Dispatch
 
-The internal `compress` and `decompress` functions in `mod.zig` select an implementation automatically. When both C and Zig implementations of a codec are enabled, the stable (C) implementation is preferred. The Zig implementation is used as a fallback when the C version is not compiled in.
+The internal `compress` and `decompress` functions in `mod.zig` select an implementation automatically. When both Zig and C implementations are compiled in (e.g. `-Dcodecs=all`), the Zig implementation is used. The C implementation is used only when the Zig version is not compiled in (e.g. `-Dcodecs=c-only`).
 
 ### Direct access
 
-Stable implementations are at the top level, experimental ones behind the `experimental` namespace:
+Both Zig and C implementations are at the top level:
 
 ```zig
 const compress = @import("zig-parquet").compress;
 
-// Stable (C)
+// Pure Zig (default)
+const zig_compressed = try compress.zig_zstd.compress(allocator, data);
+const zig_snappy_out = try compress.zig_snappy.compress(allocator, data);
+const zig_gzip_out = try compress.zig_gzip.compress(allocator, data);
+const zig_lz4_out = try compress.zig_lz4.compress(allocator, data);
+const zig_brotli_out = try compress.zig_brotli.compress(allocator, data);
+
+// C backends (when compiled in via -Dcodecs=c-only or individual names)
 const c_compressed = try compress.zstd.compress(allocator, data);
 const c_level5 = try compress.zstd.compressWithLevel(allocator, data, 5);
-
-// Experimental (Zig)
-const zig_compressed = try compress.experimental.zig_zstd.compress(allocator, data);
-const zig_snappy_out = try compress.experimental.zig_snappy.compress(allocator, data);
-const zig_gzip_out = try compress.experimental.zig_gzip.compress(allocator, data);
-const zig_lz4_out = try compress.experimental.zig_lz4.compress(allocator, data);
-const zig_brotli_out = try compress.experimental.zig_brotli.compress(allocator, data);
 ```
 
 ### Build option flags
@@ -160,23 +144,21 @@ test "my zstd test" {
 }
 ```
 
-## Experimental Codecs
+## Pure Zig Codec Details
 
 ### Pure Zig snappy
 
-The `zig-snappy` codec is a pure Zig implementation of the Snappy block format with no C/C++ dependencies.
+Pure Zig implementation of the Snappy block format with no C/C++ dependencies.
 
 - Greedy LZ matching with hash table lookup
 - Copy (match) and literal element encoding per Snappy spec
 - 64KB block size matching the reference compressor
 
-Graduation follows the same path as zstd: when mature, the contents of `zig_snappy.zig` replace `snappy.zig`.
-
 Cross-implementation tests validate interoperability between C++ snappy and the Zig implementation. Build with `-Dcodecs=snappy,zig-snappy` to enable them.
 
 ### Pure Zig LZ4
 
-The `zig-lz4` codec is a pure Zig implementation of the LZ4 raw block format with no C dependencies.
+Pure Zig implementation of the LZ4 raw block format with no C dependencies.
 
 - Greedy hash-based match finder (4096-entry table, multiplicative hash)
 - 64KB max match distance per LZ4 spec
@@ -187,13 +169,13 @@ Cross-implementation tests validate interoperability between C libLZ4 and the Zi
 
 ### Pure Zig brotli
 
-The `zig-brotli` codec is a pure Zig implementation of Brotli (RFC 7932) with no C dependencies.
+Pure Zig implementation of Brotli (RFC 7932) with no C dependencies.
 
 **Compressor** -- targets quality 0 (one-pass):
 - Uncompressed meta-block encoding (valid Brotli bitstream, no LZ77 compression)
 - Multi-block support (blocks up to 64KB)
 
-**Why quality 0:** The C binding compresses at quality 11 (maximum). A quality-11 encoder is ~25,000 lines of C (Zopfli-style optimal parsing, binary tree hashers, block splitting, context modeling) — larger than all other Zig codecs combined. Quality 0 is a self-contained ~500-line one-pass encoder that produces valid streams any decoder can read. Compression ratios are reasonable for typical Parquet data, trailing quality 11 by 4–10 percentage points (e.g., timestamps: 50% vs 40%, dictionary indices: 30% vs 21%). Users needing maximum compression can use the C backend (`-Dcodecs=brotli`); the Zig backend is for environments where no-C-dependency matters more than ratio.
+**Why quality 0:** The C backend (`-Dcodecs=brotli`) compresses at quality 11 (maximum). A quality-11 encoder is ~25,000 lines of C (Zopfli-style optimal parsing, binary tree hashers, block splitting, context modeling) — larger than all other Zig codecs combined. Quality 0 is a self-contained ~500-line one-pass encoder that produces valid streams any decoder can read. Compression ratios are reasonable for typical Parquet data, trailing quality 11 by 4–10 percentage points (e.g., timestamps: 50% vs 40%, dictionary indices: 30% vs 21%). Users needing maximum compression can use the C backend (`-Dcodecs=brotli`); the Zig backend is for environments where no-C-dependency matters more than ratio.
 
 **Decompressor** -- full RFC 7932 decoder handling all Brotli features:
 - All block types (uncompressed, compressed, metadata)
@@ -207,7 +189,7 @@ Cross-implementation tests validate interoperability between C libbrotli and the
 
 ### Pure Zig gzip
 
-The `zig-gzip` codec is a pure Zig implementation of gzip (RFC 1952) with deflate compression (RFC 1951) and no C dependencies.
+Pure Zig implementation of gzip (RFC 1952) with deflate compression (RFC 1951) and no C dependencies.
 
 **Compressor** -- targets level-9 quality:
 - Dynamic Huffman trees with canonical code assignment
@@ -220,7 +202,7 @@ Cross-implementation tests validate interoperability between C zlib and the Zig 
 
 ### Pure Zig zstd
 
-The `zig-zstd` codec is a pure Zig implementation with no C dependencies.
+Pure Zig implementation with no C dependencies.
 
 **Compressor** -- deliberately targets zstd level 1 only:
 - Greedy LZ matching with hash table lookup
@@ -232,10 +214,6 @@ The `zig-zstd` codec is a pure Zig implementation with no C dependencies.
 **Why level 1:** Zstd level 1 already delivers strong compression on Parquet's columnar data — repetitive values, run-length patterns, and dictionary-encoded columns compress well even with greedy matching. Level 1 is the default for Apache Arrow's C++ and Go Parquet writers (DuckDB and Spark default to level 3). Higher levels add Huffman-coded literals, optimal parsing, and longer match searches for diminishing returns on typical Parquet pages.
 
 **Decompressor** -- uses `std.compress.zstd` from Zig's standard library. Handles all compression levels.
-
-### Graduation path
-
-When the Zig implementation matures, its code replaces the stable version (`zig_zstd.zig` contents move to `zstd.zig`). The `experimental.zig_zstd` entry is removed, and consumers using `compress.zstd` get the Zig implementation without code changes.
 
 ### Testing
 

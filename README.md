@@ -1,6 +1,6 @@
 # zig-parquet
 
-A native Parquet library built for portability, embeddability, and low deployment friction. Use it from Zig or through a C ABI.
+A pure Zig Parquet library. All five compression codecs. No C dependencies. Runs anywhere.
 
 [![CI](https://github.com/akeating/zig-parquet/actions/workflows/test.yml/badge.svg)](https://github.com/akeating/zig-parquet/actions/workflows/test.yml)
 [![Zig](https://img.shields.io/badge/Zig-0.15.2-f7a41d?logo=zig)](https://ziglang.org/)
@@ -12,7 +12,7 @@ A native Parquet library built for portability, embeddability, and low deploymen
 - **Full Read/Write Support** - Read and write Parquet files with all physical and logical types
 - **All Standard Encodings** - PLAIN, RLE, DICTIONARY, DELTA_BINARY_PACKED, DELTA_LENGTH_BYTE_ARRAY, DELTA_BYTE_ARRAY, BYTE_STREAM_SPLIT
 - **Nested Types** - Lists, structs, maps, and arbitrary nesting depth
-- **Compression** - zstd, gzip, snappy, lz4, brotli — all five have pure Zig implementations (no C/C++ required), plus C backends for production use
+- **Compression** - zstd, gzip, snappy, lz4, brotli — pure Zig by default, no C/C++ required; C backends available as opt-in via `-Dcodecs=c-only`
 - **Logical Types** - STRING, DATE, TIME, TIMESTAMP (millis/micros/nanos), DECIMAL, UUID, INT annotations, FLOAT16, ENUM, JSON, BSON, INTERVAL, GEOMETRY, GEOGRAPHY
 - **Dynamic Row API** - Runtime `DynamicWriter` / `DynamicReader` for all types and arbitrary nesting depth
 - **Schema-Agnostic Reading** - Read any Parquet file without knowing the schema at compile time
@@ -279,18 +279,15 @@ See `examples/basic/03_nested_types.zig` for a complete example.
 
 All major Parquet compression codecs are supported, individually selectable at build time:
 
-| Codec | Implementation | Notes |
-|-------|---------------|-------|
-| zstd | C libzstd 1.5.7 | Recommended default |
-| gzip | C zlib 1.3.1 | Wide compatibility |
-| snappy | C++ snappy 1.2.2 | Fast, moderate ratio |
-| lz4 | C lz4 1.10.0 | Very fast |
-| brotli | C brotli 1.2.0 | High ratio |
-| zig-zstd | Pure Zig (experimental) | No C dependency; level-1 compressor + stdlib decompressor |
-| zig-gzip | Pure Zig (experimental) | No C dependency; level-9 deflate compressor + stdlib decompressor |
-| zig-snappy | Pure Zig (experimental) | No C/C++ dependency; full Snappy block format |
-| zig-lz4 | Pure Zig (experimental) | No C dependency; full LZ4 raw block format |
-| zig-brotli | Pure Zig (experimental) | No C dependency; quality-0 compressor + full decompressor |
+| Codec | Default | C Backend | Notes |
+|-------|---------|-----------|-------|
+| zstd | Pure Zig | libzstd 1.5.7 | Zig: level-1 compressor + stdlib decompressor |
+| gzip | Pure Zig | zlib 1.3.1 | Zig: level-9 deflate compressor + stdlib decompressor |
+| snappy | Pure Zig | snappy 1.2.2 (C++) | Full Snappy block format |
+| lz4 | Pure Zig | lz4 1.10.0 | Full LZ4 raw block format |
+| brotli | Pure Zig | brotli 1.2.0 | Zig: quality-0 compressor + full decompressor |
+
+C backends available via `-Dcodecs=c-only` for maximum compression performance.
 
 ```zig
 var writer = try parquet.createFileDynamic(allocator, file);
@@ -298,10 +295,11 @@ writer.setCompression(.zstd);
 ```
 
 ```bash
-zig build                           # all codecs (default: C libs)
+zig build                           # all codecs, Zig implementations used by default
 zig build -Dcodecs=none             # no compression (smallest binary)
-zig build -Dcodecs=zstd,snappy      # only zstd and snappy
-zig build -Dcodecs=zig-only         # all pure Zig codecs (no C/C++ deps)
+zig build -Dcodecs=zig-only         # pure Zig codecs only (no C/C++ deps at all)
+zig build -Dcodecs=c-only           # C/C++ codecs only (opt-in)
+zig build -Dcodecs=zstd,zig-zstd    # both zstd implementations (cross-impl testing)
 ```
 
 See [COMPRESSION.md](COMPRESSION.md) for build sizes, API details, and the full set of build options.
@@ -349,11 +347,11 @@ writer.setMaxPageSize(1_048_576);      // 1MB page size limit
 | BYTE_STREAM_SPLIT | ✅ | Float/double/int/fixed columns |
 | **Compression** | | |
 | UNCOMPRESSED | ✅ | |
-| SNAPPY | ✅ | C++ snappy (default) or pure Zig (experimental via `zig-snappy`) |
-| GZIP | ✅ | C zlib (default) or pure Zig (experimental via `zig-gzip`) |
-| ZSTD | ✅ | C libzstd (default) or pure Zig (experimental via `zig-zstd`) |
-| LZ4_RAW | ✅ | C lz4 (default) or pure Zig (experimental via `zig-lz4`) |
-| BROTLI | ✅ | C brotli (default) or pure Zig (experimental via `zig-brotli`) |
+| SNAPPY | ✅ | Pure Zig (default); C++ backend via `-Dcodecs=snappy` or `c-only` |
+| GZIP | ✅ | Pure Zig (default); C backend via `-Dcodecs=gzip` or `c-only` |
+| ZSTD | ✅ | Pure Zig (default); C backend via `-Dcodecs=zstd` or `c-only` |
+| LZ4_RAW | ✅ | Pure Zig (default); C backend via `-Dcodecs=lz4` or `c-only` |
+| BROTLI | ✅ | Pure Zig (default); C backend via `-Dcodecs=brotli` or `c-only` |
 | LZ4 (non-raw) | ❌ | Hadoop-specific framing format |
 | LZO | ❌ | Not implemented |
 | **Logical Types** | | |
@@ -424,8 +422,9 @@ See `examples/wasm_demo/` and `examples/wasm_freestanding/` for usage examples.
 ## Requirements
 
 - **Zig 0.15.2**
-- C compiler (for compression libraries; not needed with `-Dcodecs=none` or `-Dcodecs=zig-only`)
-- C++ compiler (for Snappy; not needed if snappy is excluded)
+- No C compiler required for the default build (`-Dcodecs=all` uses pure Zig implementations)
+- C compiler only needed when opting into C codecs via `-Dcodecs=c-only` or individual codec names (e.g. `-Dcodecs=zstd`)
+- C++ compiler only needed for the C Snappy backend
 
 ## License
 
