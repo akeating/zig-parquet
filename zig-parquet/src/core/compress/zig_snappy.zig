@@ -13,7 +13,6 @@ pub const Error = error{
     InvalidSize,
 };
 
-const MAX_DECOMPRESS_SIZE: usize = 256 * 1024 * 1024;
 const BLOCK_SIZE: usize = 1 << 16; // 64KB, matching reference compressor
 const HASH_LOG: u5 = 14;
 const HASH_SIZE: usize = 1 << HASH_LOG;
@@ -55,7 +54,6 @@ pub fn compress(allocator: std.mem.Allocator, data: []const u8) Error![]u8 {
 
 /// Decompress Snappy-compressed data (pure Zig)
 pub fn decompress(allocator: std.mem.Allocator, compressed: []const u8, uncompressed_size: usize) Error![]u8 {
-    if (uncompressed_size > MAX_DECOMPRESS_SIZE) return error.InvalidSize;
     if (compressed.len == 0) return error.DecompressionError;
 
     const dst = allocator.alloc(u8, uncompressed_size) catch return error.OutOfMemory;
@@ -63,9 +61,8 @@ pub fn decompress(allocator: std.mem.Allocator, compressed: []const u8, uncompre
 
     const written = snappyDecode(compressed, dst) catch return error.DecompressionError;
 
-    if (written != uncompressed_size) {
-        allocator.free(dst);
-        return error.DecompressionError;
+    if (written < uncompressed_size) {
+        return allocator.realloc(dst, written) catch dst[0..written];
     }
 
     return dst;
@@ -378,15 +375,14 @@ test "snappy getUncompressedLength" {
     try std.testing.expectEqual(@as(?usize, original.len), len);
 }
 
-test "snappy decompress rejects oversized uncompressed_size" {
+test "snappy decompress ignores oversized size hint" {
     const allocator = std.testing.allocator;
     const original = "test";
-
     const compressed = try compress(allocator, original);
     defer allocator.free(compressed);
-
-    const result = decompress(allocator, compressed, MAX_DECOMPRESS_SIZE + 1);
-    try std.testing.expectError(error.InvalidSize, result);
+    const result = try decompress(allocator, compressed, original.len + 10);
+    defer allocator.free(result);
+    try std.testing.expectEqualSlices(u8, original, result);
 }
 
 test "snappy decompress rejects empty compressed data" {

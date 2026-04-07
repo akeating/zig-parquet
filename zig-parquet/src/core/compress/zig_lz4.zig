@@ -21,7 +21,6 @@ const ML_BITS: u4 = 4;
 const ML_MASK: u8 = 0x0F;
 const HASH_LOG: u5 = 12;
 const HASH_SIZE: usize = 1 << HASH_LOG;
-const MAX_DECOMPRESS_SIZE: usize = 256 * 1024 * 1024;
 
 // =========================================================================
 // Public API
@@ -42,7 +41,6 @@ pub fn compress(allocator: std.mem.Allocator, data: []const u8) Error![]u8 {
 
 /// Decompress LZ4 raw block format (pure Zig)
 pub fn decompress(allocator: std.mem.Allocator, compressed: []const u8, uncompressed_size: usize) Error![]u8 {
-    if (uncompressed_size > MAX_DECOMPRESS_SIZE) return error.InvalidSize;
 
     if (uncompressed_size == 0) {
         return allocator.alloc(u8, 0) catch return error.OutOfMemory;
@@ -53,9 +51,8 @@ pub fn decompress(allocator: std.mem.Allocator, compressed: []const u8, uncompre
 
     const written = lz4DecompressBlock(compressed, dst) catch return error.DecompressionError;
 
-    if (written != uncompressed_size) {
-        allocator.free(dst);
-        return error.DecompressionError;
+    if (written < uncompressed_size) {
+        return allocator.realloc(dst, written) catch dst[0..written];
     }
 
     return dst;
@@ -344,9 +341,14 @@ test "lz4 round-trip incompressible data" {
     try std.testing.expectEqualSlices(u8, &random_data, decompressed);
 }
 
-test "lz4 decompress rejects oversized" {
-    const result = decompress(std.testing.allocator, "x", MAX_DECOMPRESS_SIZE + 1);
-    try std.testing.expectError(error.InvalidSize, result);
+test "lz4 decompress ignores oversized size hint" {
+    const allocator = std.testing.allocator;
+    const original = "hello world hello world hello world";
+    const compressed = try compress(allocator, original);
+    defer allocator.free(compressed);
+    const result = try decompress(allocator, compressed, original.len + 100);
+    defer allocator.free(result);
+    try std.testing.expectEqualSlices(u8, original, result);
 }
 
 test "lz4 small inputs" {

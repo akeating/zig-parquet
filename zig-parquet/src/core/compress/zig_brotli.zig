@@ -13,7 +13,6 @@ pub const Error = error{
     InvalidSize,
 };
 
-const MAX_DECOMPRESS_SIZE: usize = 256 * 1024 * 1024;
 
 // =========================================================================
 // Bit Writer (for encoder) — LSB-first
@@ -1236,13 +1235,7 @@ fn decodeWindowBits(reader: *BitReader) Error!u5 {
 // =========================================================================
 
 pub fn decompress(allocator: std.mem.Allocator, compressed: []const u8, uncompressed_size: usize) Error![]u8 {
-    if (uncompressed_size > MAX_DECOMPRESS_SIZE) return error.InvalidSize;
-
-    if (uncompressed_size == 0) {
-        // Even for empty output, we need to validate the stream
-        if (compressed.len == 0) return error.DecompressionError;
-        return allocator.alloc(u8, 0) catch return error.OutOfMemory;
-    }
+    if (compressed.len == 0) return error.DecompressionError;
 
     var reader = BitReader.init(compressed);
 
@@ -1252,10 +1245,10 @@ pub fn decompress(allocator: std.mem.Allocator, compressed: []const u8, uncompre
     const ring_buf = allocator.alloc(u8, window_size) catch return error.OutOfMemory;
     defer allocator.free(ring_buf);
 
-    const output = allocator.alloc(u8, uncompressed_size) catch return error.OutOfMemory;
-    errdefer allocator.free(output);
+    var output: std.ArrayListUnmanaged(u8) = .empty;
+    output.ensureTotalCapacity(allocator, uncompressed_size) catch return error.OutOfMemory;
+    errdefer output.deinit(allocator);
 
-    var out_pos: usize = 0;
     var ring_pos: usize = 0;
     var dist_rb = [4]usize{ 16, 15, 11, 4 }; // distance ring buffer, initialized per spec
     var dist_rb_idx: usize = 0; // rolling index, matches C reference
@@ -1299,11 +1292,8 @@ pub fn decompress(allocator: std.mem.Allocator, compressed: []const u8, uncompre
             reader.alignToByte();
             for (0..meta_block_len) |_| {
                 const byte = try reader.readByte();
-                if (out_pos < output.len) {
-                    output[out_pos] = byte;
-                }
+                output.append(allocator, byte) catch return error.OutOfMemory;
                 ring_buf[ring_pos % window_size] = byte;
-                out_pos += 1;
                 ring_pos += 1;
             }
             continue;
@@ -1513,11 +1503,8 @@ pub fn decompress(allocator: std.mem.Allocator, compressed: []const u8, uncompre
                 const literal = try lit_htrees[htree_idx].lookup(&reader);
 
                 const byte: u8 = @intCast(literal & 0xff);
-                if (out_pos < output.len) {
-                    output[out_pos] = byte;
-                }
+                output.append(allocator, byte) catch return error.OutOfMemory;
                 ring_buf[ring_pos % window_size] = byte;
-                out_pos += 1;
                 ring_pos += 1;
                 meta_bytes_remaining -|= 1;
             }
@@ -1578,11 +1565,8 @@ pub fn decompress(allocator: std.mem.Allocator, compressed: []const u8, uncompre
                 for (0..copy_len) |_| {
                     const src_pos = (ring_pos -% distance) % window_size;
                     const byte = ring_buf[src_pos];
-                    if (out_pos < output.len) {
-                        output[out_pos] = byte;
-                    }
+                    output.append(allocator, byte) catch return error.OutOfMemory;
                     ring_buf[ring_pos % window_size] = byte;
-                    out_pos += 1;
                     ring_pos += 1;
                     meta_bytes_remaining -|= 1;
                 }
@@ -1609,11 +1593,8 @@ pub fn decompress(allocator: std.mem.Allocator, compressed: []const u8, uncompre
 
                 for (0..tlen) |ti| {
                     const byte = transformed[ti];
-                    if (out_pos < output.len) {
-                        output[out_pos] = byte;
-                    }
+                    output.append(allocator, byte) catch return error.OutOfMemory;
                     ring_buf[ring_pos % window_size] = byte;
-                    out_pos += 1;
                     ring_pos += 1;
                     meta_bytes_remaining -|= 1;
                 }
@@ -1621,11 +1602,7 @@ pub fn decompress(allocator: std.mem.Allocator, compressed: []const u8, uncompre
         }
     }
 
-    if (out_pos != uncompressed_size) {
-        return error.DecompressionError;
-    }
-
-    return output;
+    return output.toOwnedSlice(allocator) catch return error.OutOfMemory;
 }
 
 fn resolveDistance(dist_code: u16, dist_rb: *[4]usize, dist_rb_idx: *usize, npostfix: u32, ndirect: u32, reader: *BitReader) Error!usize {
@@ -2923,4 +2900,14 @@ test "brotli zig round-trip large data" {
     const decompressed = try decompress(allocator, compressed_data, size);
     defer allocator.free(decompressed);
     try std.testing.expectEqualSlices(u8, data, decompressed);
+}
+
+test "brotli decompress ignores oversized size hint" {
+    const allocator = std.testing.allocator;
+    const original = "Hello, World!";
+    const compressed = try compress(allocator, original);
+    defer allocator.free(compressed);
+    const result = try decompress(allocator, compressed, original.len + 100);
+    defer allocator.free(result);
+    try std.testing.expectEqualSlices(u8, original, result);
 }

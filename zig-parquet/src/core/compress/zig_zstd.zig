@@ -20,7 +20,6 @@ pub const Error = error{
 // Constants
 // =========================================================================
 
-const MAX_DECOMPRESS_SIZE: usize = 256 * 1024 * 1024;
 const ZSTD_MAGIC: u32 = 0xFD2FB528;
 const BLOCK_SIZE_MAX: usize = zstd_lib.block_size_max; // 1 << 17 = 128KB
 const MIN_MATCH: usize = 4;
@@ -647,7 +646,6 @@ fn writeBlockHeader(dst: []u8, size: usize, block_type: u2, is_last: bool) void 
 // =========================================================================
 
 pub fn decompress(allocator: std.mem.Allocator, compressed: []const u8, uncompressed_size: usize) Error![]u8 {
-    if (uncompressed_size > MAX_DECOMPRESS_SIZE) return error.InvalidSize;
     if (compressed.len == 0) return error.DecompressionError;
 
     var out: std.io.Writer.Allocating = std.io.Writer.Allocating.initCapacity(allocator, uncompressed_size) catch return error.OutOfMemory;
@@ -658,14 +656,7 @@ pub fn decompress(allocator: std.mem.Allocator, compressed: []const u8, uncompre
 
     _ = zstd_stream.reader.streamRemaining(&out.writer) catch return error.DecompressionError;
 
-    const result = out.toOwnedSlice() catch return error.OutOfMemory;
-
-    if (result.len != uncompressed_size) {
-        allocator.free(result);
-        return error.DecompressionError;
-    }
-
-    return result;
+    return out.toOwnedSlice() catch return error.OutOfMemory;
 }
 
 // =========================================================================
@@ -776,15 +767,17 @@ test "zstd round-trip exactly MIN_MATCH bytes" {
     try std.testing.expectEqualStrings(original, decompressed);
 }
 
-test "zstd decompress rejects oversized uncompressed_size" {
+test "zstd decompress ignores mismatched uncompressed_size hint" {
     const allocator = std.testing.allocator;
     const original = "test data";
 
     const compressed = try compress(allocator, original);
     defer allocator.free(compressed);
 
-    const result = decompress(allocator, compressed, MAX_DECOMPRESS_SIZE + 1);
-    try std.testing.expectError(error.InvalidSize, result);
+    // Wrong size hint is ignored — actual decompressed bytes are returned
+    const result = try decompress(allocator, compressed, original.len + 1);
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings(original, result);
 }
 
 test "zstd decompress rejects empty compressed data" {

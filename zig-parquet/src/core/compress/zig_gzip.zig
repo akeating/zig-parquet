@@ -14,7 +14,6 @@ pub const Error = error{
     InvalidSize,
 };
 
-const MAX_DECOMPRESS_SIZE: usize = 256 * 1024 * 1024;
 
 // Gzip constants (RFC 1952)
 const GZIP_MAGIC: u16 = 0x1f8b;
@@ -830,7 +829,6 @@ pub fn compress(allocator: std.mem.Allocator, data: []const u8) Error![]u8 {
 }
 
 pub fn decompress(allocator: std.mem.Allocator, compressed: []const u8, uncompressed_size: usize) Error![]u8 {
-    if (uncompressed_size > MAX_DECOMPRESS_SIZE) return error.InvalidSize;
 
     var out: std.io.Writer.Allocating = std.io.Writer.Allocating.initCapacity(allocator, uncompressed_size) catch return error.OutOfMemory;
     errdefer out.deinit();
@@ -851,14 +849,7 @@ pub fn decompress(allocator: std.mem.Allocator, compressed: []const u8, uncompre
         _ = gz.reader.streamRemaining(&out.writer) catch return error.DecompressionError;
     }
 
-    const result = out.toOwnedSlice() catch return error.OutOfMemory;
-
-    if (result.len != uncompressed_size) {
-        allocator.free(result);
-        return error.DecompressionError;
-    }
-
-    return result;
+    return out.toOwnedSlice() catch return error.OutOfMemory;
 }
 
 // =========================================================================
@@ -940,5 +931,15 @@ test "gzip concatenated streams" {
     defer allocator.free(decompressed);
 
     try std.testing.expectEqualSlices(u8, part1 ++ part2, decompressed);
+}
+
+test "gzip decompress ignores oversized size hint" {
+    const allocator = std.testing.allocator;
+    const original = "Hello, World!";
+    const compressed = try compress(allocator, original);
+    defer allocator.free(compressed);
+    const result = try decompress(allocator, compressed, original.len + 100);
+    defer allocator.free(result);
+    try std.testing.expectEqualSlices(u8, original, result);
 }
 
