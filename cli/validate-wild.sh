@@ -68,10 +68,8 @@ extract_error() {
     echo "${err:-unknown error}"
 }
 
-if [[ ! -x "$PQ_BIN" ]]; then
-    echo "Building pqi..."
-    (cd "$SCRIPT_DIR" && zig build)
-fi
+echo "Building pqi..."
+(cd "$SCRIPT_DIR" && zig build)
 
 if [[ ! -d "$WILD_DIR" ]]; then
     echo -e "${RED}Error: Directory not found: $WILD_DIR${NC}"

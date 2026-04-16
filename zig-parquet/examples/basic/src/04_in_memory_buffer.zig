@@ -1,10 +1,9 @@
 const std = @import("std");
 const parquet = @import("parquet");
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    _ = init.io;
 
     std.debug.print("Writing to an in-memory buffer...\n", .{});
 

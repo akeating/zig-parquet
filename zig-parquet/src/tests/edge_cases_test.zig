@@ -3,18 +3,19 @@
 //! Tests for edge cases: empty tables, single values, large strings, nulls, etc.
 
 const std = @import("std");
+const io = std.testing.io;
 const parquet = @import("../lib.zig");
 
 test "read single_value.parquet" {
     const allocator = std.testing.allocator;
 
-    const file = std.fs.cwd().openFile("../test-files-arrow/edge_cases/single_value.parquet", .{}) catch |err| {
+    const file = std.Io.Dir.cwd().openFile(io, "../test-files-arrow/edge_cases/single_value.parquet", .{}) catch |err| {
         std.debug.print("Could not open test file: {}\n", .{err});
         return err;
     };
-    defer file.close();
+    defer file.close(io);
 
-    var reader = try parquet.openFileDynamic(allocator, file, .{});
+    var reader = try parquet.openFileDynamic(allocator, file, io, .{});
     defer reader.deinit();
 
     // Verify metadata - single row
@@ -34,13 +35,13 @@ test "read single_value.parquet" {
 test "read empty_table.parquet" {
     const allocator = std.testing.allocator;
 
-    const file = std.fs.cwd().openFile("../test-files-arrow/edge_cases/empty_table.parquet", .{}) catch |err| {
+    const file = std.Io.Dir.cwd().openFile(io, "../test-files-arrow/edge_cases/empty_table.parquet", .{}) catch |err| {
         std.debug.print("Could not open test file: {}\n", .{err});
         return err;
     };
-    defer file.close();
+    defer file.close(io);
 
-    var reader = try parquet.openFileDynamic(allocator, file, .{});
+    var reader = try parquet.openFileDynamic(allocator, file, io, .{});
     defer reader.deinit();
 
     // Verify metadata - zero rows (may still have 1 empty row group)
@@ -55,13 +56,13 @@ test "read empty_table.parquet" {
 test "read large_strings.parquet" {
     const allocator = std.testing.allocator;
 
-    const file = std.fs.cwd().openFile("../test-files-arrow/edge_cases/large_strings.parquet", .{}) catch |err| {
+    const file = std.Io.Dir.cwd().openFile(io, "../test-files-arrow/edge_cases/large_strings.parquet", .{}) catch |err| {
         std.debug.print("Could not open test file: {}\n", .{err});
         return err;
     };
-    defer file.close();
+    defer file.close(io);
 
-    var reader = try parquet.openFileDynamic(allocator, file, .{});
+    var reader = try parquet.openFileDynamic(allocator, file, io, .{});
     defer reader.deinit();
 
     // Verify metadata
@@ -94,13 +95,13 @@ test "read large_strings.parquet" {
 test "read nulls_and_empties.parquet" {
     const allocator = std.testing.allocator;
 
-    const file = std.fs.cwd().openFile("../test-files-arrow/basic/nulls_and_empties.parquet", .{}) catch |err| {
+    const file = std.Io.Dir.cwd().openFile(io, "../test-files-arrow/basic/nulls_and_empties.parquet", .{}) catch |err| {
         std.debug.print("Could not open test file: {}\n", .{err});
         return err;
     };
-    defer file.close();
+    defer file.close(io);
 
-    var reader = try parquet.openFileDynamic(allocator, file, .{});
+    var reader = try parquet.openFileDynamic(allocator, file, io, .{});
     defer reader.deinit();
 
     // Verify metadata
@@ -148,13 +149,13 @@ test "read nulls_and_empties.parquet" {
 test "read boundary_values.parquet" {
     const allocator = std.testing.allocator;
 
-    const file = std.fs.cwd().openFile("../test-files-arrow/basic/boundary_values.parquet", .{}) catch |err| {
+    const file = std.Io.Dir.cwd().openFile(io, "../test-files-arrow/basic/boundary_values.parquet", .{}) catch |err| {
         std.debug.print("Could not open test file: {}\n", .{err});
         return err;
     };
-    defer file.close();
+    defer file.close(io);
 
-    var reader = try parquet.openFileDynamic(allocator, file, .{});
+    var reader = try parquet.openFileDynamic(allocator, file, io, .{});
     defer reader.deinit();
 
     // Verify metadata

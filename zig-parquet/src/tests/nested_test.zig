@@ -4,6 +4,7 @@
 //! for complex nested structures like list<struct>, struct<list>, map<list>.
 
 const std = @import("std");
+const io = std.testing.io;
 const schema_mod = @import("../core/schema.zig");
 const value_mod = @import("../core/value.zig");
 const nested_mod = @import("../core/nested.zig");
@@ -486,8 +487,8 @@ test "parquet round-trip: list<int32> with existing reader" {
     // Create test file
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    const file = try tmp_dir.dir.createFile("list_int32.parquet", .{ .read = true });
-    defer file.close();
+    const file = try tmp_dir.dir.createFile(io, "list_int32.parquet", .{ .read = true });
+    defer file.close(io);
 
     // Define schema: list<int32>
     const element_node = SchemaNode{ .int32 = .{} };
@@ -499,7 +500,7 @@ test "parquet round-trip: list<int32> with existing reader" {
 
     // Write data using the new Value-based API
     {
-        var writer = try parquet.writeToFile(allocator, file, &columns);
+        var writer = try parquet.writeToFile(allocator, file, io, &columns);
         defer writer.deinit();
 
         // Row 1: [1, 2, 3]
@@ -520,15 +521,14 @@ test "parquet round-trip: list<int32> with existing reader" {
     }
 
     // Verify file was created with non-zero size
-    const stat = try file.stat();
+    const stat = try file.stat(io);
     try std.testing.expect(stat.size > 0);
 
     // Reset file position for reading
-    try file.seekTo(0);
 
     // Read back using the DynamicReader
     {
-        var reader = parquet.openFileDynamic(allocator, file, .{}) catch |err| {
+        var reader = parquet.openFileDynamic(allocator, file, io, .{}) catch |err| {
             std.debug.print("Reader init error: {}\n", .{err});
             return err;
         };
@@ -587,12 +587,12 @@ test "parquet round-trip: list<struct<id:i64, score:f64>>" {
     // Create test file
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    const file = try tmp_dir.dir.createFile("list_struct.parquet", .{ .read = true });
-    defer file.close();
+    const file = try tmp_dir.dir.createFile(io, "list_struct.parquet", .{ .read = true });
+    defer file.close(io);
 
     // Write data
     {
-        var writer = try parquet.writeToFile(allocator, file, &columns);
+        var writer = try parquet.writeToFile(allocator, file, io, &columns);
         defer writer.deinit();
 
         // Row 1: [{id: 1, score: 95.5}, {id: 2, score: 88.0}]
@@ -628,15 +628,14 @@ test "parquet round-trip: list<struct<id:i64, score:f64>>" {
     }
 
     // Verify file was created with non-zero size
-    const stat = try file.stat();
+    const stat = try file.stat(io);
     try std.testing.expect(stat.size > 0);
 
     // Reset file position for reading
-    try file.seekTo(0);
 
     // Read back and verify
     {
-        var reader = parquet.openFileDynamic(allocator, file, .{}) catch |err| {
+        var reader = parquet.openFileDynamic(allocator, file, io, .{}) catch |err| {
             std.debug.print("Reader init error: {}\n", .{err});
             return err;
         };
@@ -690,12 +689,12 @@ test "parquet round-trip: struct with byte_array field" {
     // Create test file
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    const file = try tmp_dir.dir.createFile("struct_bytearray.parquet", .{ .read = true });
-    defer file.close();
+    const file = try tmp_dir.dir.createFile(io, "struct_bytearray.parquet", .{ .read = true });
+    defer file.close(io);
 
     // Write data
     {
-        var writer = try parquet.writeToFile(allocator, file, &columns);
+        var writer = try parquet.writeToFile(allocator, file, io, &columns);
         defer writer.deinit();
 
         // Row 1: {name: "Alice", id: 1}
@@ -720,15 +719,14 @@ test "parquet round-trip: struct with byte_array field" {
     }
 
     // Verify file was created with non-zero size
-    const stat = try file.stat();
+    const stat = try file.stat(io);
     try std.testing.expect(stat.size > 0);
 
     // Reset file position for reading
-    try file.seekTo(0);
 
     // Read back and verify
     {
-        var reader = parquet.openFileDynamic(allocator, file, .{}) catch |err| {
+        var reader = parquet.openFileDynamic(allocator, file, io, .{}) catch |err| {
             std.debug.print("Reader init error: {}\n", .{err});
             return err;
         };
@@ -776,12 +774,12 @@ test "parquet round-trip: struct with list field" {
     // Create test file
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    const file = try tmp_dir.dir.createFile("struct_list.parquet", .{ .read = true });
-    defer file.close();
+    const file = try tmp_dir.dir.createFile(io, "struct_list.parquet", .{ .read = true });
+    defer file.close(io);
 
     // Write data
     {
-        var writer = try parquet.writeToFile(allocator, file, &columns);
+        var writer = try parquet.writeToFile(allocator, file, io, &columns);
         defer writer.deinit();
 
         // Row 1: {name: "Alice", scores: [90, 85, 92]}
@@ -808,15 +806,14 @@ test "parquet round-trip: struct with list field" {
     }
 
     // Verify file was created with non-zero size
-    const stat = try file.stat();
+    const stat = try file.stat(io);
     try std.testing.expect(stat.size > 0);
 
     // Reset file position for reading
-    try file.seekTo(0);
 
     // Read back and verify
     {
-        var reader = parquet.openFileDynamic(allocator, file, .{}) catch |err| {
+        var reader = parquet.openFileDynamic(allocator, file, io, .{}) catch |err| {
             std.debug.print("Reader init error: {}\n", .{err});
             return err;
         };
@@ -916,12 +913,12 @@ test "parquet round-trip: map<string, i32>" {
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    const file = try tmp_dir.dir.createFile("map_string_int.parquet", .{ .read = true });
-    defer file.close();
+    const file = try tmp_dir.dir.createFile(io, "map_string_int.parquet", .{ .read = true });
+    defer file.close(io);
 
     // Write data
     {
-        var writer = try parquet.writeToFile(allocator, file, &columns);
+        var writer = try parquet.writeToFile(allocator, file, io, &columns);
         defer writer.deinit();
 
         // Row 1: {"a": 1, "b": 2}
@@ -945,15 +942,14 @@ test "parquet round-trip: map<string, i32>" {
     }
 
     // Verify file was created with non-zero size
-    const stat = try file.stat();
+    const stat = try file.stat(io);
     try std.testing.expect(stat.size > 0);
 
     // Reset file position for reading
-    try file.seekTo(0);
 
     // Read back and verify
     {
-        var reader = parquet.openFileDynamic(allocator, file, .{}) catch |err| {
+        var reader = parquet.openFileDynamic(allocator, file, io, .{}) catch |err| {
             std.debug.print("Reader init error: {}\n", .{err});
             return err;
         };
@@ -1001,12 +997,12 @@ test "parquet round-trip: map<i32, i64>" {
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    const file = try tmp_dir.dir.createFile("map_int_int.parquet", .{ .read = true });
-    defer file.close();
+    const file = try tmp_dir.dir.createFile(io, "map_int_int.parquet", .{ .read = true });
+    defer file.close(io);
 
     // Write data
     {
-        var writer = try parquet.writeToFile(allocator, file, &columns);
+        var writer = try parquet.writeToFile(allocator, file, io, &columns);
         defer writer.deinit();
 
         // Row 1: {1: 100, 2: 200}
@@ -1030,15 +1026,14 @@ test "parquet round-trip: map<i32, i64>" {
     }
 
     // Verify file was created with non-zero size
-    const stat = try file.stat();
+    const stat = try file.stat(io);
     try std.testing.expect(stat.size > 0);
 
     // Reset file position for reading
-    try file.seekTo(0);
 
     // Read back and verify
     {
-        var reader = parquet.openFileDynamic(allocator, file, .{}) catch |err| {
+        var reader = parquet.openFileDynamic(allocator, file, io, .{}) catch |err| {
             std.debug.print("Reader init error: {}\n", .{err});
             return err;
         };
@@ -1131,12 +1126,12 @@ test "parquet round-trip: struct with logical types" {
     // Create test file
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    const file = try tmp_dir.dir.createFile("logical_types.parquet", .{ .read = true });
-    defer file.close();
+    const file = try tmp_dir.dir.createFile(io, "logical_types.parquet", .{ .read = true });
+    defer file.close(io);
 
     // Write data
     {
-        var writer = try parquet.writeToFile(allocator, file, &columns);
+        var writer = try parquet.writeToFile(allocator, file, io, &columns);
         defer writer.deinit();
 
         // Row 1: {name: "Alice", created: 19000 (days since epoch), score: 95}
@@ -1163,15 +1158,14 @@ test "parquet round-trip: struct with logical types" {
     }
 
     // Verify file was created
-    const stat = try file.stat();
+    const stat = try file.stat(io);
     try std.testing.expect(stat.size > 0);
 
     // Reset file position for reading
-    try file.seekTo(0);
 
     // Read back and verify both data and schema
     {
-        var reader = parquet.openFileDynamic(allocator, file, .{}) catch |err| {
+        var reader = parquet.openFileDynamic(allocator, file, io, .{}) catch |err| {
             std.debug.print("Reader init error: {}\n", .{err});
             return err;
         };
@@ -1246,12 +1240,12 @@ test "parquet round-trip: TIMESTAMP logical type" {
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    const file = try tmp_dir.dir.createFile("timestamp.parquet", .{ .read = true });
-    defer file.close();
+    const file = try tmp_dir.dir.createFile(io, "timestamp.parquet", .{ .read = true });
+    defer file.close(io);
 
     // Write data
     {
-        var writer = try parquet.writeToFile(allocator, file, &columns);
+        var writer = try parquet.writeToFile(allocator, file, io, &columns);
         defer writer.deinit();
 
         // 2024-01-15 12:30:00 UTC in micros = 1705321800000000
@@ -1277,11 +1271,10 @@ test "parquet round-trip: TIMESTAMP logical type" {
         try writer.close();
     }
 
-    try file.seekTo(0);
 
     // Read back and verify
     {
-        var reader = parquet.openFileDynamic(allocator, file, .{}) catch |err| {
+        var reader = parquet.openFileDynamic(allocator, file, io, .{}) catch |err| {
             std.debug.print("Reader init error: {}\n", .{err});
             return err;
         };
@@ -1344,12 +1337,12 @@ test "parquet round-trip: TIME logical type" {
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    const file = try tmp_dir.dir.createFile("time.parquet", .{ .read = true });
-    defer file.close();
+    const file = try tmp_dir.dir.createFile(io, "time.parquet", .{ .read = true });
+    defer file.close(io);
 
     // Write data
     {
-        var writer = try parquet.writeToFile(allocator, file, &columns);
+        var writer = try parquet.writeToFile(allocator, file, io, &columns);
         defer writer.deinit();
 
         // 12:30:45 = 45045000 millis, 45045000000 micros
@@ -1373,11 +1366,10 @@ test "parquet round-trip: TIME logical type" {
         try writer.close();
     }
 
-    try file.seekTo(0);
 
     // Read back and verify
     {
-        var reader = parquet.openFileDynamic(allocator, file, .{}) catch |err| {
+        var reader = parquet.openFileDynamic(allocator, file, io, .{}) catch |err| {
             std.debug.print("Reader init error: {}\n", .{err});
             return err;
         };
@@ -1439,12 +1431,12 @@ test "parquet round-trip: DECIMAL logical type" {
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    const file = try tmp_dir.dir.createFile("decimal.parquet", .{ .read = true });
-    defer file.close();
+    const file = try tmp_dir.dir.createFile(io, "decimal.parquet", .{ .read = true });
+    defer file.close(io);
 
     // Write data
     {
-        var writer = try parquet.writeToFile(allocator, file, &columns);
+        var writer = try parquet.writeToFile(allocator, file, io, &columns);
         defer writer.deinit();
 
         // Price 123.45 = 12345 (scaled), Quantity 100
@@ -1468,11 +1460,10 @@ test "parquet round-trip: DECIMAL logical type" {
         try writer.close();
     }
 
-    try file.seekTo(0);
 
     // Read back and verify
     {
-        var reader = parquet.openFileDynamic(allocator, file, .{}) catch |err| {
+        var reader = parquet.openFileDynamic(allocator, file, io, .{}) catch |err| {
             std.debug.print("Reader init error: {}\n", .{err});
             return err;
         };
@@ -1537,12 +1528,12 @@ test "parquet round-trip: INT logical types (INT8, INT16, UINT32)" {
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    const file = try tmp_dir.dir.createFile("int_types.parquet", .{ .read = true });
-    defer file.close();
+    const file = try tmp_dir.dir.createFile(io, "int_types.parquet", .{ .read = true });
+    defer file.close(io);
 
     // Write data
     {
-        var writer = try parquet.writeToFile(allocator, file, &columns);
+        var writer = try parquet.writeToFile(allocator, file, io, &columns);
         defer writer.deinit();
 
         const row1_fields = [_]Value.FieldValue{
@@ -1566,11 +1557,10 @@ test "parquet round-trip: INT logical types (INT8, INT16, UINT32)" {
         try writer.close();
     }
 
-    try file.seekTo(0);
 
     // Read back and verify
     {
-        var reader = parquet.openFileDynamic(allocator, file, .{}) catch |err| {
+        var reader = parquet.openFileDynamic(allocator, file, io, .{}) catch |err| {
             std.debug.print("Reader init error: {}\n", .{err});
             return err;
         };
@@ -1636,12 +1626,12 @@ test "parquet round-trip: JSON logical type" {
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    const file = try tmp_dir.dir.createFile("json.parquet", .{ .read = true });
-    defer file.close();
+    const file = try tmp_dir.dir.createFile(io, "json.parquet", .{ .read = true });
+    defer file.close(io);
 
     // Write data
     {
-        var writer = try parquet.writeToFile(allocator, file, &columns);
+        var writer = try parquet.writeToFile(allocator, file, io, &columns);
         defer writer.deinit();
 
         const row1_fields = [_]Value.FieldValue{
@@ -1661,11 +1651,10 @@ test "parquet round-trip: JSON logical type" {
         try writer.close();
     }
 
-    try file.seekTo(0);
 
     // Read back and verify
     {
-        var reader = parquet.openFileDynamic(allocator, file, .{}) catch |err| {
+        var reader = parquet.openFileDynamic(allocator, file, io, .{}) catch |err| {
             std.debug.print("Reader init error: {}\n", .{err});
             return err;
         };
@@ -1709,15 +1698,15 @@ test "parquet round-trip: UUID logical type" {
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    const file = try tmp_dir.dir.createFile("uuid.parquet", .{ .read = true });
-    defer file.close();
+    const file = try tmp_dir.dir.createFile(io, "uuid.parquet", .{ .read = true });
+    defer file.close(io);
 
     // Write data - UUID is 16 bytes
     const uuid1 = [16]u8{ 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0 };
     const uuid2 = [16]u8{ 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff };
 
     {
-        var writer = try parquet.writeToFile(allocator, file, &columns);
+        var writer = try parquet.writeToFile(allocator, file, io, &columns);
         defer writer.deinit();
 
         const row1_fields = [_]Value.FieldValue{
@@ -1737,11 +1726,10 @@ test "parquet round-trip: UUID logical type" {
         try writer.close();
     }
 
-    try file.seekTo(0);
 
     // Read back and verify
     {
-        var reader = parquet.openFileDynamic(allocator, file, .{}) catch |err| {
+        var reader = parquet.openFileDynamic(allocator, file, io, .{}) catch |err| {
             std.debug.print("Reader init error: {}\n", .{err});
             return err;
         };
@@ -1795,12 +1783,12 @@ test "parquet round-trip: ENUM logical type" {
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    const file = try tmp_dir.dir.createFile("enum.parquet", .{ .read = true });
-    defer file.close();
+    const file = try tmp_dir.dir.createFile(io, "enum.parquet", .{ .read = true });
+    defer file.close(io);
 
     // Write data
     {
-        var writer = try parquet.writeToFile(allocator, file, &columns);
+        var writer = try parquet.writeToFile(allocator, file, io, &columns);
         defer writer.deinit();
 
         const row1_fields = [_]Value.FieldValue{
@@ -1825,11 +1813,10 @@ test "parquet round-trip: ENUM logical type" {
         try writer.close();
     }
 
-    try file.seekTo(0);
 
     // Read back and verify
     {
-        var reader = parquet.openFileDynamic(allocator, file, .{}) catch |err| {
+        var reader = parquet.openFileDynamic(allocator, file, io, .{}) catch |err| {
             std.debug.print("Reader init error: {}\n", .{err});
             return err;
         };
@@ -1871,12 +1858,12 @@ test "parquet round-trip: list with logical types" {
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    const file = try tmp_dir.dir.createFile("list_string.parquet", .{ .read = true });
-    defer file.close();
+    const file = try tmp_dir.dir.createFile(io, "list_string.parquet", .{ .read = true });
+    defer file.close(io);
 
     // Write data
     {
-        var writer = try parquet.writeToFile(allocator, file, &columns);
+        var writer = try parquet.writeToFile(allocator, file, io, &columns);
         defer writer.deinit();
 
         const row1_items = [_]Value{ .{ .bytes_val = "rust" }, .{ .bytes_val = "zig" }, .{ .bytes_val = "go" } };
@@ -1891,11 +1878,10 @@ test "parquet round-trip: list with logical types" {
         try writer.close();
     }
 
-    try file.seekTo(0);
 
     // Read back and verify
     {
-        var reader = parquet.openFileDynamic(allocator, file, .{}) catch |err| {
+        var reader = parquet.openFileDynamic(allocator, file, io, .{}) catch |err| {
             std.debug.print("Reader init error: {}\n", .{err});
             return err;
         };
@@ -2769,13 +2755,13 @@ test "dynamic reader round-trip: map<string, struct<x:i32, y:i32>>" {
 test "read old_list_structure.parquet (2-level list<list<int32>>)" {
     const allocator = std.testing.allocator;
 
-    const file = std.fs.cwd().openFile("../test-files-wild/parquet-testing/data/old_list_structure.parquet", .{}) catch |err| {
+    const file = std.Io.Dir.cwd().openFile(io, "../test-files-wild/parquet-testing/data/old_list_structure.parquet", .{}) catch |err| {
         std.debug.print("Could not open old_list_structure.parquet: {}\n", .{err});
         return err;
     };
-    defer file.close();
+    defer file.close(io);
 
-    var dyn = try parquet.openFileDynamic(allocator, file, .{});
+    var dyn = try parquet.openFileDynamic(allocator, file, io, .{});
     defer dyn.deinit();
     const dyn_rows = try dyn.readAllRows(0);
     defer {

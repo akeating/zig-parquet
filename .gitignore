@@ -3,6 +3,8 @@
 
 # Zig
 .zig-cache/
+zig-cache/
+zig-pkg/
 zig-out/
 
 # Cursor

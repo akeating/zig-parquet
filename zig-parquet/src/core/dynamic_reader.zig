@@ -1048,7 +1048,7 @@ test "nested row assembly groups values by rep_level" {
 
     // Test the row boundary detection logic that assembleNestedRows uses
     // Find row boundaries (where rep_level == 0)
-    var row_starts: std.ArrayListUnmanaged(usize) = .{};
+    var row_starts: std.ArrayListUnmanaged(usize) = .empty;
     defer row_starts.deinit(allocator);
 
     for (rep_levels, 0..) |rl, i| {

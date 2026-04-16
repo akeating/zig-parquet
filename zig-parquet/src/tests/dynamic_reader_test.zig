@@ -4,6 +4,7 @@
 //! and reading back with DynamicReader.
 
 const std = @import("std");
+const io = std.testing.io;
 const parquet = @import("../lib.zig");
 const DynamicReader = parquet.DynamicReader;
 const DynamicWriter = parquet.DynamicWriter;
@@ -20,14 +21,14 @@ test "DynamicReader: basic primitives roundtrip" {
     const allocator = std.testing.allocator;
 
     const tmp_path = "test_dynamic_primitives.parquet";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
 
     // Write test data using DynamicWriter
     {
-        const file = try std.fs.cwd().createFile(tmp_path, .{});
-        defer file.close();
+        const file = try std.Io.Dir.cwd().createFile(io, tmp_path, .{});
+        defer file.close(io);
 
-        var writer = try parquet.createFileDynamic(allocator, file);
+        var writer = try parquet.createFileDynamic(allocator, file, io);
         defer writer.deinit();
 
         try writer.addColumn("id", TypeInfo.int32, .{});
@@ -62,10 +63,10 @@ test "DynamicReader: basic primitives roundtrip" {
     }
 
     // Read back with DynamicReader
-    const file = try std.fs.cwd().openFile(tmp_path, .{});
-    defer file.close();
+    const file = try std.Io.Dir.cwd().openFile(io, tmp_path, .{});
+    defer file.close(io);
 
-    var reader = try parquet.openFileDynamic(allocator, file, .{});
+    var reader = try parquet.openFileDynamic(allocator, file, io, .{});
     defer reader.deinit();
 
     // Verify metadata
@@ -108,13 +109,13 @@ test "DynamicReader: string columns roundtrip" {
     const allocator = std.testing.allocator;
 
     const tmp_path = "test_dynamic_strings.parquet";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
 
     {
-        const file = try std.fs.cwd().createFile(tmp_path, .{});
-        defer file.close();
+        const file = try std.Io.Dir.cwd().createFile(io, tmp_path, .{});
+        defer file.close(io);
 
-        var writer = try parquet.createFileDynamic(allocator, file);
+        var writer = try parquet.createFileDynamic(allocator, file, io);
         defer writer.deinit();
 
         try writer.addColumn("id", TypeInfo.int32, .{});
@@ -136,10 +137,10 @@ test "DynamicReader: string columns roundtrip" {
         try writer.close();
     }
 
-    const file = try std.fs.cwd().openFile(tmp_path, .{});
-    defer file.close();
+    const file = try std.Io.Dir.cwd().openFile(io, tmp_path, .{});
+    defer file.close(io);
 
-    var reader = try parquet.openFileDynamic(allocator, file, .{});
+    var reader = try parquet.openFileDynamic(allocator, file, io, .{});
     defer reader.deinit();
 
     const rows = try reader.readAllRows(0);
@@ -164,13 +165,13 @@ test "DynamicReader: optional fields roundtrip" {
     const allocator = std.testing.allocator;
 
     const tmp_path = "test_dynamic_optionals.parquet";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
 
     {
-        const file = try std.fs.cwd().createFile(tmp_path, .{});
-        defer file.close();
+        const file = try std.Io.Dir.cwd().createFile(io, tmp_path, .{});
+        defer file.close(io);
 
-        var writer = try parquet.createFileDynamic(allocator, file);
+        var writer = try parquet.createFileDynamic(allocator, file, io);
         defer writer.deinit();
 
         try writer.addColumn("id", TypeInfo.int32, .{});
@@ -205,10 +206,10 @@ test "DynamicReader: optional fields roundtrip" {
         try writer.close();
     }
 
-    const file = try std.fs.cwd().openFile(tmp_path, .{});
-    defer file.close();
+    const file = try std.Io.Dir.cwd().openFile(io, tmp_path, .{});
+    defer file.close(io);
 
-    var reader = try parquet.openFileDynamic(allocator, file, .{});
+    var reader = try parquet.openFileDynamic(allocator, file, io, .{});
     defer reader.deinit();
 
     const rows = try reader.readAllRows(0);
@@ -244,13 +245,13 @@ test "DynamicReader: multiple row groups" {
     const allocator = std.testing.allocator;
 
     const tmp_path = "test_dynamic_multirowgroup.parquet";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
 
     {
-        const file = try std.fs.cwd().createFile(tmp_path, .{});
-        defer file.close();
+        const file = try std.Io.Dir.cwd().createFile(io, tmp_path, .{});
+        defer file.close(io);
 
-        var writer = try parquet.createFileDynamic(allocator, file);
+        var writer = try parquet.createFileDynamic(allocator, file, io);
         defer writer.deinit();
 
         try writer.addColumn("id", TypeInfo.int32, .{});
@@ -276,10 +277,10 @@ test "DynamicReader: multiple row groups" {
         try writer.close();
     }
 
-    const file = try std.fs.cwd().openFile(tmp_path, .{});
-    defer file.close();
+    const file = try std.Io.Dir.cwd().openFile(io, tmp_path, .{});
+    defer file.close(io);
 
-    var reader = try parquet.openFileDynamic(allocator, file, .{});
+    var reader = try parquet.openFileDynamic(allocator, file, io, .{});
     defer reader.deinit();
 
     try std.testing.expectEqual(@as(usize, 2), reader.getNumRowGroups());
@@ -317,13 +318,13 @@ test "DynamicReader: compressed data roundtrip" {
     const allocator = std.testing.allocator;
 
     const tmp_path = "test_dynamic_compressed.parquet";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
 
     {
-        const file = try std.fs.cwd().createFile(tmp_path, .{});
-        defer file.close();
+        const file = try std.Io.Dir.cwd().createFile(io, tmp_path, .{});
+        defer file.close(io);
 
-        var writer = try parquet.createFileDynamic(allocator, file);
+        var writer = try parquet.createFileDynamic(allocator, file, io);
         defer writer.deinit();
 
         try writer.addColumn("id", TypeInfo.int32, .{});
@@ -345,10 +346,10 @@ test "DynamicReader: compressed data roundtrip" {
         try writer.close();
     }
 
-    const file = try std.fs.cwd().openFile(tmp_path, .{});
-    defer file.close();
+    const file = try std.Io.Dir.cwd().openFile(io, tmp_path, .{});
+    defer file.close(io);
 
-    var reader = try parquet.openFileDynamic(allocator, file, .{});
+    var reader = try parquet.openFileDynamic(allocator, file, io, .{});
     defer reader.deinit();
 
     const rows = try reader.readAllRows(0);
@@ -371,13 +372,13 @@ test "DynamicReader: dictionary encoded data roundtrip" {
     const allocator = std.testing.allocator;
 
     const tmp_path = "test_dynamic_dict.parquet";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
 
     {
-        const file = try std.fs.cwd().createFile(tmp_path, .{});
-        defer file.close();
+        const file = try std.Io.Dir.cwd().createFile(io, tmp_path, .{});
+        defer file.close(io);
 
-        var writer = try parquet.createFileDynamic(allocator, file);
+        var writer = try parquet.createFileDynamic(allocator, file, io);
         defer writer.deinit();
 
         try writer.addColumn("id", TypeInfo.int32, .{});
@@ -404,10 +405,10 @@ test "DynamicReader: dictionary encoded data roundtrip" {
         try writer.close();
     }
 
-    const file = try std.fs.cwd().openFile(tmp_path, .{});
-    defer file.close();
+    const file = try std.Io.Dir.cwd().openFile(io, tmp_path, .{});
+    defer file.close(io);
 
-    var reader = try parquet.openFileDynamic(allocator, file, .{});
+    var reader = try parquet.openFileDynamic(allocator, file, io, .{});
     defer reader.deinit();
 
     const rows = try reader.readAllRows(0);

@@ -17,56 +17,61 @@ const build_options = @import("build_options");
 
 const version = build_options.version;
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    // init.gpa is DebugAllocator in Debug mode. Its per-allocation stack
+    // trace capture uses DWARF unwinding as of Zig 0.16 (previously
+    // frame-pointer walking), which is ~1000× slower per frame. On files
+    // with hot allocation paths (e.g. ~440k dupes in the FLBA column
+    // decoder for covid.snappy.parquet), Debug-mode pqi appears to hang.
+    // pqi is a short-lived CLI; process-exit cleanup makes leak tracking
+    // here low-value. Pick a fast general-purpose allocator for all modes.
+    const allocator = std.heap.smp_allocator;
+    const io = init.io;
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    const args = try init.minimal.args.toSlice(allocator);
 
     if (args.len < 2) {
-        try printUsage();
+        try printUsage(io);
         std.process.exit(1);
     }
 
     const command = args[1];
 
     if (std.mem.eql(u8, command, "schema")) {
-        try runSchema(allocator, args[2..]);
+        try runSchema(allocator, io, args[2..]);
     } else if (std.mem.eql(u8, command, "head")) {
-        try runHead(allocator, args[2..]);
+        try runHead(allocator, io, args[2..]);
     } else if (std.mem.eql(u8, command, "cat")) {
-        try runCat(allocator, args[2..]);
+        try runCat(allocator, io, args[2..]);
     } else if (std.mem.eql(u8, command, "stats")) {
-        try runStats(allocator, args[2..]);
+        try runStats(allocator, io, args[2..]);
     } else if (std.mem.eql(u8, command, "count")) {
-        try runCount(allocator, args[2..]);
+        try runCount(allocator, io, args[2..]);
     } else if (std.mem.eql(u8, command, "rowgroups")) {
-        try runRowgroups(allocator, args[2..]);
+        try runRowgroups(allocator, io, args[2..]);
     } else if (std.mem.eql(u8, command, "size")) {
-        try runSize(allocator, args[2..]);
+        try runSize(allocator, io, args[2..]);
     } else if (std.mem.eql(u8, command, "column")) {
-        try runColumn(allocator, args[2..]);
+        try runColumn(allocator, io, args[2..]);
     } else if (std.mem.eql(u8, command, "validate")) {
-        try runValidate(allocator, args[2..]);
+        try runValidate(allocator, io, args[2..]);
     } else if (std.mem.eql(u8, command, "version") or std.mem.eql(u8, command, "--version")) {
-        try printVersion();
+        try printVersion(io);
     } else if (std.mem.eql(u8, command, "--help") or std.mem.eql(u8, command, "-h")) {
-        try printUsage();
+        try printUsage(io);
     } else {
         var buf: [4096]u8 = undefined;
-        var file_writer = std.fs.File.stderr().writer(&buf);
+        var file_writer = std.Io.File.stderr().writerStreaming(io, &buf);
         try file_writer.interface.print("Unknown command: {s}\n\n", .{command});
         try file_writer.interface.flush();
-        try printUsage();
+        try printUsage(io);
         std.process.exit(1);
     }
 }
 
-fn printUsage() !void {
+fn printUsage(io: std.Io) !void {
     var buf: [4096]u8 = undefined;
-    var file_writer = std.fs.File.stdout().writer(&buf);
+    var file_writer = std.Io.File.stdout().writerStreaming(io, &buf);
     const w = &file_writer.interface;
     try w.writeAll(
         \\pqi - Parquet file inspection tool
@@ -104,24 +109,24 @@ fn printUsage() !void {
     try w.flush();
 }
 
-fn printVersion() !void {
+fn printVersion(io: std.Io) !void {
     var buf: [256]u8 = undefined;
-    var file_writer = std.fs.File.stdout().writer(&buf);
+    var file_writer = std.Io.File.stdout().writerStreaming(io, &buf);
     try file_writer.interface.print("pqi {s}\n", .{version});
     try file_writer.interface.flush();
 }
 
-fn runSchema(allocator: std.mem.Allocator, args: []const []const u8) !void {
+fn runSchema(allocator: std.mem.Allocator, io: std.Io, args: []const [:0]const u8) !void {
     if (args.len < 1) {
-        try stderrExit("Error: schema command requires a file path\n");
+        try stderrExit(io, "Error: schema command requires a file path\n");
     }
     const schema_cmd = @import("commands/schema.zig");
-    try schema_cmd.run(allocator, args[0]);
+    try schema_cmd.run(allocator, io, args[0]);
 }
 
-fn runHead(allocator: std.mem.Allocator, args: []const []const u8) !void {
+fn runHead(allocator: std.mem.Allocator, io: std.Io, args: []const [:0]const u8) !void {
     if (args.len < 1) {
-        try stderrExit("Error: head command requires a file path\n");
+        try stderrExit(io, "Error: head command requires a file path\n");
     }
 
     const file_path = args[0];
@@ -133,7 +138,7 @@ fn runHead(allocator: std.mem.Allocator, args: []const []const u8) !void {
             if (i + 1 < args.len) {
                 num_rows = std.fmt.parseInt(usize, args[i + 1], 10) catch {
                     var buf: [4096]u8 = undefined;
-                    var file_writer = std.fs.File.stderr().writer(&buf);
+                    var file_writer = std.Io.File.stderr().writerStreaming(io, &buf);
                     try file_writer.interface.print("Error: invalid number '{s}'\n", .{args[i + 1]});
                     try file_writer.interface.flush();
                     std.process.exit(1);
@@ -144,12 +149,12 @@ fn runHead(allocator: std.mem.Allocator, args: []const []const u8) !void {
     }
 
     const head_cmd = @import("commands/head.zig");
-    try head_cmd.run(allocator, file_path, num_rows);
+    try head_cmd.run(allocator, io, file_path, num_rows);
 }
 
-fn runCat(allocator: std.mem.Allocator, args: []const []const u8) !void {
+fn runCat(allocator: std.mem.Allocator, io: std.Io, args: []const [:0]const u8) !void {
     if (args.len < 1) {
-        try stderrExit("Error: cat command requires a file path\n");
+        try stderrExit(io, "Error: cat command requires a file path\n");
     }
 
     const file_path = args[0];
@@ -162,52 +167,52 @@ fn runCat(allocator: std.mem.Allocator, args: []const []const u8) !void {
     }
 
     const cat_cmd = @import("commands/cat.zig");
-    try cat_cmd.run(allocator, file_path, json_mode);
+    try cat_cmd.run(allocator, io, file_path, json_mode);
 }
 
-fn runStats(allocator: std.mem.Allocator, args: []const []const u8) !void {
+fn runStats(allocator: std.mem.Allocator, io: std.Io, args: []const [:0]const u8) !void {
     if (args.len < 1) {
-        try stderrExit("Error: stats command requires a file path\n");
+        try stderrExit(io, "Error: stats command requires a file path\n");
     }
     const stats_cmd = @import("commands/stats.zig");
-    try stats_cmd.run(allocator, args[0]);
+    try stats_cmd.run(allocator, io, args[0]);
 }
 
-fn runCount(allocator: std.mem.Allocator, args: []const []const u8) !void {
+fn runCount(allocator: std.mem.Allocator, io: std.Io, args: []const [:0]const u8) !void {
     if (args.len < 1) {
-        try stderrExit("Error: count command requires a file path\n");
+        try stderrExit(io, "Error: count command requires a file path\n");
     }
     const count_cmd = @import("commands/count.zig");
-    try count_cmd.run(allocator, args[0]);
+    try count_cmd.run(allocator, io, args[0]);
 }
 
-fn runRowgroups(allocator: std.mem.Allocator, args: []const []const u8) !void {
+fn runRowgroups(allocator: std.mem.Allocator, io: std.Io, args: []const [:0]const u8) !void {
     if (args.len < 1) {
-        try stderrExit("Error: rowgroups command requires a file path\n");
+        try stderrExit(io, "Error: rowgroups command requires a file path\n");
     }
     const rowgroups_cmd = @import("commands/rowgroups.zig");
-    try rowgroups_cmd.run(allocator, args[0]);
+    try rowgroups_cmd.run(allocator, io, args[0]);
 }
 
-fn runSize(allocator: std.mem.Allocator, args: []const []const u8) !void {
+fn runSize(allocator: std.mem.Allocator, io: std.Io, args: []const [:0]const u8) !void {
     if (args.len < 1) {
-        try stderrExit("Error: size command requires a file path\n");
+        try stderrExit(io, "Error: size command requires a file path\n");
     }
     const size_cmd = @import("commands/size.zig");
-    try size_cmd.run(allocator, args[0]);
+    try size_cmd.run(allocator, io, args[0]);
 }
 
-fn runColumn(allocator: std.mem.Allocator, args: []const []const u8) !void {
+fn runColumn(allocator: std.mem.Allocator, io: std.Io, args: []const [:0]const u8) !void {
     if (args.len < 1) {
-        try stderrExit("Error: column command requires a file path\n");
+        try stderrExit(io, "Error: column command requires a file path\n");
     }
     const column_cmd = @import("commands/column.zig");
-    try column_cmd.run(allocator, args[0], args[1..]);
+    try column_cmd.run(allocator, io, args[0], args[1..]);
 }
 
-fn runValidate(allocator: std.mem.Allocator, args: []const []const u8) !void {
+fn runValidate(allocator: std.mem.Allocator, io: std.Io, args: []const [:0]const u8) !void {
     if (args.len < 1) {
-        try stderrExit("Error: validate command requires a file path\n");
+        try stderrExit(io, "Error: validate command requires a file path\n");
     }
 
     var file_path: []const u8 = "";
@@ -222,18 +227,18 @@ fn runValidate(allocator: std.mem.Allocator, args: []const []const u8) !void {
     }
 
     if (file_path.len == 0) {
-        try stderrExit("Error: validate command requires a file path\n");
+        try stderrExit(io, "Error: validate command requires a file path\n");
     }
 
     const validate_cmd = @import("commands/validate.zig");
-    try validate_cmd.runWithOptions(allocator, file_path, .{
+    try validate_cmd.runWithOptions(allocator, io, file_path, .{
         .validate_checksum = validate_checksum,
     });
 }
 
-fn stderrExit(msg: []const u8) !noreturn {
+fn stderrExit(io: std.Io, msg: []const u8) !noreturn {
     var buf: [4096]u8 = undefined;
-    var file_writer = std.fs.File.stderr().writer(&buf);
+    var file_writer = std.Io.File.stderr().writerStreaming(io, &buf);
     try file_writer.interface.writeAll(msg);
     try file_writer.interface.flush();
     std.process.exit(1);

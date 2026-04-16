@@ -3,6 +3,7 @@
 //! Tests that read actual Parquet files and verify the data.
 
 const std = @import("std");
+const io = std.testing.io;
 const parquet = @import("../lib.zig");
 const format = parquet.format;
 
@@ -10,13 +11,13 @@ test "read basic_types_plain_uncompressed.parquet" {
     const allocator = std.testing.allocator;
 
     // Open the test file
-    const file = std.fs.cwd().openFile("../test-files-arrow/basic/basic_types_plain_uncompressed.parquet", .{}) catch |err| {
+    const file = std.Io.Dir.cwd().openFile(io, "../test-files-arrow/basic/basic_types_plain_uncompressed.parquet", .{}) catch |err| {
         std.debug.print("Could not open test file (run from zig-parquet dir): {}\n", .{err});
         return err;
     };
-    defer file.close();
+    defer file.close(io);
 
-    var reader = try parquet.openFileDynamic(allocator, file, .{});
+    var reader = try parquet.openFileDynamic(allocator, file, io, .{});
     defer reader.deinit();
 
     // Verify metadata
@@ -56,13 +57,13 @@ test "read basic_types_plain_uncompressed.parquet" {
 test "read int32 column values" {
     const allocator = std.testing.allocator;
 
-    const file = std.fs.cwd().openFile("../test-files-arrow/basic/basic_types_plain_uncompressed.parquet", .{}) catch |err| {
+    const file = std.Io.Dir.cwd().openFile(io, "../test-files-arrow/basic/basic_types_plain_uncompressed.parquet", .{}) catch |err| {
         std.debug.print("Could not open test file: {}\n", .{err});
         return err;
     };
-    defer file.close();
+    defer file.close(io);
 
-    var reader = try parquet.openFileDynamic(allocator, file, .{});
+    var reader = try parquet.openFileDynamic(allocator, file, io, .{});
     defer reader.deinit();
 
     // Read int32_col (column index 1)
@@ -86,13 +87,13 @@ test "read int32 column values" {
 test "read int64 column values" {
     const allocator = std.testing.allocator;
 
-    const file = std.fs.cwd().openFile("../test-files-arrow/basic/basic_types_plain_uncompressed.parquet", .{}) catch |err| {
+    const file = std.Io.Dir.cwd().openFile(io, "../test-files-arrow/basic/basic_types_plain_uncompressed.parquet", .{}) catch |err| {
         std.debug.print("Could not open test file: {}\n", .{err});
         return err;
     };
-    defer file.close();
+    defer file.close(io);
 
-    var reader = try parquet.openFileDynamic(allocator, file, .{});
+    var reader = try parquet.openFileDynamic(allocator, file, io, .{});
     defer reader.deinit();
 
     // Read int64_col (column index 2)
@@ -115,13 +116,13 @@ test "read int64 column values" {
 test "read float column values" {
     const allocator = std.testing.allocator;
 
-    const file = std.fs.cwd().openFile("../test-files-arrow/basic/basic_types_plain_uncompressed.parquet", .{}) catch |err| {
+    const file = std.Io.Dir.cwd().openFile(io, "../test-files-arrow/basic/basic_types_plain_uncompressed.parquet", .{}) catch |err| {
         std.debug.print("Could not open test file: {}\n", .{err});
         return err;
     };
-    defer file.close();
+    defer file.close(io);
 
-    var reader = try parquet.openFileDynamic(allocator, file, .{});
+    var reader = try parquet.openFileDynamic(allocator, file, io, .{});
     defer reader.deinit();
 
     // Read float_col (column index 3)
@@ -144,13 +145,13 @@ test "read float column values" {
 test "read double column values" {
     const allocator = std.testing.allocator;
 
-    const file = std.fs.cwd().openFile("../test-files-arrow/basic/basic_types_plain_uncompressed.parquet", .{}) catch |err| {
+    const file = std.Io.Dir.cwd().openFile(io, "../test-files-arrow/basic/basic_types_plain_uncompressed.parquet", .{}) catch |err| {
         std.debug.print("Could not open test file: {}\n", .{err});
         return err;
     };
-    defer file.close();
+    defer file.close(io);
 
-    var reader = try parquet.openFileDynamic(allocator, file, .{});
+    var reader = try parquet.openFileDynamic(allocator, file, io, .{});
     defer reader.deinit();
 
     // Read double_col (column index 4)
@@ -173,13 +174,13 @@ test "read double column values" {
 test "read string column values" {
     const allocator = std.testing.allocator;
 
-    const file = std.fs.cwd().openFile("../test-files-arrow/basic/basic_types_plain_uncompressed.parquet", .{}) catch |err| {
+    const file = std.Io.Dir.cwd().openFile(io, "../test-files-arrow/basic/basic_types_plain_uncompressed.parquet", .{}) catch |err| {
         std.debug.print("Could not open test file: {}\n", .{err});
         return err;
     };
-    defer file.close();
+    defer file.close(io);
 
-    var reader = try parquet.openFileDynamic(allocator, file, .{});
+    var reader = try parquet.openFileDynamic(allocator, file, io, .{});
     defer reader.deinit();
 
     // Read string_col (column index 5)
@@ -202,13 +203,13 @@ test "read string column values" {
 test "read bool column values" {
     const allocator = std.testing.allocator;
 
-    const file = std.fs.cwd().openFile("../test-files-arrow/basic/basic_types_plain_uncompressed.parquet", .{}) catch |err| {
+    const file = std.Io.Dir.cwd().openFile(io, "../test-files-arrow/basic/basic_types_plain_uncompressed.parquet", .{}) catch |err| {
         std.debug.print("Could not open test file: {}\n", .{err});
         return err;
     };
-    defer file.close();
+    defer file.close(io);
 
-    var reader = try parquet.openFileDynamic(allocator, file, .{});
+    var reader = try parquet.openFileDynamic(allocator, file, io, .{});
     defer reader.deinit();
 
     // Read bool_col (column index 0)
@@ -231,13 +232,13 @@ test "read bool column values" {
 test "read binary column values" {
     const allocator = std.testing.allocator;
 
-    const file = std.fs.cwd().openFile("../test-files-arrow/basic/basic_types_plain_uncompressed.parquet", .{}) catch |err| {
+    const file = std.Io.Dir.cwd().openFile(io, "../test-files-arrow/basic/basic_types_plain_uncompressed.parquet", .{}) catch |err| {
         std.debug.print("Could not open test file: {}\n", .{err});
         return err;
     };
-    defer file.close();
+    defer file.close(io);
 
-    var reader = try parquet.openFileDynamic(allocator, file, .{});
+    var reader = try parquet.openFileDynamic(allocator, file, io, .{});
     defer reader.deinit();
 
     // Read binary_col (column index 6)
@@ -261,13 +262,13 @@ test "read binary column values" {
 test "read fixed_len_byte_array column values" {
     const allocator = std.testing.allocator;
 
-    const file = std.fs.cwd().openFile("../test-files-arrow/basic/basic_types_plain_uncompressed.parquet", .{}) catch |err| {
+    const file = std.Io.Dir.cwd().openFile(io, "../test-files-arrow/basic/basic_types_plain_uncompressed.parquet", .{}) catch |err| {
         std.debug.print("Could not open test file: {}\n", .{err});
         return err;
     };
-    defer file.close();
+    defer file.close(io);
 
-    var reader = try parquet.openFileDynamic(allocator, file, .{});
+    var reader = try parquet.openFileDynamic(allocator, file, io, .{});
     defer reader.deinit();
 
     // Read fixed_binary_col (column index 7) - 16-byte fixed length

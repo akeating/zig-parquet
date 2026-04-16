@@ -6,6 +6,7 @@
 //! - DynamicReader logical type detection API
 
 const std = @import("std");
+const io = std.testing.io;
 const parquet = @import("../lib.zig");
 const format = parquet.format;
 const DynamicReader = @import("../core/dynamic_reader.zig").DynamicReader;
@@ -21,14 +22,14 @@ test "round-trip BSON logical type" {
 
     // Write with BSON logical type
     {
-        const file = try tmp_dir.dir.createFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.createFile(io, file_path, .{});
+        defer file.close(io);
 
         const columns = [_]parquet.ColumnDef{
             parquet.ColumnDef.bson("data", false),
         };
 
-        var writer = try parquet.writeToFile(allocator, file, &columns);
+        var writer = try parquet.writeToFile(allocator, file, io, &columns);
         defer writer.deinit();
 
         // BSON documents (as raw bytes - these are example BSON structures)
@@ -46,10 +47,10 @@ test "round-trip BSON logical type" {
 
     // Read back and verify logical type
     {
-        const file = try tmp_dir.dir.openFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.openFile(io, file_path, .{});
+        defer file.close(io);
 
-        var reader = try parquet.openFileDynamic(allocator, file, .{});
+        var reader = try parquet.openFileDynamic(allocator, file, io, .{});
         defer reader.deinit();
 
         const schema = reader.getSchema();
@@ -88,14 +89,14 @@ test "BSON schema generation via SchemaNode" {
 
     // Write using ColumnDef.bson()
     {
-        const file = try tmp_dir.dir.createFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.createFile(io, file_path, .{});
+        defer file.close(io);
 
         const columns = [_]parquet.ColumnDef{
             parquet.ColumnDef.bson("document", false),
         };
 
-        var writer = try parquet.writeToFile(allocator, file, &columns);
+        var writer = try parquet.writeToFile(allocator, file, io, &columns);
         defer writer.deinit();
 
         const values = [_][]const u8{"\x05\x00\x00\x00\x00"}; // Empty BSON doc
@@ -105,10 +106,10 @@ test "BSON schema generation via SchemaNode" {
 
     // Read and verify
     {
-        const file = try tmp_dir.dir.openFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.openFile(io, file_path, .{});
+        defer file.close(io);
 
-        var reader = try parquet.openFileDynamic(allocator, file, .{});
+        var reader = try parquet.openFileDynamic(allocator, file, io, .{});
         defer reader.deinit();
 
         const schema = reader.getSchema();
@@ -135,8 +136,8 @@ test "DynamicReader BSON detection via isColumnType" {
 
     // Write file with multiple column types including BSON
     {
-        const file = try tmp_dir.dir.createFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.createFile(io, file_path, .{});
+        defer file.close(io);
 
         const columns = [_]parquet.ColumnDef{
             parquet.ColumnDef.string("text_col", false),
@@ -144,7 +145,7 @@ test "DynamicReader BSON detection via isColumnType" {
             parquet.ColumnDef.json("json_col", false),
         };
 
-        var writer = try parquet.writeToFile(allocator, file, &columns);
+        var writer = try parquet.writeToFile(allocator, file, io, &columns);
         defer writer.deinit();
 
         const text_values = [_][]const u8{"hello"};
@@ -159,10 +160,10 @@ test "DynamicReader BSON detection via isColumnType" {
 
     // Read with DynamicReader and test logical type detection
     {
-        const file = try tmp_dir.dir.openFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.openFile(io, file_path, .{});
+        defer file.close(io);
 
-        var reader = try parquet.openFileDynamic(allocator, file, .{});
+        var reader = try parquet.openFileDynamic(allocator, file, io, .{});
         defer reader.deinit();
 
         // Column 0: string

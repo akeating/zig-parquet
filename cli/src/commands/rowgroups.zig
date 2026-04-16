@@ -5,23 +5,23 @@ const parquet = @import("parquet");
 const helpers = @import("../helpers.zig");
 const cat = @import("cat.zig");
 
-pub fn run(allocator: std.mem.Allocator, file_path: []const u8) !void {
+pub fn run(allocator: std.mem.Allocator, io: std.Io, file_path: []const u8) !void {
     var stdout_buf: [8192]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
+    var stdout_writer = std.Io.File.stdout().writerStreaming(io, &stdout_buf);
     const stdout = &stdout_writer.interface;
 
     var stderr_buf: [4096]u8 = undefined;
-    var stderr_writer = std.fs.File.stderr().writer(&stderr_buf);
+    var stderr_writer = std.Io.File.stderr().writerStreaming(io, &stderr_buf);
     const stderr = &stderr_writer.interface;
 
-    const file = std.fs.cwd().openFile(file_path, .{}) catch |err| {
+    const file = std.Io.Dir.cwd().openFile(io, file_path, .{}) catch |err| {
         try stderr.print("Error: Cannot open file '{s}': {}\n", .{ file_path, err });
         try stderr.flush();
         std.process.exit(1);
     };
-    defer file.close();
+    defer file.close(io);
 
-    var reader = parquet.openFileDynamic(allocator, file, .{}) catch |err| {
+    var reader = parquet.openFileDynamic(allocator, file, io, .{}) catch |err| {
         try stderr.print("Error: Cannot read parquet file: {}\n", .{err});
         try stderr.flush();
         std.process.exit(1);

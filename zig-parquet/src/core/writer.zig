@@ -24,6 +24,7 @@
 //! ```
 
 const std = @import("std");
+const io = std.testing.io;
 const safe = @import("safe.zig");
 const format = @import("format.zig");
 const thrift = @import("thrift/mod.zig");
@@ -1709,15 +1710,15 @@ test "Writer basic i64 column" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const file = try tmp_dir.dir.createFile("test.parquet", .{ .read = true });
-    defer file.close();
+    const file = try tmp_dir.dir.createFile(io, "test.parquet", .{ .read = true });
+    defer file.close(io);
 
     const columns = [_]ColumnDef{
         .{ .name = "id", .type_ = .int64, .optional = false },
     };
 
     const api_writer = @import("../api/zig/writer.zig");
-    var writer = try api_writer.writeToFile(allocator, file, &columns);
+    var writer = try api_writer.writeToFile(allocator, file, io, &columns);
     defer writer.deinit();
 
     const values = [_]i64{ 1, 2, 3, 4, 5 };
@@ -1726,9 +1727,8 @@ test "Writer basic i64 column" {
     try writer.close();
 
     // Verify file has content
-    try file.seekTo(0);
     var magic: [4]u8 = undefined;
-    _ = try file.read(&magic);
+    _ = try file.readPositionalAll(io, &magic, 0);
     try std.testing.expectEqualStrings("PAR1", &magic);
 }
 
@@ -1738,15 +1738,15 @@ test "Writer nullable column" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const file = try tmp_dir.dir.createFile("test_nullable.parquet", .{});
-    defer file.close();
+    const file = try tmp_dir.dir.createFile(io, "test_nullable.parquet", .{});
+    defer file.close(io);
 
     const columns = [_]ColumnDef{
         .{ .name = "value", .type_ = .double, .optional = true },
     };
 
     const api_writer2 = @import("../api/zig/writer.zig");
-    var writer = try api_writer2.writeToFile(allocator, file, &columns);
+    var writer = try api_writer2.writeToFile(allocator, file, io, &columns);
     defer writer.deinit();
 
     const values = [_]?f64{ 1.5, null, 3.5 };
@@ -1761,8 +1761,8 @@ test "Writer multiple columns" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const file = try tmp_dir.dir.createFile("test_multi.parquet", .{});
-    defer file.close();
+    const file = try tmp_dir.dir.createFile(io, "test_multi.parquet", .{});
+    defer file.close(io);
 
     const columns = [_]ColumnDef{
         .{ .name = "id", .type_ = .int64, .optional = false },
@@ -1771,7 +1771,7 @@ test "Writer multiple columns" {
     };
 
     const api_writer3 = @import("../api/zig/writer.zig");
-    var writer = try api_writer3.writeToFile(allocator, file, &columns);
+    var writer = try api_writer3.writeToFile(allocator, file, io, &columns);
     defer writer.deinit();
 
     const ids = [_]i64{ 1, 2, 3 };

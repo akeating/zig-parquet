@@ -3,6 +3,7 @@
 //! Tests reading and writing struct columns from Parquet files.
 
 const std = @import("std");
+const io = std.testing.io;
 const parquet = @import("../lib.zig");
 
 // =============================================================================
@@ -13,13 +14,13 @@ test "read struct_simple.parquet" {
     const allocator = std.testing.allocator;
 
     // Open the test file
-    const file = std.fs.cwd().openFile("../test-files-arrow/nested/struct_simple.parquet", .{}) catch |err| {
+    const file = std.Io.Dir.cwd().openFile(io, "../test-files-arrow/nested/struct_simple.parquet", .{}) catch |err| {
         std.debug.print("Skipping test - file not found: {}\n", .{err});
         return;
     };
-    defer file.close();
+    defer file.close(io);
 
-    var reader = try parquet.openFileDynamic(allocator, file, .{});
+    var reader = try parquet.openFileDynamic(allocator, file, io, .{});
     defer reader.deinit();
 
     // Verify schema
@@ -81,13 +82,13 @@ test "read struct_nested.parquet" {
     const allocator = std.testing.allocator;
 
     // Open the test file
-    const file = std.fs.cwd().openFile("../test-files-arrow/nested/struct_nested.parquet", .{}) catch |err| {
+    const file = std.Io.Dir.cwd().openFile(io, "../test-files-arrow/nested/struct_nested.parquet", .{}) catch |err| {
         std.debug.print("Skipping test - file not found: {}\n", .{err});
         return;
     };
-    defer file.close();
+    defer file.close(io);
 
-    var reader = try parquet.openFileDynamic(allocator, file, .{});
+    var reader = try parquet.openFileDynamic(allocator, file, io, .{});
     defer reader.deinit();
 
     // Schema: nested (struct with inner (struct with a, b), value (string))
@@ -165,8 +166,8 @@ test "write and read simple struct" {
 
     // Write a struct with two i32 fields
     {
-        const file = try tmp_dir.dir.createFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.createFile(io, file_path, .{});
+        defer file.close(io);
 
         const columns = [_]ColumnDef{
             ColumnDef.struct_("point", &.{
@@ -175,7 +176,7 @@ test "write and read simple struct" {
             }, true),
         };
 
-        var writer = try parquet.writeToFile(allocator, file, &columns);
+        var writer = try parquet.writeToFile(allocator, file, io, &columns);
         defer writer.deinit();
 
         // Write point.x: values [1, 3, null, 5]
@@ -193,10 +194,10 @@ test "write and read simple struct" {
 
     // Read it back
     {
-        const file = try tmp_dir.dir.openFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.openFile(io, file_path, .{});
+        defer file.close(io);
 
-        var reader = try parquet.openFileDynamic(allocator, file, .{});
+        var reader = try parquet.openFileDynamic(allocator, file, io, .{});
         defer reader.deinit();
 
         const rows = try reader.readAllRows(0);
@@ -240,8 +241,8 @@ test "write and read struct with null fields" {
 
     // Write a struct where some individual fields are null
     {
-        const file = try tmp_dir.dir.createFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.createFile(io, file_path, .{});
+        defer file.close(io);
 
         const columns = [_]ColumnDef{
             ColumnDef.struct_("data", &.{
@@ -250,7 +251,7 @@ test "write and read struct with null fields" {
             }, true),
         };
 
-        var writer = try parquet.writeToFile(allocator, file, &columns);
+        var writer = try parquet.writeToFile(allocator, file, io, &columns);
         defer writer.deinit();
 
         // Row 0: {a: 1, b: 2} - both present
@@ -269,10 +270,10 @@ test "write and read struct with null fields" {
 
     // Read it back
     {
-        const file = try tmp_dir.dir.openFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.openFile(io, file_path, .{});
+        defer file.close(io);
 
-        var reader = try parquet.openFileDynamic(allocator, file, .{});
+        var reader = try parquet.openFileDynamic(allocator, file, io, .{});
         defer reader.deinit();
 
         const rows = try reader.readAllRows(0);
@@ -319,8 +320,8 @@ test "write and read struct with string field" {
 
     // Write a struct with int and string fields
     {
-        const file = try tmp_dir.dir.createFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.createFile(io, file_path, .{});
+        defer file.close(io);
 
         const columns = [_]ColumnDef{
             ColumnDef.struct_("person", &.{
@@ -329,7 +330,7 @@ test "write and read struct with string field" {
             }, true),
         };
 
-        var writer = try parquet.writeToFile(allocator, file, &columns);
+        var writer = try parquet.writeToFile(allocator, file, io, &columns);
         defer writer.deinit();
 
         // Row 0: {id: 1, name: "Alice"}
@@ -347,10 +348,10 @@ test "write and read struct with string field" {
 
     // Read it back
     {
-        const file = try tmp_dir.dir.openFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.openFile(io, file_path, .{});
+        defer file.close(io);
 
-        var reader = try parquet.openFileDynamic(allocator, file, .{});
+        var reader = try parquet.openFileDynamic(allocator, file, io, .{});
         defer reader.deinit();
 
         const rows = try reader.readAllRows(0);

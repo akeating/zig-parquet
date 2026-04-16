@@ -116,7 +116,7 @@ pub fn generateMetadata(
     };
 
     // Serialize to JSON
-    var out: std.io.Writer.Allocating = .init(allocator);
+    var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
 
     try std.json.Stringify.value(metadata, .{}, &out.writer);

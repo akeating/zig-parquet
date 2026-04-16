@@ -16,33 +16,33 @@ pub const ValidateOptions = struct {
     validate_checksum: bool = true,
 };
 
-pub fn run(allocator: std.mem.Allocator, file_path: []const u8) !void {
-    return runWithOptions(allocator, file_path, .{});
+pub fn run(allocator: std.mem.Allocator, io: std.Io, file_path: []const u8) !void {
+    return runWithOptions(allocator, io, file_path, .{});
 }
 
-pub fn runWithOptions(allocator: std.mem.Allocator, file_path: []const u8, options: ValidateOptions) !void {
+pub fn runWithOptions(allocator: std.mem.Allocator, io: std.Io, file_path: []const u8, options: ValidateOptions) !void {
     var stdout_buf: [8192]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
+    var stdout_writer = std.Io.File.stdout().writerStreaming(io, &stdout_buf);
     const stdout = &stdout_writer.interface;
 
     var stderr_buf: [4096]u8 = undefined;
-    var stderr_writer = std.fs.File.stderr().writer(&stderr_buf);
+    var stderr_writer = std.Io.File.stderr().writerStreaming(io, &stderr_buf);
     const stderr = &stderr_writer.interface;
     _ = stderr;
 
     try stdout.print("Validating: {s}\n", .{file_path});
 
     // Step 1: Open the file
-    const file = std.fs.cwd().openFile(file_path, .{}) catch |err| {
+    const file = std.Io.Dir.cwd().openFile(io, file_path, .{}) catch |err| {
         try stdout.print("  File access: FAILED ({s})\n", .{@errorName(err)});
         try stdout.writeAll("Invalid\n");
         try stdout.flush();
         std.process.exit(1);
     };
-    defer file.close();
+    defer file.close(io);
 
     // Step 2: Check magic bytes
-    const magic_ok = checkMagicBytes(file) catch false;
+    const magic_ok = checkMagicBytes(file, io) catch false;
     if (!magic_ok) {
         try stdout.writeAll("  Magic bytes: FAILED (not a valid parquet file)\n");
         try stdout.writeAll("Invalid\n");
@@ -53,7 +53,7 @@ pub fn runWithOptions(allocator: std.mem.Allocator, file_path: []const u8, optio
 
     // Step 3: Initialize DynamicReader (parses metadata)
     // Enable CRC checksum validation by default for validation command
-    var reader = parquet.openFileDynamic(allocator, file, .{
+    var reader = parquet.openFileDynamic(allocator, file, io, .{
         .checksum = .{
             .validate_page_checksum = options.validate_checksum,
             .strict_checksum = false, // Missing CRC is OK
@@ -121,27 +121,22 @@ pub fn runWithOptions(allocator: std.mem.Allocator, file_path: []const u8, optio
     }
 }
 
-fn checkMagicBytes(file: std.fs.File) !bool {
+fn checkMagicBytes(file: std.Io.File, io: std.Io) !bool {
     const MAGIC = "PAR1";
 
-    // Check start magic
+    // Check start magic using positional reads
     var start_buf: [4]u8 = undefined;
-    file.seekTo(0) catch return false;
-    const start_read = file.read(&start_buf) catch return false;
+    const start_read = file.readPositionalAll(io, &start_buf, 0) catch return false;
     if (start_read != 4) return false;
     if (!std.mem.eql(u8, &start_buf, MAGIC)) return false;
 
     // Check end magic
-    const end_pos = file.getEndPos() catch return false;
+    const end_pos = file.length(io) catch return false;
     if (end_pos < 8) return false;
-    file.seekTo(end_pos - 4) catch return false;
     var end_buf: [4]u8 = undefined;
-    const end_read = file.read(&end_buf) catch return false;
+    const end_read = file.readPositionalAll(io, &end_buf, end_pos - 4) catch return false;
     if (end_read != 4) return false;
     if (!std.mem.eql(u8, &end_buf, MAGIC)) return false;
-
-    // Reset position
-    file.seekTo(0) catch return false;
 
     return true;
 }

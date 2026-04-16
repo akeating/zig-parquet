@@ -6,14 +6,15 @@ const std = @import("std");
 const SeekableReader = @import("../core/seekable_reader.zig").SeekableReader;
 
 pub const FileReader = struct {
-    file: std.fs.File,
+    file: std.Io.File,
+    io: std.Io,
     file_size: u64,
 
     /// Create a FileReader from an open file handle.
     /// The file must be seekable and remain open while the FileReader is in use.
-    pub fn init(file: std.fs.File) SeekableReader.Error!FileReader {
-        const file_size = file.getEndPos() catch return error.Unseekable;
-        return .{ .file = file, .file_size = file_size };
+    pub fn init(file: std.Io.File, io: std.Io) SeekableReader.Error!FileReader {
+        const file_size = file.length(io) catch return error.Unseekable;
+        return .{ .file = file, .io = io, .file_size = file_size };
     }
 
     /// Get a SeekableReader interface for this file.
@@ -32,8 +33,7 @@ pub const FileReader = struct {
 
     fn readAt(ctx: *anyopaque, offset: u64, buf: []u8) SeekableReader.Error!usize {
         const self: *FileReader = @ptrCast(@alignCast(ctx));
-        self.file.seekTo(offset) catch return error.Unseekable;
-        return self.file.read(buf) catch return error.InputOutput;
+        return self.file.readPositionalAll(self.io, buf, offset) catch return error.InputOutput;
     }
 
     fn getSize(ctx: *anyopaque) u64 {

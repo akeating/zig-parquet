@@ -11,38 +11,32 @@ pub fn build(b: *std.Build) void {
     });
     const parquet_mod = parquet_dep.module("parquet");
 
-    // Discover examples in src/
-    var examples_dir = std.fs.cwd().openDir("src", .{ .iterate = true }) catch return;
-    defer examples_dir.close();
+    const examples = [_][]const u8{
+        "01_read_write",
+        "02_dynamic_read",
+        "03_nested_types",
+        "04_in_memory_buffer",
+        "05_column_api",
+    };
 
-    var walker = examples_dir.walk(b.allocator) catch return;
-    defer walker.deinit();
+    for (examples) |example_name| {
+        const exe = b.addExecutable(.{
+            .name = example_name,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(b.fmt("src/{s}.zig", .{example_name})),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
 
-    while (walker.next() catch null) |entry| {
-        if (entry.kind == .file and std.mem.endsWith(u8, entry.path, ".zig")) {
-            const example_name = entry.basename[0 .. entry.basename.len - ".zig".len];
-            
-            const exe = b.addExecutable(.{
-                .name = example_name,
-                .root_module = b.createModule(.{
-                    .root_source_file = b.path(b.fmt("src/{s}", .{entry.basename})),
-                    .target = target,
-                    .optimize = optimize,
-                }),
-            });
+        exe.root_module.addImport("parquet", parquet_mod);
+        b.installArtifact(exe);
 
-            // Add the parquet module
-            exe.root_module.addImport("parquet", parquet_mod);
-
-            b.installArtifact(exe);
-
-            // Create a convenient run command: `zig build run-{name}`
-            const run_cmd = b.addRunArtifact(exe);
-            const run_step = b.step(
-                b.fmt("run-{s}", .{example_name}), 
-                b.fmt("Run the {s} example", .{example_name})
-            );
-            run_step.dependOn(&run_cmd.step);
-        }
+        const run_cmd = b.addRunArtifact(exe);
+        const run_step = b.step(
+            b.fmt("run-{s}", .{example_name}),
+            b.fmt("Run the {s} example", .{example_name}),
+        );
+        run_step.dependOn(&run_cmd.step);
     }
 }

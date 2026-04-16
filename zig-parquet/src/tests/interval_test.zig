@@ -7,6 +7,7 @@
 //! - Statistics are NOT written (per Parquet spec, sort order is undefined)
 
 const std = @import("std");
+const io = std.testing.io;
 const parquet = @import("../lib.zig");
 const format = parquet.format;
 const types = parquet.types;
@@ -46,14 +47,14 @@ test "round-trip INTERVAL with Writer/Reader API" {
 
     // Write INTERVAL column
     {
-        const file = try tmp_dir.dir.createFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.createFile(io, file_path, .{});
+        defer file.close(io);
 
         const columns = [_]parquet.ColumnDef{
             parquet.ColumnDef.interval("duration", false),
         };
 
-        var writer = try parquet.writeToFile(allocator, file, &columns);
+        var writer = try parquet.writeToFile(allocator, file, io, &columns);
         defer writer.deinit();
 
         // Create interval values as raw bytes
@@ -74,10 +75,10 @@ test "round-trip INTERVAL with Writer/Reader API" {
 
     // Read back and verify schema
     {
-        const file = try tmp_dir.dir.openFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.openFile(io, file_path, .{});
+        defer file.close(io);
 
-        var reader = try parquet.openFileDynamic(allocator, file, .{});
+        var reader = try parquet.openFileDynamic(allocator, file, io, .{});
         defer reader.deinit();
 
         const schema = reader.getSchema();
@@ -123,10 +124,10 @@ test "round-trip INTERVAL with DynamicWriter/DynamicReader API" {
 
     // Write using DynamicWriter
     {
-        const file = try tmp_dir.dir.createFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.createFile(io, file_path, .{});
+        defer file.close(io);
 
-        var writer = try parquet.createFileDynamic(allocator, file);
+        var writer = try parquet.createFileDynamic(allocator, file, io);
         defer writer.deinit();
 
         try writer.addColumn("duration", TypeInfo.interval, .{});
@@ -149,10 +150,10 @@ test "round-trip INTERVAL with DynamicWriter/DynamicReader API" {
 
     // Read using DynamicReader
     {
-        const file = try tmp_dir.dir.openFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.openFile(io, file_path, .{});
+        defer file.close(io);
 
-        var reader = try parquet.openFileDynamic(allocator, file, .{});
+        var reader = try parquet.openFileDynamic(allocator, file, io, .{});
         defer reader.deinit();
 
         const rows = try reader.readAllRows(0);
@@ -193,10 +194,10 @@ test "round-trip nullable INTERVAL with DynamicWriter/DynamicReader API" {
 
     // Write using DynamicWriter
     {
-        const file = try tmp_dir.dir.createFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.createFile(io, file_path, .{});
+        defer file.close(io);
 
-        var writer = try parquet.createFileDynamic(allocator, file);
+        var writer = try parquet.createFileDynamic(allocator, file, io);
         defer writer.deinit();
 
         try writer.addColumn("duration", TypeInfo.interval, .{});
@@ -218,10 +219,10 @@ test "round-trip nullable INTERVAL with DynamicWriter/DynamicReader API" {
 
     // Read using DynamicReader
     {
-        const file = try tmp_dir.dir.openFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.openFile(io, file_path, .{});
+        defer file.close(io);
 
-        var reader = try parquet.openFileDynamic(allocator, file, .{});
+        var reader = try parquet.openFileDynamic(allocator, file, io, .{});
         defer reader.deinit();
 
         const rows = try reader.readAllRows(0);
@@ -261,14 +262,14 @@ test "INTERVAL statistics are not written" {
 
     // Write INTERVAL column
     {
-        const file = try tmp_dir.dir.createFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.createFile(io, file_path, .{});
+        defer file.close(io);
 
         const columns = [_]parquet.ColumnDef{
             parquet.ColumnDef.interval("duration", false),
         };
 
-        var writer = try parquet.writeToFile(allocator, file, &columns);
+        var writer = try parquet.writeToFile(allocator, file, io, &columns);
         defer writer.deinit();
 
         const interval1 = Interval.fromMonths(1);
@@ -285,10 +286,10 @@ test "INTERVAL statistics are not written" {
 
     // Read and verify statistics are NOT present
     {
-        const file = try tmp_dir.dir.openFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.openFile(io, file_path, .{});
+        defer file.close(io);
 
-        var reader = try parquet.openFileDynamic(allocator, file, .{});
+        var reader = try parquet.openFileDynamic(allocator, file, io, .{});
         defer reader.deinit();
 
         // Get statistics for the INTERVAL column

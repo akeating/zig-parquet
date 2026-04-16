@@ -3,19 +3,20 @@
 //! Tests for dictionary encoding, compression, and multiple row groups.
 
 const std = @import("std");
+const io = std.testing.io;
 const parquet = @import("../lib.zig");
 const build_options = @import("build_options");
 
 test "read dictionary_low_cardinality.parquet" {
     const allocator = std.testing.allocator;
 
-    const file = std.fs.cwd().openFile("../test-files-arrow/encodings/dictionary_low_cardinality.parquet", .{}) catch |err| {
+    const file = std.Io.Dir.cwd().openFile(io, "../test-files-arrow/encodings/dictionary_low_cardinality.parquet", .{}) catch |err| {
         std.debug.print("Could not open test file: {}\n", .{err});
         return err;
     };
-    defer file.close();
+    defer file.close(io);
 
-    var reader = try parquet.openFileDynamic(allocator, file, .{});
+    var reader = try parquet.openFileDynamic(allocator, file, io, .{});
     defer reader.deinit();
 
     // Verify metadata
@@ -54,13 +55,13 @@ test "read dictionary_low_cardinality.parquet" {
 test "read dictionary_high_cardinality.parquet" {
     const allocator = std.testing.allocator;
 
-    const file = std.fs.cwd().openFile("../test-files-arrow/encodings/dictionary_high_cardinality.parquet", .{}) catch |err| {
+    const file = std.Io.Dir.cwd().openFile(io, "../test-files-arrow/encodings/dictionary_high_cardinality.parquet", .{}) catch |err| {
         std.debug.print("Could not open test file: {}\n", .{err});
         return err;
     };
-    defer file.close();
+    defer file.close(io);
 
-    var reader = try parquet.openFileDynamic(allocator, file, .{});
+    var reader = try parquet.openFileDynamic(allocator, file, io, .{});
     defer reader.deinit();
 
     // Verify metadata
@@ -85,13 +86,13 @@ test "read compression_zstd.parquet" {
     if (!build_options.supports_zstd) return;
     const allocator = std.testing.allocator;
 
-    const file = std.fs.cwd().openFile("../test-files-arrow/compression/compression_zstd.parquet", .{}) catch |err| {
+    const file = std.Io.Dir.cwd().openFile(io, "../test-files-arrow/compression/compression_zstd.parquet", .{}) catch |err| {
         std.debug.print("Could not open test file: {}\n", .{err});
         return err;
     };
-    defer file.close();
+    defer file.close(io);
 
-    var reader = try parquet.openFileDynamic(allocator, file, .{});
+    var reader = try parquet.openFileDynamic(allocator, file, io, .{});
     defer reader.deinit();
 
     // Verify metadata
@@ -121,13 +122,13 @@ test "read compression_gzip.parquet" {
     if (!build_options.enable_gzip) return;
     const allocator = std.testing.allocator;
 
-    const file = std.fs.cwd().openFile("../test-files-arrow/compression/compression_gzip.parquet", .{}) catch |err| {
+    const file = std.Io.Dir.cwd().openFile(io, "../test-files-arrow/compression/compression_gzip.parquet", .{}) catch |err| {
         std.debug.print("Could not open test file: {}\n", .{err});
         return err;
     };
-    defer file.close();
+    defer file.close(io);
 
-    var reader = try parquet.openFileDynamic(allocator, file, .{});
+    var reader = try parquet.openFileDynamic(allocator, file, io, .{});
     defer reader.deinit();
 
     // Verify metadata
@@ -153,13 +154,13 @@ test "read compression_gzip.parquet" {
 test "read multiple_row_groups.parquet" {
     const allocator = std.testing.allocator;
 
-    const file = std.fs.cwd().openFile("../test-files-arrow/structure/multiple_row_groups.parquet", .{}) catch |err| {
+    const file = std.Io.Dir.cwd().openFile(io, "../test-files-arrow/structure/multiple_row_groups.parquet", .{}) catch |err| {
         std.debug.print("Could not open test file: {}\n", .{err});
         return err;
     };
-    defer file.close();
+    defer file.close(io);
 
-    var reader = try parquet.openFileDynamic(allocator, file, .{});
+    var reader = try parquet.openFileDynamic(allocator, file, io, .{});
     defer reader.deinit();
 
     // Verify metadata
@@ -203,13 +204,13 @@ test "read multiple_row_groups.parquet" {
 test "read compression_none.parquet" {
     const allocator = std.testing.allocator;
 
-    const file = std.fs.cwd().openFile("../test-files-arrow/compression/compression_none.parquet", .{}) catch |err| {
+    const file = std.Io.Dir.cwd().openFile(io, "../test-files-arrow/compression/compression_none.parquet", .{}) catch |err| {
         std.debug.print("Could not open test file: {}\n", .{err});
         return err;
     };
-    defer file.close();
+    defer file.close(io);
 
-    var reader = try parquet.openFileDynamic(allocator, file, .{});
+    var reader = try parquet.openFileDynamic(allocator, file, io, .{});
     defer reader.deinit();
 
     // Verify metadata
@@ -237,13 +238,13 @@ test "read compression_snappy.parquet" {
     if (!build_options.supports_snappy) return;
     const allocator = std.testing.allocator;
 
-    const file = std.fs.cwd().openFile("../test-files-arrow/compression/compression_snappy.parquet", .{}) catch |err| {
+    const file = std.Io.Dir.cwd().openFile(io, "../test-files-arrow/compression/compression_snappy.parquet", .{}) catch |err| {
         std.debug.print("Could not open test file: {}\n", .{err});
         return err;
     };
-    defer file.close();
+    defer file.close(io);
 
-    var reader = try parquet.openFileDynamic(allocator, file, .{});
+    var reader = try parquet.openFileDynamic(allocator, file, io, .{});
     defer reader.deinit();
 
     // Verify metadata
@@ -271,13 +272,13 @@ test "read compression_lz4.parquet" {
     if (!build_options.enable_lz4) return;
     const allocator = std.testing.allocator;
 
-    const file = std.fs.cwd().openFile("../test-files-arrow/compression/compression_lz4.parquet", .{}) catch |err| {
+    const file = std.Io.Dir.cwd().openFile(io, "../test-files-arrow/compression/compression_lz4.parquet", .{}) catch |err| {
         std.debug.print("Could not open test file: {}\n", .{err});
         return err;
     };
-    defer file.close();
+    defer file.close(io);
 
-    var reader = try parquet.openFileDynamic(allocator, file, .{});
+    var reader = try parquet.openFileDynamic(allocator, file, io, .{});
     defer reader.deinit();
 
     // Verify metadata
@@ -305,13 +306,13 @@ test "read compression_brotli.parquet" {
     if (!build_options.supports_brotli) return;
     const allocator = std.testing.allocator;
 
-    const file = std.fs.cwd().openFile("../test-files-arrow/compression/compression_brotli.parquet", .{}) catch |err| {
+    const file = std.Io.Dir.cwd().openFile(io, "../test-files-arrow/compression/compression_brotli.parquet", .{}) catch |err| {
         std.debug.print("Could not open test file: {}\n", .{err});
         return err;
     };
-    defer file.close();
+    defer file.close(io);
 
-    var reader = try parquet.openFileDynamic(allocator, file, .{});
+    var reader = try parquet.openFileDynamic(allocator, file, io, .{});
     defer reader.deinit();
 
     // Verify metadata
@@ -342,13 +343,13 @@ test "read compression_brotli.parquet" {
 test "read delta_binary_packed_int32.parquet" {
     const allocator = std.testing.allocator;
 
-    const file = std.fs.cwd().openFile("../test-files-arrow/encodings/delta_binary_packed_int32.parquet", .{}) catch |err| {
+    const file = std.Io.Dir.cwd().openFile(io, "../test-files-arrow/encodings/delta_binary_packed_int32.parquet", .{}) catch |err| {
         std.debug.print("Could not open test file: {}\n", .{err});
         return err;
     };
-    defer file.close();
+    defer file.close(io);
 
-    var reader = try parquet.openFileDynamic(allocator, file, .{});
+    var reader = try parquet.openFileDynamic(allocator, file, io, .{});
     defer reader.deinit();
 
     try std.testing.expectEqual(@as(i64, 1000), reader.metadata.num_rows);
@@ -384,13 +385,13 @@ test "read delta_binary_packed_int32.parquet" {
 test "read delta_binary_packed_int64.parquet" {
     const allocator = std.testing.allocator;
 
-    const file = std.fs.cwd().openFile("../test-files-arrow/encodings/delta_binary_packed_int64.parquet", .{}) catch |err| {
+    const file = std.Io.Dir.cwd().openFile(io, "../test-files-arrow/encodings/delta_binary_packed_int64.parquet", .{}) catch |err| {
         std.debug.print("Could not open test file: {}\n", .{err});
         return err;
     };
-    defer file.close();
+    defer file.close(io);
 
-    var reader = try parquet.openFileDynamic(allocator, file, .{});
+    var reader = try parquet.openFileDynamic(allocator, file, io, .{});
     defer reader.deinit();
 
     try std.testing.expectEqual(@as(i64, 1000), reader.metadata.num_rows);
@@ -417,13 +418,13 @@ test "read delta_binary_packed_int64.parquet" {
 test "read delta_length_byte_array.parquet" {
     const allocator = std.testing.allocator;
 
-    const file = std.fs.cwd().openFile("../test-files-arrow/encodings/delta_length_byte_array.parquet", .{}) catch |err| {
+    const file = std.Io.Dir.cwd().openFile(io, "../test-files-arrow/encodings/delta_length_byte_array.parquet", .{}) catch |err| {
         std.debug.print("Could not open test file: {}\n", .{err});
         return err;
     };
-    defer file.close();
+    defer file.close(io);
 
-    var reader = try parquet.openFileDynamic(allocator, file, .{});
+    var reader = try parquet.openFileDynamic(allocator, file, io, .{});
     defer reader.deinit();
 
     const rows = try reader.readAllRows(0);
@@ -453,13 +454,13 @@ test "read delta_length_byte_array.parquet" {
 test "read delta_byte_array.parquet" {
     const allocator = std.testing.allocator;
 
-    const file = std.fs.cwd().openFile("../test-files-arrow/encodings/delta_byte_array.parquet", .{}) catch |err| {
+    const file = std.Io.Dir.cwd().openFile(io, "../test-files-arrow/encodings/delta_byte_array.parquet", .{}) catch |err| {
         std.debug.print("Could not open test file: {}\n", .{err});
         return err;
     };
-    defer file.close();
+    defer file.close(io);
 
-    var reader = try parquet.openFileDynamic(allocator, file, .{});
+    var reader = try parquet.openFileDynamic(allocator, file, io, .{});
     defer reader.deinit();
 
     const rows = try reader.readAllRows(0);
@@ -494,13 +495,13 @@ test "read delta_byte_array.parquet" {
 test "read delta_with_nulls_int.parquet" {
     const allocator = std.testing.allocator;
 
-    const file = std.fs.cwd().openFile("../test-files-arrow/encodings/delta_with_nulls_int.parquet", .{}) catch |err| {
+    const file = std.Io.Dir.cwd().openFile(io, "../test-files-arrow/encodings/delta_with_nulls_int.parquet", .{}) catch |err| {
         std.debug.print("Could not open test file: {}\n", .{err});
         return err;
     };
-    defer file.close();
+    defer file.close(io);
 
-    var reader = try parquet.openFileDynamic(allocator, file, .{});
+    var reader = try parquet.openFileDynamic(allocator, file, io, .{});
     defer reader.deinit();
 
     try std.testing.expectEqual(@as(i64, 1000), reader.metadata.num_rows);
@@ -526,13 +527,13 @@ test "read delta_with_nulls_int.parquet" {
 test "read delta_with_nulls_string.parquet" {
     const allocator = std.testing.allocator;
 
-    const file = std.fs.cwd().openFile("../test-files-arrow/encodings/delta_with_nulls_string.parquet", .{}) catch |err| {
+    const file = std.Io.Dir.cwd().openFile(io, "../test-files-arrow/encodings/delta_with_nulls_string.parquet", .{}) catch |err| {
         std.debug.print("Could not open test file: {}\n", .{err});
         return err;
     };
-    defer file.close();
+    defer file.close(io);
 
-    var reader = try parquet.openFileDynamic(allocator, file, .{});
+    var reader = try parquet.openFileDynamic(allocator, file, io, .{});
     defer reader.deinit();
 
     try std.testing.expectEqual(@as(i64, 500), reader.metadata.num_rows);
@@ -562,13 +563,13 @@ test "read delta_with_nulls_string.parquet" {
 test "read byte_stream_split_float.parquet" {
     const allocator = std.testing.allocator;
 
-    const file = std.fs.cwd().openFile("../test-files-arrow/encodings/byte_stream_split_float.parquet", .{}) catch |err| {
+    const file = std.Io.Dir.cwd().openFile(io, "../test-files-arrow/encodings/byte_stream_split_float.parquet", .{}) catch |err| {
         std.debug.print("Could not open test file: {}\n", .{err});
         return err;
     };
-    defer file.close();
+    defer file.close(io);
 
-    var reader = try parquet.openFileDynamic(allocator, file, .{});
+    var reader = try parquet.openFileDynamic(allocator, file, io, .{});
     defer reader.deinit();
 
     try std.testing.expectEqual(@as(i64, 1000), reader.metadata.num_rows);
@@ -596,13 +597,13 @@ test "read byte_stream_split_float.parquet" {
 test "read byte_stream_split_double.parquet" {
     const allocator = std.testing.allocator;
 
-    const file = std.fs.cwd().openFile("../test-files-arrow/encodings/byte_stream_split_double.parquet", .{}) catch |err| {
+    const file = std.Io.Dir.cwd().openFile(io, "../test-files-arrow/encodings/byte_stream_split_double.parquet", .{}) catch |err| {
         std.debug.print("Could not open test file: {}\n", .{err});
         return err;
     };
-    defer file.close();
+    defer file.close(io);
 
-    var reader = try parquet.openFileDynamic(allocator, file, .{});
+    var reader = try parquet.openFileDynamic(allocator, file, io, .{});
     defer reader.deinit();
 
     try std.testing.expectEqual(@as(i64, 1000), reader.metadata.num_rows);
@@ -628,13 +629,13 @@ test "read byte_stream_split_double.parquet" {
 test "read byte_stream_split_int32.parquet" {
     const allocator = std.testing.allocator;
 
-    const file = std.fs.cwd().openFile("../test-files-arrow/encodings/byte_stream_split_int32.parquet", .{}) catch |err| {
+    const file = std.Io.Dir.cwd().openFile(io, "../test-files-arrow/encodings/byte_stream_split_int32.parquet", .{}) catch |err| {
         std.debug.print("Could not open test file: {}\n", .{err});
         return err;
     };
-    defer file.close();
+    defer file.close(io);
 
-    var reader = try parquet.openFileDynamic(allocator, file, .{});
+    var reader = try parquet.openFileDynamic(allocator, file, io, .{});
     defer reader.deinit();
 
     try std.testing.expectEqual(@as(i64, 1000), reader.metadata.num_rows);
@@ -656,13 +657,13 @@ test "read byte_stream_split_int32.parquet" {
 test "read byte_stream_split_int64.parquet" {
     const allocator = std.testing.allocator;
 
-    const file = std.fs.cwd().openFile("../test-files-arrow/encodings/byte_stream_split_int64.parquet", .{}) catch |err| {
+    const file = std.Io.Dir.cwd().openFile(io, "../test-files-arrow/encodings/byte_stream_split_int64.parquet", .{}) catch |err| {
         std.debug.print("Could not open test file: {}\n", .{err});
         return err;
     };
-    defer file.close();
+    defer file.close(io);
 
-    var reader = try parquet.openFileDynamic(allocator, file, .{});
+    var reader = try parquet.openFileDynamic(allocator, file, io, .{});
     defer reader.deinit();
 
     try std.testing.expectEqual(@as(i64, 1000), reader.metadata.num_rows);
@@ -689,13 +690,13 @@ test "read byte_stream_split_int64.parquet" {
 test "read byte_stream_split_float16.parquet" {
     const allocator = std.testing.allocator;
 
-    const file = std.fs.cwd().openFile("../test-files-arrow/encodings/byte_stream_split_float16.parquet", .{}) catch |err| {
+    const file = std.Io.Dir.cwd().openFile(io, "../test-files-arrow/encodings/byte_stream_split_float16.parquet", .{}) catch |err| {
         std.debug.print("Could not open test file: {}\n", .{err});
         return err;
     };
-    defer file.close();
+    defer file.close(io);
 
-    var reader = try parquet.openFileDynamic(allocator, file, .{});
+    var reader = try parquet.openFileDynamic(allocator, file, io, .{});
     defer reader.deinit();
 
     try std.testing.expectEqual(@as(i64, 200), reader.metadata.num_rows);
@@ -714,13 +715,13 @@ test "read byte_stream_split_float16.parquet" {
 test "read byte_stream_split_flba.parquet" {
     const allocator = std.testing.allocator;
 
-    const file = std.fs.cwd().openFile("../test-files-arrow/encodings/byte_stream_split_flba.parquet", .{}) catch |err| {
+    const file = std.Io.Dir.cwd().openFile(io, "../test-files-arrow/encodings/byte_stream_split_flba.parquet", .{}) catch |err| {
         std.debug.print("Could not open test file: {}\n", .{err});
         return err;
     };
-    defer file.close();
+    defer file.close(io);
 
-    var reader = try parquet.openFileDynamic(allocator, file, .{});
+    var reader = try parquet.openFileDynamic(allocator, file, io, .{});
     defer reader.deinit();
 
     try std.testing.expectEqual(@as(i64, 200), reader.metadata.num_rows);
@@ -740,13 +741,13 @@ test "read byte_stream_split_flba.parquet" {
 test "read byte_stream_split_with_nulls.parquet" {
     const allocator = std.testing.allocator;
 
-    const file = std.fs.cwd().openFile("../test-files-arrow/encodings/byte_stream_split_with_nulls.parquet", .{}) catch |err| {
+    const file = std.Io.Dir.cwd().openFile(io, "../test-files-arrow/encodings/byte_stream_split_with_nulls.parquet", .{}) catch |err| {
         std.debug.print("Could not open test file: {}\n", .{err});
         return err;
     };
-    defer file.close();
+    defer file.close(io);
 
-    var reader = try parquet.openFileDynamic(allocator, file, .{});
+    var reader = try parquet.openFileDynamic(allocator, file, io, .{});
     defer reader.deinit();
 
     try std.testing.expectEqual(@as(i64, 1000), reader.metadata.num_rows);

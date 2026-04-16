@@ -648,10 +648,10 @@ fn writeBlockHeader(dst: []u8, size: usize, block_type: u2, is_last: bool) void 
 pub fn decompress(allocator: std.mem.Allocator, compressed: []const u8, uncompressed_size: usize) Error![]u8 {
     if (compressed.len == 0) return error.DecompressionError;
 
-    var out: std.io.Writer.Allocating = std.io.Writer.Allocating.initCapacity(allocator, uncompressed_size) catch return error.OutOfMemory;
+    var out: std.Io.Writer.Allocating = std.Io.Writer.Allocating.initCapacity(allocator, uncompressed_size) catch return error.OutOfMemory;
     errdefer out.deinit();
 
-    var in: std.io.Reader = .fixed(compressed);
+    var in: std.Io.Reader = .fixed(compressed);
     var zstd_stream: std.compress.zstd.Decompress = .init(&in, &.{}, .{});
 
     _ = zstd_stream.reader.streamRemaining(&out.writer) catch return error.DecompressionError;

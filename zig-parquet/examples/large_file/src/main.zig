@@ -35,13 +35,12 @@ const sources = [_][]const u8{
     "api", "web", "mobile", "batch", "stream", "import", "manual", "sync",
 };
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const io = init.io;
 
     const output_path = "test_large_file.parquet";
-    defer std.fs.cwd().deleteFile(output_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, output_path) catch {};
 
     const target_rows: usize = 10_000;
     const flush_interval: usize = 2_500;
@@ -51,10 +50,10 @@ pub fn main() !void {
 
     // Write phase
     {
-        const file = try std.fs.cwd().createFile(output_path, .{});
-        defer file.close();
+        const file = try std.Io.Dir.cwd().createFile(io, output_path, .{});
+        defer file.close(io);
 
-        var writer = try parquet.createFileDynamic(allocator, file);
+        var writer = try parquet.createFileDynamic(allocator, file, io);
         defer writer.deinit();
 
         // Col 0-3: signed integers
@@ -207,10 +206,10 @@ pub fn main() !void {
     std.debug.print("\n=== Validating with DynamicReader ===\n", .{});
 
     {
-        const file = try std.fs.cwd().openFile(output_path, .{});
-        defer file.close();
+        const file = try std.Io.Dir.cwd().openFile(io, output_path, .{});
+        defer file.close(io);
 
-        var reader = try parquet.openFileDynamic(allocator, file, .{});
+        var reader = try parquet.openFileDynamic(allocator, file, io, .{});
         defer reader.deinit();
 
         const num_row_groups = reader.getNumRowGroups();

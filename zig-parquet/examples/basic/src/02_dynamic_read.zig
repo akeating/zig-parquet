@@ -1,20 +1,19 @@
 const std = @import("std");
 const parquet = @import("parquet");
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const io = init.io;
 
     const output_path = "dynamic_test.parquet";
-    defer std.fs.cwd().deleteFile(output_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, output_path) catch {};
 
     // First create a file to read
     {
-        const file = try std.fs.cwd().createFile(output_path, .{});
-        defer file.close();
+        const file = try std.Io.Dir.cwd().createFile(io, output_path, .{});
+        defer file.close(io);
 
-        var writer = try parquet.createFileDynamic(allocator, file);
+        var writer = try parquet.createFileDynamic(allocator, file, io);
         defer writer.deinit();
 
         try writer.addColumn("id", parquet.TypeInfo.int32, .{});
@@ -41,10 +40,10 @@ pub fn main() !void {
     std.debug.print("Dynamically reading {s}...\n", .{output_path});
 
     // Now read it dynamically
-    const file = try std.fs.cwd().openFile(output_path, .{});
-    defer file.close();
+    const file = try std.Io.Dir.cwd().openFile(io, output_path, .{});
+    defer file.close(io);
 
-    var reader = try parquet.openFileDynamic(allocator, file, .{});
+    var reader = try parquet.openFileDynamic(allocator, file, io, .{});
     defer reader.deinit();
 
     // Print schema

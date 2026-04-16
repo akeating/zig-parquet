@@ -4,6 +4,7 @@
 //! to verify correctness.
 
 const std = @import("std");
+const io = std.testing.io;
 const parquet = @import("../lib.zig");
 const build_options = @import("build_options");
 
@@ -39,14 +40,14 @@ test "round-trip with zstd compression" {
 
     // Write with zstd compression
     {
-        const file = try tmp_dir.dir.createFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.createFile(io, file_path, .{});
+        defer file.close(io);
 
         const columns = [_]parquet.ColumnDef{
             .{ .name = "id", .type_ = .int64, .optional = false, .codec = .zstd },
         };
 
-        var writer = try parquet.writeToFile(allocator, file, &columns);
+        var writer = try parquet.writeToFile(allocator, file, io, &columns);
         defer writer.deinit();
 
         const values = [_]i64{ 1, 2, 3, 4, 5, 100, -50, 0, 999999, -123456 };
@@ -56,10 +57,10 @@ test "round-trip with zstd compression" {
 
     // Read back and verify
     {
-        const file = try tmp_dir.dir.openFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.openFile(io, file_path, .{});
+        defer file.close(io);
 
-        var reader = try parquet.openFileDynamic(allocator, file, .{});
+        var reader = try parquet.openFileDynamic(allocator, file, io, .{});
         defer reader.deinit();
 
         // Verify metadata
@@ -100,8 +101,8 @@ test "round-trip zstd compression with byte arrays" {
 
     // Write with zstd compression
     {
-        const file = try tmp_dir.dir.createFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.createFile(io, file_path, .{});
+        defer file.close(io);
 
         // Create a STRING column with zstd compression
         var col = parquet.ColumnDef.string("name", false);
@@ -109,7 +110,7 @@ test "round-trip zstd compression with byte arrays" {
 
         const columns = [_]parquet.ColumnDef{col};
 
-        var writer = try parquet.writeToFile(allocator, file, &columns);
+        var writer = try parquet.writeToFile(allocator, file, io, &columns);
         defer writer.deinit();
 
         const values = [_][]const u8{ "hello", "world", "test", "compression", "parquet" };
@@ -119,10 +120,10 @@ test "round-trip zstd compression with byte arrays" {
 
     // Read back and verify
     {
-        const file = try tmp_dir.dir.openFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.openFile(io, file_path, .{});
+        defer file.close(io);
 
-        var reader = try parquet.openFileDynamic(allocator, file, .{});
+        var reader = try parquet.openFileDynamic(allocator, file, io, .{});
         defer reader.deinit();
 
         try std.testing.expectEqual(@as(i64, 5), reader.metadata.num_rows);
@@ -161,15 +162,15 @@ test "round-trip mixed compression (zstd and uncompressed)" {
 
     // Write with mixed compression
     {
-        const file = try tmp_dir.dir.createFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.createFile(io, file_path, .{});
+        defer file.close(io);
 
         const columns = [_]parquet.ColumnDef{
             .{ .name = "compressed_col", .type_ = .int64, .optional = false, .codec = .zstd },
             .{ .name = "uncompressed_col", .type_ = .int32, .optional = false, .codec = .uncompressed },
         };
 
-        var writer = try parquet.writeToFile(allocator, file, &columns);
+        var writer = try parquet.writeToFile(allocator, file, io, &columns);
         defer writer.deinit();
 
         const i64_values = [_]i64{ 100, 200, 300 };
@@ -183,10 +184,10 @@ test "round-trip mixed compression (zstd and uncompressed)" {
 
     // Read back and verify
     {
-        const file = try tmp_dir.dir.openFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.openFile(io, file_path, .{});
+        defer file.close(io);
 
-        var reader = try parquet.openFileDynamic(allocator, file, .{});
+        var reader = try parquet.openFileDynamic(allocator, file, io, .{});
         defer reader.deinit();
 
         try std.testing.expectEqual(@as(i64, 3), reader.metadata.num_rows);
@@ -228,14 +229,14 @@ test "round-trip with gzip compression" {
 
     // Write with gzip compression
     {
-        const file = try tmp_dir.dir.createFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.createFile(io, file_path, .{});
+        defer file.close(io);
 
         const columns = [_]parquet.ColumnDef{
             .{ .name = "id", .type_ = .int64, .optional = false, .codec = .gzip },
         };
 
-        var writer = try parquet.writeToFile(allocator, file, &columns);
+        var writer = try parquet.writeToFile(allocator, file, io, &columns);
         defer writer.deinit();
 
         const values = [_]i64{ 1, 2, 3, 4, 5, 100, -50, 0, 999999, -123456 };
@@ -245,10 +246,10 @@ test "round-trip with gzip compression" {
 
     // Read back and verify
     {
-        const file = try tmp_dir.dir.openFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.openFile(io, file_path, .{});
+        defer file.close(io);
 
-        var reader = try parquet.openFileDynamic(allocator, file, .{});
+        var reader = try parquet.openFileDynamic(allocator, file, io, .{});
         defer reader.deinit();
 
         // Verify metadata
@@ -289,8 +290,8 @@ test "round-trip gzip compression with byte arrays" {
 
     // Write with gzip compression
     {
-        const file = try tmp_dir.dir.createFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.createFile(io, file_path, .{});
+        defer file.close(io);
 
         // Create a STRING column with gzip compression
         var col = parquet.ColumnDef.string("name", false);
@@ -298,7 +299,7 @@ test "round-trip gzip compression with byte arrays" {
 
         const columns = [_]parquet.ColumnDef{col};
 
-        var writer = try parquet.writeToFile(allocator, file, &columns);
+        var writer = try parquet.writeToFile(allocator, file, io, &columns);
         defer writer.deinit();
 
         const values = [_][]const u8{ "hello", "world", "test", "compression", "parquet" };
@@ -308,10 +309,10 @@ test "round-trip gzip compression with byte arrays" {
 
     // Read back and verify
     {
-        const file = try tmp_dir.dir.openFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.openFile(io, file_path, .{});
+        defer file.close(io);
 
-        var reader = try parquet.openFileDynamic(allocator, file, .{});
+        var reader = try parquet.openFileDynamic(allocator, file, io, .{});
         defer reader.deinit();
 
         try std.testing.expectEqual(@as(i64, 5), reader.metadata.num_rows);
@@ -350,14 +351,14 @@ test "round-trip with snappy compression" {
 
     // Write with snappy compression
     {
-        const file = try tmp_dir.dir.createFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.createFile(io, file_path, .{});
+        defer file.close(io);
 
         const columns = [_]parquet.ColumnDef{
             .{ .name = "id", .type_ = .int64, .optional = false, .codec = .snappy },
         };
 
-        var writer = try parquet.writeToFile(allocator, file, &columns);
+        var writer = try parquet.writeToFile(allocator, file, io, &columns);
         defer writer.deinit();
 
         const values = [_]i64{ 1, 2, 3, 4, 5, 100, -50, 0, 999999, -123456 };
@@ -367,10 +368,10 @@ test "round-trip with snappy compression" {
 
     // Read back and verify
     {
-        const file = try tmp_dir.dir.openFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.openFile(io, file_path, .{});
+        defer file.close(io);
 
-        var reader = try parquet.openFileDynamic(allocator, file, .{});
+        var reader = try parquet.openFileDynamic(allocator, file, io, .{});
         defer reader.deinit();
 
         // Verify metadata
@@ -411,8 +412,8 @@ test "round-trip snappy compression with byte arrays" {
 
     // Write with snappy compression
     {
-        const file = try tmp_dir.dir.createFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.createFile(io, file_path, .{});
+        defer file.close(io);
 
         // Create a STRING column with snappy compression
         var col_def = parquet.ColumnDef.string("name", false);
@@ -420,7 +421,7 @@ test "round-trip snappy compression with byte arrays" {
 
         const columns = [_]parquet.ColumnDef{col_def};
 
-        var writer = try parquet.writeToFile(allocator, file, &columns);
+        var writer = try parquet.writeToFile(allocator, file, io, &columns);
         defer writer.deinit();
 
         const values = [_][]const u8{ "hello", "world", "test", "compression", "parquet" };
@@ -430,10 +431,10 @@ test "round-trip snappy compression with byte arrays" {
 
     // Read back and verify
     {
-        const file = try tmp_dir.dir.openFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.openFile(io, file_path, .{});
+        defer file.close(io);
 
-        var reader = try parquet.openFileDynamic(allocator, file, .{});
+        var reader = try parquet.openFileDynamic(allocator, file, io, .{});
         defer reader.deinit();
 
         try std.testing.expectEqual(@as(i64, 5), reader.metadata.num_rows);
@@ -472,14 +473,14 @@ test "round-trip with lz4_raw compression" {
 
     // Write with lz4_raw compression
     {
-        const file = try tmp_dir.dir.createFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.createFile(io, file_path, .{});
+        defer file.close(io);
 
         const columns = [_]parquet.ColumnDef{
             .{ .name = "id", .type_ = .int64, .optional = false, .codec = .lz4_raw },
         };
 
-        var writer = try parquet.writeToFile(allocator, file, &columns);
+        var writer = try parquet.writeToFile(allocator, file, io, &columns);
         defer writer.deinit();
 
         const values = [_]i64{ 1, 2, 3, 4, 5, 100, -50, 0, 999999, -123456 };
@@ -489,10 +490,10 @@ test "round-trip with lz4_raw compression" {
 
     // Read back and verify
     {
-        const file = try tmp_dir.dir.openFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.openFile(io, file_path, .{});
+        defer file.close(io);
 
-        var reader = try parquet.openFileDynamic(allocator, file, .{});
+        var reader = try parquet.openFileDynamic(allocator, file, io, .{});
         defer reader.deinit();
 
         // Verify metadata
@@ -533,8 +534,8 @@ test "round-trip lz4_raw compression with byte arrays" {
 
     // Write with lz4_raw compression
     {
-        const file = try tmp_dir.dir.createFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.createFile(io, file_path, .{});
+        defer file.close(io);
 
         // Create a STRING column with lz4_raw compression
         var col_def = parquet.ColumnDef.string("name", false);
@@ -542,7 +543,7 @@ test "round-trip lz4_raw compression with byte arrays" {
 
         const columns = [_]parquet.ColumnDef{col_def};
 
-        var writer = try parquet.writeToFile(allocator, file, &columns);
+        var writer = try parquet.writeToFile(allocator, file, io, &columns);
         defer writer.deinit();
 
         const values = [_][]const u8{ "hello", "world", "test", "compression", "parquet" };
@@ -552,10 +553,10 @@ test "round-trip lz4_raw compression with byte arrays" {
 
     // Read back and verify
     {
-        const file = try tmp_dir.dir.openFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.openFile(io, file_path, .{});
+        defer file.close(io);
 
-        var reader = try parquet.openFileDynamic(allocator, file, .{});
+        var reader = try parquet.openFileDynamic(allocator, file, io, .{});
         defer reader.deinit();
 
         try std.testing.expectEqual(@as(i64, 5), reader.metadata.num_rows);
@@ -594,14 +595,14 @@ test "round-trip with brotli compression" {
 
     // Write with brotli compression
     {
-        const file = try tmp_dir.dir.createFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.createFile(io, file_path, .{});
+        defer file.close(io);
 
         const columns = [_]parquet.ColumnDef{
             .{ .name = "id", .type_ = .int64, .optional = false, .codec = .brotli },
         };
 
-        var writer = try parquet.writeToFile(allocator, file, &columns);
+        var writer = try parquet.writeToFile(allocator, file, io, &columns);
         defer writer.deinit();
 
         const values = [_]i64{ 1, 2, 3, 4, 5, 100, -50, 0, 999999, -123456 };
@@ -611,10 +612,10 @@ test "round-trip with brotli compression" {
 
     // Read back and verify
     {
-        const file = try tmp_dir.dir.openFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.openFile(io, file_path, .{});
+        defer file.close(io);
 
-        var reader = try parquet.openFileDynamic(allocator, file, .{});
+        var reader = try parquet.openFileDynamic(allocator, file, io, .{});
         defer reader.deinit();
 
         // Verify metadata
@@ -655,8 +656,8 @@ test "round-trip brotli compression with byte arrays" {
 
     // Write with brotli compression
     {
-        const file = try tmp_dir.dir.createFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.createFile(io, file_path, .{});
+        defer file.close(io);
 
         // Create a STRING column with brotli compression
         var col_def = parquet.ColumnDef.string("name", false);
@@ -664,7 +665,7 @@ test "round-trip brotli compression with byte arrays" {
 
         const columns = [_]parquet.ColumnDef{col_def};
 
-        var writer = try parquet.writeToFile(allocator, file, &columns);
+        var writer = try parquet.writeToFile(allocator, file, io, &columns);
         defer writer.deinit();
 
         const values = [_][]const u8{ "hello", "world", "test", "compression", "parquet" };
@@ -674,10 +675,10 @@ test "round-trip brotli compression with byte arrays" {
 
     // Read back and verify
     {
-        const file = try tmp_dir.dir.openFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.openFile(io, file_path, .{});
+        defer file.close(io);
 
-        var reader = try parquet.openFileDynamic(allocator, file, .{});
+        var reader = try parquet.openFileDynamic(allocator, file, io, .{});
         defer reader.deinit();
 
         try std.testing.expectEqual(@as(i64, 5), reader.metadata.num_rows);

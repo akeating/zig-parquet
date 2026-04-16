@@ -4,25 +4,25 @@ const std = @import("std");
 const parquet = @import("parquet");
 const safe = parquet.safe;
 
-pub fn run(allocator: std.mem.Allocator, file_path: []const u8, json_mode: bool) !void {
+pub fn run(allocator: std.mem.Allocator, io: std.Io, file_path: []const u8, json_mode: bool) !void {
     var stdout_buf: [16384]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
+    var stdout_writer = std.Io.File.stdout().writerStreaming(io, &stdout_buf);
     const stdout = &stdout_writer.interface;
 
     var stderr_buf: [4096]u8 = undefined;
-    var stderr_writer = std.fs.File.stderr().writer(&stderr_buf);
+    var stderr_writer = std.Io.File.stderr().writerStreaming(io, &stderr_buf);
     const stderr = &stderr_writer.interface;
 
     // Open the file
-    const file = std.fs.cwd().openFile(file_path, .{}) catch |err| {
+    const file = std.Io.Dir.cwd().openFile(io, file_path, .{}) catch |err| {
         try stderr.print("Error: Cannot open file '{s}': {}\n", .{ file_path, err });
         try stderr.flush();
         std.process.exit(1);
     };
-    defer file.close();
+    defer file.close(io);
 
     // Create dynamic reader — handles all types including INT96 and nested
-    var reader = parquet.openFileDynamic(allocator, file, .{}) catch |err| {
+    var reader = parquet.openFileDynamic(allocator, file, io, .{}) catch |err| {
         try stderr.print("Error: Cannot read parquet file: {}\n", .{err});
         try stderr.flush();
         std.process.exit(1);
@@ -251,12 +251,10 @@ pub fn formatCellValue(allocator: std.mem.Allocator, val: parquet.Value) ![]cons
         .bytes_val => |v| try formatStringForTable(allocator, v),
         .fixed_bytes_val => |v| try formatStringForTable(allocator, v),
         .list_val, .map_val, .struct_val => blk: {
-            var buf: std.ArrayListUnmanaged(u8) = .empty;
-            errdefer buf.deinit(allocator);
-            val.format("", .{}, buf.writer(allocator)) catch |e| switch (e) {
-                error.OutOfMemory => return error.OutOfMemory,
-            };
-            break :blk try buf.toOwnedSlice(allocator);
+            var out: std.Io.Writer.Allocating = .init(allocator);
+            errdefer out.deinit();
+            out.writer.print("{}", .{val}) catch return error.OutOfMemory;
+            break :blk out.toOwnedSlice() catch return error.OutOfMemory;
         },
     };
 }

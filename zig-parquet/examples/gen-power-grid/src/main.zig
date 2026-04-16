@@ -16,10 +16,9 @@
 const std = @import("std");
 const parquet = @import("parquet");
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const io = init.io;
 
     const sample_interval_ms: i64 = 4; // 250 Hz
     const duration_seconds: i64 = 60;
@@ -40,10 +39,10 @@ pub fn main() !void {
     std.debug.print("  Batch size: {} (10 seconds)\n", .{batch_size});
     std.debug.print("  Row groups: {}\n", .{num_batches});
 
-    const file = try std.fs.cwd().createFile("grid_data.parquet", .{});
-    defer file.close();
+    const file = try std.Io.Dir.cwd().createFile(io, "grid_data.parquet", .{});
+    defer file.close(io);
 
-    var writer = try parquet.createFileDynamic(allocator, file);
+    var writer = try parquet.createFileDynamic(allocator, file, io);
     defer writer.deinit();
 
     try writer.addColumn("timestamp_ms", parquet.TypeInfo.int64, .{});
@@ -76,7 +75,7 @@ pub fn main() !void {
     var freq_drift: f64 = 0.0;
 
     std.debug.print("\nWriting batches...\n", .{});
-    var timer = try std.time.Timer.start();
+    const timer_start = std.Io.Timestamp.now(io, .awake);
 
     var samples_written: usize = 0;
     for (0..num_batches) |batch_idx| {
@@ -144,16 +143,18 @@ pub fn main() !void {
         samples_written += this_batch_size;
 
         if (batch_idx == num_batches - 1) {
-            const elapsed_s = @as(f64, @floatFromInt(timer.read())) / 1_000_000_000.0;
+            const elapsed_ns = timer_start.durationTo(std.Io.Timestamp.now(io, .awake)).nanoseconds;
+    const elapsed_s = @as(f64, @floatFromInt(@as(i64, @intCast(elapsed_ns)))) / 1_000_000_000.0;
             const rate = @as(f64, @floatFromInt(samples_written)) / elapsed_s;
             std.debug.print("  {} samples written ({d:.0} samples/sec)\n", .{ samples_written, rate });
         }
     }
 
     try writer.close();
-    const elapsed_s = @as(f64, @floatFromInt(timer.read())) / 1_000_000_000.0;
+    const elapsed_ns = timer_start.durationTo(std.Io.Timestamp.now(io, .awake)).nanoseconds;
+    const elapsed_s = @as(f64, @floatFromInt(@as(i64, @intCast(elapsed_ns)))) / 1_000_000_000.0;
 
-    const stat = try std.fs.cwd().statFile("grid_data.parquet");
+    const stat = try std.Io.Dir.cwd().statFile(io, "grid_data.parquet", .{});
     const size_mb = @as(f64, @floatFromInt(stat.size)) / (1024.0 * 1024.0);
 
     std.debug.print("\nDone!\n", .{});

@@ -830,12 +830,12 @@ pub fn compress(allocator: std.mem.Allocator, data: []const u8) Error![]u8 {
 
 pub fn decompress(allocator: std.mem.Allocator, compressed: []const u8, uncompressed_size: usize) Error![]u8 {
 
-    var out: std.io.Writer.Allocating = std.io.Writer.Allocating.initCapacity(allocator, uncompressed_size) catch return error.OutOfMemory;
+    var out: std.Io.Writer.Allocating = std.Io.Writer.Allocating.initCapacity(allocator, uncompressed_size) catch return error.OutOfMemory;
     errdefer out.deinit();
 
     // Handle concatenated gzip members (RFC 1952 §2.2)
     // Use .gzip container mode so std.compress.flate handles header/footer parsing.
-    var in: std.io.Reader = .fixed(compressed);
+    var in: std.Io.Reader = .fixed(compressed);
 
     while (true) {
         // Check if there's another gzip member (need at least magic + method = 3 bytes)

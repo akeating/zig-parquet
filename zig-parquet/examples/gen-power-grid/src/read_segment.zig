@@ -8,23 +8,21 @@
 const std = @import("std");
 const parquet = @import("parquet");
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const io = init.io;
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    const args = try init.minimal.args.toSlice(allocator);
 
     const file_path = if (args.len > 1) args[1] else "grid_data.parquet";
 
-    const file = std.fs.cwd().openFile(file_path, .{}) catch |err| {
+    const file = std.Io.Dir.cwd().openFile(io, file_path, .{}) catch |err| {
         std.debug.print("Error opening file '{s}': {}\n", .{ file_path, err });
         return err;
     };
-    defer file.close();
+    defer file.close(io);
 
-    var reader = parquet.openFileDynamic(allocator, file, .{}) catch |err| {
+    var reader = parquet.openFileDynamic(allocator, file, io, .{}) catch |err| {
         std.debug.print("Error initializing parquet reader: {}\n", .{err});
         return err;
     };
@@ -39,7 +37,7 @@ pub fn main() !void {
     std.debug.print("Row groups: {}\n", .{num_row_groups});
     std.debug.print("Total duration: {d:.1} seconds\n", .{@as(f64, @floatFromInt(total_rows)) / 250.0});
 
-    var prng = std.Random.DefaultPrng.init(@intCast(std.time.nanoTimestamp()));
+    var prng = std.Random.DefaultPrng.init(@intCast(std.Io.Timestamp.now(io, .awake).nanoseconds));
     const random = prng.random();
     const row_group_idx = random.intRangeAtMost(usize, 0, num_row_groups - 1);
     const start_row = row_group_idx * rows_per_group;
@@ -69,7 +67,7 @@ pub fn main() !void {
     }
 
     var stdout_buf: [8192]u8 = undefined;
-    var stdout_stream = std.fs.File.stdout().writerStreaming(&stdout_buf);
+    var stdout_stream = std.Io.File.stdout().writerStreaming(io, &stdout_buf);
     const stdout = &stdout_stream.interface;
 
     try stdout.writeAll("[\n");

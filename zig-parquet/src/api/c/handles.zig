@@ -38,6 +38,15 @@ const Allocator = std.mem.Allocator;
 /// page_allocator is always available on all targets.
 const backing_allocator = std.heap.page_allocator;
 
+/// Lazily-initialized blocking I/O backend for file operations.
+var c_io_threaded: ?std.Io.Threaded = null;
+fn cIo() std.Io {
+    if (c_io_threaded == null) {
+        c_io_threaded = .init(backing_allocator, .{});
+    }
+    return c_io_threaded.?.io();
+}
+
 /// Thunk adapter bridging C callback signatures to Zig's SeekableReader interface.
 ///
 /// C callbacks use `int` return for error codes and out-params for results.
@@ -171,17 +180,18 @@ pub const ReaderHandle = struct {
 
     pub fn openFile(path: [*:0]const u8) !*ReaderHandle {
         const allocator = backing_allocator;
+        const io = cIo();
         const fr = try allocator.create(FileReader);
         errdefer allocator.destroy(fr);
 
-        const file = std.fs.cwd().openFileZ(path, .{}) catch return error.InputOutput;
-        fr.* = FileReader.init(file) catch |e| {
-            file.close();
+        const file = std.Io.Dir.cwd().openFile(io, std.mem.span(path), .{}) catch return error.InputOutput;
+        fr.* = FileReader.init(file, io) catch |e| {
+            file.close(io);
             return e;
         };
 
         const info = parquet_reader.parseFooter(allocator, fr.reader()) catch |e| {
-            file.close();
+            file.close(io);
             allocator.destroy(fr);
             return e;
         };
@@ -243,7 +253,7 @@ pub const ReaderHandle = struct {
             .buffer => |br| allocator.destroy(br),
             .callback => |cb| allocator.destroy(cb),
             .file => |fr| {
-                fr.file.close();
+                fr.file.close(fr.io);
                 allocator.destroy(fr);
             },
         }
@@ -310,11 +320,12 @@ pub const WriterHandle = struct {
 
     pub fn openFile(path: [*:0]const u8) !*WriterHandle {
         const allocator = backing_allocator;
+        const io = cIo();
         const ft = try allocator.create(FileTarget);
         errdefer allocator.destroy(ft);
 
-        const file = std.fs.cwd().createFileZ(path, .{}) catch return error.InputOutput;
-        ft.* = FileTarget.init(file);
+        const file = std.Io.Dir.cwd().createFile(io, std.mem.span(path), .{}) catch return error.InputOutput;
+        ft.* = FileTarget.init(file, io);
 
         const handle = try allocator.create(WriterHandle);
         handle.* = .{
@@ -387,7 +398,7 @@ pub const WriterHandle = struct {
             },
             .callback => |cb| allocator.destroy(cb),
             .file => |ft| {
-                ft.file.close();
+                ft.file.close(ft.io);
                 allocator.destroy(ft);
             },
         }
@@ -442,16 +453,17 @@ pub const RowReaderHandle = struct {
 
     pub fn openFile(path: [*:0]const u8) !*RowReaderHandle {
         const allocator = backing_allocator;
+        const io = cIo();
         const fr = try allocator.create(FileReader);
 
-        const file = std.fs.cwd().openFileZ(path, .{}) catch return error.InputOutput;
-        fr.* = FileReader.init(file) catch |e| {
-            file.close();
+        const file = std.Io.Dir.cwd().openFile(io, std.mem.span(path), .{}) catch return error.InputOutput;
+        fr.* = FileReader.init(file, io) catch |e| {
+            file.close(io);
             return e;
         };
 
         var dr = core_dynamic.DynamicReader.initFromSeekable(allocator, fr.reader(), .{}) catch |e| {
-            file.close();
+            file.close(io);
             allocator.destroy(fr);
             return e;
         };
@@ -579,7 +591,7 @@ pub const RowReaderHandle = struct {
 
     fn fileReaderCleanup(ptr: *anyopaque, allocator: Allocator) void {
         const fr: *FileReader = @ptrCast(@alignCast(ptr));
-        fr.file.close();
+        fr.file.close(fr.io);
         allocator.destroy(fr);
     }
 };
@@ -675,11 +687,12 @@ pub const RowWriterHandle = struct {
 
     pub fn openFile(path: [*:0]const u8) !*RowWriterHandle {
         const allocator = backing_allocator;
+        const io = cIo();
         const ft = try allocator.create(FileTarget);
         errdefer allocator.destroy(ft);
 
-        const file = std.fs.cwd().createFileZ(path, .{}) catch return error.InputOutput;
-        ft.* = FileTarget.init(file);
+        const file = std.Io.Dir.cwd().createFile(io, std.mem.span(path), .{}) catch return error.InputOutput;
+        ft.* = FileTarget.init(file, io);
 
         const handle = try allocator.create(RowWriterHandle);
         handle.* = .{
@@ -819,7 +832,7 @@ pub const RowWriterHandle = struct {
             },
             .callback => |cb| allocator.destroy(cb),
             .file => |ft| {
-                ft.file.close();
+                ft.file.close(ft.io);
                 allocator.destroy(ft);
             },
         }

@@ -16,7 +16,7 @@ pub const PhysicalType = enum(i32) {
     fixed_len_byte_array = 7,
 
     pub fn fromInt(v: i32) !PhysicalType {
-        return std.meta.intToEnum(PhysicalType, v) catch error.InvalidPhysicalType;
+        return std.enums.fromInt(PhysicalType, v) orelse return error.InvalidPhysicalType;
     }
 };
 
@@ -27,7 +27,7 @@ pub const RepetitionType = enum(i32) {
     repeated = 2,
 
     pub fn fromInt(v: i32) !RepetitionType {
-        return std.meta.intToEnum(RepetitionType, v) catch error.InvalidRepetitionType;
+        return std.enums.fromInt(RepetitionType, v) orelse return error.InvalidRepetitionType;
     }
 };
 
@@ -44,7 +44,7 @@ pub const Encoding = enum(i32) {
     byte_stream_split = 9,
 
     pub fn fromInt(v: i32) !Encoding {
-        return std.meta.intToEnum(Encoding, v) catch error.InvalidEncoding;
+        return std.enums.fromInt(Encoding, v) orelse return error.InvalidEncoding;
     }
 };
 
@@ -60,7 +60,7 @@ pub const CompressionCodec = enum(i32) {
     lz4_raw = 7,
 
     pub fn fromInt(v: i32) !CompressionCodec {
-        return std.meta.intToEnum(CompressionCodec, v) catch error.InvalidCompressionCodec;
+        return std.enums.fromInt(CompressionCodec, v) orelse return error.InvalidCompressionCodec;
     }
 };
 
@@ -72,6 +72,6 @@ pub const PageType = enum(i32) {
     data_page_v2 = 3,
 
     pub fn fromInt(v: i32) !PageType {
-        return std.meta.intToEnum(PageType, v) catch error.InvalidPageType;
+        return std.enums.fromInt(PageType, v) orelse return error.InvalidPageType;
     }
 };

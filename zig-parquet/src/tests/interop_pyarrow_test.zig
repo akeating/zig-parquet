@@ -4,6 +4,7 @@
 //! Direction 2: Write files with zig-parquet for PyArrow verification (test_interop.py)
 
 const std = @import("std");
+const io = std.testing.io;
 const parquet = @import("../lib.zig");
 const format = parquet.format;
 const Optional = parquet.Optional;
@@ -12,7 +13,7 @@ const Interval = parquet.types.Interval;
 const output_dir = "../test-files-arrow/interop";
 
 fn ensureOutputDir() !void {
-    std.fs.cwd().makePath(output_dir) catch |err| switch (err) {
+    std.Io.Dir.cwd().createDirPath(io, output_dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
     };
@@ -25,13 +26,13 @@ fn ensureOutputDir() !void {
 test "PyArrow interop: read UUID" {
     const allocator = std.testing.allocator;
 
-    const file = std.fs.cwd().openFile("../test-files-arrow/logical_types/uuid.parquet", .{}) catch |err| {
+    const file = std.Io.Dir.cwd().openFile(io, "../test-files-arrow/logical_types/uuid.parquet", .{}) catch |err| {
         std.debug.print("Could not open test file (run from zig-parquet dir): {}\n", .{err});
         return err;
     };
-    defer file.close();
+    defer file.close(io);
 
-    var reader = try parquet.openFileDynamic(allocator, file, .{});
+    var reader = try parquet.openFileDynamic(allocator, file, io, .{});
     defer reader.deinit();
 
     try std.testing.expectEqual(@as(i64, 5), reader.metadata.num_rows);
@@ -70,13 +71,13 @@ test "PyArrow interop: read UUID" {
 test "PyArrow interop: read ENUM" {
     const allocator = std.testing.allocator;
 
-    const file = std.fs.cwd().openFile("../test-files-arrow/logical_types/enum.parquet", .{}) catch |err| {
+    const file = std.Io.Dir.cwd().openFile(io, "../test-files-arrow/logical_types/enum.parquet", .{}) catch |err| {
         std.debug.print("Could not open test file: {}\n", .{err});
         return err;
     };
-    defer file.close();
+    defer file.close(io);
 
-    var reader = try parquet.openFileDynamic(allocator, file, .{});
+    var reader = try parquet.openFileDynamic(allocator, file, io, .{});
     defer reader.deinit();
 
     try std.testing.expectEqual(@as(i64, 5), reader.metadata.num_rows);
@@ -99,13 +100,13 @@ test "PyArrow interop: read ENUM" {
 test "PyArrow interop: read INT96 timestamp" {
     const allocator = std.testing.allocator;
 
-    const file = std.fs.cwd().openFile("../test-files-arrow/logical_types/int96_timestamp.parquet", .{}) catch |err| {
+    const file = std.Io.Dir.cwd().openFile(io, "../test-files-arrow/logical_types/int96_timestamp.parquet", .{}) catch |err| {
         std.debug.print("Could not open test file: {}\n", .{err});
         return err;
     };
-    defer file.close();
+    defer file.close(io);
 
-    var reader = try parquet.openFileDynamic(allocator, file, .{});
+    var reader = try parquet.openFileDynamic(allocator, file, io, .{});
     defer reader.deinit();
 
     const expected_nanos = [_]?i64{
@@ -144,14 +145,14 @@ test "PyArrow interop: write ENUM" {
 
     try ensureOutputDir();
 
-    const file = try std.fs.cwd().createFile(output_dir ++ "/enum.parquet", .{});
-    defer file.close();
+    const file = try std.Io.Dir.cwd().createFile(io, output_dir ++ "/enum.parquet", .{});
+    defer file.close(io);
 
     const columns = [_]parquet.ColumnDef{
         parquet.ColumnDef.enum_("color", true),
     };
 
-    var writer = try parquet.writeToFile(allocator, file, &columns);
+    var writer = try parquet.writeToFile(allocator, file, io, &columns);
     defer writer.deinit();
 
     const values = [_]Optional([]const u8){
@@ -170,14 +171,14 @@ test "PyArrow interop: write BSON" {
 
     try ensureOutputDir();
 
-    const file = try std.fs.cwd().createFile(output_dir ++ "/bson.parquet", .{});
-    defer file.close();
+    const file = try std.Io.Dir.cwd().createFile(io, output_dir ++ "/bson.parquet", .{});
+    defer file.close(io);
 
     const columns = [_]parquet.ColumnDef{
         parquet.ColumnDef.bson("data", true),
     };
 
-    var writer = try parquet.writeToFile(allocator, file, &columns);
+    var writer = try parquet.writeToFile(allocator, file, io, &columns);
     defer writer.deinit();
 
     // Example BSON documents as raw bytes
@@ -204,10 +205,10 @@ test "PyArrow interop: write UUID" {
     const uuid2 = [_]u8{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
     const uuid3 = [_]u8{ 0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6, 0x78, 0x90, 0xab, 0xcd, 0xef, 0x12, 0x34, 0x56, 0x78, 0x90 };
 
-    var file = try std.fs.cwd().createFile(output_dir ++ "/uuid.parquet", .{});
-    defer file.close();
+    var file = try std.Io.Dir.cwd().createFile(io, output_dir ++ "/uuid.parquet", .{});
+    defer file.close(io);
 
-    var dw = try parquet.createFileDynamic(allocator, file);
+    var dw = try parquet.createFileDynamic(allocator, file, io);
     defer dw.deinit();
 
     try dw.addColumn("id", parquet.TypeInfo.uuid, .{});
@@ -230,10 +231,10 @@ test "PyArrow interop: write Interval" {
 
     try ensureOutputDir();
 
-    var file = try std.fs.cwd().createFile(output_dir ++ "/interval.parquet", .{});
-    defer file.close();
+    var file = try std.Io.Dir.cwd().createFile(io, output_dir ++ "/interval.parquet", .{});
+    defer file.close(io);
 
-    var dw = try parquet.createFileDynamic(allocator, file);
+    var dw = try parquet.createFileDynamic(allocator, file, io);
     defer dw.deinit();
 
     try dw.addColumn("duration", parquet.TypeInfo.interval, .{});
@@ -260,15 +261,15 @@ test "PyArrow interop: write TimestampInt96" {
 
     try ensureOutputDir();
 
-    var file = try std.fs.cwd().createFile(output_dir ++ "/int96_timestamp.parquet", .{});
-    defer file.close();
+    var file = try std.Io.Dir.cwd().createFile(io, output_dir ++ "/int96_timestamp.parquet", .{});
+    defer file.close(io);
 
     // INT96 is a special physical type not exposed through the high-level Writer.
     // Use column_writer directly for the data, then assemble the footer manually.
     const column_writer = parquet.internals.writer.column_writer;
 
     const FileTarget = parquet.io.FileTarget;
-    var ft = FileTarget.init(file);
+    var ft = FileTarget.init(file, io);
     const write_target = ft.target();
     var target_writer = parquet.WriteTargetWriter.init(write_target);
     const writer = target_writer.writer();
@@ -349,14 +350,14 @@ test "PyArrow interop: write Geometry" {
 
     try ensureOutputDir();
 
-    const file = try std.fs.cwd().createFile(output_dir ++ "/geometry.parquet", .{});
-    defer file.close();
+    const file = try std.Io.Dir.cwd().createFile(io, output_dir ++ "/geometry.parquet", .{});
+    defer file.close(io);
 
     const columns = [_]parquet.ColumnDef{
         parquet.ColumnDef.geometry("geom", true, "OGC:CRS84"),
     };
 
-    var writer = try parquet.writeToFile(allocator, file, &columns);
+    var writer = try parquet.writeToFile(allocator, file, io, &columns);
     defer writer.deinit();
 
     // WKB Point(1.0, 2.0): byte_order(1) + type(1=Point,4) + x(f64) + y(f64) = 21 bytes
@@ -384,14 +385,14 @@ test "PyArrow interop: write Geography" {
 
     try ensureOutputDir();
 
-    const file = try std.fs.cwd().createFile(output_dir ++ "/geography.parquet", .{});
-    defer file.close();
+    const file = try std.Io.Dir.cwd().createFile(io, output_dir ++ "/geography.parquet", .{});
+    defer file.close(io);
 
     const columns = [_]parquet.ColumnDef{
         parquet.ColumnDef.geography("geog", true, "OGC:CRS84", null),
     };
 
-    var writer = try parquet.writeToFile(allocator, file, &columns);
+    var writer = try parquet.writeToFile(allocator, file, io, &columns);
     defer writer.deinit();
 
     const wkb_point1 = "\x01" ++
@@ -422,8 +423,8 @@ test "PyArrow interop: write primitives" {
 
     try ensureOutputDir();
 
-    const file = try std.fs.cwd().createFile(output_dir ++ "/primitives.parquet", .{});
-    defer file.close();
+    const file = try std.Io.Dir.cwd().createFile(io, output_dir ++ "/primitives.parquet", .{});
+    defer file.close(io);
 
     const columns = [_]parquet.ColumnDef{
         .{ .name = "bool_col", .type_ = .boolean, .optional = true },
@@ -435,7 +436,7 @@ test "PyArrow interop: write primitives" {
         .{ .name = "binary_col", .type_ = .byte_array, .optional = true },
     };
 
-    var writer = try parquet.writeToFile(allocator, file, &columns);
+    var writer = try parquet.writeToFile(allocator, file, io, &columns);
     defer writer.deinit();
 
     const bools = [_]Optional(bool){
@@ -502,8 +503,8 @@ test "PyArrow interop: write small ints" {
 
     try ensureOutputDir();
 
-    const file = try std.fs.cwd().createFile(output_dir ++ "/small_ints.parquet", .{});
-    defer file.close();
+    const file = try std.Io.Dir.cwd().createFile(io, output_dir ++ "/small_ints.parquet", .{});
+    defer file.close(io);
 
     const columns = [_]parquet.ColumnDef{
         parquet.ColumnDef.int8("i8_col", true),
@@ -514,7 +515,7 @@ test "PyArrow interop: write small ints" {
         parquet.ColumnDef.uint64("u64_col", true),
     };
 
-    var writer = try parquet.writeToFile(allocator, file, &columns);
+    var writer = try parquet.writeToFile(allocator, file, io, &columns);
     defer writer.deinit();
 
     // INT8: stored as INT32 with INT(8,signed) annotation
@@ -579,8 +580,8 @@ test "PyArrow interop: write temporal" {
 
     try ensureOutputDir();
 
-    const file = try std.fs.cwd().createFile(output_dir ++ "/temporal.parquet", .{});
-    defer file.close();
+    const file = try std.Io.Dir.cwd().createFile(io, output_dir ++ "/temporal.parquet", .{});
+    defer file.close(io);
 
     const columns = [_]parquet.ColumnDef{
         parquet.ColumnDef.date("date_col", true),
@@ -590,7 +591,7 @@ test "PyArrow interop: write temporal" {
         parquet.ColumnDef.time("time_micros", .micros, true, true),
     };
 
-    var writer = try parquet.writeToFile(allocator, file, &columns);
+    var writer = try parquet.writeToFile(allocator, file, io, &columns);
     defer writer.deinit();
 
     // DATE: days since epoch
@@ -646,15 +647,15 @@ test "PyArrow interop: write decimal" {
 
     try ensureOutputDir();
 
-    const file = try std.fs.cwd().createFile(output_dir ++ "/decimal.parquet", .{});
-    defer file.close();
+    const file = try std.Io.Dir.cwd().createFile(io, output_dir ++ "/decimal.parquet", .{});
+    defer file.close(io);
 
     const columns = [_]parquet.ColumnDef{
         parquet.ColumnDef.decimal("dec_9_2", 9, 2, true),
         parquet.ColumnDef.decimal("dec_18_4", 18, 4, true),
     };
 
-    var writer = try parquet.writeToFile(allocator, file, &columns);
+    var writer = try parquet.writeToFile(allocator, file, io, &columns);
     defer writer.deinit();
 
     // DECIMAL(9,2) stored as INT32: value * 100
@@ -683,14 +684,14 @@ test "PyArrow interop: write float16" {
 
     try ensureOutputDir();
 
-    const file = try std.fs.cwd().createFile(output_dir ++ "/float16.parquet", .{});
-    defer file.close();
+    const file = try std.Io.Dir.cwd().createFile(io, output_dir ++ "/float16.parquet", .{});
+    defer file.close(io);
 
     const columns = [_]parquet.ColumnDef{
         parquet.ColumnDef.float16("f16_col", true),
     };
 
-    var writer = try parquet.writeToFile(allocator, file, &columns);
+    var writer = try parquet.writeToFile(allocator, file, io, &columns);
     defer writer.deinit();
 
     // FLOAT16 stored as FLBA(2), IEEE 754 half-precision
@@ -714,10 +715,10 @@ test "PyArrow interop: write nested" {
 
     try ensureOutputDir();
 
-    var file = try std.fs.cwd().createFile(output_dir ++ "/nested.parquet", .{});
-    defer file.close();
+    var file = try std.Io.Dir.cwd().createFile(io, output_dir ++ "/nested.parquet", .{});
+    defer file.close(io);
 
-    var dw = try parquet.createFileDynamic(allocator, file);
+    var dw = try parquet.createFileDynamic(allocator, file, io);
     defer dw.deinit();
 
     // int_list: optional list of int32

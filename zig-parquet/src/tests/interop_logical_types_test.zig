@@ -4,19 +4,20 @@
 //! to verify our reader correctly parses logical types from real-world files.
 
 const std = @import("std");
+const io = std.testing.io;
 const parquet = @import("../lib.zig");
 const format = parquet.format;
 
 test "read PyArrow STRING logical type" {
     const allocator = std.testing.allocator;
 
-    const file = std.fs.cwd().openFile("../test-files-arrow/logical_types/string.parquet", .{}) catch |err| {
+    const file = std.Io.Dir.cwd().openFile(io, "../test-files-arrow/logical_types/string.parquet", .{}) catch |err| {
         std.debug.print("Could not open test file (run from zig-parquet dir): {}\n", .{err});
         return err;
     };
-    defer file.close();
+    defer file.close(io);
 
-    var reader = try parquet.openFileDynamic(allocator, file, .{});
+    var reader = try parquet.openFileDynamic(allocator, file, io, .{});
     defer reader.deinit();
 
     // Verify metadata
@@ -61,13 +62,13 @@ test "read PyArrow STRING logical type" {
 test "read PyArrow DATE logical type" {
     const allocator = std.testing.allocator;
 
-    const file = std.fs.cwd().openFile("../test-files-arrow/logical_types/date.parquet", .{}) catch |err| {
+    const file = std.Io.Dir.cwd().openFile(io, "../test-files-arrow/logical_types/date.parquet", .{}) catch |err| {
         std.debug.print("Could not open test file: {}\n", .{err});
         return err;
     };
-    defer file.close();
+    defer file.close(io);
 
-    var reader = try parquet.openFileDynamic(allocator, file, .{});
+    var reader = try parquet.openFileDynamic(allocator, file, io, .{});
     defer reader.deinit();
 
     try std.testing.expectEqual(@as(i64, 5), reader.metadata.num_rows);
@@ -107,13 +108,13 @@ test "read PyArrow DATE logical type" {
 test "read PyArrow TIMESTAMP logical type" {
     const allocator = std.testing.allocator;
 
-    const file = std.fs.cwd().openFile("../test-files-arrow/logical_types/timestamp.parquet", .{}) catch |err| {
+    const file = std.Io.Dir.cwd().openFile(io, "../test-files-arrow/logical_types/timestamp.parquet", .{}) catch |err| {
         std.debug.print("Could not open test file: {}\n", .{err});
         return err;
     };
-    defer file.close();
+    defer file.close(io);
 
-    var reader = try parquet.openFileDynamic(allocator, file, .{});
+    var reader = try parquet.openFileDynamic(allocator, file, io, .{});
     defer reader.deinit();
 
     try std.testing.expectEqual(@as(i64, 5), reader.metadata.num_rows);
@@ -194,13 +195,13 @@ test "read PyArrow TIMESTAMP logical type" {
 test "read PyArrow TIME logical type" {
     const allocator = std.testing.allocator;
 
-    const file = std.fs.cwd().openFile("../test-files-arrow/logical_types/time.parquet", .{}) catch |err| {
+    const file = std.Io.Dir.cwd().openFile(io, "../test-files-arrow/logical_types/time.parquet", .{}) catch |err| {
         std.debug.print("Could not open test file: {}\n", .{err});
         return err;
     };
-    defer file.close();
+    defer file.close(io);
 
-    var reader = try parquet.openFileDynamic(allocator, file, .{});
+    var reader = try parquet.openFileDynamic(allocator, file, io, .{});
     defer reader.deinit();
 
     try std.testing.expectEqual(@as(i64, 5), reader.metadata.num_rows);
@@ -273,13 +274,13 @@ test "read PyArrow TIME logical type" {
 test "read PyArrow DECIMAL logical type" {
     const allocator = std.testing.allocator;
 
-    const file = std.fs.cwd().openFile("../test-files-arrow/logical_types/decimal.parquet", .{}) catch |err| {
+    const file = std.Io.Dir.cwd().openFile(io, "../test-files-arrow/logical_types/decimal.parquet", .{}) catch |err| {
         std.debug.print("Could not open test file: {}\n", .{err});
         return err;
     };
-    defer file.close();
+    defer file.close(io);
 
-    var reader = try parquet.openFileDynamic(allocator, file, .{});
+    var reader = try parquet.openFileDynamic(allocator, file, io, .{});
     defer reader.deinit();
 
     try std.testing.expectEqual(@as(i64, 5), reader.metadata.num_rows);
@@ -332,13 +333,13 @@ test "read PyArrow DECIMAL logical type" {
 test "read PyArrow INT types logical type" {
     const allocator = std.testing.allocator;
 
-    const file = std.fs.cwd().openFile("../test-files-arrow/logical_types/int_types.parquet", .{}) catch |err| {
+    const file = std.Io.Dir.cwd().openFile(io, "../test-files-arrow/logical_types/int_types.parquet", .{}) catch |err| {
         std.debug.print("Could not open test file: {}\n", .{err});
         return err;
     };
-    defer file.close();
+    defer file.close(io);
 
-    var reader = try parquet.openFileDynamic(allocator, file, .{});
+    var reader = try parquet.openFileDynamic(allocator, file, io, .{});
     defer reader.deinit();
 
     try std.testing.expectEqual(@as(i64, 5), reader.metadata.num_rows);
@@ -406,13 +407,13 @@ test "read PyArrow INT types logical type" {
 test "read PyArrow FLOAT16 logical type" {
     const allocator = std.testing.allocator;
 
-    const file = std.fs.cwd().openFile("../test-files-arrow/logical_types/float16.parquet", .{}) catch |err| {
+    const file = std.Io.Dir.cwd().openFile(io, "../test-files-arrow/logical_types/float16.parquet", .{}) catch |err| {
         std.debug.print("Could not open test file: {}\n", .{err});
         return err;
     };
-    defer file.close();
+    defer file.close(io);
 
-    var reader = try parquet.openFileDynamic(allocator, file, .{});
+    var reader = try parquet.openFileDynamic(allocator, file, io, .{});
     defer reader.deinit();
 
     try std.testing.expectEqual(@as(i64, 5), reader.metadata.num_rows);
@@ -447,13 +448,13 @@ test "read PyArrow FLOAT16 logical type" {
 test "read PyArrow JSON logical type" {
     const allocator = std.testing.allocator;
 
-    const file = std.fs.cwd().openFile("../test-files-arrow/logical_types/json.parquet", .{}) catch |err| {
+    const file = std.Io.Dir.cwd().openFile(io, "../test-files-arrow/logical_types/json.parquet", .{}) catch |err| {
         std.debug.print("Could not open test file: {}\n", .{err});
         return err;
     };
-    defer file.close();
+    defer file.close(io);
 
-    var reader = try parquet.openFileDynamic(allocator, file, .{});
+    var reader = try parquet.openFileDynamic(allocator, file, io, .{});
     defer reader.deinit();
 
     try std.testing.expectEqual(@as(i64, 5), reader.metadata.num_rows);

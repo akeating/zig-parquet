@@ -21,10 +21,10 @@ pub const BackendCleanup = parquet_reader.BackendCleanup;
 /// Open a Parquet file for schema-agnostic reading. Returns a `DynamicReader`
 /// that can read any file without knowing the schema at compile time.
 /// Call `deinit()` when done; the caller retains ownership of `file`.
-pub fn openFileDynamic(allocator: std.mem.Allocator, file: std.fs.File, options: DynamicReaderOptions) DynamicReaderError!DynamicReader {
+pub fn openFileDynamic(allocator: std.mem.Allocator, file: std.Io.File, io: std.Io, options: DynamicReaderOptions) DynamicReaderError!DynamicReader {
     const fr = allocator.create(FileReader) catch return error.OutOfMemory;
     errdefer allocator.destroy(fr);
-    fr.* = FileReader.init(file) catch return error.Unseekable;
+    fr.* = FileReader.init(file, io) catch return error.Unseekable;
     var reader = try DynamicReader.initFromSeekable(allocator, fr.reader(), options);
     reader._backend_cleanup = .{
         .ptr = @ptrCast(fr),

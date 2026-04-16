@@ -4,6 +4,7 @@
 //! preserved when reading back.
 
 const std = @import("std");
+const io = std.testing.io;
 const parquet = @import("../lib.zig");
 
 test "round-trip STRING logical type" {
@@ -16,14 +17,14 @@ test "round-trip STRING logical type" {
 
     // Write with STRING logical type
     {
-        const file = try tmp_dir.dir.createFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.createFile(io, file_path, .{});
+        defer file.close(io);
 
         const columns = [_]parquet.ColumnDef{
             parquet.ColumnDef.string("name", false),
         };
 
-        var writer = try parquet.writeToFile(allocator, file, &columns);
+        var writer = try parquet.writeToFile(allocator, file, io, &columns);
         defer writer.deinit();
 
         const values = [_][]const u8{ "hello", "world" };
@@ -33,10 +34,10 @@ test "round-trip STRING logical type" {
 
     // Read back and verify logical type
     {
-        const file = try tmp_dir.dir.openFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.openFile(io, file_path, .{});
+        defer file.close(io);
 
-        var reader = try parquet.openFileDynamic(allocator, file, .{});
+        var reader = try parquet.openFileDynamic(allocator, file, io, .{});
         defer reader.deinit();
 
         // Check schema has STRING logical type
@@ -64,14 +65,14 @@ test "round-trip TIMESTAMP logical type" {
 
     // Write with TIMESTAMP logical type
     {
-        const file = try tmp_dir.dir.createFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.createFile(io, file_path, .{});
+        defer file.close(io);
 
         const columns = [_]parquet.ColumnDef{
             parquet.ColumnDef.timestamp("created_at", .micros, true, false),
         };
 
-        var writer = try parquet.writeToFile(allocator, file, &columns);
+        var writer = try parquet.writeToFile(allocator, file, io, &columns);
         defer writer.deinit();
 
         // Microseconds since epoch
@@ -82,10 +83,10 @@ test "round-trip TIMESTAMP logical type" {
 
     // Read back and verify logical type
     {
-        const file = try tmp_dir.dir.openFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.openFile(io, file_path, .{});
+        defer file.close(io);
 
-        var reader = try parquet.openFileDynamic(allocator, file, .{});
+        var reader = try parquet.openFileDynamic(allocator, file, io, .{});
         defer reader.deinit();
 
         const schema = reader.getSchema();
@@ -114,14 +115,14 @@ test "round-trip DATE logical type" {
 
     // Write with DATE logical type
     {
-        const file = try tmp_dir.dir.createFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.createFile(io, file_path, .{});
+        defer file.close(io);
 
         const columns = [_]parquet.ColumnDef{
             parquet.ColumnDef.date("birth_date", false),
         };
 
-        var writer = try parquet.writeToFile(allocator, file, &columns);
+        var writer = try parquet.writeToFile(allocator, file, io, &columns);
         defer writer.deinit();
 
         // Days since epoch
@@ -132,10 +133,10 @@ test "round-trip DATE logical type" {
 
     // Read back and verify logical type
     {
-        const file = try tmp_dir.dir.openFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.openFile(io, file_path, .{});
+        defer file.close(io);
 
-        var reader = try parquet.openFileDynamic(allocator, file, .{});
+        var reader = try parquet.openFileDynamic(allocator, file, io, .{});
         defer reader.deinit();
 
         const schema = reader.getSchema();
@@ -161,14 +162,14 @@ test "round-trip TIME logical type" {
 
     // Write with TIME logical type (millis uses INT32)
     {
-        const file = try tmp_dir.dir.createFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.createFile(io, file_path, .{});
+        defer file.close(io);
 
         const columns = [_]parquet.ColumnDef{
             parquet.ColumnDef.time("event_time", .millis, false, false),
         };
 
-        var writer = try parquet.writeToFile(allocator, file, &columns);
+        var writer = try parquet.writeToFile(allocator, file, io, &columns);
         defer writer.deinit();
 
         // Milliseconds since midnight
@@ -179,10 +180,10 @@ test "round-trip TIME logical type" {
 
     // Read back and verify logical type
     {
-        const file = try tmp_dir.dir.openFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.openFile(io, file_path, .{});
+        defer file.close(io);
 
-        var reader = try parquet.openFileDynamic(allocator, file, .{});
+        var reader = try parquet.openFileDynamic(allocator, file, io, .{});
         defer reader.deinit();
 
         const schema = reader.getSchema();
@@ -211,14 +212,14 @@ test "round-trip DECIMAL logical type" {
 
     // Write with DECIMAL(9,2) logical type (uses INT32)
     {
-        const file = try tmp_dir.dir.createFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.createFile(io, file_path, .{});
+        defer file.close(io);
 
         const columns = [_]parquet.ColumnDef{
             parquet.ColumnDef.decimal("amount", 9, 2, false),
         };
 
-        var writer = try parquet.writeToFile(allocator, file, &columns);
+        var writer = try parquet.writeToFile(allocator, file, io, &columns);
         defer writer.deinit();
 
         // Scaled integer values: 12345 = 123.45, -99999 = -999.99
@@ -229,10 +230,10 @@ test "round-trip DECIMAL logical type" {
 
     // Read back and verify logical type
     {
-        const file = try tmp_dir.dir.openFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.openFile(io, file_path, .{});
+        defer file.close(io);
 
-        var reader = try parquet.openFileDynamic(allocator, file, .{});
+        var reader = try parquet.openFileDynamic(allocator, file, io, .{});
         defer reader.deinit();
 
         const schema = reader.getSchema();
@@ -261,14 +262,14 @@ test "round-trip UUID logical type" {
 
     // Write with UUID logical type
     {
-        const file = try tmp_dir.dir.createFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.createFile(io, file_path, .{});
+        defer file.close(io);
 
         const columns = [_]parquet.ColumnDef{
             parquet.ColumnDef.uuid("id", false),
         };
 
-        var writer = try parquet.writeToFile(allocator, file, &columns);
+        var writer = try parquet.writeToFile(allocator, file, io, &columns);
         defer writer.deinit();
 
         // 16-byte UUID values
@@ -281,10 +282,10 @@ test "round-trip UUID logical type" {
 
     // Read back and verify logical type
     {
-        const file = try tmp_dir.dir.openFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.openFile(io, file_path, .{});
+        defer file.close(io);
 
-        var reader = try parquet.openFileDynamic(allocator, file, .{});
+        var reader = try parquet.openFileDynamic(allocator, file, io, .{});
         defer reader.deinit();
 
         const schema = reader.getSchema();
@@ -311,14 +312,14 @@ test "round-trip INT8 logical type" {
 
     // Write with INT8 logical type
     {
-        const file = try tmp_dir.dir.createFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.createFile(io, file_path, .{});
+        defer file.close(io);
 
         const columns = [_]parquet.ColumnDef{
             parquet.ColumnDef.int8("tiny_val", false),
         };
 
-        var writer = try parquet.writeToFile(allocator, file, &columns);
+        var writer = try parquet.writeToFile(allocator, file, io, &columns);
         defer writer.deinit();
 
         const values = [_]i32{ 1, -128, 127 };
@@ -328,10 +329,10 @@ test "round-trip INT8 logical type" {
 
     // Read back and verify logical type
     {
-        const file = try tmp_dir.dir.openFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.openFile(io, file_path, .{});
+        defer file.close(io);
 
-        var reader = try parquet.openFileDynamic(allocator, file, .{});
+        var reader = try parquet.openFileDynamic(allocator, file, io, .{});
         defer reader.deinit();
 
         const schema = reader.getSchema();
@@ -360,14 +361,14 @@ test "round-trip UINT32 logical type" {
 
     // Write with UINT32 logical type
     {
-        const file = try tmp_dir.dir.createFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.createFile(io, file_path, .{});
+        defer file.close(io);
 
         const columns = [_]parquet.ColumnDef{
             parquet.ColumnDef.uint32("unsigned_val", false),
         };
 
-        var writer = try parquet.writeToFile(allocator, file, &columns);
+        var writer = try parquet.writeToFile(allocator, file, io, &columns);
         defer writer.deinit();
 
         // Stored as i32 but interpreted as unsigned
@@ -378,10 +379,10 @@ test "round-trip UINT32 logical type" {
 
     // Read back and verify logical type
     {
-        const file = try tmp_dir.dir.openFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.openFile(io, file_path, .{});
+        defer file.close(io);
 
-        var reader = try parquet.openFileDynamic(allocator, file, .{});
+        var reader = try parquet.openFileDynamic(allocator, file, io, .{});
         defer reader.deinit();
 
         const schema = reader.getSchema();
@@ -410,14 +411,14 @@ test "round-trip FLOAT16 logical type" {
 
     // Write with FLOAT16 logical type
     {
-        const file = try tmp_dir.dir.createFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.createFile(io, file_path, .{});
+        defer file.close(io);
 
         const columns = [_]parquet.ColumnDef{
             parquet.ColumnDef.float16("half_precision", false),
         };
 
-        var writer = try parquet.writeToFile(allocator, file, &columns);
+        var writer = try parquet.writeToFile(allocator, file, io, &columns);
         defer writer.deinit();
 
         // 2-byte IEEE 754 half-precision values
@@ -430,10 +431,10 @@ test "round-trip FLOAT16 logical type" {
 
     // Read back and verify logical type
     {
-        const file = try tmp_dir.dir.openFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.openFile(io, file_path, .{});
+        defer file.close(io);
 
-        var reader = try parquet.openFileDynamic(allocator, file, .{});
+        var reader = try parquet.openFileDynamic(allocator, file, io, .{});
         defer reader.deinit();
 
         const schema = reader.getSchema();
@@ -460,14 +461,14 @@ test "round-trip ENUM logical type" {
 
     // Write with ENUM logical type
     {
-        const file = try tmp_dir.dir.createFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.createFile(io, file_path, .{});
+        defer file.close(io);
 
         const columns = [_]parquet.ColumnDef{
             parquet.ColumnDef.enum_("status", false),
         };
 
-        var writer = try parquet.writeToFile(allocator, file, &columns);
+        var writer = try parquet.writeToFile(allocator, file, io, &columns);
         defer writer.deinit();
 
         const values = [_][]const u8{ "ACTIVE", "INACTIVE", "PENDING" };
@@ -477,10 +478,10 @@ test "round-trip ENUM logical type" {
 
     // Read back and verify logical type
     {
-        const file = try tmp_dir.dir.openFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.openFile(io, file_path, .{});
+        defer file.close(io);
 
-        var reader = try parquet.openFileDynamic(allocator, file, .{});
+        var reader = try parquet.openFileDynamic(allocator, file, io, .{});
         defer reader.deinit();
 
         const schema = reader.getSchema();
@@ -506,14 +507,14 @@ test "round-trip JSON logical type" {
 
     // Write with JSON logical type
     {
-        const file = try tmp_dir.dir.createFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.createFile(io, file_path, .{});
+        defer file.close(io);
 
         const columns = [_]parquet.ColumnDef{
             parquet.ColumnDef.json("data", false),
         };
 
-        var writer = try parquet.writeToFile(allocator, file, &columns);
+        var writer = try parquet.writeToFile(allocator, file, io, &columns);
         defer writer.deinit();
 
         const values = [_][]const u8{
@@ -527,10 +528,10 @@ test "round-trip JSON logical type" {
 
     // Read back and verify logical type
     {
-        const file = try tmp_dir.dir.openFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.openFile(io, file_path, .{});
+        defer file.close(io);
 
-        var reader = try parquet.openFileDynamic(allocator, file, .{});
+        var reader = try parquet.openFileDynamic(allocator, file, io, .{});
         defer reader.deinit();
 
         const schema = reader.getSchema();

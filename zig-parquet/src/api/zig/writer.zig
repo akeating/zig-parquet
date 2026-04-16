@@ -27,12 +27,13 @@ pub const BackendCleanup = parquet_reader.BackendCleanup;
 /// The caller retains ownership of `file`.
 pub fn writeToFile(
     allocator: std.mem.Allocator,
-    file: std.fs.File,
+    file: std.Io.File,
+    io: std.Io,
     columns: []const ColumnDef,
 ) WriterError!Writer {
     const ft = allocator.create(FileTarget) catch return error.OutOfMemory;
     errdefer allocator.destroy(ft);
-    ft.* = FileTarget.init(file);
+    ft.* = FileTarget.init(file, io);
     var writer = try Writer.initWithTarget(allocator, ft.target(), columns);
     writer._backend_cleanup = .{
         .ptr = @ptrCast(ft),
@@ -68,11 +69,12 @@ pub fn writeToBuffer(
 /// The caller retains ownership of `file`.
 pub fn createFileDynamic(
     allocator: std.mem.Allocator,
-    file: std.fs.File,
+    file: std.Io.File,
+    io: std.Io,
 ) DynamicWriterError!DynamicWriter {
     const ft = allocator.create(FileTarget) catch return error.OutOfMemory;
     errdefer allocator.destroy(ft);
-    ft.* = FileTarget.init(file);
+    ft.* = FileTarget.init(file, io);
     var writer = DynamicWriter.init(allocator, ft.target());
     writer._backend_cleanup = .{
         .ptr = @ptrCast(ft),

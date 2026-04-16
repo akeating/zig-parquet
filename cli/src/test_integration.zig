@@ -3,15 +3,12 @@
 
 const std = @import("std");
 const testing = std.testing;
+const io = std.testing.io;
 
 const test_file_basic = "../test-files-arrow/basic/basic_types_plain_uncompressed.parquet";
 const test_file_multi_rg = "../test-files-arrow/structure/multiple_row_groups.parquet";
 
-fn runPq(allocator: std.mem.Allocator, args: []const []const u8) !struct {
-    stdout: []const u8,
-    stderr: []const u8,
-    term: std.process.Child.Term,
-} {
+fn runPq(allocator: std.mem.Allocator, args: []const []const u8) !std.process.RunResult {
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(allocator);
 
@@ -20,30 +17,7 @@ fn runPq(allocator: std.mem.Allocator, args: []const []const u8) !struct {
         try argv.append(allocator, arg);
     }
 
-    var child = std.process.Child.init(argv.items, allocator);
-    child.cwd = null; // Use current working directory
-
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-
-    try child.spawn();
-
-    var stdout_buf: std.ArrayList(u8) = .empty;
-    var stderr_buf: std.ArrayList(u8) = .empty;
-    errdefer stdout_buf.deinit(allocator);
-    errdefer stderr_buf.deinit(allocator);
-
-    child.collectOutput(allocator, &stdout_buf, &stderr_buf, 1024 * 1024) catch {
-        return error.CollectOutputFailed;
-    };
-
-    const term = try child.wait();
-
-    return .{
-        .stdout = try stdout_buf.toOwnedSlice(allocator),
-        .stderr = try stderr_buf.toOwnedSlice(allocator),
-        .term = term,
-    };
+    return std.process.run(allocator, io, .{ .argv = argv.items });
 }
 
 // ============================================================================
@@ -57,8 +31,8 @@ test "pq --help shows usage" {
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 
-    try testing.expect(result.term == .Exited);
-    try testing.expectEqual(@as(u8, 0), result.term.Exited);
+    try testing.expect(result.term == .exited);
+    try testing.expectEqual(@as(u8, 0), result.term.exited);
     try testing.expect(std.mem.containsAtLeast(u8, result.stdout, 1, "pqi - Parquet file inspection tool"));
     try testing.expect(std.mem.containsAtLeast(u8, result.stdout, 1, "schema <file>"));
     try testing.expect(std.mem.containsAtLeast(u8, result.stdout, 1, "head <file>"));
@@ -73,8 +47,8 @@ test "pq -h shows usage" {
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 
-    try testing.expect(result.term == .Exited);
-    try testing.expectEqual(@as(u8, 0), result.term.Exited);
+    try testing.expect(result.term == .exited);
+    try testing.expectEqual(@as(u8, 0), result.term.exited);
     try testing.expect(std.mem.containsAtLeast(u8, result.stdout, 1, "Usage:"));
 }
 
@@ -89,8 +63,8 @@ test "pq schema shows column tree" {
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 
-    try testing.expect(result.term == .Exited);
-    try testing.expectEqual(@as(u8, 0), result.term.Exited);
+    try testing.expect(result.term == .exited);
+    try testing.expectEqual(@as(u8, 0), result.term.exited);
 
     // Check for expected schema elements
     try testing.expect(std.mem.containsAtLeast(u8, result.stdout, 1, "8 columns"));
@@ -112,8 +86,8 @@ test "pq schema shows fixed length info" {
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 
-    try testing.expect(result.term == .Exited);
-    try testing.expectEqual(@as(u8, 0), result.term.Exited);
+    try testing.expect(result.term == .exited);
+    try testing.expectEqual(@as(u8, 0), result.term.exited);
 
     // Should show fixed_len_byte_array with length
     try testing.expect(std.mem.containsAtLeast(u8, result.stdout, 1, "FIXED_LEN_BYTE_ARRAY"));
@@ -127,8 +101,8 @@ test "pq schema errors on missing file" {
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 
-    try testing.expect(result.term == .Exited);
-    try testing.expect(result.term.Exited != 0);
+    try testing.expect(result.term == .exited);
+    try testing.expect(result.term.exited != 0);
     try testing.expect(std.mem.containsAtLeast(u8, result.stderr, 1, "Error"));
 }
 
@@ -143,8 +117,8 @@ test "pq stats shows file metadata" {
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 
-    try testing.expect(result.term == .Exited);
-    try testing.expectEqual(@as(u8, 0), result.term.Exited);
+    try testing.expect(result.term == .exited);
+    try testing.expectEqual(@as(u8, 0), result.term.exited);
 
     // Check for expected stats
     try testing.expect(std.mem.containsAtLeast(u8, result.stdout, 1, "File:"));
@@ -164,8 +138,8 @@ test "pq stats shows multiple row groups" {
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 
-    try testing.expect(result.term == .Exited);
-    try testing.expectEqual(@as(u8, 0), result.term.Exited);
+    try testing.expect(result.term == .exited);
+    try testing.expectEqual(@as(u8, 0), result.term.exited);
 
     // Check for row group details
     try testing.expect(std.mem.containsAtLeast(u8, result.stdout, 1, "Row Groups: 10"));
@@ -186,8 +160,8 @@ test "pq head shows default 5 rows" {
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 
-    try testing.expect(result.term == .Exited);
-    try testing.expectEqual(@as(u8, 0), result.term.Exited);
+    try testing.expect(result.term == .exited);
+    try testing.expectEqual(@as(u8, 0), result.term.exited);
 
     // Check for table structure
     try testing.expect(std.mem.containsAtLeast(u8, result.stdout, 1, "|"));
@@ -206,8 +180,8 @@ test "pq head -n limits rows" {
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 
-    try testing.expect(result.term == .Exited);
-    try testing.expectEqual(@as(u8, 0), result.term.Exited);
+    try testing.expect(result.term == .exited);
+    try testing.expectEqual(@as(u8, 0), result.term.exited);
 
     // Count data rows (lines after header separator)
     var line_count: usize = 0;
@@ -234,8 +208,8 @@ test "pq head handles large -n gracefully" {
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 
-    try testing.expect(result.term == .Exited);
-    try testing.expectEqual(@as(u8, 0), result.term.Exited);
+    try testing.expect(result.term == .exited);
+    try testing.expectEqual(@as(u8, 0), result.term.exited);
 
     // Should show all 5 rows without error
     try testing.expect(std.mem.containsAtLeast(u8, result.stdout, 1, "bool_col"));
@@ -252,8 +226,8 @@ test "pq cat outputs table format by default" {
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 
-    try testing.expect(result.term == .Exited);
-    try testing.expectEqual(@as(u8, 0), result.term.Exited);
+    try testing.expect(result.term == .exited);
+    try testing.expectEqual(@as(u8, 0), result.term.exited);
 
     // Check for table structure
     try testing.expect(std.mem.containsAtLeast(u8, result.stdout, 1, "|"));
@@ -267,8 +241,8 @@ test "pq cat --json outputs NDJSON" {
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 
-    try testing.expect(result.term == .Exited);
-    try testing.expectEqual(@as(u8, 0), result.term.Exited);
+    try testing.expect(result.term == .exited);
+    try testing.expectEqual(@as(u8, 0), result.term.exited);
 
     // Check for JSON structure
     try testing.expect(std.mem.containsAtLeast(u8, result.stdout, 1, "{"));
@@ -298,7 +272,7 @@ test "pq cat --json has correct boolean values" {
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 
-    try testing.expect(result.term == .Exited);
+    try testing.expect(result.term == .exited);
 
     // JSON booleans should be lowercase without quotes
     try testing.expect(std.mem.containsAtLeast(u8, result.stdout, 1, "\"bool_col\":true") or
@@ -319,8 +293,8 @@ test "pq with no args shows usage" {
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 
-    try testing.expect(result.term == .Exited);
-    try testing.expect(result.term.Exited != 0);
+    try testing.expect(result.term == .exited);
+    try testing.expect(result.term.exited != 0);
 }
 
 test "pq with unknown command shows error" {
@@ -330,8 +304,8 @@ test "pq with unknown command shows error" {
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 
-    try testing.expect(result.term == .Exited);
-    try testing.expect(result.term.Exited != 0);
+    try testing.expect(result.term == .exited);
+    try testing.expect(result.term.exited != 0);
     try testing.expect(std.mem.containsAtLeast(u8, result.stderr, 1, "Unknown command"));
 }
 
@@ -342,7 +316,7 @@ test "pq schema without file shows error" {
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 
-    try testing.expect(result.term == .Exited);
-    try testing.expect(result.term.Exited != 0);
+    try testing.expect(result.term == .exited);
+    try testing.expect(result.term.exited != 0);
     try testing.expect(std.mem.containsAtLeast(u8, result.stderr, 1, "Error"));
 }

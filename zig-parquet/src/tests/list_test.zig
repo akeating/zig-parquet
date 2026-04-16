@@ -3,6 +3,7 @@
 //! Tests reading and writing list columns from Parquet files.
 
 const std = @import("std");
+const io = std.testing.io;
 const parquet = @import("../lib.zig");
 
 const Value = parquet.Value;
@@ -16,13 +17,13 @@ test "read list_int.parquet" {
     const allocator = std.testing.allocator;
 
     // Open the test file
-    const file = std.fs.cwd().openFile("../test-files-arrow/nested/list_int.parquet", .{}) catch |err| {
+    const file = std.Io.Dir.cwd().openFile(io, "../test-files-arrow/nested/list_int.parquet", .{}) catch |err| {
         std.debug.print("Skipping test - file not found: {}\n", .{err});
         return;
     };
-    defer file.close();
+    defer file.close(io);
 
-    var reader = try parquet.openFileDynamic(allocator, file, .{});
+    var reader = try parquet.openFileDynamic(allocator, file, io, .{});
     defer reader.deinit();
 
     // Verify schema
@@ -109,13 +110,13 @@ test "read list_nullable.parquet" {
     const allocator = std.testing.allocator;
 
     // Open the test file
-    const file = std.fs.cwd().openFile("../test-files-arrow/nested/list_nullable.parquet", .{}) catch |err| {
+    const file = std.Io.Dir.cwd().openFile(io, "../test-files-arrow/nested/list_nullable.parquet", .{}) catch |err| {
         std.debug.print("Skipping test - file not found: {}\n", .{err});
         return;
     };
-    defer file.close();
+    defer file.close(io);
 
-    var reader = try parquet.openFileDynamic(allocator, file, .{});
+    var reader = try parquet.openFileDynamic(allocator, file, io, .{});
     defer reader.deinit();
 
     // Read all rows
@@ -194,8 +195,8 @@ test "write and read list of i32" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const file = try tmp_dir.dir.createFile("list_roundtrip.parquet", .{ .read = true });
-    defer file.close();
+    const file = try tmp_dir.dir.createFile(io, "list_roundtrip.parquet", .{ .read = true });
+    defer file.close(io);
 
     // Define a list column
     const columns = [_]parquet.ColumnDef{
@@ -211,7 +212,7 @@ test "write and read list of i32" {
     };
 
     {
-        var writer = try parquet.writeToFile(allocator, file, &columns);
+        var writer = try parquet.writeToFile(allocator, file, io, &columns);
         defer writer.deinit();
 
         try writer.writeListColumnI32(0, &lists);
@@ -219,8 +220,7 @@ test "write and read list of i32" {
     }
 
     // Read it back
-    try file.seekTo(0);
-    var reader = try parquet.openFileDynamic(allocator, file, .{});
+    var reader = try parquet.openFileDynamic(allocator, file, io, .{});
     defer reader.deinit();
 
     const rows = try reader.readAllRows(0);
@@ -266,8 +266,8 @@ test "write and read list with null list" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const file = try tmp_dir.dir.createFile("list_null_roundtrip.parquet", .{ .read = true });
-    defer file.close();
+    const file = try tmp_dir.dir.createFile(io, "list_null_roundtrip.parquet", .{ .read = true });
+    defer file.close(io);
 
     const columns = [_]parquet.ColumnDef{
         parquet.ColumnDef.listInt32("numbers", true),
@@ -283,7 +283,7 @@ test "write and read list with null list" {
     };
 
     {
-        var writer = try parquet.writeToFile(allocator, file, &columns);
+        var writer = try parquet.writeToFile(allocator, file, io, &columns);
         defer writer.deinit();
 
         try writer.writeListColumnI32(0, &lists);
@@ -291,8 +291,7 @@ test "write and read list with null list" {
     }
 
     // Read it back
-    try file.seekTo(0);
-    var reader = try parquet.openFileDynamic(allocator, file, .{});
+    var reader = try parquet.openFileDynamic(allocator, file, io, .{});
     defer reader.deinit();
 
     const rows = try reader.readAllRows(0);
@@ -338,8 +337,8 @@ test "write and read list with empty list" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const file = try tmp_dir.dir.createFile("list_empty_roundtrip.parquet", .{ .read = true });
-    defer file.close();
+    const file = try tmp_dir.dir.createFile(io, "list_empty_roundtrip.parquet", .{ .read = true });
+    defer file.close(io);
 
     const columns = [_]parquet.ColumnDef{
         parquet.ColumnDef.listInt32("numbers", true),
@@ -356,7 +355,7 @@ test "write and read list with empty list" {
     };
 
     {
-        var writer = try parquet.writeToFile(allocator, file, &columns);
+        var writer = try parquet.writeToFile(allocator, file, io, &columns);
         defer writer.deinit();
 
         try writer.writeListColumnI32(0, &lists);
@@ -364,8 +363,7 @@ test "write and read list with empty list" {
     }
 
     // Read it back
-    try file.seekTo(0);
-    var reader = try parquet.openFileDynamic(allocator, file, .{});
+    var reader = try parquet.openFileDynamic(allocator, file, io, .{});
     defer reader.deinit();
 
     const rows = try reader.readAllRows(0);
@@ -417,8 +415,8 @@ test "write and read list with null elements" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const file = try tmp_dir.dir.createFile("list_null_elem_roundtrip.parquet", .{ .read = true });
-    defer file.close();
+    const file = try tmp_dir.dir.createFile(io, "list_null_elem_roundtrip.parquet", .{ .read = true });
+    defer file.close(io);
 
     const columns = [_]parquet.ColumnDef{
         parquet.ColumnDef.listInt32("numbers", true),
@@ -431,7 +429,7 @@ test "write and read list with null elements" {
     };
 
     {
-        var writer = try parquet.writeToFile(allocator, file, &columns);
+        var writer = try parquet.writeToFile(allocator, file, io, &columns);
         defer writer.deinit();
 
         try writer.writeListColumnI32(0, &lists);
@@ -439,8 +437,7 @@ test "write and read list with null elements" {
     }
 
     // Read it back
-    try file.seekTo(0);
-    var reader = try parquet.openFileDynamic(allocator, file, .{});
+    var reader = try parquet.openFileDynamic(allocator, file, io, .{});
     defer reader.deinit();
 
     const rows = try reader.readAllRows(0);

@@ -4,6 +4,7 @@
 //! to verify correctness for all physical types.
 
 const std = @import("std");
+const io = std.testing.io;
 const parquet = @import("../lib.zig");
 const format = parquet.format;
 const build_options = @import("build_options");
@@ -19,14 +20,14 @@ test "round-trip i64 column" {
 
     // Write
     {
-        const file = try tmp_dir.dir.createFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.createFile(io, file_path, .{});
+        defer file.close(io);
 
         const columns = [_]parquet.ColumnDef{
             .{ .name = "id", .type_ = .int64, .optional = false },
         };
 
-        var writer = try parquet.writeToFile(allocator, file, &columns);
+        var writer = try parquet.writeToFile(allocator, file, io, &columns);
         defer writer.deinit();
 
         const values = [_]i64{ 1, 2, 3, 4, 5, 100, -50, 0, 999999, -123456 };
@@ -36,10 +37,10 @@ test "round-trip i64 column" {
 
     // Read back
     {
-        const file = try tmp_dir.dir.openFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.openFile(io, file_path, .{});
+        defer file.close(io);
 
-        var reader = try parquet.openFileDynamic(allocator, file, .{});
+        var reader = try parquet.openFileDynamic(allocator, file, io, .{});
         defer reader.deinit();
 
         // Verify metadata
@@ -75,14 +76,14 @@ test "round-trip nullable i64 column" {
 
     // Write
     {
-        const file = try tmp_dir.dir.createFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.createFile(io, file_path, .{});
+        defer file.close(io);
 
         const columns = [_]parquet.ColumnDef{
             .{ .name = "value", .type_ = .int64, .optional = true },
         };
 
-        var writer = try parquet.writeToFile(allocator, file, &columns);
+        var writer = try parquet.writeToFile(allocator, file, io, &columns);
         defer writer.deinit();
 
         const values = [_]?i64{ 1, null, 3, null, 5 };
@@ -92,10 +93,10 @@ test "round-trip nullable i64 column" {
 
     // Read back
     {
-        const file = try tmp_dir.dir.openFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.openFile(io, file_path, .{});
+        defer file.close(io);
 
-        var reader = try parquet.openFileDynamic(allocator, file, .{});
+        var reader = try parquet.openFileDynamic(allocator, file, io, .{});
         defer reader.deinit();
 
         try std.testing.expectEqual(@as(i64, 5), reader.metadata.num_rows);
@@ -127,14 +128,14 @@ test "round-trip double column" {
 
     // Write
     {
-        const file = try tmp_dir.dir.createFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.createFile(io, file_path, .{});
+        defer file.close(io);
 
         const columns = [_]parquet.ColumnDef{
             .{ .name = "price", .type_ = .double, .optional = false },
         };
 
-        var writer = try parquet.writeToFile(allocator, file, &columns);
+        var writer = try parquet.writeToFile(allocator, file, io, &columns);
         defer writer.deinit();
 
         const values = [_]f64{ 1.5, 2.25, 3.125, -4.5, 0.0 };
@@ -144,10 +145,10 @@ test "round-trip double column" {
 
     // Read back
     {
-        const file = try tmp_dir.dir.openFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.openFile(io, file_path, .{});
+        defer file.close(io);
 
-        var reader = try parquet.openFileDynamic(allocator, file, .{});
+        var reader = try parquet.openFileDynamic(allocator, file, io, .{});
         defer reader.deinit();
 
         try std.testing.expectEqual(@as(i64, 5), reader.metadata.num_rows);
@@ -177,15 +178,15 @@ test "round-trip multiple columns" {
 
     // Write
     {
-        const file = try tmp_dir.dir.createFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.createFile(io, file_path, .{});
+        defer file.close(io);
 
         const columns = [_]parquet.ColumnDef{
             .{ .name = "id", .type_ = .int64, .optional = false },
             .{ .name = "value", .type_ = .double, .optional = true },
         };
 
-        var writer = try parquet.writeToFile(allocator, file, &columns);
+        var writer = try parquet.writeToFile(allocator, file, io, &columns);
         defer writer.deinit();
 
         const ids = [_]i64{ 1, 2, 3 };
@@ -199,10 +200,10 @@ test "round-trip multiple columns" {
 
     // Read back
     {
-        const file = try tmp_dir.dir.openFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.openFile(io, file_path, .{});
+        defer file.close(io);
 
-        var reader = try parquet.openFileDynamic(allocator, file, .{});
+        var reader = try parquet.openFileDynamic(allocator, file, io, .{});
         defer reader.deinit();
 
         try std.testing.expectEqual(@as(i64, 3), reader.metadata.num_rows);
@@ -234,14 +235,14 @@ test "round-trip i32 column" {
 
     // Write
     {
-        const file = try tmp_dir.dir.createFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.createFile(io, file_path, .{});
+        defer file.close(io);
 
         const columns = [_]parquet.ColumnDef{
             .{ .name = "count", .type_ = .int32, .optional = false },
         };
 
-        var writer = try parquet.writeToFile(allocator, file, &columns);
+        var writer = try parquet.writeToFile(allocator, file, io, &columns);
         defer writer.deinit();
 
         const values = [_]i32{ 1, -2, 3, 0, 2147483647, -2147483648 };
@@ -251,10 +252,10 @@ test "round-trip i32 column" {
 
     // Read back
     {
-        const file = try tmp_dir.dir.openFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.openFile(io, file_path, .{});
+        defer file.close(io);
 
-        var reader = try parquet.openFileDynamic(allocator, file, .{});
+        var reader = try parquet.openFileDynamic(allocator, file, io, .{});
         defer reader.deinit();
 
         try std.testing.expectEqual(@as(i64, 6), reader.metadata.num_rows);
@@ -284,14 +285,14 @@ test "round-trip bool column" {
 
     // Write
     {
-        const file = try tmp_dir.dir.createFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.createFile(io, file_path, .{});
+        defer file.close(io);
 
         const columns = [_]parquet.ColumnDef{
             .{ .name = "flag", .type_ = .boolean, .optional = false },
         };
 
-        var writer = try parquet.writeToFile(allocator, file, &columns);
+        var writer = try parquet.writeToFile(allocator, file, io, &columns);
         defer writer.deinit();
 
         const values = [_]bool{ true, false, true, true, false, false, true, false };
@@ -301,10 +302,10 @@ test "round-trip bool column" {
 
     // Read back
     {
-        const file = try tmp_dir.dir.openFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.openFile(io, file_path, .{});
+        defer file.close(io);
 
-        var reader = try parquet.openFileDynamic(allocator, file, .{});
+        var reader = try parquet.openFileDynamic(allocator, file, io, .{});
         defer reader.deinit();
 
         try std.testing.expectEqual(@as(i64, 8), reader.metadata.num_rows);
@@ -334,14 +335,14 @@ test "round-trip float column" {
 
     // Write
     {
-        const file = try tmp_dir.dir.createFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.createFile(io, file_path, .{});
+        defer file.close(io);
 
         const columns = [_]parquet.ColumnDef{
             .{ .name = "temp", .type_ = .float, .optional = false },
         };
 
-        var writer = try parquet.writeToFile(allocator, file, &columns);
+        var writer = try parquet.writeToFile(allocator, file, io, &columns);
         defer writer.deinit();
 
         const values = [_]f32{ 1.5, -2.25, 0.0, 3.14159 };
@@ -351,10 +352,10 @@ test "round-trip float column" {
 
     // Read back
     {
-        const file = try tmp_dir.dir.openFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.openFile(io, file_path, .{});
+        defer file.close(io);
 
-        var reader = try parquet.openFileDynamic(allocator, file, .{});
+        var reader = try parquet.openFileDynamic(allocator, file, io, .{});
         defer reader.deinit();
 
         try std.testing.expectEqual(@as(i64, 4), reader.metadata.num_rows);
@@ -384,14 +385,14 @@ test "round-trip byte_array column" {
 
     // Write
     {
-        const file = try tmp_dir.dir.createFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.createFile(io, file_path, .{});
+        defer file.close(io);
 
         const columns = [_]parquet.ColumnDef{
             .{ .name = "name", .type_ = .byte_array, .optional = false },
         };
 
-        var writer = try parquet.writeToFile(allocator, file, &columns);
+        var writer = try parquet.writeToFile(allocator, file, io, &columns);
         defer writer.deinit();
 
         const values = [_][]const u8{ "hello", "world" };
@@ -401,20 +402,20 @@ test "round-trip byte_array column" {
 
     // Read back raw bytes to debug
     {
-        const file = try tmp_dir.dir.openFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.openFile(io, file_path, .{});
+        defer file.close(io);
 
         // Read entire file
-        const stat = try file.stat();
+        const stat = try file.stat(io);
         const file_data = try allocator.alloc(u8, stat.size);
         defer allocator.free(file_data);
-        _ = try file.readAll(file_data);
+        _ = try file.readPositionalAll(io, file_data, 0);
 
         // Verify magic bytes
         try std.testing.expectEqualStrings("PAR1", file_data[0..4]);
 
         // Check metadata - the footer should have the correct schema
-        var reader = try parquet.openFileDynamic(allocator, file, .{});
+        var reader = try parquet.openFileDynamic(allocator, file, io, .{});
         defer reader.deinit();
 
         try std.testing.expectEqual(@as(i64, 2), reader.metadata.num_rows);
@@ -457,14 +458,14 @@ test "round-trip fixed_len_byte_array column" {
 
     // Write
     {
-        const file = try tmp_dir.dir.createFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.createFile(io, file_path, .{});
+        defer file.close(io);
 
         const columns = [_]parquet.ColumnDef{
             .{ .name = "uuid", .type_ = .fixed_len_byte_array, .optional = false, .type_length = 4 },
         };
 
-        var writer = try parquet.writeToFile(allocator, file, &columns);
+        var writer = try parquet.writeToFile(allocator, file, io, &columns);
         defer writer.deinit();
 
         const values = [_][]const u8{ "ABCD", "1234", "test" };
@@ -474,10 +475,10 @@ test "round-trip fixed_len_byte_array column" {
 
     // Read back
     {
-        const file = try tmp_dir.dir.openFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.openFile(io, file_path, .{});
+        defer file.close(io);
 
-        var reader = try parquet.openFileDynamic(allocator, file, .{});
+        var reader = try parquet.openFileDynamic(allocator, file, io, .{});
         defer reader.deinit();
 
         try std.testing.expectEqual(@as(i64, 3), reader.metadata.num_rows);
@@ -507,10 +508,10 @@ test "dictionary cardinality fallback" {
 
     // Write using DynamicWriter with high-cardinality data
     {
-        const file = try tmp_dir.dir.createFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.createFile(io, file_path, .{});
+        defer file.close(io);
 
-        var writer = try parquet.createFileDynamic(allocator, file);
+        var writer = try parquet.createFileDynamic(allocator, file, io);
         defer writer.deinit();
 
         try writer.addColumn("id", parquet.TypeInfo.int64, .{});
@@ -526,10 +527,10 @@ test "dictionary cardinality fallback" {
 
     // Read back
     {
-        const file = try tmp_dir.dir.openFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.openFile(io, file_path, .{});
+        defer file.close(io);
 
-        var reader = try parquet.openFileDynamic(allocator, file, .{});
+        var reader = try parquet.openFileDynamic(allocator, file, io, .{});
         defer reader.deinit();
 
         // Verify metadata
@@ -566,10 +567,10 @@ test "round-trip sorting_columns metadata via DynamicWriter" {
 
     // Write
     {
-        const file = try tmp_dir.dir.createFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.createFile(io, file_path, .{});
+        defer file.close(io);
 
-        var writer = parquet.createFileDynamic(allocator, file) catch |e| {
+        var writer = parquet.createFileDynamic(allocator, file, io) catch |e| {
             std.debug.print("createFileDynamic error: {any}\n", .{e});
             return e;
         };
@@ -594,10 +595,10 @@ test "round-trip sorting_columns metadata via DynamicWriter" {
 
     // Read back and verify sorting_columns metadata
     {
-        const file = try tmp_dir.dir.openFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.openFile(io, file_path, .{});
+        defer file.close(io);
 
-        var reader = try parquet.openFileDynamic(allocator, file, .{});
+        var reader = try parquet.openFileDynamic(allocator, file, io, .{});
         defer reader.deinit();
 
         try std.testing.expectEqual(@as(usize, 1), reader.metadata.row_groups.len);
@@ -630,14 +631,14 @@ test "round-trip sorting_columns metadata via Writer" {
 
     // Write
     {
-        const file = try tmp_dir.dir.createFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.createFile(io, file_path, .{});
+        defer file.close(io);
 
         const columns = [_]parquet.ColumnDef{
             .{ .name = "value", .type_ = .int64, .optional = false },
         };
 
-        var writer = try parquet.writeToFile(allocator, file, &columns);
+        var writer = try parquet.writeToFile(allocator, file, io, &columns);
         defer writer.deinit();
 
         writer.sorting_columns = &sorting_cols;
@@ -649,10 +650,10 @@ test "round-trip sorting_columns metadata via Writer" {
 
     // Read back
     {
-        const file = try tmp_dir.dir.openFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.openFile(io, file_path, .{});
+        defer file.close(io);
 
-        var reader = try parquet.openFileDynamic(allocator, file, .{});
+        var reader = try parquet.openFileDynamic(allocator, file, io, .{});
         defer reader.deinit();
 
         const sc = reader.metadata.row_groups[0].sorting_columns orelse
@@ -675,10 +676,10 @@ test "sorting_columns defaults to null" {
 
     // Write without setting sorting_columns
     {
-        const file = try tmp_dir.dir.createFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.createFile(io, file_path, .{});
+        defer file.close(io);
 
-        var writer = parquet.createFileDynamic(allocator, file) catch |e| return e;
+        var writer = parquet.createFileDynamic(allocator, file, io) catch |e| return e;
         defer writer.deinit();
 
         try writer.addColumn("id", parquet.TypeInfo.int64, .{});
@@ -690,10 +691,10 @@ test "sorting_columns defaults to null" {
 
     // Read back — sorting_columns should be null
     {
-        const file = try tmp_dir.dir.openFile(file_path, .{});
-        defer file.close();
+        const file = try tmp_dir.dir.openFile(io, file_path, .{});
+        defer file.close(io);
 
-        var reader = try parquet.openFileDynamic(allocator, file, .{});
+        var reader = try parquet.openFileDynamic(allocator, file, io, .{});
         defer reader.deinit();
 
         try std.testing.expectEqual(@as(?[]const format.SortingColumn, null), reader.metadata.row_groups[0].sorting_columns);

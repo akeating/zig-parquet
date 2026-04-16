@@ -134,7 +134,7 @@ pub const CompactReader = struct {
 
         // Mask to 4 bits: value 0-15 always fits in u4
         const type_id: u4 = @truncate(b & 0x0F);
-        const field_type = std.meta.intToEnum(Type, type_id) catch return error.InvalidFieldType;
+        const field_type = std.enums.fromInt(Type, type_id) orelse return error.InvalidFieldType;
 
         // Delta encoding: high nibble contains field ID delta
         const delta: u4 = @truncate((b >> 4) & 0x0F);
@@ -159,7 +159,7 @@ pub const CompactReader = struct {
         // Mask to 4 bits: value 0-15 always fits in u4
         const size_nibble: u4 = @truncate((b >> 4) & 0x0F);
         const type_nibble: u4 = @truncate(b & 0x0F);
-        const element_type = std.meta.intToEnum(Type, type_nibble) catch return error.InvalidListType;
+        const element_type = std.enums.fromInt(Type, type_nibble) orelse return error.InvalidListType;
 
         var size: u32 = undefined;
         if (size_nibble == 0x0F) {

@@ -4,6 +4,7 @@
 //! polymorphically through the SeekableReader interface.
 
 const std = @import("std");
+const io = std.testing.io;
 const parquet = @import("../lib.zig");
 const SeekableReader = parquet.SeekableReader;
 const BufferReader = parquet.io.BufferReader;
@@ -106,13 +107,12 @@ test "FileReader basic read" {
     defer tmp_dir.cleanup();
 
     const test_data = "Hello from file!";
-    const file = try tmp_dir.dir.createFile("test.bin", .{ .read = true });
-    try file.writeAll(test_data);
-    try file.seekTo(0);
+    const file = try tmp_dir.dir.createFile(io, "test.bin", .{ .read = true });
+    try file.writePositionalAll(io, test_data, 0);
 
-    var file_reader = try FileReader.init(file);
+    var file_reader = try FileReader.init(file, io);
     const reader = file_reader.reader();
-    defer file.close();
+    defer file.close(io);
 
     // Check size
     try std.testing.expectEqual(@as(u64, test_data.len), reader.size());
@@ -140,13 +140,12 @@ test "FileReader matches BufferReader" {
     const test_data = "The quick brown fox jumps over the lazy dog.";
 
     // Create file with data
-    const file = try tmp_dir.dir.createFile("match_test.bin", .{ .read = true });
-    try file.writeAll(test_data);
-    try file.seekTo(0);
+    const file = try tmp_dir.dir.createFile(io, "match_test.bin", .{ .read = true });
+    try file.writePositionalAll(io, test_data, 0);
 
-    var file_reader = try FileReader.init(file);
+    var file_reader = try FileReader.init(file, io);
     const freader = file_reader.reader();
-    defer file.close();
+    defer file.close(io);
 
     var buf_reader = BufferReader.init(test_data);
     const breader = buf_reader.reader();
@@ -181,12 +180,11 @@ test "SeekableReader interface works with both backends" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const file = try tmp_dir.dir.createFile("poly_test.bin", .{ .read = true });
-    try file.writeAll(test_data);
-    try file.seekTo(0);
-    defer file.close();
+    const file = try tmp_dir.dir.createFile(io, "poly_test.bin", .{ .read = true });
+    try file.writePositionalAll(io, test_data, 0);
+    defer file.close(io);
 
-    var file_reader = try FileReader.init(file);
+    var file_reader = try FileReader.init(file, io);
 
     // Get SeekableReader interfaces
     const readers = [_]SeekableReader{
@@ -278,10 +276,7 @@ test "Reader.initFromBuffer reads real Parquet file" {
 
     // Read the Parquet file into memory
     // Schema: bool_col, int32_col, int64_col, float_col, double_col, string_col, binary_col, fixed_binary_col
-    const file_data = try std.fs.cwd().readFileAlloc(
-        allocator,
-        "../test-files-arrow/basic/basic_types_plain_uncompressed.parquet",
-        10_000_000,
+    const file_data = try std.Io.Dir.cwd().readFileAlloc(io, "../test-files-arrow/basic/basic_types_plain_uncompressed.parquet", allocator, @enumFromInt(10_000_000),
     );
     defer allocator.free(file_data);
 
@@ -309,7 +304,7 @@ test "Reader.initFromBuffer matches file-based reading" {
     const file_path = "../test-files-arrow/basic/basic_types_plain_uncompressed.parquet";
 
     // Read file into memory
-    const file_data = try std.fs.cwd().readFileAlloc(allocator, file_path, 10_000_000);
+    const file_data = try std.Io.Dir.cwd().readFileAlloc(io, file_path, allocator, @enumFromInt(10_000_000));
     defer allocator.free(file_data);
 
     // Initialize from buffer
@@ -317,9 +312,9 @@ test "Reader.initFromBuffer matches file-based reading" {
     defer buf_reader_inst.deinit();
 
     // Initialize from file
-    const file = try std.fs.cwd().openFile(file_path, .{});
-    defer file.close();
-    var file_reader_inst = try parquet.openFileDynamic(allocator, file, .{});
+    const file = try std.Io.Dir.cwd().openFile(io, file_path, .{});
+    defer file.close(io);
+    var file_reader_inst = try parquet.openFileDynamic(allocator, file, io, .{});
     defer file_reader_inst.deinit();
 
     // Metadata should match
@@ -355,10 +350,7 @@ test "DynamicReader.initFromBuffer reads real Parquet file" {
     const allocator = std.testing.allocator;
 
     // Read the Parquet file into memory
-    const file_data = try std.fs.cwd().readFileAlloc(
-        allocator,
-        "../test-files-arrow/basic/basic_types_plain_uncompressed.parquet",
-        10_000_000,
+    const file_data = try std.Io.Dir.cwd().readFileAlloc(io, "../test-files-arrow/basic/basic_types_plain_uncompressed.parquet", allocator, @enumFromInt(10_000_000),
     );
     defer allocator.free(file_data);
 
@@ -385,10 +377,7 @@ test "DynamicReader.initFromBuffer reads real Parquet file with row iteration" {
 
     // Read the Parquet file into memory
     // Schema: bool_col, int32_col, int64_col, float_col, double_col, string_col, binary_col, fixed_binary_col
-    const file_data = try std.fs.cwd().readFileAlloc(
-        allocator,
-        "../test-files-arrow/basic/basic_types_plain_uncompressed.parquet",
-        10_000_000,
+    const file_data = try std.Io.Dir.cwd().readFileAlloc(io, "../test-files-arrow/basic/basic_types_plain_uncompressed.parquet", allocator, @enumFromInt(10_000_000),
     );
     defer allocator.free(file_data);
 
@@ -411,10 +400,7 @@ test "Reader.initFromBuffer with compressed file" {
 
     // Read a zstd-compressed Parquet file into memory
     // Schema: repeated (string), sequence (i64)
-    const file_data = try std.fs.cwd().readFileAlloc(
-        allocator,
-        "../test-files-arrow/compression/compression_zstd.parquet",
-        10_000_000,
+    const file_data = try std.Io.Dir.cwd().readFileAlloc(io, "../test-files-arrow/compression/compression_zstd.parquet", allocator, @enumFromInt(10_000_000),
     );
     defer allocator.free(file_data);
 

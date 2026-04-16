@@ -144,10 +144,8 @@ pub const Value = union(enum) {
     /// Format value for printing
     pub fn format(
         self: Value,
-        comptime _: []const u8,
-        _: std.fmt.FormatOptions,
-        writer: anytype,
-    ) !void {
+        writer: *std.Io.Writer,
+    ) std.Io.Writer.Error!void {
         switch (self) {
             .null_val => try writer.writeAll("null"),
             .bool_val => |v| try writer.print("{}", .{v}),
@@ -161,7 +159,7 @@ pub const Value = union(enum) {
                 try writer.writeAll("[");
                 for (items, 0..) |item, i| {
                     if (i > 0) try writer.writeAll(", ");
-                    try item.format("", .{}, writer);
+                    try item.format(writer);
                 }
                 try writer.writeAll("]");
             },
@@ -169,9 +167,9 @@ pub const Value = union(enum) {
                 try writer.writeAll("{");
                 for (entries, 0..) |entry, i| {
                     if (i > 0) try writer.writeAll(", ");
-                    try entry.key.format("", .{}, writer);
+                    try entry.key.format(writer);
                     try writer.writeAll(": ");
-                    try entry.value.format("", .{}, writer);
+                    try entry.value.format(writer);
                 }
                 try writer.writeAll("}");
             },
@@ -180,14 +178,14 @@ pub const Value = union(enum) {
                 for (fields, 0..) |field, i| {
                     if (i > 0) try writer.writeAll(", ");
                     try writer.print("{s}: ", .{field.name});
-                    try field.value.format("", .{}, writer);
+                    try field.value.format(writer);
                 }
                 try writer.writeAll("}");
             },
         }
     }
 
-    fn formatFloat(comptime T: type, v: T, writer: anytype) !void {
+    fn formatFloat(comptime T: type, v: T, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         if (std.math.isInf(v)) {
             if (v < 0) {
                 try writer.writeAll("-inf");
@@ -327,13 +325,12 @@ test "Value struct" {
 }
 
 test "Value format" {
-    var buf: [256]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    const writer = fbs.writer();
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
 
     const v = Value{ .int32_val = 42 };
-    try v.format("", .{}, writer);
-    try std.testing.expectEqualStrings("42", fbs.getWritten());
+    try v.format(&out.writer);
+    try std.testing.expectEqualStrings("42", out.written());
 }
 
 test "Row getColumn and columnCount" {
