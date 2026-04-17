@@ -38,16 +38,29 @@ zig-parquet is a native Parquet library written in Zig 0.16.0. It provides read/
 
 ## Build & Test
 
+**Always run from the repo root via `make`. Never `cd` into `zig-parquet/` or `cli/`** — the tool session preserves cwd across commands, so a stray `cd` strands later commands in the wrong directory. The Makefile's recipes handle the `cd` in a subshell so the outer cwd is unchanged.
+
+`test`, `lib`, and `cli` accept `CODECS=<spec>` and `OPT=<ReleaseSmall|ReleaseFast|ReleaseSafe|Debug>` as make variables — don't add new fixed targets for each combination.
+
 ```bash
-cd zig-parquet && zig build test                  # Run library tests (all codecs, Zig used by default)
-cd zig-parquet && zig build test -Dcodecs=c-only  # Run with C/C++ codecs only
-cd zig-parquet && zig build test -Dcodecs=none    # Run non-compression tests only
-cd zig-parquet && zig build test -Dcodecs=c-zstd    # Run with C zstd only
-cd zig-parquet && zig build test -Dcodecs=zig-only # Run with pure Zig codecs only (no C deps)
-cd cli && zig build                               # Build pqi CLI
-cd cli && ./validate-wild.sh                      # Validate against wild test files (failures only)
-cd cli && ./validate-wild.sh --all                # Show all results
+make help                              # List all targets with examples
+make build                             # Build library + CLI (defaults)
+make test                              # Library tests, all codecs (Zig preferred)
+make test CODECS=zig-only              # Pure Zig codecs only (no C deps)
+make test CODECS=c-only                # C/C++ codecs only
+make test CODECS=none                  # Non-compression tests only
+make test CODECS=c-zstd,zstd           # Cross-implementation (both zstd codecs)
+make lib CODECS=c-brotli OPT=ReleaseSmall  # Size-measured release build
+make example NAME=basic                # Build an example (NAME is required)
+make example NAME=wasm_demo OPT=ReleaseSmall
+make wasm                              # Verify WASM targets compile and link
+make validate-wild                     # Validate pqi against wild files (failures)
+make validate-wild-all                 # Validate pqi against wild files (all)
+make fmt                               # zig fmt across sources
+make clean                             # Remove .zig-cache and zig-out everywhere
 ```
+
+`CODECS` values: `all` (default), `none`, `zig-only`, `c-only`, or comma-separated list from `zstd,snappy,gzip,lz4,brotli` (Zig) and `c-zstd,c-snappy,c-gzip,c-lz4,c-brotli` (C/C++).
 
 ## Zig 0.16.0 — Key API Patterns
 
