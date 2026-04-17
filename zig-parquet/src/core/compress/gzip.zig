@@ -424,25 +424,50 @@ const Deflater = struct {
     prev: [WINDOW_SIZE]u16,
     ins_h: u32 = 0,
     strstart: u32 = 0,
-    match_start: u32 = 0,
+    window_end: u32 = 0,
     prev_length: u32 = 0,
     prev_match: u32 = 0,
     match_available: bool = false,
-    allocator: std.mem.Allocator,
 
-    fn init(allocator: std.mem.Allocator, data: []const u8) !Deflater {
-        var d: Deflater = .{
+    // Heap-allocated: the struct is ~192 KiB (window + head + prev), too big for the stack.
+    fn create(allocator: std.mem.Allocator) !*Deflater {
+        const d = try allocator.create(Deflater);
+        d.* = .{
             .window = undefined,
             .head = [_]u16{0} ** HASH_SIZE,
             .prev = [_]u16{0} ** WINDOW_SIZE,
-            .allocator = allocator,
         };
-        @memcpy(d.window[0..data.len], data);
         return d;
     }
 
-    fn insertString(d: *Deflater, s: u32, data_len: u32) u16 {
-        if (s + MIN_MATCH > data_len) return 0;
+    fn destroy(d: *Deflater, allocator: std.mem.Allocator) void {
+        allocator.destroy(d);
+    }
+
+    // Copy as much remaining input as fits into the free space above window_end.
+    fn fill(d: *Deflater, data: []const u8, data_pos: *usize) void {
+        const space: usize = 2 * WINDOW_SIZE - d.window_end;
+        const n = @min(space, data.len - data_pos.*);
+        if (n == 0) return;
+        @memcpy(d.window[d.window_end .. d.window_end + n], data[data_pos.* .. data_pos.* + n]);
+        d.window_end += @intCast(n);
+        data_pos.* += n;
+    }
+
+    // Drop the lower WINDOW_SIZE bytes and shift the upper half down to make room for more input.
+    // Hash chains retarget to the new positions; chain entries that pointed into the dropped
+    // half are zeroed (0 means "no prior match").
+    fn slide(d: *Deflater) void {
+        const w: u16 = @intCast(WINDOW_SIZE);
+        @memcpy(d.window[0..WINDOW_SIZE], d.window[WINDOW_SIZE .. 2 * WINDOW_SIZE]);
+        for (&d.head) |*h| h.* = if (h.* >= w) h.* - w else 0;
+        for (&d.prev) |*p| p.* = if (p.* >= w) p.* - w else 0;
+        d.strstart -= @intCast(WINDOW_SIZE);
+        d.window_end -= @intCast(WINDOW_SIZE);
+    }
+
+    fn insertString(d: *Deflater, s: u32) u16 {
+        if (s + MIN_MATCH > d.window_end) return 0;
         d.ins_h = updateHash(d.ins_h, d.window[s + MIN_MATCH - 1]);
         const h = d.ins_h;
         const head = d.head[h];
@@ -491,21 +516,33 @@ const Deflater = struct {
         return .{ .length = best_len, .distance = best_dist };
     }
 
-    fn compressLazy(d: *Deflater, allocator: std.mem.Allocator, data: []const u8) !std.ArrayList(Token) {
+    fn tokenize(d: *Deflater, allocator: std.mem.Allocator, data: []const u8) !std.ArrayList(Token) {
         var tokens: std.ArrayList(Token) = .empty;
-        const data_len: u32 = @intCast(@min(data.len, WINDOW_SIZE));
+        errdefer tokens.deinit(allocator);
 
         const max_chain: u16 = 4096;
         d.prev_length = MIN_MATCH - 1;
         d.prev_match = 0;
         d.match_available = false;
 
-        while (d.strstart < data_len) {
-            const hash_head = d.insertString(d.strstart, data_len);
+        var data_pos: usize = 0;
+        d.fill(data, &data_pos);
+
+        while (true) {
+            // Slide when strstart has moved past the lower half and there's still input to fetch.
+            // Guard with strstart > WINDOW_SIZE (not >=) so the pending match_available literal
+            // at strstart-1 stays in the preserved upper half across the slide.
+            if (d.strstart > WINDOW_SIZE and data_pos < data.len and d.window_end == 2 * WINDOW_SIZE) {
+                d.slide();
+                d.fill(data, &data_pos);
+            }
+            if (d.strstart >= d.window_end) break;
+
+            const hash_head = d.insertString(d.strstart);
             var len: u32 = MIN_MATCH - 1;
             var match_dist: u32 = 0;
 
-            const lookahead = data_len - d.strstart;
+            const lookahead = d.window_end - d.strstart;
             if (hash_head > 0 and d.strstart > hash_head and d.strstart - hash_head <= MAX_DIST and lookahead >= MIN_MATCH) {
                 const m = d.longestMatch(hash_head, max_chain, lookahead);
                 len = m.length;
@@ -523,12 +560,11 @@ const Deflater = struct {
                 var i: u32 = 2;
                 while (i < d.prev_length) : (i += 1) {
                     d.strstart += 1;
-                    if (d.strstart < data_len) {
-                        _ = d.insertString(d.strstart, data_len);
+                    if (d.strstart < d.window_end) {
+                        _ = d.insertString(d.strstart);
                     }
                 }
                 d.match_available = false;
-                // Reset: len/match_dist are stale (computed at old strstart)
                 d.prev_length = MIN_MATCH - 1;
             } else if (d.match_available) {
                 try tokens.append(allocator, .{ .literal = d.window[d.strstart - 1] });
@@ -806,9 +842,10 @@ pub fn compress(allocator: std.mem.Allocator, data: []const u8) Error![]u8 {
     try out.append(allocator, GZIP_XFL);
     try out.append(allocator, GZIP_OS);
 
-    // Compress using level-9 deflate
-    var deflater = try Deflater.init(allocator, data);
-    var tokens = try deflater.compressLazy(allocator, data);
+    // Compress using level-9 deflate (sliding-window LZ77, single final dynamic-Huffman block).
+    const deflater = try Deflater.create(allocator);
+    defer deflater.destroy(allocator);
+    var tokens = try deflater.tokenize(allocator, data);
     defer tokens.deinit(allocator);
 
     // Encode tokens to bitstream

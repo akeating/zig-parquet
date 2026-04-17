@@ -271,3 +271,51 @@ test "write-path: large dataset" {
 
     try crossRoundTrip(allocator, &buf);
 }
+
+// Exercises the sliding-window path: inputs past 32 KiB used to be silently truncated,
+// and inputs past 64 KiB overran a fixed stack buffer.
+test "sliding-window: 48 KiB incompressible" {
+    const allocator = std.testing.allocator;
+    const buf = try allocator.alloc(u8, 48 * 1024);
+    defer allocator.free(buf);
+    var seed: u64 = 0x9e3779b97f4a7c15;
+    for (buf) |*b| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        b.* = @intCast(seed >> 56);
+    }
+    try crossRoundTrip(allocator, buf);
+}
+
+test "sliding-window: 128 KiB structured" {
+    const allocator = std.testing.allocator;
+    const buf = try allocator.alloc(u8, 128 * 1024);
+    defer allocator.free(buf);
+    for (buf, 0..) |*b, i| b.* = @intCast((i * 31 + 17) % 251);
+    try crossRoundTrip(allocator, buf);
+}
+
+test "sliding-window: 1 MiB with cross-chunk back-references" {
+    const allocator = std.testing.allocator;
+    const buf = try allocator.alloc(u8, 1024 * 1024);
+    defer allocator.free(buf);
+    // Repeating 37-byte pattern: matches span every slide boundary.
+    const pat = "The quick brown fox jumps over lazy dog";
+    for (buf, 0..) |*b, i| b.* = pat[i % pat.len];
+    try crossRoundTrip(allocator, buf);
+}
+
+test "sliding-window: 200 KiB random-like" {
+    const allocator = std.testing.allocator;
+    const buf = try allocator.alloc(u8, 200 * 1024);
+    defer allocator.free(buf);
+    var seed: u64 = 0x243f6a8885a308d3;
+    for (buf) |*b| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        b.* = @intCast(seed >> 56);
+    }
+    try crossRoundTrip(allocator, buf);
+}
