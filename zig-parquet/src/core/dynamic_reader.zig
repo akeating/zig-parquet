@@ -80,6 +80,11 @@ pub const DynamicReader = struct {
     footer_data: []u8,
     checksum_options: ChecksumOptions,
     _backend_cleanup: ?BackendCleanup = null,
+    /// Arena for `bytes_val` / `fixed_bytes_val` payloads decoded into rows.
+    /// Lives as long as the reader — caller must deinit rows before the reader.
+    /// Rows produced by the reader set `bytes_borrowed = true` so their byte
+    /// payloads are not freed per-value; the arena is freed en masse in deinit.
+    bytes_arena: std.heap.ArenaAllocator,
 
     const Self = @This();
 
@@ -105,6 +110,7 @@ pub const DynamicReader = struct {
             .metadata = info.metadata,
             .footer_data = info.footer_data,
             .checksum_options = options.checksum,
+            .bytes_arena = std.heap.ArenaAllocator.init(allocator),
         };
     }
 
@@ -159,6 +165,8 @@ pub const DynamicReader = struct {
         }
 
         self.allocator.free(self.footer_data);
+
+        self.bytes_arena.deinit();
 
         if (self._backend_cleanup) |cleanup| {
             cleanup.deinit_fn(cleanup.ptr, self.allocator);
@@ -346,6 +354,15 @@ pub const DynamicReader = struct {
         if (row_group_index >= self.metadata.row_groups.len) {
             return try self.allocator.alloc(Row, 0);
         }
+
+        // Route byte payloads produced via `value_mod.dupeBytes` into the
+        // reader-owned arena for the duration of this decode. The emitted
+        // Rows below are marked `bytes_borrowed = true` so their byte
+        // slices are not individually freed; the arena is released by
+        // `DynamicReader.deinit`.
+        const prev_bytes_alloc = value_mod.bytes_arena_allocator;
+        value_mod.bytes_arena_allocator = self.bytes_arena.allocator();
+        defer value_mod.bytes_arena_allocator = prev_bytes_alloc;
 
         const rg = &self.metadata.row_groups[row_group_index];
         const num_rows = try safeRowCount(rg.num_rows);
@@ -867,7 +884,7 @@ pub const DynamicReader = struct {
                 vals_initialized += 1;
             }
 
-            rows[row_idx] = .{ .values = values, .allocator = self.allocator };
+            rows[row_idx] = .{ .values = values, .allocator = self.allocator, .bytes_borrowed = true };
             rows_initialized += 1;
         }
 
@@ -922,7 +939,7 @@ pub const DynamicReader = struct {
                 vals_initialized += 1;
             }
 
-            rows[row_idx] = .{ .values = values, .allocator = self.allocator };
+            rows[row_idx] = .{ .values = values, .allocator = self.allocator, .bytes_borrowed = true };
             rows_initialized += 1;
         }
         return rows;
@@ -967,8 +984,8 @@ fn cloneValue(allocator: std.mem.Allocator, v: Value) !Value {
         .int64_val => |i| .{ .int64_val = i },
         .float_val => |f| .{ .float_val = f },
         .double_val => |d| .{ .double_val = d },
-        .bytes_val => |b| .{ .bytes_val = try allocator.dupe(u8, b) },
-        .fixed_bytes_val => |b| .{ .fixed_bytes_val = try allocator.dupe(u8, b) },
+        .bytes_val => |b| .{ .bytes_val = try value_mod.dupeBytes(allocator, b) },
+        .fixed_bytes_val => |b| .{ .fixed_bytes_val = try value_mod.dupeBytes(allocator, b) },
         .list_val => |items| blk: {
             const cloned = try allocator.alloc(Value, items.len);
             var cloned_count: usize = 0;

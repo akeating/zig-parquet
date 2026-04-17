@@ -441,9 +441,9 @@ fn decodeDictStringsWithDefLevels(
             const dict_idx = indices[idx_pos];
             idx_pos += 1;
             if (ctx.string_dict.?.get(dict_idx)) |v| {
-                result[i] = .{ .value = try ctx.allocator.dupe(u8, v) };
+                result[i] = .{ .value = try value_mod.dupeBytes(ctx.allocator, v) };
             } else {
-                result[i] = .{ .value = try ctx.allocator.dupe(u8, "") };
+                result[i] = .{ .value = try value_mod.dupeBytes(ctx.allocator, "") };
             }
         } else {
             result[i] = .{ .null_value = {} };
@@ -627,7 +627,7 @@ fn decodeDictFixedByteArrayWithDefLevels(
             const dict_idx = indices[idx_pos];
             idx_pos += 1;
             if (ctx.fixed_byte_array_dict.?.get(dict_idx)) |v| {
-                result[i] = .{ .value = try ctx.allocator.dupe(u8, v) };
+                result[i] = .{ .value = try value_mod.dupeBytes(ctx.allocator, v) };
             } else {
                 result[i] = .{ .null_value = {} };
             }
@@ -686,7 +686,7 @@ fn decodePlainWithDefLevels(
                     // Fixed-length byte array - no length prefix
                     if (data_offset + fixed_len > value_data.len) return error.EndOfData;
                     const value = value_data[data_offset..][0..fixed_len];
-                    result[i] = .{ .value = try ctx.allocator.dupe(u8, value) };
+                    result[i] = .{ .value = try value_mod.dupeBytes(ctx.allocator, value) };
                     data_offset += fixed_len;
                 } else if (isDecimalIntColumn(ctx)) {
                     // Decimal stored as INT32/INT64: read integer bytes, convert to big-endian
@@ -698,7 +698,7 @@ fn decodePlainWithDefLevels(
                     if (data_offset + 4 > value_data.len) return error.EndOfData;
                     const ba = try plain.decodeByteArray(value_data[data_offset..]);
                     if (data_offset + ba.bytes_read > value_data.len) return error.EndOfData;
-                    result[i] = .{ .value = try ctx.allocator.dupe(u8, ba.value) };
+                    result[i] = .{ .value = try value_mod.dupeBytes(ctx.allocator, ba.value) };
                     data_offset += ba.bytes_read;
                 }
             } else if (T == Int96) {
@@ -733,7 +733,7 @@ fn decodeRequiredColumn(
 
         for (0..ctx.num_values) |i| {
             if (ctx.fixed_byte_array_dict.?.get(indices[i])) |v| {
-                result[i] = .{ .value = try ctx.allocator.dupe(u8, v) };
+                result[i] = .{ .value = try value_mod.dupeBytes(ctx.allocator, v) };
             } else {
                 result[i] = .{ .null_value = {} };
             }
@@ -749,9 +749,9 @@ fn decodeRequiredColumn(
 
         for (0..ctx.num_values) |i| {
             if (ctx.string_dict.?.get(indices[i])) |v| {
-                result[i] = .{ .value = try ctx.allocator.dupe(u8, v) };
+                result[i] = .{ .value = try value_mod.dupeBytes(ctx.allocator, v) };
             } else {
-                result[i] = .{ .value = try ctx.allocator.dupe(u8, "") };
+                result[i] = .{ .value = try value_mod.dupeBytes(ctx.allocator, "") };
             }
         }
     } else if (ctx.uses_dict and T == i32) {
@@ -814,7 +814,7 @@ fn decodeRequiredColumn(
         for (0..ctx.num_values) |i| {
             if (data_offset + fixed_len > value_data.len) return error.EndOfData;
             const value = value_data[data_offset..][0..fixed_len];
-            result[i] = .{ .value = try ctx.allocator.dupe(u8, value) };
+            result[i] = .{ .value = try value_mod.dupeBytes(ctx.allocator, value) };
             data_offset += fixed_len;
         }
     } else if (T == f16 and is_fixed_len and fixed_len == 2) {
@@ -841,7 +841,7 @@ fn decodeRequiredColumn(
             if (decoder.next()) |v| {
                 // For byte arrays, we need to dupe since value_data may be freed
                 if (T == []const u8) {
-                    result[i] = .{ .value = try ctx.allocator.dupe(u8, v) };
+                    result[i] = .{ .value = try value_mod.dupeBytes(ctx.allocator, v) };
                 } else {
                     result[i] = .{ .value = v };
                 }
@@ -1194,7 +1194,7 @@ fn decodeDeltaEncodedValuesV2(
             for (0..num_values) |i| {
                 if (def_mask[i]) {
                     if (decoded_idx < result.values.len) {
-                        values[i] = .{ .bytes_val = try allocator.dupe(u8, result.values[decoded_idx]) };
+                        values[i] = .{ .bytes_val = try value_mod.dupeBytes(allocator, result.values[decoded_idx]) };
                         decoded_idx += 1;
                     } else {
                         values[i] = .{ .null_val = {} };
@@ -1212,7 +1212,7 @@ fn decodeDeltaEncodedValuesV2(
             for (0..num_values) |i| {
                 if (def_mask[i]) {
                     if (decoded_idx < result.values.len) {
-                        values[i] = .{ .bytes_val = try allocator.dupe(u8, result.values[decoded_idx]) };
+                        values[i] = .{ .bytes_val = try value_mod.dupeBytes(allocator, result.values[decoded_idx]) };
                         decoded_idx += 1;
                     } else {
                         values[i] = .{ .null_val = {} };
@@ -1537,9 +1537,9 @@ fn decodeDynamicByteArrayV2(allocator: std.mem.Allocator, values_data: []const u
         for (0..num_values) |i| {
             if (def_mask[i]) {
                 if (string_dict.?.get(indices[idx_pos])) |v| {
-                    values[i] = .{ .bytes_val = try allocator.dupe(u8, v) };
+                    values[i] = .{ .bytes_val = try value_mod.dupeBytes(allocator, v) };
                 } else {
-                    values[i] = .{ .bytes_val = try allocator.dupe(u8, "") };
+                    values[i] = .{ .bytes_val = try value_mod.dupeBytes(allocator, "") };
                 }
                 idx_pos += 1;
             } else {
@@ -1551,7 +1551,7 @@ fn decodeDynamicByteArrayV2(allocator: std.mem.Allocator, values_data: []const u
         for (0..num_values) |i| {
             if (def_mask[i]) {
                 const ba = try plain.decodeByteArray(values_data[data_offset..]);
-                values[i] = .{ .bytes_val = try allocator.dupe(u8, ba.value) };
+                values[i] = .{ .bytes_val = try value_mod.dupeBytes(allocator, ba.value) };
                 data_offset += ba.bytes_read;
             } else {
                 values[i] = .{ .null_val = {} };
@@ -1574,7 +1574,7 @@ fn decodeDynamicFixedByteArrayV2(allocator: std.mem.Allocator, schema_elem: form
         for (0..num_values) |i| {
             if (def_mask[i]) {
                 if (fixed_byte_array_dict.?.get(indices[idx_pos])) |v| {
-                    values[i] = .{ .fixed_bytes_val = try allocator.dupe(u8, v) };
+                    values[i] = .{ .fixed_bytes_val = try value_mod.dupeBytes(allocator, v) };
                 } else {
                     values[i] = .{ .null_val = {} };
                 }
@@ -1591,7 +1591,7 @@ fn decodeDynamicFixedByteArrayV2(allocator: std.mem.Allocator, schema_elem: form
             if (def_mask[i]) {
                 if (data_offset + fixed_len > values_data.len) return error.EndOfData;
                 const value = values_data[data_offset..][0..fixed_len];
-                values[i] = .{ .fixed_bytes_val = try allocator.dupe(u8, value) };
+                values[i] = .{ .fixed_bytes_val = try value_mod.dupeBytes(allocator, value) };
                 data_offset += fixed_len;
             } else {
                 values[i] = .{ .null_val = {} };
@@ -2219,7 +2219,7 @@ fn decodeDynamicFixedByteArray(
             const is_present = if (def_levels) |dl| dl[i] == max_def_level else true;
             if (is_present) {
                 if (fixed_byte_array_dict.?.get(indices[idx_pos])) |v| {
-                    values[i] = .{ .fixed_bytes_val = try allocator.dupe(u8, v) };
+                    values[i] = .{ .fixed_bytes_val = try value_mod.dupeBytes(allocator, v) };
                 } else {
                     values[i] = .{ .null_val = {} };
                 }
@@ -2556,7 +2556,7 @@ fn decodeDeltaLengthByteArray(
     for (0..num_values) |i| {
         if (levels_info.def_mask[i]) {
             if (decoded_idx < decode_result.values.len) {
-                values[i] = .{ .bytes_val = try allocator.dupe(u8, decode_result.values[decoded_idx]) };
+                values[i] = .{ .bytes_val = try value_mod.dupeBytes(allocator, decode_result.values[decoded_idx]) };
                 decoded_idx += 1;
             } else {
                 values[i] = .{ .null_val = {} };
@@ -2611,7 +2611,7 @@ fn decodeDeltaByteArray(
     for (0..num_values) |i| {
         if (levels_info.def_mask[i]) {
             if (decoded_idx < decode_result.values.len) {
-                values[i] = .{ .bytes_val = try allocator.dupe(u8, decode_result.values[decoded_idx]) };
+                values[i] = .{ .bytes_val = try value_mod.dupeBytes(allocator, decode_result.values[decoded_idx]) };
                 decoded_idx += 1;
             } else {
                 values[i] = .{ .null_val = {} };
@@ -2758,8 +2758,8 @@ fn decodeByteStreamSplit(
         for (0..num_values) |i| {
             if (levels_info.def_mask[i]) {
                 if (decoded_idx < decoded.len) {
-                    // Copy the bytes to owned memory
-                    const owned = try allocator.dupe(u8, decoded[decoded_idx]);
+                    // Copy the bytes (into bytes_arena if active, else allocator)
+                    const owned = try value_mod.dupeBytes(allocator, decoded[decoded_idx]);
                     values[i] = .{ .fixed_bytes_val = owned };
                     decoded_idx += 1;
                 } else {

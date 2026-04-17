@@ -6,6 +6,31 @@
 
 const std = @import("std");
 
+/// Thread-local override for byte payload allocations. When set (typically by
+/// `DynamicReader.readRowsInternal`), all `bytes_val` / `fixed_bytes_val`
+/// payloads produced via `dupeBytes` go into this allocator instead of the
+/// per-value allocator. Paired with `Row.bytes_borrowed = true` so per-value
+/// frees in `deinit` skip these payloads; the producer frees the arena en
+/// masse. Save/restore the prior value at each entry point — the pattern is:
+///
+///     const prev = value_mod.bytes_arena_allocator;
+///     value_mod.bytes_arena_allocator = arena.allocator();
+///     defer value_mod.bytes_arena_allocator = prev;
+///
+/// This replaces the per-value `allocator.dupe(u8, ...)` hot path (~440k
+/// allocations on covid.snappy.parquet) with one arena's worth of contiguous
+/// allocations, avoiding the N*stack-trace overhead of DebugAllocator.
+pub threadlocal var bytes_arena_allocator: ?std.mem.Allocator = null;
+
+/// Duplicate a byte slice, routing through `bytes_arena_allocator` if set,
+/// else through the provided `fallback` allocator. Every producer of
+/// `Value.bytes_val` and `Value.fixed_bytes_val` should call this helper
+/// instead of `allocator.dupe(u8, ...)` to participate in the arena scheme.
+pub fn dupeBytes(fallback: std.mem.Allocator, bytes: []const u8) std.mem.Allocator.Error![]u8 {
+    const alloc = bytes_arena_allocator orelse fallback;
+    return alloc.dupe(u8, bytes);
+}
+
 /// A dynamic value that can represent any Parquet data.
 ///
 /// Unlike the typed `Optional(T)` approach which requires knowing types at
@@ -199,34 +224,51 @@ pub const Value = union(enum) {
         }
     }
 
+    pub const DeinitOptions = struct {
+        /// When true, skip freeing `bytes_val` / `fixed_bytes_val` payloads.
+        /// Set by producers that routed byte allocations through an arena
+        /// (see `bytes_arena_allocator`); those slices are sub-slices of
+        /// arena chunks and cannot be freed individually.
+        skip_bytes: bool = false,
+    };
+
     /// Free all memory owned by this value recursively.
     ///
-    /// Ownership contract: Values produced by DynamicReader own their memory
-    /// (bytes_val, fixed_bytes_val, struct field names, and all nested containers
-    /// are heap-allocated). Call deinit to free them. Values created from stack
-    /// or borrowed data must NOT be passed to deinit.
+    /// If `bytes_arena_allocator` is currently set (i.e. we're inside a
+    /// decode context), byte payloads are automatically skipped — they
+    /// live in the arena and are freed en masse by the producer. Outside
+    /// a decode context this behaves as the classic owned-everything free.
+    ///
+    /// For explicit control use `deinitWithOptions`.
     pub fn deinit(self: Value, allocator: std.mem.Allocator) void {
+        self.deinitWithOptions(allocator, .{ .skip_bytes = bytes_arena_allocator != null });
+    }
+
+    /// Like `deinit` but with explicit byte-payload freeing control.
+    /// Callers holding a `Row` with `bytes_borrowed = true` pass
+    /// `.{ .skip_bytes = true }` so the arena-owned payloads are preserved.
+    pub fn deinitWithOptions(self: Value, allocator: std.mem.Allocator, opts: DeinitOptions) void {
         switch (self) {
             .null_val, .bool_val, .int32_val, .int64_val, .float_val, .double_val => {},
-            .bytes_val => |v| allocator.free(v),
-            .fixed_bytes_val => |v| allocator.free(v),
+            .bytes_val => |v| if (!opts.skip_bytes) allocator.free(v),
+            .fixed_bytes_val => |v| if (!opts.skip_bytes) allocator.free(v),
             .list_val => |items| {
                 for (items) |item| {
-                    item.deinit(allocator);
+                    item.deinitWithOptions(allocator, opts);
                 }
                 allocator.free(items);
             },
             .map_val => |entries| {
                 for (entries) |entry| {
-                    entry.key.deinit(allocator);
-                    entry.value.deinit(allocator);
+                    entry.key.deinitWithOptions(allocator, opts);
+                    entry.value.deinitWithOptions(allocator, opts);
                 }
                 allocator.free(entries);
             },
             .struct_val => |fields| {
                 for (fields) |field| {
                     allocator.free(field.name);
-                    field.value.deinit(allocator);
+                    field.value.deinitWithOptions(allocator, opts);
                 }
                 allocator.free(fields);
             },
@@ -238,6 +280,11 @@ pub const Value = union(enum) {
 pub const Row = struct {
     values: []Value,
     allocator: std.mem.Allocator,
+    /// When true, bytes_val / fixed_bytes_val payloads live in an arena
+    /// owned by the producer (e.g. DynamicReader.bytes_arena) and must
+    /// NOT be freed per-value. List/map/struct container slices and
+    /// struct field names are still freed through `allocator`.
+    bytes_borrowed: bool = false,
 
     /// Get the value for a specific column index
     pub fn getColumn(self: Row, col_idx: usize) ?Value {
@@ -262,9 +309,8 @@ pub const Row = struct {
 
     /// Free all memory owned by this row
     pub fn deinit(self: Row) void {
-        for (self.values) |v| {
-            v.deinit(self.allocator);
-        }
+        const opts: Value.DeinitOptions = .{ .skip_bytes = self.bytes_borrowed };
+        for (self.values) |v| v.deinitWithOptions(self.allocator, opts);
         self.allocator.free(self.values);
     }
 };
