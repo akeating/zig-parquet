@@ -2,9 +2,22 @@
 
 A pure Zig Parquet library. All five compression codecs. No C dependencies. Runs anywhere.
 
+Built against Zig 0.16 — uses the unified `std.Io` reader/writer interfaces throughout.
+
 [![CI](https://github.com/akeating/zig-parquet/actions/workflows/test.yml/badge.svg)](https://github.com/akeating/zig-parquet/actions/workflows/test.yml)
 [![Zig](https://img.shields.io/badge/Zig-0.16.0-f7a41d?logo=zig)](https://ziglang.org/)
 [![License](https://img.shields.io/badge/License-MIT%2FApache--2.0-blue.svg)](COPYRIGHT)
+
+## Build Sizes
+
+Pure Zig, all five compression codecs, no C compiler required. Measured with `ReleaseSmall`.
+
+| Target | Size |
+|--------|------|
+| Static library (macOS arm64) | 1,365 KB |
+| WASM (brotli-compressed) | 199 KB |
+
+The 1,365 KB figure includes all five Zig codecs. Per-codec cost (on top of a 992 KB codec-less baseline) ranges from 89 KB for lz4 to 254 KB for brotli — use `-Dcodecs=` to pick a subset. See [COMPRESSION.md](COMPRESSION.md) for the full breakdown.
 
 ## Features
 
