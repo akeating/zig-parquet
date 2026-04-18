@@ -20,7 +20,9 @@ help:
 	@echo "  make build             Build library + CLI"
 	@echo "  make lib               Build library (honors CODECS, OPT)"
 	@echo "  make cli               Build pqi CLI (honors OPT)"
-	@echo "  make test              Library tests (honors CODECS, OPT)"
+	@echo "  make test              Library + CLI tests (honors CODECS, OPT)"
+	@echo "  make test-lib          Library tests only (honors CODECS, OPT)"
+	@echo "  make test-cli          CLI tests only (honors OPT)"
 	@echo "  make example NAME=...  Build an example (honors OPT)"
 	@echo "  make wasm              Verify WASM targets compile and link"
 	@echo "  make validate-wild     Validate pqi against wild files (failures only)"
@@ -55,8 +57,15 @@ cli:
 	cd $(CLI_DIR) && zig build $(OPT_FLAG)
 
 .PHONY: test
-test:
+test: test-lib test-cli
+
+.PHONY: test-lib
+test-lib:
 	cd $(LIB_DIR) && zig build test $(CODEC_FLAG) $(OPT_FLAG)
+
+.PHONY: test-cli
+test-cli:
+	cd $(CLI_DIR) && zig build test $(OPT_FLAG)
 
 .PHONY: example
 example:
