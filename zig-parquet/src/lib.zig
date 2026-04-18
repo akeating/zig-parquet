@@ -673,6 +673,9 @@ test {
     _ = internals.reader;
     _ = internals.reader.seekable_reader;
     _ = @import("core/writer.zig");
+    _ = @import("core/row_ranges.zig");
+    _ = @import("core/page_index_reader.zig");
+    _ = @import("core/page_filter.zig");
     _ = internals.writer;
     _ = schema;
     _ = value;

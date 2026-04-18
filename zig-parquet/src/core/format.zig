@@ -13,6 +13,7 @@ pub const page = @import("format/page.zig");
 pub const metadata = @import("format/metadata.zig");
 pub const logical_types = @import("format/logical_types.zig");
 pub const schema_utils = @import("format/schema_utils.zig");
+pub const page_index = @import("format/page_index.zig");
 
 // Convenience re-exports for common types
 pub const PhysicalType = types.PhysicalType;
@@ -45,6 +46,10 @@ pub const PageHeader = page.PageHeader;
 pub const DataPageHeader = page.DataPageHeader;
 pub const DataPageHeaderV2 = page.DataPageHeaderV2;
 pub const DictionaryPageHeader = page.DictionaryPageHeader;
+pub const PageLocation = page_index.PageLocation;
+pub const OffsetIndex = page_index.OffsetIndex;
+pub const ColumnIndex = page_index.ColumnIndex;
+pub const BoundaryOrder = page_index.BoundaryOrder;
 
 // Schema utilities
 pub const ColumnInfo = schema_utils.ColumnInfo;

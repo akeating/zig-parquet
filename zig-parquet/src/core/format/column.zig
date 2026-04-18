@@ -136,6 +136,11 @@ pub const ColumnChunk = struct {
     file_path: ?[]const u8 = null,
     file_offset: i64 = 0,
     meta_data: ?ColumnMetaData = null,
+    // Page index locators (set after row groups are flushed, before the footer).
+    offset_index_offset: ?i64 = null,
+    offset_index_length: ?i32 = null,
+    column_index_offset: ?i64 = null,
+    column_index_length: ?i32 = null,
 
     const Self = @This();
 
@@ -149,6 +154,10 @@ pub const ColumnChunk = struct {
                 1 => chunk.file_path = try allocator.dupe(u8, try reader.readString()),
                 2 => chunk.file_offset = try reader.readI64(),
                 3 => chunk.meta_data = try ColumnMetaData.parse(allocator, reader),
+                4 => chunk.offset_index_offset = try reader.readI64(),
+                5 => chunk.offset_index_length = try reader.readI32(),
+                6 => chunk.column_index_offset = try reader.readI64(),
+                7 => chunk.column_index_length = try reader.readI32(),
                 else => try reader.skip(field.field_type),
             }
         }
@@ -173,6 +182,23 @@ pub const ColumnChunk = struct {
         if (self.meta_data) |*md| {
             try writer.writeFieldHeader(3, .struct_);
             try md.serialize(writer);
+        }
+
+        if (self.offset_index_offset) |v| {
+            try writer.writeFieldHeader(4, .i64);
+            try writer.writeI64(v);
+        }
+        if (self.offset_index_length) |v| {
+            try writer.writeFieldHeader(5, .i32);
+            try writer.writeI32(v);
+        }
+        if (self.column_index_offset) |v| {
+            try writer.writeFieldHeader(6, .i64);
+            try writer.writeI64(v);
+        }
+        if (self.column_index_length) |v| {
+            try writer.writeFieldHeader(7, .i32);
+            try writer.writeI32(v);
         }
 
         try writer.writeStructEnd();
