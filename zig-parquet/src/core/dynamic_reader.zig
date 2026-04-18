@@ -36,12 +36,18 @@ const parquet_reader = @import("parquet_reader.zig");
 const errors_mod = @import("errors.zig");
 const schema_mod = @import("schema.zig");
 const nested_mod = @import("nested.zig");
+const row_ranges_mod = @import("row_ranges.zig");
+const page_filter_mod = @import("page_filter.zig");
+const page_index_reader_mod = @import("page_index_reader.zig");
+const page_range_reader_mod = @import("page_range_reader.zig");
 
 pub const Value = value_mod.Value;
 pub const Row = value_mod.Row;
 pub const SeekableReader = seekable_reader.SeekableReader;
 pub const BackendCleanup = parquet_reader.BackendCleanup;
 pub const ChecksumOptions = parquet_reader.ChecksumOptions;
+pub const RowRanges = row_ranges_mod.RowRanges;
+pub const ColumnFilter = page_filter_mod.ColumnFilter;
 
 /// Options for DynamicReader initialization
 pub const DynamicReaderOptions = struct {
@@ -350,6 +356,190 @@ pub const DynamicReader = struct {
         return self.readRowsInternal(row_group_index, col_indices);
     }
 
+    /// Read rows from a row group, applying page-index-driven filters to skip
+    /// pages whose min/max ranges cannot match the predicates.
+    ///
+    /// Behavior:
+    ///   - Every leaf column in the row group must advertise an `OffsetIndex`;
+    ///     otherwise `error.PageIndexMissing` is returned (use `readAllRows`
+    ///     for unindexed files).
+    ///   - Only flat schemas are supported; `error.NestedNotSupported` is
+    ///     returned for nested / list / map / struct columns.
+    ///   - `filters` target leaf column indices. Columns without a filter are
+    ///     treated as wildcards (`full(rg_num_rows)`).
+    ///   - Pages whose row ranges don't intersect the final (intersected)
+    ///     `RowRanges` are never read or decompressed.
+    ///
+    /// The returned rows are in row-group order, restricted to the final
+    /// `RowRanges`. A stats-level predicate pushdown may still leave rows that
+    /// don't actually match — apply value-level predicates post-decode.
+    pub fn readRowsFiltered(
+        self: *Self,
+        row_group_index: usize,
+        filters: []const ColumnFilter,
+    ) ![]Row {
+        if (row_group_index >= self.metadata.row_groups.len) {
+            return try self.allocator.alloc(Row, 0);
+        }
+
+        // Route bytes through reader-owned arena, mirroring readRowsInternal.
+        const prev_bytes_alloc = value_mod.bytes_arena_allocator;
+        value_mod.bytes_arena_allocator = self.bytes_arena.allocator();
+        defer value_mod.bytes_arena_allocator = prev_bytes_alloc;
+
+        const rg = &self.metadata.row_groups[row_group_index];
+        const num_rows = try safeRowCount(rg.num_rows);
+        const num_leaf_columns = rg.columns.len;
+        if (num_rows == 0 or num_leaf_columns == 0) {
+            return try self.allocator.alloc(Row, 0);
+        }
+
+        // Flat-schema-only in this first cut.
+        const schema = self.metadata.schema;
+        const num_top: usize = if (schema.len > 0)
+            safe.castTo(usize, schema[0].num_children orelse 0) catch 0
+        else
+            0;
+        if (num_top != 0 and num_top != num_leaf_columns) {
+            return error.NestedNotSupported;
+        }
+
+        // Validate filter column indices.
+        for (filters) |f| {
+            if (f.column >= num_leaf_columns) return error.InvalidArgument;
+        }
+
+        // Load offset + column indexes for the whole row group.
+        var pir = page_index_reader_mod.PageIndexReader.init(self.allocator, self.getSource());
+        const offset_indexes = try pir.readOffsetIndexesForRowGroup(rg);
+        defer page_index_reader_mod.freeOptionalIndexes(format.OffsetIndex, self.allocator, offset_indexes);
+        for (offset_indexes) |oi| {
+            if (oi == null) return error.PageIndexMissing;
+        }
+        const column_indexes = try pir.readColumnIndexesForRowGroup(rg);
+        defer page_index_reader_mod.freeOptionalIndexes(format.ColumnIndex, self.allocator, column_indexes);
+
+        // Compute final_ranges by intersecting each filter's RowRanges.
+        var final_ranges = try RowRanges.full(self.allocator, num_rows);
+        defer final_ranges.deinit(self.allocator);
+
+        for (filters) |f| {
+            const oi_ref = &offset_indexes[f.column].?;
+            const ci_ref: ?*const format.ColumnIndex = if (column_indexes[f.column]) |*ci| ci else null;
+
+            var per_filter = try f.evaluate(ci_ref, oi_ref, num_rows, self.allocator);
+            defer per_filter.deinit(self.allocator);
+
+            const next = try RowRanges.intersect(self.allocator, final_ranges, per_filter);
+            final_ranges.deinit(self.allocator);
+            final_ranges = next;
+            // Early exit if the intersection is already empty — no column read needed.
+            if (final_ranges.isEmpty()) break;
+        }
+
+        if (final_ranges.isEmpty()) {
+            return try self.allocator.alloc(Row, 0);
+        }
+
+        // Per-column: fetch just the pages intersecting final_ranges and decode.
+        const column_values = try self.allocator.alloc([]Value, num_leaf_columns);
+        @memset(column_values, &.{});
+        defer {
+            for (column_values) |vals| {
+                for (vals) |v| v.deinit(self.allocator);
+                if (vals.len > 0) self.allocator.free(vals);
+            }
+            self.allocator.free(column_values);
+        }
+
+        const column_rg_indices = try self.allocator.alloc([]u64, num_leaf_columns);
+        @memset(column_rg_indices, &.{});
+        defer {
+            for (column_rg_indices) |idx| {
+                if (idx.len > 0) self.allocator.free(idx);
+            }
+            self.allocator.free(column_rg_indices);
+        }
+
+        for (0..num_leaf_columns) |col_idx| {
+            const chunk = &rg.columns[col_idx];
+            const oi = &offset_indexes[col_idx].?;
+
+            var page_result = try page_range_reader_mod.readSelectedPages(
+                self.allocator,
+                self.getSource(),
+                chunk,
+                oi,
+                final_ranges,
+                num_rows,
+            );
+            defer page_result.deinit(self.allocator);
+
+            if (page_result.data.len == 0) {
+                // Nothing selected for this column → no decoded values.
+                continue;
+            }
+
+            // Decode using the substituted buffer.
+            const decoded = try self.readColumnDynamicWithData(col_idx, row_group_index, page_result.data);
+            // We don't use def/rep levels in the flat path; free them if present.
+            if (decoded.def_levels) |dl| self.allocator.free(dl);
+            if (decoded.rep_levels) |rl| self.allocator.free(rl);
+
+            // Build the decoded-row-idx → rg-local-row-idx mapping, constrained
+            // to final_ranges. For flat columns, each decoded value is one row.
+            const total = decoded.values.len;
+            var kept_values = try std.ArrayList(Value).initCapacity(self.allocator, total);
+            errdefer {
+                for (kept_values.items) |v| v.deinit(self.allocator);
+                kept_values.deinit(self.allocator);
+            }
+            var kept_indices = try std.ArrayList(u64).initCapacity(self.allocator, total);
+            errdefer kept_indices.deinit(self.allocator);
+
+            for (decoded.values, 0..) |v, i| {
+                const rg_row = page_result.mapDecodedRow(i) orelse {
+                    // Shouldn't happen if the decoder produced the expected count.
+                    return error.InvalidPageData;
+                };
+                if (final_ranges.contains(rg_row)) {
+                    try kept_values.append(self.allocator, v);
+                    try kept_indices.append(self.allocator, rg_row);
+                } else {
+                    v.deinit(self.allocator);
+                }
+            }
+
+            // Free the now-drained values slice (values themselves were moved or freed above).
+            self.allocator.free(decoded.values);
+
+            column_values[col_idx] = try kept_values.toOwnedSlice(self.allocator);
+            column_rg_indices[col_idx] = try kept_indices.toOwnedSlice(self.allocator);
+        }
+
+        // Every column must agree on the kept row indices.
+        const first_non_empty = blk: {
+            for (column_rg_indices, 0..) |idx, i| {
+                if (idx.len > 0) break :blk i;
+            }
+            break :blk null;
+        };
+        if (first_non_empty == null) {
+            return try self.allocator.alloc(Row, 0);
+        }
+        const canonical = column_rg_indices[first_non_empty.?];
+        for (column_rg_indices) |idx| {
+            if (idx.len == 0) continue;
+            if (idx.len != canonical.len) return error.InconsistentPageAlignment;
+            for (idx, canonical) |a, b| {
+                if (a != b) return error.InconsistentPageAlignment;
+            }
+        }
+
+        // Assemble flat rows from the kept per-column values.
+        return self.assembleFlatRows(canonical.len, num_leaf_columns, column_values, null);
+    }
+
     fn readRowsInternal(self: *Self, row_group_index: usize, col_indices: ?[]const usize) ![]Row {
         if (row_group_index >= self.metadata.row_groups.len) {
             return try self.allocator.alloc(Row, 0);
@@ -490,15 +680,34 @@ pub const DynamicReader = struct {
 
     /// Read a single column dynamically
     fn readColumnDynamic(self: *Self, column_index: usize, row_group_index: usize) !column_decoder.DynamicDecodeResult {
+        return self.readColumnDynamicWithData(column_index, row_group_index, null);
+    }
+
+    /// Read a single column, optionally using caller-supplied page bytes.
+    ///
+    /// When `override_page_data` is non-null it must contain `[dict_page?]
+    /// [data_pages...]` in the layout produced by `PageRangeReader`. This is
+    /// the hook for filtered reads: the caller pre-reads just the data pages
+    /// whose rows intersect the wanted `RowRanges`.
+    fn readColumnDynamicWithData(
+        self: *Self,
+        column_index: usize,
+        row_group_index: usize,
+        override_page_data: ?[]const u8,
+    ) !column_decoder.DynamicDecodeResult {
         const rg = &self.metadata.row_groups[row_group_index];
         if (column_index >= rg.columns.len) return error.InvalidArgument;
 
         const chunk = &rg.columns[column_index];
         const meta = chunk.meta_data orelse return error.InvalidArgument;
 
-        // Read the raw page data
-        const page_data = try self.readColumnChunkData(chunk);
-        defer self.allocator.free(page_data);
+        // Read the raw page data (or use caller's buffer).
+        const owned_page_data: ?[]u8 = if (override_page_data == null)
+            try self.readColumnChunkData(chunk)
+        else
+            null;
+        defer if (owned_page_data) |pd| self.allocator.free(pd);
+        const page_data: []const u8 = owned_page_data orelse override_page_data.?;
 
         var pos: usize = 0;
 

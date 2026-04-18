@@ -1349,6 +1349,31 @@ def generate_multipage_large_column() -> dict:
     )
 
 
+def generate_multipage_with_page_index() -> dict:
+    """Multi-page column with page index emitted.
+
+    The id column is monotonically increasing so the ColumnIndex's
+    boundary_order is ascending, which tests that our reader correctly
+    consumes both ColumnIndex min/max and OffsetIndex first_row_index
+    when skipping pages.
+    """
+    num_rows = 4000
+    table = pa.table({
+        "id": pa.array(list(range(num_rows)), type=pa.int32()),
+        "bucket": pa.array([i // 1000 for i in range(num_rows)], type=pa.int32()),
+    })
+    return write_with_options(
+        table, "multipage", "with_page_index",
+        use_dictionary=False,
+        compression=None,
+        write_statistics=True,
+        row_group_size=num_rows,
+        data_page_size=1024,
+        data_page_version="1.0",
+        write_page_index=True,
+    )
+
+
 # =============================================================================
 # Main
 # =============================================================================
@@ -1434,6 +1459,7 @@ def main():
         # Multipage
         print("\nGenerating multipage files...")
         files.append(generate_multipage_large_column())
+        files.append(generate_multipage_with_page_index())
         
         # Edge cases
         print("\nGenerating edge case files...")

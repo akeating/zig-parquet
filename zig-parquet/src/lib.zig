@@ -123,6 +123,11 @@ pub const ChecksumOptions = reader_module.ChecksumOptions;
 pub const RowIterator = DynamicReader.RowIterator;
 pub const Row = value.Row;
 
+// Page-index filtering (read-time skip of pages whose min/max can't match).
+pub const page_filter = @import("core/page_filter.zig");
+pub const ColumnFilter = page_filter.ColumnFilter;
+pub const RowRanges = @import("core/row_ranges.zig").RowRanges;
+
 // SeekableReader interface (core)
 pub const SeekableReader = reader_module.SeekableReader;
 pub const BackendCleanup = reader_module.BackendCleanup;
