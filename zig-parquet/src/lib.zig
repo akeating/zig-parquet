@@ -682,6 +682,7 @@ test {
     _ = @import("core/page_index_reader.zig");
     _ = @import("core/page_filter.zig");
     _ = @import("core/page_range_reader.zig");
+    _ = @import("core/page_index_writer.zig");
     _ = internals.writer;
     _ = schema;
     _ = value;

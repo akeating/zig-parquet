@@ -37,6 +37,7 @@ const write_target = @import("write_target.zig");
 const value_mod = @import("value.zig");
 const core_writer = @import("writer.zig");
 const parquet_reader = @import("parquet_reader.zig");
+const page_index_writer = @import("page_index_writer.zig");
 
 const WriteTarget = write_target.WriteTarget;
 const WriteTargetWriter = write_target.WriteTargetWriter;
@@ -249,6 +250,10 @@ pub const DynamicWriter = struct {
     dictionary_size_limit: ?usize = 1_048_576, // 1MB default, matches Arrow/parquet-go
     dictionary_cardinality_threshold: ?f32 = null,
     write_page_checksum: bool = true,
+    /// Emit OffsetIndex + ColumnIndex blobs after each row group (pre-footer)
+    /// and patch `ColumnChunk` fields 4-7 to point to them. Currently covers
+    /// flat columns only; nested leaves are skipped silently.
+    write_page_index: bool = false,
 
     path_properties: std.StringHashMapUnmanaged(ColumnProperties) = .empty,
 
@@ -269,6 +274,9 @@ pub const DynamicWriter = struct {
     schema_arena: std.heap.ArenaAllocator,
 
     row_groups: std.ArrayListUnmanaged(RowGroupMeta) = .empty,
+    /// Per row group × leaf column, `null` means "no page index for this slot".
+    /// Nested leaves produce `null`; flat columns produce a populated builder.
+    page_index_builders: std.ArrayListUnmanaged([]?page_index_writer.PageIndexBuilder) = .empty,
     current_offset: i64 = 4, // after PAR1 magic
 
     sorting_columns: ?[]const format.SortingColumn = null,
@@ -797,6 +805,85 @@ pub const DynamicWriter = struct {
 
     // -- Flush (writes one row group) --
 
+    /// Build a single-page PageIndexBuilder entry from a flat-column write
+    /// result. The chunk emits exactly one data page in today's writer, so the
+    /// entry's first_row_index is always 0 and num_rows equals n.
+    fn recordFlatPage(
+        self: *DynamicWriter,
+        slot: *?page_index_writer.PageIndexBuilder,
+        result: *const column_writer.ColumnChunkResult,
+        n: usize,
+    ) DynamicWriterError!void {
+        const meta = result.metadata;
+
+        // Data page offset + compressed size. If the chunk carries a dict
+        // page, the dict occupies [file_offset, data_page_offset); we want
+        // only the data-page portion in OffsetIndex.
+        const dict_bytes: i64 = blk: {
+            if (meta.dictionary_page_offset) |d_off| {
+                if (d_off > 0) break :blk meta.data_page_offset - d_off;
+            }
+            break :blk 0;
+        };
+        const total_i64 = safe.castTo(i64, result.total_bytes) catch return error.IntegerOverflow;
+        const data_page_compressed = total_i64 - dict_bytes;
+        if (data_page_compressed <= 0) return; // defensive — shouldn't happen
+
+        // Extract stats. Without stats we can't produce a ColumnIndex for
+        // this page; emit an OffsetIndex-only builder by marking all_null.
+        var min_bytes: []const u8 = &.{};
+        var max_bytes: []const u8 = &.{};
+        var null_count: i64 = 0;
+        var all_null = true;
+        if (meta.statistics) |st| {
+            null_count = st.null_count orelse 0;
+            if (st.getMinBytes()) |mb| {
+                min_bytes = mb;
+                all_null = false;
+            }
+            if (st.getMaxBytes()) |mb| {
+                max_bytes = mb;
+                all_null = false;
+            }
+            if (null_count == safe.castTo(i64, n) catch @as(i64, std.math.maxInt(i32))) {
+                all_null = true;
+            }
+        }
+
+        var builder = page_index_writer.PageIndexBuilder.init(self.allocator, meta.type_, true);
+        errdefer builder.deinit();
+
+        const data_page_compressed_i32 = safe.castTo(i32, data_page_compressed) catch return error.IntegerOverflow;
+        const n_i64 = safe.castTo(i64, n) catch return error.TooManyValues;
+        builder.recordPage(
+            meta.data_page_offset,
+            data_page_compressed_i32,
+            0, // first_row_index
+            n_i64,
+            min_bytes,
+            max_bytes,
+            null_count,
+            all_null,
+        ) catch return error.OutOfMemory;
+
+        slot.* = builder;
+    }
+
+    /// Sum the leaf column count across every top-level column. Flat columns
+    /// contribute 1; nested columns delegate to their schema node.
+    fn countLeafColumns(self: *const DynamicWriter) DynamicWriterError!usize {
+        var total: usize = 0;
+        for (0..self.num_columns) |col| {
+            if (self.column_types[col] == .nested) {
+                const node = self.column_schema_nodes[col] orelse return error.InvalidState;
+                total += node.countLeafColumns();
+            } else {
+                total += 1;
+            }
+        }
+        return total;
+    }
+
     pub fn flush(self: *DynamicWriter) DynamicWriterError!void {
         if (!self.began) return error.InvalidState;
         if (self.column_buffers.len == 0) return;
@@ -817,6 +904,21 @@ pub const DynamicWriter = struct {
                 }
             }
             col_chunks_list.deinit(allocator);
+        }
+
+        // Page-index builders for this row group. Left as all-null when
+        // write_page_index is off; each populated slot corresponds to a flat
+        // column chunk we know how to index (single-page, non-nested).
+        var pi_builders: ?[]?page_index_writer.PageIndexBuilder = null;
+        errdefer if (pi_builders) |pb| {
+            for (pb) |*maybe| if (maybe.*) |*b| b.deinit();
+            allocator.free(pb);
+        };
+        if (self.write_page_index) {
+            const leaf_count = try self.countLeafColumns();
+            const builders = allocator.alloc(?page_index_writer.PageIndexBuilder, leaf_count) catch return error.OutOfMemory;
+            @memset(builders, null);
+            pi_builders = builders;
         }
 
         var total_byte_size: i64 = 0;
@@ -856,6 +958,12 @@ pub const DynamicWriter = struct {
                 }) catch return error.OutOfMemory;
                 total_byte_size += result.metadata.total_compressed_size;
                 self.current_offset += safe.castTo(i64, result.total_bytes) catch return error.IntegerOverflow;
+
+                // Record a single-page entry for this flat column chunk.
+                if (pi_builders) |pb| {
+                    const leaf_idx = col_chunks_list.items.len - 1;
+                    try self.recordFlatPage(&pb[leaf_idx], &result, n);
+                }
             }
         }
 
@@ -870,6 +978,19 @@ pub const DynamicWriter = struct {
             allocator.free(col_chunks);
             return error.OutOfMemory;
         };
+
+        // Transfer page-index builders for this row group into self's list.
+        // `pi_builders` is null when the feature is off; otherwise we always
+        // append a parallel slot (even if some entries are null for nested
+        // columns we don't index yet).
+        if (pi_builders) |pb| {
+            self.page_index_builders.append(allocator, pb) catch {
+                for (pb) |*maybe| if (maybe.*) |*b| b.deinit();
+                allocator.free(pb);
+                return error.OutOfMemory;
+            };
+            pi_builders = null;
+        }
 
         for (0..self.num_columns) |i| {
             self.column_buffers[i].clearRetainingCapacity();
@@ -1221,8 +1342,73 @@ pub const DynamicWriter = struct {
         if (self.column_buffers.len > 0 and self.column_buffers[0].items.len > 0) {
             try self.flush();
         }
+        if (self.write_page_index) {
+            try self.writePageIndexes();
+        }
         try self.writeFooter();
         self.target_writer.target.close() catch return error.WriteError;
+    }
+
+    /// Serialize ColumnIndex then OffsetIndex blobs for every row-group /
+    /// flat-column we accumulated during flush. For each emitted blob we
+    /// patch the corresponding `ColumnChunk` so the footer points at it.
+    ///
+    /// Layout: `[col_index_0_0][col_index_0_1]...[offset_index_0_0][offset_index_0_1]...`
+    /// for each row group in order, then the footer. Matches parquet-mr /
+    /// pyarrow convention (col indexes precede offset indexes).
+    fn writePageIndexes(self: *DynamicWriter) DynamicWriterError!void {
+        const allocator = self.allocator;
+        const writer = self.target_writer.writer();
+
+        // ColumnIndexes first.
+        for (self.page_index_builders.items, 0..) |builders, rg_idx| {
+            const rg = &self.row_groups.items[rg_idx];
+            for (builders, 0..) |*maybe, leaf_idx| {
+                const builder = if (maybe.*) |*b| b else continue;
+                if (leaf_idx >= rg.columns.len) continue;
+
+                const ci_opt = builder.buildColumnIndex(allocator) catch return error.OutOfMemory;
+                if (ci_opt == null) continue;
+                var ci = ci_opt.?;
+                defer ci.deinit(allocator);
+
+                var tw = thrift.CompactWriter.init(allocator);
+                defer tw.deinit();
+                ci.serialize(&tw) catch return error.OutOfMemory;
+                const blob = tw.getWritten();
+
+                writer.writeAll(blob) catch return error.WriteError;
+                const col_chunk = &rg.columns[leaf_idx];
+                col_chunk.column_index_offset = self.current_offset;
+                col_chunk.column_index_length = safe.castTo(i32, blob.len) catch return error.IntegerOverflow;
+                self.current_offset += safe.castTo(i64, blob.len) catch return error.IntegerOverflow;
+            }
+        }
+
+        // Then OffsetIndexes.
+        for (self.page_index_builders.items, 0..) |builders, rg_idx| {
+            const rg = &self.row_groups.items[rg_idx];
+            for (builders, 0..) |*maybe, leaf_idx| {
+                const builder = if (maybe.*) |*b| b else continue;
+                if (leaf_idx >= rg.columns.len) continue;
+
+                var oi = builder.buildOffsetIndex(allocator) catch return error.OutOfMemory;
+                defer oi.deinit(allocator);
+
+                var tw = thrift.CompactWriter.init(allocator);
+                defer tw.deinit();
+                oi.serialize(&tw) catch return error.OutOfMemory;
+                const blob = tw.getWritten();
+
+                writer.writeAll(blob) catch return error.WriteError;
+                const col_chunk = &rg.columns[leaf_idx];
+                col_chunk.offset_index_offset = self.current_offset;
+                col_chunk.offset_index_length = safe.castTo(i32, blob.len) catch return error.IntegerOverflow;
+                self.current_offset += safe.castTo(i64, blob.len) catch return error.IntegerOverflow;
+            }
+        }
+
+        self.target_writer.flush() catch return error.WriteError;
     }
 
     fn writeFooter(self: *DynamicWriter) DynamicWriterError!void {
@@ -1393,6 +1579,14 @@ pub const DynamicWriter = struct {
             allocator.free(rg.columns);
         }
         self.row_groups.deinit(allocator);
+
+        for (self.page_index_builders.items) |builders| {
+            for (builders) |*maybe| {
+                if (maybe.*) |*b| b.deinit();
+            }
+            allocator.free(builders);
+        }
+        self.page_index_builders.deinit(allocator);
 
         for (self.kv_metadata.items) |kv| {
             allocator.free(kv.key);

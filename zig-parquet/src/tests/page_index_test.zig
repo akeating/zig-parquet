@@ -159,6 +159,110 @@ test "page index: readRowsFiltered with impossible predicate returns empty" {
     try std.testing.expectEqual(@as(usize, 0), rows.len);
 }
 
+test "page index: writer emits + reader consumes round-trip" {
+    const allocator = std.testing.allocator;
+
+    // Write a small file with write_page_index enabled.
+    var writer = try parquet.createBufferDynamic(allocator);
+    defer writer.deinit();
+    writer.write_page_index = true;
+    writer.use_dictionary = false; // force plain so per-page stats aren't hidden
+
+    try writer.addColumn("a", parquet.TypeInfo.int32, .{});
+    try writer.addColumn("b", parquet.TypeInfo.int64, .{});
+    try writer.begin();
+
+    const N: i32 = 32;
+    for (0..@intCast(N)) |i| {
+        try writer.setInt32(0, @intCast(i));
+        try writer.setInt64(1, @as(i64, @intCast(i)) * 10);
+        try writer.addRow();
+    }
+    try writer.close();
+    const bytes = try writer.toOwnedSlice();
+    defer allocator.free(bytes);
+
+    // Read it back.
+    var reader = try parquet.openBufferDynamic(allocator, bytes, .{});
+    defer reader.deinit();
+
+    try std.testing.expectEqual(@as(i64, N), reader.metadata.num_rows);
+    const rg = &reader.metadata.row_groups[0];
+
+    // Both columns should carry index locators.
+    for (rg.columns) |chunk| {
+        try std.testing.expect(chunk.offset_index_offset != null);
+        try std.testing.expect(chunk.column_index_offset != null);
+        try std.testing.expect(chunk.offset_index_length.? > 0);
+        try std.testing.expect(chunk.column_index_length.? > 0);
+    }
+
+    var pir = @import("../core/page_index_reader.zig").PageIndexReader.init(allocator, reader.getSource());
+
+    // OffsetIndex for column 0: one page, first_row_index = 0.
+    var oi_a = (try pir.readOffsetIndex(&rg.columns[0])).?;
+    defer oi_a.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), oi_a.page_locations.len);
+    try std.testing.expectEqual(@as(i64, 0), oi_a.page_locations[0].first_row_index);
+    try std.testing.expect(oi_a.page_locations[0].compressed_page_size > 0);
+
+    // ColumnIndex for column 0: min=0, max=31, ascending (single-page trivially).
+    var ci_a = (try pir.readColumnIndex(&rg.columns[0])).?;
+    defer ci_a.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), ci_a.null_pages.len);
+    try std.testing.expectEqual(false, ci_a.null_pages[0]);
+    try std.testing.expectEqual(@as(i32, 0), std.mem.readInt(i32, ci_a.min_values[0][0..4], .little));
+    try std.testing.expectEqual(@as(i32, N - 1), std.mem.readInt(i32, ci_a.max_values[0][0..4], .little));
+
+    // Round-trip readRowsFiltered with equality predicate.
+    const page_filter = @import("../core/page_filter.zig");
+    const filter = page_filter.cmpI32(0, .eq, 7);
+    const rows = try reader.readRowsFiltered(0, &.{filter});
+    defer {
+        for (rows) |row| row.deinit();
+        allocator.free(rows);
+    }
+    // Single page contains everything, so all 32 rows come back (stats filter is
+    // conservative; it just confirms the page _might_ contain 7).
+    try std.testing.expectEqual(@as(usize, @intCast(N)), rows.len);
+
+    // Impossible predicate returns empty.
+    const impossible = page_filter.cmpI32(0, .eq, 10_000);
+    const empty_rows = try reader.readRowsFiltered(0, &.{impossible});
+    defer allocator.free(empty_rows);
+    try std.testing.expectEqual(@as(usize, 0), empty_rows.len);
+}
+
+test "page index: Zig-written file is readable by pyarrow (Direction 2)" {
+    const allocator = std.testing.allocator;
+
+    // Write a file with page index to the interop/ directory so test_interop.py
+    // (or a manual pyarrow invocation) can validate it.
+    std.Io.Dir.cwd().createDirPath(io, "../test-files-arrow/interop") catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+    const file = try std.Io.Dir.cwd().createFile(io, "../test-files-arrow/interop/page_index_roundtrip.parquet", .{});
+    defer file.close(io);
+
+    var writer = try parquet.createFileDynamic(allocator, file, io);
+    defer writer.deinit();
+    writer.write_page_index = true;
+    writer.use_dictionary = false;
+
+    try writer.addColumn("a", parquet.TypeInfo.int32, .{});
+    try writer.addColumn("b", parquet.TypeInfo.int64, .{});
+    try writer.begin();
+
+    const N: i32 = 64;
+    for (0..@intCast(N)) |i| {
+        try writer.setInt32(0, @intCast(i));
+        try writer.setInt64(1, @as(i64, @intCast(i)) * 10);
+        try writer.addRow();
+    }
+    try writer.close();
+}
+
 test "page index: intersecting filters narrow further than either alone" {
     const allocator = std.testing.allocator;
     var reader = try openFixture(allocator);
