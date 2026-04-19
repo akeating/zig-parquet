@@ -805,12 +805,12 @@ pub const DynamicWriter = struct {
 
     // -- Flush (writes one row group) --
 
-    /// Build a single-page PageIndexBuilder entry from a flat-column write
-    /// result. The chunk emits exactly one data page in today's writer, so the
-    /// entry's first_row_index is always 0 and num_rows equals n.
-    fn recordFlatPage(
-        self: *DynamicWriter,
-        slot: *?page_index_writer.PageIndexBuilder,
+    /// Record a single-page entry into `builder` using the chunk-level
+    /// metadata we already have. Used as the fallback for paths where
+    /// column_writer didn't emit per-page entries (e.g. dict-encoded chunks).
+    fn recordFlatPageInto(
+        _: *DynamicWriter,
+        builder: *page_index_writer.PageIndexBuilder,
         result: *const column_writer.ColumnChunkResult,
         n: usize,
     ) DynamicWriterError!void {
@@ -827,10 +827,8 @@ pub const DynamicWriter = struct {
         };
         const total_i64 = safe.castTo(i64, result.total_bytes) catch return error.IntegerOverflow;
         const data_page_compressed = total_i64 - dict_bytes;
-        if (data_page_compressed <= 0) return; // defensive — shouldn't happen
+        if (data_page_compressed <= 0) return; // defensive
 
-        // Extract stats. Without stats we can't produce a ColumnIndex for
-        // this page; emit an OffsetIndex-only builder by marking all_null.
         var min_bytes: []const u8 = &.{};
         var max_bytes: []const u8 = &.{};
         var null_count: i64 = 0;
@@ -850,23 +848,18 @@ pub const DynamicWriter = struct {
             }
         }
 
-        var builder = page_index_writer.PageIndexBuilder.init(self.allocator, meta.type_, true);
-        errdefer builder.deinit();
-
         const data_page_compressed_i32 = safe.castTo(i32, data_page_compressed) catch return error.IntegerOverflow;
         const n_i64 = safe.castTo(i64, n) catch return error.TooManyValues;
         builder.recordPage(
             meta.data_page_offset,
             data_page_compressed_i32,
-            0, // first_row_index
+            0,
             n_i64,
             min_bytes,
             max_bytes,
             null_count,
             all_null,
         ) catch return error.OutOfMemory;
-
-        slot.* = builder;
     }
 
     /// Sum the leaf column count across every top-level column. Flat columns
@@ -935,12 +928,23 @@ pub const DynamicWriter = struct {
                 const path: []const []const u8 = &.{col_name};
                 const opts = self.resolveOpts(col, &.{col_name});
                 const is_optional = !self.column_required[col];
+
+                // Pre-create the builder so column_writer can populate per-page
+                // entries directly (multi-page path).
+                const leaf_idx = col_chunks_list.items.len;
+                var pib_ptr: ?*page_index_writer.PageIndexBuilder = null;
+                if (pi_builders) |pb| {
+                    const phys = self.column_types[col].toPhysicalType() orelse return error.InvalidState;
+                    pb[leaf_idx] = page_index_writer.PageIndexBuilder.init(allocator, phys, true);
+                    pib_ptr = &pb[leaf_idx].?;
+                }
+
                 const result: column_writer.ColumnChunkResult = switch (self.column_types[col]) {
                     .bool_ => flushColumnBool(allocator, writer, path, items, n, self.current_offset, codec, is_optional, opts) catch |e| return mapFlushError(e),
-                    .int32 => flushColumnTyped(i32, allocator, writer, path, items, n, self.current_offset, codec, is_optional, opts) catch |e| return mapFlushError(e),
-                    .int64 => flushColumnTyped(i64, allocator, writer, path, items, n, self.current_offset, codec, is_optional, opts) catch |e| return mapFlushError(e),
-                    .float_ => flushColumnTyped(f32, allocator, writer, path, items, n, self.current_offset, codec, is_optional, opts) catch |e| return mapFlushError(e),
-                    .double_ => flushColumnTyped(f64, allocator, writer, path, items, n, self.current_offset, codec, is_optional, opts) catch |e| return mapFlushError(e),
+                    .int32 => flushColumnTyped(i32, allocator, writer, path, items, n, self.current_offset, codec, is_optional, opts, pib_ptr) catch |e| return mapFlushError(e),
+                    .int64 => flushColumnTyped(i64, allocator, writer, path, items, n, self.current_offset, codec, is_optional, opts, pib_ptr) catch |e| return mapFlushError(e),
+                    .float_ => flushColumnTyped(f32, allocator, writer, path, items, n, self.current_offset, codec, is_optional, opts, pib_ptr) catch |e| return mapFlushError(e),
+                    .double_ => flushColumnTyped(f64, allocator, writer, path, items, n, self.current_offset, codec, is_optional, opts, pib_ptr) catch |e| return mapFlushError(e),
                     .bytes => flushColumnBytes(allocator, writer, path, items, n, self.current_offset, codec, is_optional, opts) catch |e| return mapFlushError(e),
                     .fixed_bytes => flushColumnFixedBytes(
                         allocator, writer, path, items, n, self.current_offset, codec,
@@ -959,10 +963,13 @@ pub const DynamicWriter = struct {
                 total_byte_size += result.metadata.total_compressed_size;
                 self.current_offset += safe.castTo(i64, result.total_bytes) catch return error.IntegerOverflow;
 
-                // Record a single-page entry for this flat column chunk.
-                if (pi_builders) |pb| {
-                    const leaf_idx = col_chunks_list.items.len - 1;
-                    try self.recordFlatPage(&pb[leaf_idx], &result, n);
+                // If column_writer didn't populate the builder (dict path,
+                // bytes, bool, fixed_bytes), fall back to a single entry
+                // built from the chunk-level metadata.
+                if (pib_ptr) |pib| {
+                    if (pib.pageCount() == 0) {
+                        try self.recordFlatPageInto(pib, &result, n);
+                    }
                 }
             }
         }
@@ -1198,6 +1205,7 @@ pub const DynamicWriter = struct {
         codec: format.CompressionCodec,
         is_optional: bool,
         opts: EncodingOpts,
+        page_index_builder: ?*page_index_writer.PageIndexBuilder,
     ) !column_writer.ColumnChunkResult {
         const typed = try allocator.alloc(types.Optional(T), n);
         defer allocator.free(typed);
@@ -1211,6 +1219,7 @@ pub const DynamicWriter = struct {
             return column_writer.writeColumnChunkOptionalWithEncoding(
                 T, allocator, writer, path, typed,
                 is_optional, offset, codec, enc, opts.max_page_size, opts.write_page_checksum,
+                page_index_builder,
             );
         }
 
@@ -1223,6 +1232,7 @@ pub const DynamicWriter = struct {
             return column_writer.writeColumnChunkOptionalWithEncoding(
                 T, allocator, writer, path, typed,
                 is_optional, offset, codec, enc, opts.max_page_size, opts.write_page_checksum,
+                page_index_builder,
             );
         }
 

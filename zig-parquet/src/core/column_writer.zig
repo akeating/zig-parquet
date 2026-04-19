@@ -14,6 +14,7 @@ const compress = @import("compress/mod.zig");
 const rle_encoder = @import("encoding/rle_encoder.zig");
 const plain = @import("encoding/plain.zig");
 const statistics = @import("statistics.zig");
+const page_index_writer = @import("page_index_writer.zig");
 const safe = @import("safe.zig");
 const build_options = @import("build_options");
 const crc = std.hash.crc;
@@ -2026,6 +2027,8 @@ fn writeColumnChunkWithEncoding(
 /// This is the unified function that handles both nullable and non-nullable cases.
 /// Supports multi-page output when max_page_size is specified.
 /// is_optional: true if column is optional in schema (writes def levels), false for required columns.
+/// page_index_builder (optional) receives a PageEntry per emitted page so the
+/// caller can later emit OffsetIndex + ColumnIndex.
 pub fn writeColumnChunkOptionalWithEncoding(
     comptime T: type,
     allocator: std.mem.Allocator,
@@ -2038,6 +2041,7 @@ pub fn writeColumnChunkOptionalWithEncoding(
     value_encoding: format.Encoding,
     max_page_size: ?usize,
     write_page_checksum: bool,
+    page_index_builder: ?*page_index_writer.PageIndexBuilder,
 ) ColumnWriteError!ColumnChunkResult {
     // Compute statistics from Optional values (including null count)
     var stats_builder = statistics.StatisticsBuilder(T){};
@@ -2052,6 +2056,7 @@ pub fn writeColumnChunkOptionalWithEncoding(
     var total_uncompressed_written: usize = 0;
     var total_values: usize = 0;
     var offset: usize = 0;
+    var first_row_index: i64 = 0;
 
     while (offset < values.len) {
         const chunk_end = @min(offset + values_per_page, values.len);
@@ -2105,6 +2110,35 @@ pub fn writeColumnChunkOptionalWithEncoding(
         output.writeAll(compressed_data) catch return error.WriteError;
 
         const page_bytes = std.math.add(usize, header_bytes.len, compressed_data.len) catch return error.IntegerOverflow;
+
+        // Record this page into the PageIndexBuilder before advancing counters
+        // so we can compute the correct absolute offset.
+        if (page_index_builder) |pib| {
+            var per_page_stats = statistics.StatisticsBuilder(T){};
+            per_page_stats.updateOptional(chunk);
+            const per_page = per_page_stats.build(allocator) catch return error.OutOfMemory;
+            defer if (per_page) |st| freeStatistics(allocator, st);
+
+            const page_offset = start_offset + (safe.castTo(i64, total_bytes_written) catch return error.IntegerOverflow);
+            const null_count = if (per_page) |st| (st.null_count orelse 0) else 0;
+            const min_bytes: []const u8 = if (per_page) |st| (st.getMinBytes() orelse &.{}) else &.{};
+            const max_bytes: []const u8 = if (per_page) |st| (st.getMaxBytes() orelse &.{}) else &.{};
+            const chunk_len_i64 = safe.castTo(i64, chunk.len) catch return error.IntegerOverflow;
+            const all_null = null_count == chunk_len_i64;
+
+            pib.recordPage(
+                page_offset,
+                safe.castTo(i32, page_bytes) catch return error.IntegerOverflow,
+                first_row_index,
+                chunk_len_i64,
+                min_bytes,
+                max_bytes,
+                null_count,
+                all_null,
+            ) catch return error.OutOfMemory;
+            first_row_index = std.math.add(i64, first_row_index, chunk_len_i64) catch return error.IntegerOverflow;
+        }
+
         total_bytes_written = std.math.add(usize, total_bytes_written, page_bytes) catch return error.IntegerOverflow;
         const uncompressed_page_bytes = std.math.add(usize, header_bytes.len, page_result.data.len) catch return error.IntegerOverflow;
         total_uncompressed_written = std.math.add(usize, total_uncompressed_written, uncompressed_page_bytes) catch return error.IntegerOverflow;
@@ -2279,7 +2313,7 @@ pub fn writeColumnChunkOptionalWithPathArray(
     codec: format.CompressionCodec,
     write_page_checksum: bool,
 ) ColumnWriteError!ColumnChunkResult {
-    return writeColumnChunkOptionalWithEncoding(T, allocator, output, path_in_schema, values, is_optional, start_offset, codec, .plain, null, write_page_checksum);
+    return writeColumnChunkOptionalWithEncoding(T, allocator, output, path_in_schema, values, is_optional, start_offset, codec, .plain, null, write_page_checksum, null);
 }
 
 /// Write a byte array column chunk with Optional values (unified API).

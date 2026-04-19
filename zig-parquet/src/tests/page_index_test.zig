@@ -233,6 +233,75 @@ test "page index: writer emits + reader consumes round-trip" {
     try std.testing.expectEqual(@as(usize, 0), empty_rows.len);
 }
 
+test "page index: multi-page write captures distinct per-page min/max" {
+    const allocator = std.testing.allocator;
+
+    var writer = try parquet.createBufferDynamic(allocator);
+    defer writer.deinit();
+    writer.write_page_index = true;
+    writer.use_dictionary = false;
+    // 4 bytes per i32 * 64 = 256 bytes per page → 4 pages across 256 rows.
+    writer.max_page_size = 256;
+
+    try writer.addColumn("id", parquet.TypeInfo.int32, .{});
+    try writer.begin();
+
+    const N: i32 = 256;
+    for (0..@intCast(N)) |i| {
+        try writer.setInt32(0, @intCast(i));
+        try writer.addRow();
+    }
+    try writer.close();
+    const bytes = try writer.toOwnedSlice();
+    defer allocator.free(bytes);
+
+    var reader = try parquet.openBufferDynamic(allocator, bytes, .{});
+    defer reader.deinit();
+    const rg = &reader.metadata.row_groups[0];
+
+    var pir = @import("../core/page_index_reader.zig").PageIndexReader.init(allocator, reader.getSource());
+    var oi = (try pir.readOffsetIndex(&rg.columns[0])).?;
+    defer oi.deinit(allocator);
+    var ci = (try pir.readColumnIndex(&rg.columns[0])).?;
+    defer ci.deinit(allocator);
+
+    // Expect multiple pages.
+    try std.testing.expect(oi.page_locations.len > 1);
+    try std.testing.expectEqual(oi.page_locations.len, ci.null_pages.len);
+    try std.testing.expectEqual(format.BoundaryOrder.ascending, ci.boundary_order);
+
+    // Per-page min/max must reflect the id range in that page, not the chunk
+    // min/max. Verify each page covers a distinct window.
+    var prev_max: i32 = -1;
+    for (ci.min_values, ci.max_values, 0..) |mn_b, mx_b, i| {
+        const mn = std.mem.readInt(i32, mn_b[0..4], .little);
+        const mx = std.mem.readInt(i32, mx_b[0..4], .little);
+        try std.testing.expect(mn <= mx);
+        // Monotonically ascending id → this page's min must exceed the
+        // previous page's max.
+        if (i > 0) try std.testing.expect(mn > prev_max);
+        prev_max = mx;
+    }
+    try std.testing.expectEqual(@as(i32, 0), std.mem.readInt(i32, ci.min_values[0][0..4], .little));
+    try std.testing.expectEqual(@as(i32, N - 1), std.mem.readInt(i32, ci.max_values[ci.max_values.len - 1][0..4], .little));
+
+    // Filtered read: equality predicate should now narrow to one page of rows.
+    const page_filter = @import("../core/page_filter.zig");
+    const filter = page_filter.cmpI32(0, .eq, 130);
+    const rows = try reader.readRowsFiltered(0, &.{filter});
+    defer {
+        for (rows) |row| row.deinit();
+        allocator.free(rows);
+    }
+    try std.testing.expect(rows.len < @as(usize, @intCast(N))); // skipped some pages
+    try std.testing.expect(rows.len >= 1);
+    var saw_130 = false;
+    for (rows) |row| {
+        if (row.getColumn(0).?.asInt32().? == 130) saw_130 = true;
+    }
+    try std.testing.expect(saw_130);
+}
+
 test "page index: Zig-written file is readable by pyarrow (Direction 2)" {
     const allocator = std.testing.allocator;
 
