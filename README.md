@@ -30,6 +30,7 @@ The 1,365 KB figure includes all five Zig codecs. Per-codec cost (on top of a 99
 - **Dynamic Row API** - Runtime `DynamicWriter` / `DynamicReader` for all types and arbitrary nesting depth
 - **Schema-Agnostic Reading** - Read any Parquet file without knowing the schema at compile time
 - **Column Statistics** - Min/max/null_count in column metadata
+- **Page Index** - Read and write OffsetIndex + ColumnIndex; `readRowsFiltered` skips pages whose min/max can't match a predicate, reading only needed byte ranges
 - **Page-Level CRC Checksums** - Written by default, validated on read
 - **Key-Value Metadata** - Read and write arbitrary file-level metadata
 - **DataPage V1 and V2** - Read both page formats; write uses V1
@@ -74,6 +75,9 @@ pqi column data.parquet price quantity
 
 # Validate file integrity
 pqi validate data.parquet
+
+# Show OffsetIndex + ColumnIndex for each row group / column
+pqi page-index data.parquet
 ```
 
 ## Why zig-parquet?
@@ -218,6 +222,40 @@ for (0..reader.getNumRowGroups()) |rg| {
     // ... process matching rows ...
 }
 ```
+
+### Page-Index Filtering
+
+For files written with page indexes, `readRowsFiltered` evaluates column-level predicates against per-page min/max and reads only the pages whose ranges might match. Non-matching pages are never fetched from the source and never decompressed:
+
+```zig
+var reader = try parquet.openFileDynamic(allocator, file, .{});
+defer reader.deinit();
+
+// Keep rows where col 0 is between 100 and 200 AND col 1 equals the bytes "active".
+const filters = [_]parquet.ColumnFilter{
+    parquet.page_filter.betweenI32(0, 100, 200),
+    parquet.page_filter.cmpBytes(1, .eq, "active"),
+};
+
+const rows = try reader.readRowsFiltered(0, &filters);
+defer {
+    for (rows) |row| row.deinit();
+    allocator.free(rows);
+}
+```
+
+The filter is conservative: kept rows come from pages whose stats *could* match, so you may still need a value-level check post-decode. `readRowsFiltered` requires every leaf column in the row group to carry an `OffsetIndex`; use `readAllRows` for unindexed files.
+
+Writing files with indexes is opt-in:
+
+```zig
+var writer = try parquet.createFileDynamic(allocator, file);
+writer.write_page_index = true;
+writer.max_page_size = 64 * 1024; // roll pages at 64 KiB of encoded data
+// ... addColumn / begin / rows / close as usual
+```
+
+Per-page min/max is captured automatically during multi-page writes for non-dictionary-encoded flat primitive columns (i32/i64/f32/f64). Dictionary-encoded or byte-array columns still emit a valid single-page index with chunk-level stats. Inspect what you wrote with `pqi page-index <file>`.
 
 ### Row Iterator
 
@@ -395,8 +433,9 @@ writer.setMaxPageSize(1_048_576);      // 1MB page size limit
 | Column statistics | ✅ | min/max/null_count |
 | Multi-page columns | ✅ | Large column support |
 | Multi-row-group files | ✅ | |
+| Page Index (read) | ✅ | `readRowsFiltered` skips pages whose min/max can't match |
+| Page Index (write) | ✅ | Flat columns; nested-leaf emission is a follow-up |
 | Bloom filters | ⏳ | Planned |
-| Page Index | ⏳ | Planned |
 | CRC checksums | ✅ | Page-level CRC32 |
 | Encryption | 🔍 | Under review — Java/Python-only ecosystem support |
 
