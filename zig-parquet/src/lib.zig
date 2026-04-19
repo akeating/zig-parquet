@@ -127,6 +127,7 @@ pub const Row = value.Row;
 pub const page_filter = @import("core/page_filter.zig");
 pub const ColumnFilter = page_filter.ColumnFilter;
 pub const RowRanges = @import("core/row_ranges.zig").RowRanges;
+pub const PageIndexReader = @import("core/page_index_reader.zig").PageIndexReader;
 
 // SeekableReader interface (core)
 pub const SeekableReader = reader_module.SeekableReader;

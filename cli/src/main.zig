@@ -55,6 +55,8 @@ pub fn main(init: std.process.Init) !void {
         try runColumn(allocator, io, args[2..]);
     } else if (std.mem.eql(u8, command, "validate")) {
         try runValidate(allocator, io, args[2..]);
+    } else if (std.mem.eql(u8, command, "page-index")) {
+        try runPageIndex(allocator, io, args[2..]);
     } else if (std.mem.eql(u8, command, "version") or std.mem.eql(u8, command, "--version")) {
         try printVersion(io);
     } else if (std.mem.eql(u8, command, "--help") or std.mem.eql(u8, command, "-h")) {
@@ -88,6 +90,7 @@ fn printUsage(io: std.Io) !void {
         \\  size <file>                Show file size breakdown with percentages
         \\  column <file> [cols...]    Column detail across row groups
         \\  validate <file>            Validate file integrity (incl. CRC checksums)
+        \\  page-index <file>          Show OffsetIndex + ColumnIndex (pages per chunk)
         \\
         \\Validate options:
         \\  --no-checksum              Skip CRC32 page checksum validation
@@ -208,6 +211,14 @@ fn runColumn(allocator: std.mem.Allocator, io: std.Io, args: []const [:0]const u
     }
     const column_cmd = @import("commands/column.zig");
     try column_cmd.run(allocator, io, args[0], args[1..]);
+}
+
+fn runPageIndex(allocator: std.mem.Allocator, io: std.Io, args: []const [:0]const u8) !void {
+    if (args.len < 1) {
+        try stderrExit(io, "Error: page-index command requires a file path\n");
+    }
+    const page_index_cmd = @import("commands/page_index.zig");
+    try page_index_cmd.run(allocator, io, args[0]);
 }
 
 fn runValidate(allocator: std.mem.Allocator, io: std.Io, args: []const [:0]const u8) !void {
