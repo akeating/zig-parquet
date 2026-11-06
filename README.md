@@ -28,6 +28,7 @@ The 1,365 KB figure includes all five Zig codecs. Per-codec cost (on top of a 99
 - **Compression** - zstd, gzip, snappy, lz4, brotli — pure Zig by default, no C/C++ required; C backends available as opt-in via `-Dcodecs=c-only`
 - **Logical Types** - STRING, DATE, TIME, TIMESTAMP (millis/micros/nanos), DECIMAL, UUID, INT annotations, FLOAT16, ENUM, JSON, BSON, INTERVAL, GEOMETRY, GEOGRAPHY
 - **Dynamic Row API** - Runtime `DynamicWriter` / `DynamicReader` for all types and arbitrary nesting depth
+- **Column API** - Write one column at a time from a slice; read a row group's columns as Arrow arrays with contiguous value buffers (see [Column-Based API](#column-based-api))
 - **Schema-Agnostic Reading** - Read any Parquet file without knowing the schema at compile time
 - **Column Statistics** - Min/max/null_count in column metadata
 - **Page Index** - Read and write OffsetIndex + ColumnIndex; `readRowsFiltered` skips pages whose min/max can't match a predicate, reading only needed byte ranges
@@ -273,6 +274,58 @@ while (try iter.next()) |row| {
     std.debug.print("id={}\n", .{id});
 }
 ```
+
+### Column-Based API
+
+Write each column from one slice, and read each column back as an Arrow array whose values sit in one contiguous buffer. Full example: [`examples/basic/src/05_column_api.zig`](zig-parquet/examples/basic/src/05_column_api.zig).
+
+Write with `writeToFile` (or `writeToBuffer`) and one `writeColumnOptional` call per column. It takes a slice of `Optional(T)` for both required and nullable columns. List, map, struct and nested columns have their own `write*Column` functions.
+
+```zig
+const Optional = parquet.Optional;
+
+var writer = try parquet.writeToFile(allocator, file, io, &.{
+    .{ .name = "id", .type_ = .int64, .optional = false },
+    .{ .name = "score", .type_ = .double, .optional = true },
+});
+defer writer.deinit();
+
+try writer.writeColumnOptional(i64, 0, &[_]Optional(i64){ .{ .value = 1 }, .{ .value = 2 } });
+try writer.writeColumnOptional(f64, 1, &[_]Optional(f64){ .{ .value = 95.0 }, .null_value });
+try writer.close();
+```
+
+`writeColumn(T, index, []const T)` accepts a plain slice but is deprecated; it copies the slice into `Optional(T)` values and calls `writeColumnOptional`.
+
+Read with `readRowGroupAsArrow`, which returns one `ArrowArray` per top-level column of a row group, in [Arrow C Data Interface](https://arrow.apache.org/docs/format/CDataInterface.html) layout. Pass column indices to read a subset, or `null` for all columns:
+
+```zig
+var reader = try parquet.openFileDynamic(allocator, file, io, .{});
+defer reader.deinit();
+
+var result = try parquet.readRowGroupAsArrow(allocator, reader.getSource(), reader.metadata, 0, &.{0});
+defer result.deinit();
+
+const col = &result.arrays[0]; // column 0 ("id"), required, so it has no nulls
+const ids: [*]const i64 = @ptrCast(@alignCast(col.buffers[1].?));
+var total: i64 = 0;
+for (ids[0..@intCast(col.length)]) |id| total += id;
+```
+
+For a nullable column, check the validity bitmap in `buffers[0]` before using an entry; the values buffer still has a slot at each null position.
+
+Buffer layout:
+
+| Column type | `buffers[0]` | `buffers[1]` | `buffers[2]` |
+|---|---|---|---|
+| Primitive (int, float, bool, date, timestamp) | Validity bitmap, LSB first; `null` when the column has no nulls | Values (bool: bit-packed) | — |
+| Fixed-length byte array (UUID, interval, …) | Validity bitmap | Bytes, fixed width per entry (`w:N` in the schema) | — |
+| Byte array / string | Validity bitmap | `i32` offsets, `length + 1` entries | Bytes |
+| List, struct, map | Validity bitmap | Offsets (list, map) | — (values are in `children`) |
+
+`result.schema` is a struct `ArrowSchema` whose children give each column's Arrow type (format string), name and nullability. It describes every column in the file, also when `col_indices` selects a subset, so index `schema.children` by the original column index. `result.deinit()` releases all arrays and the schema. The same function is available to C callers as `zp_reader_read_row_group`, and `zp_reader_get_stream` returns an `ArrowArrayStream` over all row groups.
+
+The reader decodes each column into an intermediate per-value array and then copies it into the Arrow buffers, so a read allocates that intermediate array in addition to the returned buffers.
 
 ## Supported Types
 

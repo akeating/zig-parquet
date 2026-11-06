@@ -38,7 +38,8 @@ pub fn main(init: std.process.Init) !void {
 
     std.debug.print("Reading columns from {s}...\n", .{output_path});
 
-    // Read phase — DynamicReader returns rows of Value types
+    // Read phase — readRowGroupAsArrow returns one Arrow array per column,
+    // each with its values in one contiguous buffer
     {
         const file = try std.Io.Dir.cwd().openFile(io, output_path, .{});
         defer file.close(io);
@@ -46,24 +47,57 @@ pub fn main(init: std.process.Init) !void {
         var reader = try parquet.openFileDynamic(allocator, file, io, .{});
         defer reader.deinit();
 
-        const rows = try reader.readAllRows(0);
-        defer {
-            for (rows) |row| row.deinit();
-            allocator.free(rows);
-        }
+        // null reads all columns; pass e.g. &.{ 0, 2 } to read only those columns
+        var result = try parquet.readRowGroupAsArrow(allocator, reader.getSource(), reader.metadata, 0, null);
+        defer result.deinit();
 
-        for (rows) |row| {
-            const id_val = if (row.getColumn(0)) |v| v.asInt64() orelse 0 else 0;
-            const score_val = if (row.getColumn(1)) |v| v.asDouble() orelse 0 else 0;
-            const name_val = if (row.getColumn(2)) |v| v.asBytes() else null;
+        const id_col = &result.arrays[0];
+        const score_col = &result.arrays[1];
+        const name_col = &result.arrays[2];
 
-            if (name_val) |name| {
-                std.debug.print("ID {d}: score {d:.1}, name: {s}\n", .{ id_val, score_val, name });
+        // Primitive columns are slices: sum a column without touching the others
+        const scores = primitiveValues(f64, score_col);
+        var total: f64 = 0;
+        for (scores) |s| total += s;
+        std.debug.print("{d} scores, mean {d:.2}\n", .{ scores.len, total / @as(f64, @floatFromInt(scores.len)) });
+
+        const ids = primitiveValues(i64, id_col);
+        for (ids, scores, 0..) |id, score, i| {
+            if (isValid(name_col, i)) {
+                std.debug.print("ID {d}: score {d:.1}, name: {s}\n", .{ id, score, byteValue(name_col, i) });
             } else {
-                std.debug.print("ID {d}: score {d:.1}, name: (null)\n", .{ id_val, score_val });
+                std.debug.print("ID {d}: score {d:.1}, name: (null)\n", .{ id, score });
             }
         }
     }
 
     std.debug.print("Done!\n", .{});
+}
+
+// Helpers for reading Arrow C Data Interface buffers.
+// buffers[0] is the validity bitmap (null when the column has no nulls).
+// Primitive columns: buffers[1] holds the values.
+// Byte array / string columns: buffers[1] holds i32 offsets, buffers[2] the bytes.
+
+/// Values of a primitive column as a slice. Entries at null positions are undefined.
+fn primitiveValues(comptime T: type, arr: *const parquet.ArrowArray) []const T {
+    const start: usize = @intCast(arr.offset);
+    const len: usize = @intCast(arr.length);
+    const ptr: [*]const T = @ptrCast(@alignCast(arr.buffers[1].?));
+    return ptr[start..][0..len];
+}
+
+/// Whether entry `i` is non-null. The bitmap is LSB-first, one bit per entry.
+fn isValid(arr: *const parquet.ArrowArray, i: usize) bool {
+    const bitmap: [*]const u8 = @ptrCast(arr.buffers[0] orelse return true);
+    const bit = @as(usize, @intCast(arr.offset)) + i;
+    return (bitmap[bit / 8] >> @intCast(bit % 8)) & 1 == 1;
+}
+
+/// Entry `i` of a byte array or string column.
+fn byteValue(arr: *const parquet.ArrowArray, i: usize) []const u8 {
+    const offsets: [*]const i32 = @ptrCast(@alignCast(arr.buffers[1].?));
+    const data: [*]const u8 = @ptrCast(arr.buffers[2].?);
+    const j = @as(usize, @intCast(arr.offset)) + i;
+    return data[@intCast(offsets[j])..@intCast(offsets[j + 1])];
 }
