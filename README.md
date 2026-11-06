@@ -2,10 +2,10 @@
 
 A pure Zig Parquet library. All five compression codecs. No C dependencies. Runs anywhere.
 
-Built against Zig 0.16 — uses the unified `std.Io` reader/writer interfaces throughout.
+Requires Zig 0.17.0 or later. Uses the unified `std.Io` reader/writer interfaces throughout.
 
 [![CI](https://github.com/akeating/zig-parquet/actions/workflows/test.yml/badge.svg)](https://github.com/akeating/zig-parquet/actions/workflows/test.yml)
-[![Zig](https://img.shields.io/badge/Zig-0.16.0-f7a41d?logo=zig)](https://ziglang.org/)
+[![Zig](https://img.shields.io/badge/Zig-0.17-f7a41d?logo=zig)](https://ziglang.org/)
 [![License](https://img.shields.io/badge/License-MIT%2FApache--2.0-blue.svg)](COPYRIGHT)
 
 ## Build Sizes
@@ -473,7 +473,7 @@ See `examples/wasm_demo/` and `examples/wasm_freestanding/` for usage examples.
 
 ## Requirements
 
-- **Zig 0.16.0**
+- **Zig 0.17.0 or later**
 - No C compiler required for the default build (`-Dcodecs=all` uses pure Zig implementations)
 - C compiler only needed when opting into C codecs via `-Dcodecs=c-only` or individual codec names (e.g. `-Dcodecs=c-zstd`)
 - C++ compiler only needed for the C Snappy backend

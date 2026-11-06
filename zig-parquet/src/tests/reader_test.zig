@@ -285,11 +285,11 @@ test "read fixed_len_byte_array column values" {
     try std.testing.expectEqualSlices(u8, &expected_uuid1, rows[0].getColumn(7).?.asBytes().?);
 
     // uuid2 - all zeros
-    const expected_uuid2 = [_]u8{0} ** 16;
+    const expected_uuid2: [16]u8 = @splat(0);
     try std.testing.expectEqualSlices(u8, &expected_uuid2, rows[1].getColumn(7).?.asBytes().?);
 
     // uuid3 - all 0xff
-    const expected_uuid3 = [_]u8{0xff} ** 16;
+    const expected_uuid3: [16]u8 = @splat(0xff);
     try std.testing.expectEqualSlices(u8, &expected_uuid3, rows[2].getColumn(7).?.asBytes().?);
 
     // null

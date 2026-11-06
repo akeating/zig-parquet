@@ -334,11 +334,29 @@ fn resolveDeps(b: *std.Build, codecs: Codecs) Deps {
     };
 }
 
+/// Translates `src/core/compress/c/<name>.h` to Zig and adds it to `module` as the import
+/// `c_<name>`. Zig 0.17 removed `@cImport`; C headers are translated by the build system.
+fn addCImport(
+    b: *std.Build,
+    module: *std.Build.Module,
+    comptime name: []const u8,
+    include_paths: []const std.Build.LazyPath,
+) void {
+    const translate = b.addTranslateC(.{
+        .root_source_file = b.path("src/core/compress/c/" ++ name ++ ".h"),
+        .target = module.resolved_target.?,
+        .optimize = module.optimize.?,
+    });
+    for (include_paths) |path| translate.addIncludePath(path);
+    module.addImport("c_" ++ name, translate.createModule());
+}
+
 fn configureCodecs(module: *std.Build.Module, deps: Deps, b: *std.Build) void {
     if (!deps.codecs.anyC()) return;
 
     if (deps.lz4) |dep| {
         module.addIncludePath(dep.path("lib"));
+        addCImport(b, module, "lz4", &.{dep.path("lib")});
         module.addCSourceFile(.{
             .file = dep.path("lib/lz4.c"),
             .flags = &.{"-DXXH_NAMESPACE=LZ4_"},
@@ -347,6 +365,7 @@ fn configureCodecs(module: *std.Build.Module, deps: Deps, b: *std.Build) void {
 
     if (deps.brotli) |dep| {
         module.addIncludePath(dep.path("c/include"));
+        addCImport(b, module, "brotli", &.{dep.path("c/include")});
         for (brotli_common_sources) |src| {
             module.addCSourceFile(.{ .file = dep.path(src), .flags = &.{} });
         }
@@ -361,6 +380,7 @@ fn configureCodecs(module: *std.Build.Module, deps: Deps, b: *std.Build) void {
     if (deps.snappy) |dep| {
         module.addIncludePath(dep.path(""));
         module.addIncludePath(b.path("src/core/compress"));
+        addCImport(b, module, "snappy", &.{ dep.path(""), b.path("src/core/compress") });
         for (snappy_sources) |src| {
             module.addCSourceFile(.{
                 .file = dep.path(src),
@@ -372,6 +392,7 @@ fn configureCodecs(module: *std.Build.Module, deps: Deps, b: *std.Build) void {
 
     if (deps.zstd) |dep| {
         module.addIncludePath(dep.path("lib"));
+        addCImport(b, module, "zstd", &.{dep.path("lib")});
         for (zstd_common_sources) |src| {
             module.addCSourceFile(.{ .file = dep.path(src), .flags = zstd_flags });
         }
@@ -385,6 +406,7 @@ fn configureCodecs(module: *std.Build.Module, deps: Deps, b: *std.Build) void {
 
     if (deps.zlib) |dep| {
         module.addIncludePath(dep.path(""));
+        addCImport(b, module, "gzip", &.{dep.path("")});
         for (zlib_sources) |src| {
             module.addCSourceFile(.{ .file = dep.path(src), .flags = &.{} });
         }

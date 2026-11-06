@@ -376,7 +376,7 @@ pub const DecimalValue = struct {
         if (raw_bytes.len > 16) return error.InvalidDecimalLength;
 
         var result = DecimalValue{
-            .bytes = [_]u8{0} ** 16,
+            .bytes = @splat(0),
             .byte_len = safe.castTo(u8, raw_bytes.len) catch unreachable, // checked <= 16 above
             .precision = precision,
             .scale = scale,
@@ -539,7 +539,7 @@ pub fn Decimal(comptime precision: comptime_int, comptime scale: comptime_int) t
         /// Convert to the runtime DecimalValue type
         pub fn toDecimalValue(self: Self) DecimalValue {
             var dv = DecimalValue{
-                .bytes = [_]u8{0} ** 16,
+                .bytes = @splat(0),
                 .byte_len = byte_len,
                 .precision = precision,
                 .scale = scale,

@@ -5,6 +5,7 @@
 //! Reference: https://www.rfc-editor.org/rfc/rfc7932
 
 const std = @import("std");
+const test_util = @import("../test_util.zig");
 
 pub const Error = error{
     CompressionError,
@@ -219,7 +220,7 @@ const HuffmanTable = struct {
 
 fn buildHuffmanTable(allocator: std.mem.Allocator, code_lengths: []const u8, alphabet_size: u16) Error!HuffmanTable {
     // Count code lengths
-    var bl_count: [16]u16 = .{0} ** 16;
+    var bl_count: [16]u16 = @splat(0);
     for (code_lengths) |cl| {
         if (cl > 15) return error.DecompressionError;
         bl_count[cl] += 1;
@@ -227,7 +228,7 @@ fn buildHuffmanTable(allocator: std.mem.Allocator, code_lengths: []const u8, alp
     bl_count[0] = 0;
 
     // Compute next_code
-    var next_code: [16]u32 = .{0} ** 16;
+    var next_code: [16]u32 = @splat(0);
     var code: u32 = 0;
     for (1..16) |bits| {
         code = (code + bl_count[bits - 1]) << 1;
@@ -268,7 +269,7 @@ fn buildHuffmanTable(allocator: std.mem.Allocator, code_lengths: []const u8, alp
     }
 
     // Compute per-primary-key secondary table bit widths
-    var secondary_table_bits: [PRIMARY_TABLE_SIZE]u8 = .{0} ** PRIMARY_TABLE_SIZE;
+    var secondary_table_bits: [PRIMARY_TABLE_SIZE]u8 = @splat(0);
     var table_size: usize = PRIMARY_TABLE_SIZE;
     if (max_bits > PRIMARY_TABLE_BITS) {
         var temp_codes: [16]u32 = next_code;
@@ -296,7 +297,7 @@ fn buildHuffmanTable(allocator: std.mem.Allocator, code_lengths: []const u8, alp
     }
 
     // Build secondary table offset map
-    var secondary_offsets: [PRIMARY_TABLE_SIZE]u16 = .{0} ** PRIMARY_TABLE_SIZE;
+    var secondary_offsets: [PRIMARY_TABLE_SIZE]u16 = @splat(0);
     if (max_bits > PRIMARY_TABLE_BITS) {
         var offset: u16 = @intCast(PRIMARY_TABLE_SIZE);
         for (0..PRIMARY_TABLE_SIZE) |i| {
@@ -997,7 +998,7 @@ fn readHuffmanCode(allocator: std.mem.Allocator, reader: *BitReader, alphabet_si
         // Simple prefix code
         const nsym_minus1 = try reader.readBits(2);
         const nsym: u8 = @intCast(nsym_minus1 + 1);
-        var symbols: [4]u16 = .{0} ** 4;
+        var symbols: [4]u16 = @splat(0);
 
         // Number of bits per symbol: Log2Floor(alphabet_size - 1), matching C reference
         // C's Log2Floor counts right-shifts until 0, i.e. ceil(log2(x+1)) = number of bits needed
@@ -1101,7 +1102,7 @@ fn readComplexHuffmanCode(allocator: std.mem.Allocator, reader: *BitReader, alph
 // Actual complex Huffman code reading (replaces the above)
 fn readComplexHuffmanCodeWithSkip(allocator: std.mem.Allocator, reader: *BitReader, alphabet_size: u16, hskip: u32) Error!HuffmanTable {
     // Read code-length code lengths
-    var cl_code_lengths: [18]u8 = .{0} ** 18;
+    var cl_code_lengths: [18]u8 = @splat(0);
     var space: i32 = 32;
     var num_codes: usize = 0;
 
@@ -1777,7 +1778,7 @@ fn emitCompressedMetaBlockInner(writer: *BitWriter, block: []const u8, is_last: 
     try writer.writeBits(0, 1); // Distance context map: VarLenUint8=0 → 1 tree
 
     // --- Build literal Huffman code ---
-    var histogram = [_]u32{0} ** 256;
+    var histogram: [256]u32 = @splat(0);
     for (block) |byte| histogram[byte] += 1;
 
     // Count distinct symbols
@@ -1905,18 +1906,18 @@ fn buildAndEmitComplexCode(
     codes_out: *[256]u16,
 ) Error!void {
     // Build code lengths from histogram
-    var code_lengths: [256]u8 = .{0} ** 256;
+    var code_lengths: [256]u8 = @splat(0);
     buildCodeLengthsFromHistogram(histogram, &code_lengths, num_symbols);
 
     // Build canonical codes
-    var bl_count = [_]u32{0} ** 16;
+    var bl_count: [16]u32 = @splat(0);
     for (0..num_symbols) |i| {
         if (code_lengths[i] > 0 and code_lengths[i] <= 15) {
             bl_count[code_lengths[i]] += 1;
         }
     }
 
-    var next_code = [_]u32{0} ** 16;
+    var next_code: [16]u32 = @splat(0);
     {
         var code: u32 = 0;
         for (1..16) |bits| {
@@ -1939,13 +1940,13 @@ fn buildAndEmitComplexCode(
     try writer.writeBits(0, 2); // HSKIP=0
 
     // Build code-length histogram
-    var cl_histogram = [_]u32{0} ** 18;
+    var cl_histogram: [18]u32 = @splat(0);
     for (0..num_symbols) |i| {
         cl_histogram[code_lengths[i]] += 1;
     }
 
     // Build code-length code lengths (max 5 bits)
-    var cl_depths: [18]u8 = .{0} ** 18;
+    var cl_depths: [18]u8 = @splat(0);
     buildClCodeLengthsSimple(&cl_histogram, &cl_depths);
 
     // Emit code-length code lengths in specified order
@@ -1959,13 +1960,13 @@ fn buildAndEmitComplexCode(
     }
 
     // Build canonical codes for code-length symbols
-    var cl_bl_count = [_]u32{0} ** 6;
+    var cl_bl_count: [6]u32 = @splat(0);
     for (0..18) |i| {
         if (cl_depths[i] > 0 and cl_depths[i] <= 5) {
             cl_bl_count[cl_depths[i]] += 1;
         }
     }
-    var cl_next_code = [_]u32{0} ** 6;
+    var cl_next_code: [6]u32 = @splat(0);
     {
         var code: u32 = 0;
         for (1..6) |bits| {
@@ -1973,7 +1974,7 @@ fn buildAndEmitComplexCode(
             cl_next_code[bits] = code;
         }
     }
-    var cl_codes: [18]u32 = .{0} ** 18;
+    var cl_codes: [18]u32 = @splat(0);
     for (0..18) |i| {
         if (cl_depths[i] > 0) {
             cl_codes[i] = @intCast(reverseBits(cl_next_code[cl_depths[i]], cl_depths[i]));
@@ -2272,7 +2273,7 @@ fn writeTrivialCompressedBlock(writer: *BitWriter, block: []const u8, allocator:
 
     // Now write the Huffman codes
     // 1. Literal Huffman code: build from histogram
-    var histogram: [256]u32 = .{0} ** 256;
+    var histogram: [256]u32 = @splat(0);
     for (block) |byte| {
         histogram[byte] += 1;
     }
@@ -2467,14 +2468,14 @@ fn writeSimpleLiteralCode(writer: *BitWriter, histogram: *const [256]u32, num_sy
 
 fn writeComplexLiteralCode(writer: *BitWriter, histogram: *const [256]u32, allocator: std.mem.Allocator) !void {
     // Build optimal code lengths using package-merge or simple method
-    var code_lengths: [256]u8 = .{0} ** 256;
+    var code_lengths: [256]u8 = @splat(0);
     buildCodeLengths(histogram, &code_lengths);
 
     // Encode using complex prefix code
     try writer.writeBits(0, 2); // HSKIP=0
 
     // First encode the code-length code lengths
-    var cl_histogram: [18]u32 = .{0} ** 18;
+    var cl_histogram: [18]u32 = @splat(0);
     // Count what code length symbols we'll need
     for (0..256) |i| {
         if (code_lengths[i] > 0 and code_lengths[i] <= 15) {
@@ -2483,7 +2484,7 @@ fn writeComplexLiteralCode(writer: *BitWriter, histogram: *const [256]u32, alloc
     }
     // Also count zeros (we'll need repeat-zero for runs)
     // For simplicity, just emit each code length directly (no RLE)
-    var cl_code_lengths: [18]u8 = .{0} ** 18;
+    var cl_code_lengths: [18]u8 = @splat(0);
     buildClCodeLengths(&cl_histogram, &cl_code_lengths);
 
     // Write code-length code lengths in the specified order
@@ -2492,7 +2493,7 @@ fn writeComplexLiteralCode(writer: *BitWriter, histogram: *const [256]u32, alloc
     }
 
     // Build codes for code-length symbols
-    var cl_codes: [18]u32 = .{0} ** 18;
+    var cl_codes: [18]u32 = @splat(0);
     buildCanonicalCodes(&cl_code_lengths, &cl_codes, 18);
 
     // Write symbol code lengths
@@ -2641,7 +2642,7 @@ fn buildClCodeLengths(histogram: *const [18]u32, code_lengths: *[18]u8) void {
 }
 
 fn buildCanonicalCodes(code_lengths: anytype, codes: anytype, count: usize) void {
-    var bl_count: [16]u16 = .{0} ** 16;
+    var bl_count: [16]u16 = @splat(0);
     for (0..count) |i| {
         if (code_lengths[i] <= 15) {
             bl_count[code_lengths[i]] += 1;
@@ -2649,7 +2650,7 @@ fn buildCanonicalCodes(code_lengths: anytype, codes: anytype, count: usize) void
     }
     bl_count[0] = 0;
 
-    var next_code: [16]u32 = .{0} ** 16;
+    var next_code: [16]u32 = @splat(0);
     var code: u32 = 0;
     for (1..16) |bits| {
         code = (code + bl_count[bits - 1]) << 1;
@@ -2805,7 +2806,7 @@ test "brotli zig compress empty data" {
 
 test "brotli zig round-trip repeated data" {
     const allocator = std.testing.allocator;
-    const original = "ABCDEFGH" ** 200;
+    const original = test_util.repeatString(200, "ABCDEFGH");
     const compressed_data = try compress(allocator, original);
     defer allocator.free(compressed_data);
     const decompressed = try decompress(allocator, compressed_data, original.len);
@@ -2841,7 +2842,7 @@ test "buildHuffmanTable: lookup correctness" {
 
     // Test 2: codes > 8 bits (secondary tables)
     {
-        var cl: [300]u8 = .{0} ** 300;
+        var cl: [300]u8 = @splat(0);
         cl[0] = 1;
         for (1..10) |i| cl[i] = 9;
         var table = try buildHuffmanTable(allocator, &cl, 300);
@@ -2865,7 +2866,7 @@ test "buildHuffmanTable: lookup correctness" {
 
     // Test 3: mixed short (2,4-bit) and long (9-bit)
     {
-        var cl: [704]u8 = .{0} ** 704;
+        var cl: [704]u8 = @splat(0);
         cl[0] = 2; cl[1] = 2; cl[2] = 4; cl[3] = 4; cl[4] = 4; cl[5] = 4;
         cl[6] = 9; cl[7] = 9; cl[8] = 9; cl[9] = 9;
         var table = try buildHuffmanTable(allocator, &cl, 704);

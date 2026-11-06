@@ -120,7 +120,7 @@ const StreamHandle = struct {
     rg_index: usize,
 };
 
-var handle_table: [MAX_HANDLES]HandleSlot = [_]HandleSlot{.{ .empty = {} }} ** MAX_HANDLES;
+var handle_table: [MAX_HANDLES]HandleSlot = @splat(.{ .empty = {} });
 
 fn allocHandleSlot() i32 {
     for (&handle_table, 0..) |*slot, i| {

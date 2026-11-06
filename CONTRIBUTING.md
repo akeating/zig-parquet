@@ -5,7 +5,7 @@ Contributions are welcome! This document covers how to get started.
 ## Development Setup
 
 **Requirements:**
-- Zig 0.16.0
+- Zig 0.17.0 or later
 - C compiler (for compression libraries)
 - C++ compiler (for Snappy)
 

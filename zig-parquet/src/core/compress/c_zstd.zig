@@ -4,9 +4,7 @@
 
 const std = @import("std");
 
-const c = @cImport({
-    @cInclude("zstd.h");
-});
+const c = @import("c_zstd");
 
 pub const Error = error{
     CompressionError,

@@ -328,7 +328,7 @@ pub const DynamicWriter = struct {
         for (self.pending_columns.items) |col| {
             if (std.mem.eql(u8, col.name, name)) return error.DuplicateColumnName;
         }
-        const duped = self.allocator.dupeZ(u8, name) catch return error.OutOfMemory;
+        const duped = self.allocator.dupeSentinel(u8, name, 0) catch return error.OutOfMemory;
         errdefer self.allocator.free(duped);
         self.pending_columns.append(self.allocator, .{
             .name = duped,
@@ -345,7 +345,7 @@ pub const DynamicWriter = struct {
         for (self.pending_columns.items) |col| {
             if (std.mem.eql(u8, col.name, name)) return error.DuplicateColumnName;
         }
-        const duped = self.allocator.dupeZ(u8, name) catch return error.OutOfMemory;
+        const duped = self.allocator.dupeSentinel(u8, name, 0) catch return error.OutOfMemory;
         errdefer self.allocator.free(duped);
         self.pending_columns.append(self.allocator, .{
             .name = duped,

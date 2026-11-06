@@ -5,6 +5,7 @@
 //! Edge-case tests always run (Zig-only round-trips) with cross-validation when available.
 
 const std = @import("std");
+const test_util = @import("../core/test_util.zig");
 const build_options = @import("build_options");
 const c_lz4 = @import("../core/compress/c_lz4.zig");
 const zig_lz4 = @import("../core/compress/lz4.zig");
@@ -60,7 +61,7 @@ test "cross-impl: C compress, Zig decompress" {
     if (!both_enabled) return;
     const allocator = std.testing.allocator;
 
-    const original = "Hello, World! This is a cross-implementation LZ4 test." ** 20;
+    const original = test_util.repeatString(20, "Hello, World! This is a cross-implementation LZ4 test.");
 
     const compressed = try c_lz4.compress(allocator, original);
     defer allocator.free(compressed);
@@ -75,7 +76,7 @@ test "cross-impl: Zig compress, C decompress" {
     if (!both_enabled) return;
     const allocator = std.testing.allocator;
 
-    const original = "Hello, World! This is a cross-implementation LZ4 test." ** 20;
+    const original = test_util.repeatString(20, "Hello, World! This is a cross-implementation LZ4 test.");
 
     const compressed = try zig_lz4.compress(allocator, original);
     defer allocator.free(compressed);
@@ -90,7 +91,7 @@ test "cross-impl: bidirectional round-trip (all 4 combinations)" {
     if (!both_enabled) return;
     const allocator = std.testing.allocator;
 
-    const original = "ABCDEFGH" ** 200;
+    const original = test_util.repeatString(200, "ABCDEFGH");
 
     const c_compressed = try c_lz4.compress(allocator, original);
     defer allocator.free(c_compressed);
@@ -137,9 +138,9 @@ test "cross-impl: varied patterns" {
 
     const patterns = [_][]const u8{
         "short",
-        "a" ** 500,
-        "abcdefghijklmnop" ** 200,
-        "The quick brown fox jumps over the lazy dog. " ** 100,
+        test_util.repeatString(500, "a"),
+        test_util.repeatString(200, "abcdefghijklmnop"),
+        test_util.repeatString(100, "The quick brown fox jumps over the lazy dog. "),
     };
 
     for (patterns) |original| {

@@ -1,13 +1,11 @@
 //! LZ4 compression/decompression for Parquet
 //!
-//! Uses the LZ4 C library via @cImport.
+//! Uses the LZ4 C library via a translate-c module (see build.zig).
 //! Parquet uses LZ4_RAW codec (raw LZ4 block format, no framing).
 
 const std = @import("std");
 const safe = @import("../safe.zig");
-const c = @cImport({
-    @cInclude("lz4.h");
-});
+const c = @import("c_lz4");
 
 pub const Error = error{
     CompressionError,

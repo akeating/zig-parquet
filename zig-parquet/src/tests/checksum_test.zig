@@ -11,7 +11,6 @@ const thrift = @import("../core/thrift/mod.zig");
 
 const PageIterator = parquet_reader.PageIterator;
 const ChecksumOptions = parquet_reader.ChecksumOptions;
-const crc = std.hash.crc;
 
 test "computePageCrc returns i32 checksum" {
     // Verify the CRC32 helper function works correctly
@@ -34,7 +33,7 @@ test "CRC32 matches expected value" {
     // Test that our CRC32 implementation matches expected values
     // "123456789" has a well-known CRC32 checksum
     const test_data = "123456789";
-    const checksum = crc.Crc32.hash(test_data);
+    const checksum = std.hash.Crc32.hash(test_data);
 
     // CRC32 IEEE polynomial: "123456789" -> 0xCBF43926
     try std.testing.expectEqual(@as(u32, 0xCBF43926), checksum);

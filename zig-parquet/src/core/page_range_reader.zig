@@ -360,7 +360,7 @@ test "readSelectedPages: empty wanted produces empty result" {
     const chunk = format.ColumnChunk{
         .meta_data = format.ColumnMetaData{ .data_page_offset = 0 },
     };
-    const data = [_]u8{0} ** 100;
+    const data: [100]u8 = @splat(0);
     var src = Source{ .data = &data, .allocator = testing.allocator };
     defer src.deinit();
 

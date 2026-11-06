@@ -17,7 +17,6 @@ const statistics = @import("statistics.zig");
 const page_index_writer = @import("page_index_writer.zig");
 const safe = @import("safe.zig");
 const build_options = @import("build_options");
-const crc = std.hash.crc;
 
 const Optional = types.Optional;
 
@@ -39,7 +38,7 @@ fn DictHashContext(comptime K: type) type {
 
 /// Compute CRC32 checksum for page data (per Parquet spec, covers compressed data)
 pub fn computePageCrc(data: []const u8) i32 {
-    return @bitCast(crc.Crc32.hash(data));
+    return @bitCast(std.hash.Crc32.hash(data));
 }
 
 pub const ColumnWriteError = error{

@@ -598,7 +598,7 @@ fn decodeDictInt96WithDefLevels(
             if (ctx.int96_dict.?.get(dict_idx)) |bytes| {
                 result[i] = .{ .value = Int96.fromBytes(bytes) };
             } else {
-                result[i] = .{ .value = Int96.fromBytes([_]u8{0} ** 12) };
+                result[i] = .{ .value = Int96.fromBytes(@as([12]u8, @splat(0))) };
             }
         } else {
             result[i] = .{ .null_value = {} };

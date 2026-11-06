@@ -1,12 +1,9 @@
 //! Brotli compression/decompression for Parquet
 //!
-//! Uses the Brotli C library via @cImport.
+//! Uses the Brotli C library via a translate-c module (see build.zig).
 
 const std = @import("std");
-const c = @cImport({
-    @cInclude("brotli/decode.h");
-    @cInclude("brotli/encode.h");
-});
+const c = @import("c_brotli");
 
 pub const Error = error{
     CompressionError,

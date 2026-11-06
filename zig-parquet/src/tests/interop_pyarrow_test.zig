@@ -56,10 +56,10 @@ test "PyArrow interop: read UUID" {
     try std.testing.expectEqualSlices(u8, &.{ 0x12, 0x34, 0x56, 0x78, 0x12, 0x34, 0x56, 0x78, 0x12, 0x34, 0x56, 0x78, 0x12, 0x34, 0x56, 0x78 }, rows[0].getColumn(0).?.asBytes().?);
 
     // UUID "00000000-0000-0000-0000-000000000000"
-    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 16), rows[1].getColumn(0).?.asBytes().?);
+    try std.testing.expectEqualSlices(u8, &(@as([16]u8, @splat(0))), rows[1].getColumn(0).?.asBytes().?);
 
     // UUID "ffffffff-ffff-ffff-ffff-ffffffffffff"
-    try std.testing.expectEqualSlices(u8, &([_]u8{0xff} ** 16), rows[2].getColumn(0).?.asBytes().?);
+    try std.testing.expectEqualSlices(u8, &(@as([16]u8, @splat(0xff))), rows[2].getColumn(0).?.asBytes().?);
 
     // null
     try std.testing.expect(rows[3].getColumn(0).?.isNull());

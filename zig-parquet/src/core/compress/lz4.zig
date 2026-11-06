@@ -5,6 +5,7 @@
 //! Reference: https://github.com/lz4/lz4/blob/dev/doc/lz4_Block_format.md
 
 const std = @import("std");
+const test_util = @import("../test_util.zig");
 
 pub const Error = error{
     CompressionError,
@@ -147,7 +148,7 @@ fn lz4CompressBlock(src: []const u8, dst: []u8) usize {
         return writeLastLiterals(dst, 0, src[0..]);
     }
 
-    var hash_table: [HASH_SIZE]u32 = [_]u32{0} ** HASH_SIZE;
+    var hash_table: [HASH_SIZE]u32 = @splat(0);
     var dp: usize = 0;
     var anchor: usize = 0;
     var ip: usize = 1; // skip first byte
@@ -312,7 +313,7 @@ test "lz4 empty data" {
 
 test "lz4 round-trip repetitive data" {
     const allocator = std.testing.allocator;
-    const original = "abcdefgh" ** 1000;
+    const original = test_util.repeatString(1000, "abcdefgh");
 
     const compressed = try compress(allocator, original);
     defer allocator.free(compressed);

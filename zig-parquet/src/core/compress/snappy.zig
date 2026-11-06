@@ -4,6 +4,7 @@
 //! of the Snappy block format. No C/C++ dependencies.
 
 const std = @import("std");
+const test_util = @import("../test_util.zig");
 const safe = @import("../safe.zig");
 
 pub const Error = error{
@@ -351,7 +352,7 @@ test "snappy compress empty data" {
 
 test "snappy round-trip repetitive data" {
     const allocator = std.testing.allocator;
-    const original = "abcdefgh" ** 1000;
+    const original = test_util.repeatString(1000, "abcdefgh");
 
     const compressed = try compress(allocator, original);
     defer allocator.free(compressed);

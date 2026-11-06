@@ -6,6 +6,7 @@
 //! offset tracking, raw literals, and predefined FSE tables.
 
 const std = @import("std");
+const test_util = @import("../test_util.zig");
 const zstd_lib = std.compress.zstd;
 const safe = @import("../safe.zig");
 
@@ -691,7 +692,7 @@ test "zstd compress empty data" {
 
 test "zstd round-trip repetitive data" {
     const allocator = std.testing.allocator;
-    const original = "abcdefgh" ** 1000;
+    const original = test_util.repeatString(1000, "abcdefgh");
 
     const compressed = try compress(allocator, original);
     defer allocator.free(compressed);
@@ -720,7 +721,7 @@ test "zstd round-trip small data" {
 test "zstd round-trip multi-block data" {
     const allocator = std.testing.allocator;
     // 256KB > BLOCK_SIZE_MAX (128KB), forces at least 2 blocks
-    const original = "ABCDEFGHIJKLMNOP" ** (256 * 1024 / 16);
+    const original = test_util.repeatString(256 * 1024 / 16, "ABCDEFGHIJKLMNOP");
 
     const compressed = try compress(allocator, original);
     defer allocator.free(compressed);
@@ -791,7 +792,7 @@ test "zstd rep offsets improve columnar data compression" {
     const allocator = std.testing.allocator;
 
     // Simulate columnar data: repeating 8-byte pattern where rep[0] should fire
-    const original = "abcdefgh" ** 1000;
+    const original = test_util.repeatString(1000, "abcdefgh");
 
     const compressed = try compress(allocator, original);
     defer allocator.free(compressed);

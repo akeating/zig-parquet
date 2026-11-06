@@ -100,7 +100,7 @@ fn encodeBlock(buffer: *std.ArrayList(u8), allocator: std.mem.Allocator, deltas:
     try writeSignedVarint(buffer, allocator, min_delta);
 
     // Compute relative deltas and bit widths for each mini-block
-    var bit_widths: [NUM_MINI_BLOCKS]u8 = .{0} ** NUM_MINI_BLOCKS;
+    var bit_widths: [NUM_MINI_BLOCKS]u8 = @splat(0);
     var mini_block_idx: usize = 0;
     var delta_idx: usize = 0;
 

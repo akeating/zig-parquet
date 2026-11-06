@@ -6,9 +6,7 @@
 const std = @import("std");
 
 const safe = @import("../safe.zig");
-const c = @cImport({
-    @cInclude("zlib.h");
-});
+const c = @import("c_gzip");
 
 pub const Error = error{
     CompressionError,

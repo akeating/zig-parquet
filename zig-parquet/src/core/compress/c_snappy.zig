@@ -1,12 +1,10 @@
 //! Snappy compression/decompression for Parquet
 //!
-//! Uses the Snappy C library via @cImport.
+//! Uses the Snappy C library via a translate-c module (see build.zig).
 //! Note: Snappy is a C++ library with a C API (snappy-c.h).
 
 const std = @import("std");
-const c = @cImport({
-    @cInclude("snappy-c.h");
-});
+const c = @import("c_snappy");
 
 pub const Error = error{
     CompressionError,

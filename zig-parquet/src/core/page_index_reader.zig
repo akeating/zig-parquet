@@ -275,7 +275,7 @@ test "PageIndexReader: read single OffsetIndex" {
 }
 
 test "PageIndexReader: returns null when chunk has no index" {
-    const file = [_]u8{0} ** 100;
+    const file: [100]u8 = @splat(0);
     var src = BufferSource{ .data = &file };
     var pir = PageIndexReader.init(testing.allocator, src.reader());
 

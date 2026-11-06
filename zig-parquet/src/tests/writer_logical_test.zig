@@ -274,7 +274,7 @@ test "round-trip UUID logical type" {
 
         // 16-byte UUID values
         const uuid1 = [_]u8{ 0x12, 0x34, 0x56, 0x78, 0x12, 0x34, 0x56, 0x78, 0x12, 0x34, 0x56, 0x78, 0x12, 0x34, 0x56, 0x78 };
-        const uuid2 = [_]u8{0} ** 16;
+        const uuid2: [16]u8 = @splat(0);
         const values = [_][]const u8{ &uuid1, &uuid2 };
         try writer.writeColumnFixedByteArray(0, &values);
         try writer.close();

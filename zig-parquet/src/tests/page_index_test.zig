@@ -134,7 +134,7 @@ test "page index: readRowsFiltered on id between narrows to a page window" {
     }
 
     // Kept rows must at minimum cover every id in [2000, 2050].
-    var have: [51]bool = [_]bool{false} ** 51;
+    var have: [51]bool = @splat(false);
     for (rows) |row| {
         const id = row.getColumn(0).?.asInt32().?;
         if (id >= 2000 and id <= 2050) have[@intCast(id - 2000)] = true;
@@ -352,7 +352,7 @@ test "page index: intersecting filters narrow further than either alone" {
     }
 
     // Must include every id in [2000, 2100).
-    var have: [100]bool = [_]bool{false} ** 100;
+    var have: [100]bool = @splat(false);
     for (rows) |row| {
         const id = row.getColumn(0).?.asInt32().?;
         if (id >= 2000 and id < 2100) have[@intCast(id - 2000)] = true;

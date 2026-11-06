@@ -267,7 +267,7 @@ test "stop field" {
 
 test "malicious varint returns error instead of panicking" {
     // 11 bytes all with continuation bit set — would overflow u6 shift without the fix
-    const bad_varint = [_]u8{0x80} ** 11;
+    const bad_varint: [11]u8 = @splat(0x80);
     var reader = CompactReader.init(&bad_varint);
     try std.testing.expectError(error.VarIntTooLong, reader.readVarInt());
 }

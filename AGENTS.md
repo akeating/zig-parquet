@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-zig-parquet is a native Parquet library written in Zig 0.16.0. It provides read/write support for Parquet files, a C ABI, and a CLI tool (`pqi`). Read `README.md` for the full feature list and API examples.
+zig-parquet is a native Parquet library written in Zig 0.17 (minimum 0.17.0). It provides read/write support for Parquet files, a C ABI, and a CLI tool (`pqi`). Read `README.md` for the full feature list and API examples.
 
 ## Project Structure
 
@@ -62,13 +62,13 @@ make clean                             # Remove .zig-cache and zig-out everywher
 
 `CODECS` values: `all` (default), `none`, `zig-only`, `c-only`, or comma-separated list from `zstd,snappy,gzip,lz4,brotli` (Zig) and `c-zstd,c-snappy,c-gzip,c-lz4,c-brotli` (C/C++).
 
-## Zig 0.16.0 — Key API Patterns
+## Zig 0.17 — Key API Patterns
 
 Always search the codebase for existing patterns before writing new code.
 
 ### std.Io Interface
 
-Zig 0.16 uses a unified `std.Io` interface for all I/O. File operations require an `io: std.Io` parameter.
+Zig 0.16 and later use a unified `std.Io` interface for all I/O. File operations require an `io: std.Io` parameter.
 
 - **In `main`**: Accept `std.process.Init` — provides `init.io`, `init.gpa`
 - **In tests**: Use `std.testing.io`
@@ -148,6 +148,23 @@ return out.toOwnedSlice();
 var parsed = try std.json.parseFromSlice(MyData, allocator, json, .{});
 defer parsed.deinit();
 ```
+
+### Removed in Zig 0.17
+
+```zig
+// `**` (array/string repetition) was removed
+var counts: [16]u32 = @splat(0);                    // NOT .{0} ** 16
+foo(@as([12]u8, @splat(0)));                        // when the result type is not known
+const input = test_util.repeatString(20, "abc");   // NOT "abc" ** 20 (src/core/test_util.zig)
+
+// Allocator.dupeZ was removed
+const name_z = try allocator.dupeSentinel(u8, name, 0);
+
+// std.hash.crc.Crc32 moved
+const sum = std.hash.Crc32.hash(data);
+```
+
+`@cImport` was removed. C headers are translated by the build system: each C codec has a header in `src/core/compress/c/<name>.h`, `addCImport` in `build.zig` translates it, and the Zig code imports it with `@import("c_<name>")`.
 
 ### ArenaAllocator
 

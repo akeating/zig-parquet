@@ -368,13 +368,13 @@ const HuffmanTree = struct {
     fn genCodes(self: *HuffmanTree) void {
         // RFC 1951 §3.2.2 canonical Huffman code assignment
         // Step 1: count symbols per bit-length
-        var bl_count = [_]u32{0} ** 16;
+        var bl_count: [16]u32 = @splat(0);
         for (self.len.items) |len| {
             if (len > 0) bl_count[len] += 1;
         }
 
         // Step 2: compute starting code for each bit-length
-        var next_code = [_]u32{0} ** 16;
+        var next_code: [16]u32 = @splat(0);
         var code: u32 = 0;
         for (1..16) |bits| {
             code = (code + bl_count[bits - 1]) << 1;
@@ -434,8 +434,8 @@ const Deflater = struct {
         const d = try allocator.create(Deflater);
         d.* = .{
             .window = undefined,
-            .head = [_]u16{0} ** HASH_SIZE,
-            .prev = [_]u16{0} ** WINDOW_SIZE,
+            .head = @splat(0),
+            .prev = @splat(0),
         };
         return d;
     }

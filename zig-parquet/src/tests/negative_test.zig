@@ -300,7 +300,7 @@ test "DynamicWriter: close with no columns returns InvalidState" {
 test "V2 decoder: delta_binary_packed on BYTE_ARRAY returns UnsupportedEncoding" {
     const allocator = std.testing.allocator;
     const schema_elem = makeSchemaElem(.byte_array);
-    const dummy_data = &[_]u8{0} ** 8;
+    const dummy_data = &@as([8]u8, @splat(0));
 
     const result = column_decoder.decodeColumnDynamicV2(
         allocator,
@@ -321,7 +321,7 @@ test "V2 decoder: delta_binary_packed on BYTE_ARRAY returns UnsupportedEncoding"
 test "V2 decoder: byte_stream_split on BOOLEAN returns UnsupportedEncoding" {
     const allocator = std.testing.allocator;
     const schema_elem = makeSchemaElem(.boolean);
-    const dummy_data = &[_]u8{0} ** 8;
+    const dummy_data = &@as([8]u8, @splat(0));
 
     const result = column_decoder.decodeColumnDynamicV2(
         allocator,
@@ -342,7 +342,7 @@ test "V2 decoder: byte_stream_split on BOOLEAN returns UnsupportedEncoding" {
 test "V2 decoder: RLE on INT32 returns UnsupportedEncoding" {
     const allocator = std.testing.allocator;
     const schema_elem = makeSchemaElem(.int32);
-    const dummy_data = &[_]u8{0} ** 8;
+    const dummy_data = &@as([8]u8, @splat(0));
 
     const result = column_decoder.decodeColumnDynamicV2(
         allocator,
@@ -363,7 +363,7 @@ test "V2 decoder: RLE on INT32 returns UnsupportedEncoding" {
 test "V2 decoder: unknown encoding (bit_packed) returns UnsupportedEncoding" {
     const allocator = std.testing.allocator;
     const schema_elem = makeSchemaElem(.int32);
-    const dummy_data = &[_]u8{0} ** 8;
+    const dummy_data = &@as([8]u8, @splat(0));
 
     const result = column_decoder.decodeColumnDynamicV2(
         allocator,
@@ -401,7 +401,7 @@ test "reader: too-short file (no magic) returns error" {
 
 test "reader: wrong magic bytes returns error" {
     const allocator = std.testing.allocator;
-    var bad_magic = [_]u8{0} ** 64;
+    var bad_magic: [64]u8 = @splat(0);
     bad_magic[0] = 'X';
     bad_magic[1] = 'X';
     bad_magic[2] = 'X';

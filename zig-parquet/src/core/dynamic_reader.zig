@@ -59,11 +59,10 @@ pub const DynamicReaderOptions = struct {
 /// Composed from categorized error sets — no more `SchemaParseError` coalescing.
 pub const DynamicReaderError = errors_mod.DynamicReaderError;
 
-const crc = std.hash.crc;
 
 /// Compute CRC32 checksum for page data (per Parquet spec, covers compressed data)
 fn computePageCrc(data: []const u8) i32 {
-    return @bitCast(crc.Crc32.hash(data));
+    return @bitCast(std.hash.Crc32.hash(data));
 }
 
 /// Safely cast i32 page size/count to usize, validating non-negative.

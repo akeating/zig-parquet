@@ -274,7 +274,7 @@ pub const WriterHandle = struct {
             allocator.free(names);
         }
         for (col_defs, 0..) |*cd, i| {
-            names[i] = try allocator.dupeZ(u8, cd.name);
+            names[i] = try allocator.dupeSentinel(u8, cd.name, 0);
             cd.name = names[i];
         }
 
@@ -389,7 +389,7 @@ pub const RowReaderHandle = struct {
         var col: usize = 0;
         var idx: usize = 1;
         while (col < num_top and idx < schema.len) {
-            self.col_names[col] = try self.allocator.dupeZ(u8, schema[idx].name);
+            self.col_names[col] = try self.allocator.dupeSentinel(u8, schema[idx].name, 0);
             col += 1;
             idx = skipSubtree(schema, idx);
         }
