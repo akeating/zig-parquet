@@ -17,15 +17,21 @@ const safe = @import("../safe.zig");
 /// Decode RLE/bit-packed hybrid encoded data
 /// Returns a slice of u32 values (caller owns the memory)
 pub fn decode(allocator: std.mem.Allocator, data: []const u8, bit_width: u5, num_values: usize) ![]u32 {
+    const result = try allocator.alloc(u32, num_values);
+    errdefer allocator.free(result);
+    try decodeInto(data, bit_width, result);
+    return result;
+}
+
+/// Decode RLE/bit-packed hybrid encoded data into `result`, filling all of it.
+/// Entries the data does not cover are set to 0.
+pub fn decodeInto(data: []const u8, bit_width: u5, result: []u32) !void {
+    const num_values = result.len;
     if (bit_width == 0) {
         // All values are 0
-        const result = try allocator.alloc(u32, num_values);
         @memset(result, 0);
-        return result;
+        return;
     }
-
-    var result = try allocator.alloc(u32, num_values);
-    errdefer allocator.free(result);
 
     var pos: usize = 0;
     var out_idx: usize = 0;
@@ -82,8 +88,6 @@ pub fn decode(allocator: std.mem.Allocator, data: []const u8, bit_width: u5, num
         result[out_idx] = 0;
         out_idx += 1;
     }
-
-    return result;
 }
 
 /// Decode definition levels (special case for bool output)
@@ -113,6 +117,11 @@ pub fn decodeBitPackedLevels(allocator: std.mem.Allocator, data: []const u8, bit
     errdefer allocator.free(result);
     try decodeBitPacked(data, bit_width, result);
     return result;
+}
+
+/// Decode pure bit-packed levels into `result`, filling all of it.
+pub fn decodeBitPackedLevelsInto(data: []const u8, bit_width: u5, result: []u32) !void {
+    try decodeBitPacked(data, bit_width, result);
 }
 
 /// Calculate the byte size needed for bit-packed levels

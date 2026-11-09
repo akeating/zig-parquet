@@ -1,0 +1,784 @@
+//! Decoding of flat column chunks into Arrow-layout buffers.
+//!
+//! A flat column is a leaf with no repetition and a maximum definition level of 0 or 1: a
+//! top-level primitive column, required or optional. Each page is decoded directly into the
+//! output buffers; no `Value` is built per entry.
+//!
+//! Output (Arrow C Data Interface layout, native byte order):
+//! - `validity`: one bit per entry, LSB first, set when the entry is non-null. Bits past
+//!   `length` in the last byte are set.
+//! - `values`:
+//!     BOOLEAN: one bit per entry, LSB first.
+//!     INT32, FLOAT: 4 bytes per entry. INT64, DOUBLE: 8 bytes per entry.
+//!     INT96: 8 bytes per entry, converted to nanoseconds since the Unix epoch.
+//!     FIXED_LEN_BYTE_ARRAY: `type_length` bytes per entry.
+//!     BYTE_ARRAY: the entries' bytes back to back (at least 1 byte is allocated).
+//!   Null entries hold zero bytes (fixed width) or a zero bit (BOOLEAN), or add no bytes
+//!   (BYTE_ARRAY).
+//! - `offsets` (BYTE_ARRAY only): `length + 1` i32 offsets into `values`.
+//!
+//! Supported: PLAIN, PLAIN_DICTIONARY / RLE_DICTIONARY, RLE (BOOLEAN), DELTA_BINARY_PACKED
+//! (INT32, INT64), DELTA_LENGTH_BYTE_ARRAY (BYTE_ARRAY), DELTA_BYTE_ARRAY (BYTE_ARRAY,
+//! FIXED_LEN_BYTE_ARRAY) and BYTE_STREAM_SPLIT (INT32, INT64, FLOAT, DOUBLE,
+//! FIXED_LEN_BYTE_ARRAY), in V1 and V2 data pages.
+//!
+//! Malformed input returns an error instead of producing values: a value section shorter
+//! than the number of non-null entries needs, a dictionary index outside the dictionary, a
+//! dictionary-encoded page without a dictionary, and a delta-encoded page that holds fewer
+//! values than non-null entries. Level and dictionary-index streams follow `rle.decodeInto`,
+//! which sets entries the data does not cover to 0.
+
+const std = @import("std");
+const builtin = @import("builtin");
+const Allocator = std.mem.Allocator;
+
+const format = @import("format.zig");
+const safe = @import("safe.zig");
+const types = @import("types.zig");
+const thrift = @import("thrift/mod.zig");
+const compress = @import("compress/mod.zig");
+const parquet_reader = @import("parquet_reader.zig");
+const rle = @import("encoding/rle.zig");
+const delta_binary_packed = @import("encoding/delta_binary_packed.zig");
+const delta_length_byte_array = @import("encoding/delta_length_byte_array.zig");
+const delta_byte_array = @import("encoding/delta_byte_array.zig");
+
+const native_little = builtin.cpu.arch.endian() == .little;
+
+/// Upper bound on entries reserved before decoding, taken from the column chunk's
+/// `num_values`. That count comes from the file footer; past this bound, the buffers grow as
+/// pages are decoded instead.
+const max_reserved_entries: usize = 64 * 1024 * 1024;
+
+/// Alignment of the output buffers. The Arrow C Data Interface requires at least 8 bytes and
+/// recommends 64.
+pub const buffer_alignment: std.mem.Alignment = .@"64";
+pub const Buffer = []align(buffer_alignment.toByteUnits()) u8;
+const BufferList = std.array_list.Aligned(u8, buffer_alignment);
+
+/// Decoded column chunk. All slices are owned and allocated with the allocator passed to
+/// `decodeChunk`.
+pub const Buffers = struct {
+    length: usize,
+    null_count: usize,
+    validity: Buffer,
+    values: Buffer,
+    offsets: ?Buffer,
+
+    pub fn deinit(self: *Buffers, allocator: Allocator) void {
+        allocator.free(self.validity);
+        allocator.free(self.values);
+        if (self.offsets) |o| allocator.free(o);
+    }
+};
+
+/// Whether `decodeChunk` handles this column.
+pub fn isFlat(info: format.ColumnInfo) bool {
+    return info.max_rep_level == 0 and info.max_def_level <= 1;
+}
+
+/// Decodes all data pages of a flat column chunk. `page_data` is the column chunk's bytes as
+/// stored in the file (page headers and page bodies, starting with the dictionary page if
+/// there is one).
+pub fn decodeChunk(
+    allocator: Allocator,
+    page_data: []const u8,
+    meta: format.ColumnMetaData,
+    info: format.ColumnInfo,
+) !Buffers {
+    if (!isFlat(info)) return error.InvalidArgument;
+    const physical = info.element.type_ orelse return error.InvalidSchema;
+
+    var builder = Builder{
+        .allocator = allocator,
+        .kind = switch (physical) {
+            .boolean => .bits,
+            .int32, .float => .{ .fixed = 4 },
+            .int64, .double, .int96 => .{ .fixed = 8 },
+            .fixed_len_byte_array => .{ .fixed = try fixedLength(info.element) },
+            .byte_array => .bytes,
+        },
+    };
+    errdefer builder.deinit();
+    try builder.init(reservedEntries(meta.num_values));
+
+    var dec = ChunkDecoder{
+        .allocator = allocator,
+        .physical = physical,
+        .info = info,
+        .codec = meta.codec,
+        .dict_set = parquet_reader.DictionarySet.init(allocator),
+    };
+    defer dec.deinit();
+
+    var pos: usize = 0;
+
+    // A dictionary page can only be the first page of the chunk.
+    if (pos < page_data.len) {
+        var peek = thrift.CompactReader.init(page_data[pos..]);
+        const first = try format.PageHeader.parse(allocator, &peek);
+        defer parquet_reader.freePageHeaderContents(allocator, &first);
+
+        if (first.dictionary_page_header) |dph| {
+            pos += peek.pos;
+            const size = safe.cast(first.compressed_page_size) catch return error.InvalidPageSize;
+            const body = try safe.slice(page_data, pos, size);
+            pos += size;
+            const uncompressed = safe.cast(first.uncompressed_page_size) catch return error.InvalidPageSize;
+            const count = safe.cast(dph.num_values) catch return error.InvalidPageSize;
+            try dec.dict_set.initFromPage(body, count, physical, info.element.type_length, meta.codec, uncompressed);
+            try dec.buildDictView();
+        }
+    }
+
+    while (pos < page_data.len) {
+        var reader = thrift.CompactReader.init(page_data[pos..]);
+        const header = try format.PageHeader.parse(allocator, &reader);
+        defer parquet_reader.freePageHeaderContents(allocator, &header);
+        pos += reader.pos;
+
+        const size = safe.cast(header.compressed_page_size) catch return error.InvalidPageSize;
+        if (header.data_page_header == null and header.data_page_header_v2 == null) {
+            // Other page types (index pages, a second dictionary page) are skipped.
+            pos = std.math.add(usize, pos, size) catch page_data.len;
+            continue;
+        }
+        const body = try safe.slice(page_data, pos, size);
+        pos += size;
+
+        if (header.data_page_header) |dph| {
+            try dec.decodeV1Page(&builder, body, dph, header);
+        } else if (header.data_page_header_v2) |v2| {
+            try dec.decodeV2Page(&builder, body, v2, header);
+        }
+    }
+
+    return builder.finish();
+}
+
+fn fixedLength(element: format.SchemaElement) !usize {
+    const tl = element.type_length orelse return error.InvalidSchema;
+    return safe.cast(tl) catch return error.InvalidTypeLength;
+}
+
+fn reservedEntries(num_values: i64) usize {
+    const n = safe.cast(num_values) catch return 0;
+    return @min(n, max_reserved_entries);
+}
+
+fn bitBytes(n: usize) usize {
+    return n / 8 + @intFromBool(n % 8 != 0);
+}
+
+// =============================================================================
+// Output buffers
+// =============================================================================
+
+const Kind = union(enum) {
+    /// BOOLEAN: one bit per entry.
+    bits,
+    /// Fixed width in bytes.
+    fixed: usize,
+    /// BYTE_ARRAY: offsets and data.
+    bytes,
+};
+
+const Builder = struct {
+    allocator: Allocator,
+    kind: Kind,
+    length: usize = 0,
+    null_count: usize = 0,
+    validity: BufferList = .empty,
+    values: BufferList = .empty,
+    offsets: BufferList = .empty,
+
+    fn init(self: *Builder, entries: usize) !void {
+        try self.validity.ensureTotalCapacityPrecise(self.allocator, bitBytes(entries));
+        switch (self.kind) {
+            .bits => try self.values.ensureTotalCapacityPrecise(self.allocator, bitBytes(entries)),
+            .fixed => |w| try self.values.ensureTotalCapacityPrecise(self.allocator, try mulSize(entries, w)),
+            .bytes => {
+                try self.offsets.ensureTotalCapacityPrecise(self.allocator, try mulSize(entries + 1, 4));
+                self.offsets.appendSliceAssumeCapacity(std.mem.asBytes(&@as(i32, 0)));
+            },
+        }
+    }
+
+    fn deinit(self: *Builder) void {
+        self.validity.deinit(self.allocator);
+        self.values.deinit(self.allocator);
+        self.offsets.deinit(self.allocator);
+    }
+
+    /// Reserves room for `n` more entries in the validity bitmap, and in the values (fixed
+    /// width, bits) or offsets (byte arrays).
+    fn reserve(self: *Builder, n: usize) !void {
+        const total = std.math.add(usize, self.length, n) catch return error.OutOfMemory;
+        try self.validity.ensureTotalCapacity(self.allocator, bitBytes(total));
+        switch (self.kind) {
+            .bits => try self.values.ensureTotalCapacity(self.allocator, bitBytes(total)),
+            .fixed => |w| try self.values.ensureTotalCapacity(self.allocator, try mulSize(total, w)),
+            .bytes => try self.offsets.ensureTotalCapacity(self.allocator, try mulSize(total + 1, 4)),
+        }
+    }
+
+    /// Marks `n` more entries valid. Requires `reserve(n)`.
+    fn validRun(self: *Builder, n: usize) void {
+        const need = bitBytes(self.length + n) - self.validity.items.len;
+        self.validity.appendNTimesAssumeCapacity(0xFF, need);
+        self.length += n;
+    }
+
+    /// Marks one more entry valid or null. Requires `reserve`.
+    fn pushValidity(self: *Builder, valid: bool) void {
+        const i = self.length;
+        if (i % 8 == 0) self.validity.appendAssumeCapacity(0xFF);
+        if (!valid) {
+            self.validity.items[i / 8] &= ~(@as(u8, 1) << @intCast(i % 8));
+            self.null_count += 1;
+        }
+        self.length += 1;
+    }
+
+    /// Appends one bit to the BOOLEAN values. Call before `pushValidity` for the same entry.
+    /// Requires `reserve`.
+    fn pushBit(self: *Builder, bit: bool) void {
+        const i = self.length;
+        if (i % 8 == 0) self.values.appendAssumeCapacity(0);
+        if (bit) self.values.items[i / 8] |= @as(u8, 1) << @intCast(i % 8);
+    }
+
+    /// Appends the current data length as the next offset. Requires `reserve`.
+    fn pushOffset(self: *Builder) !void {
+        if (self.values.items.len > std.math.maxInt(i32)) return error.IntegerOverflow;
+        const end: i32 = @intCast(self.values.items.len);
+        self.offsets.appendSliceAssumeCapacity(std.mem.asBytes(&end));
+    }
+
+    fn finish(self: *Builder) !Buffers {
+        if (self.kind == .bytes and self.values.items.len == 0) {
+            // Arrow consumers expect a non-null data buffer.
+            try self.values.append(self.allocator, 0);
+        }
+        const validity = try self.validity.toOwnedSlice(self.allocator);
+        errdefer self.allocator.free(validity);
+        const values = try self.values.toOwnedSlice(self.allocator);
+        errdefer self.allocator.free(values);
+        const offsets: ?Buffer = if (self.kind == .bytes) try self.offsets.toOwnedSlice(self.allocator) else null;
+        self.offsets.deinit(self.allocator);
+        return .{
+            .length = self.length,
+            .null_count = self.null_count,
+            .validity = validity,
+            .values = values,
+            .offsets = offsets,
+        };
+    }
+};
+
+fn mulSize(a: usize, b: usize) error{OutOfMemory}!usize {
+    return std.math.mul(usize, a, b) catch error.OutOfMemory;
+}
+
+// =============================================================================
+// Page decoding
+// =============================================================================
+
+/// Dictionary entries in output form.
+const DictView = union(enum) {
+    none,
+    /// `count` entries of the column's fixed width, back to back, native byte order.
+    fixed: struct { bytes: []const u8, count: usize },
+    /// BYTE_ARRAY entries.
+    bytes: []const []const u8,
+};
+
+const ChunkDecoder = struct {
+    allocator: Allocator,
+    physical: format.PhysicalType,
+    info: format.ColumnInfo,
+    codec: format.CompressionCodec,
+    dict_set: parquet_reader.DictionarySet,
+    dict: DictView = .none,
+    /// Dictionary bytes built by `buildDictView` (INT96, FIXED_LEN_BYTE_ARRAY).
+    dict_owned: ?[]u8 = null,
+    /// Definition levels of the current page.
+    levels: std.ArrayList(u32) = .empty,
+    /// Dictionary indices or RLE booleans of the current page.
+    indices: std.ArrayList(u32) = .empty,
+    /// Dense values of the current page when they must be converted before copying.
+    scratch: std.ArrayList(u8) = .empty,
+
+    fn deinit(self: *ChunkDecoder) void {
+        self.dict_set.deinit();
+        if (self.dict_owned) |d| self.allocator.free(d);
+        self.levels.deinit(self.allocator);
+        self.indices.deinit(self.allocator);
+        self.scratch.deinit(self.allocator);
+    }
+
+    fn buildDictView(self: *ChunkDecoder) !void {
+        const ds = &self.dict_set;
+        self.dict = switch (self.physical) {
+            .int32 => if (ds.int32_dict) |d| fixedView(std.mem.sliceAsBytes(d.values), d.values.len) else .none,
+            .int64 => if (ds.int64_dict) |d| fixedView(std.mem.sliceAsBytes(d.values), d.values.len) else .none,
+            .float => if (ds.float32_dict) |d| fixedView(std.mem.sliceAsBytes(d.values), d.values.len) else .none,
+            .double => if (ds.float64_dict) |d| fixedView(std.mem.sliceAsBytes(d.values), d.values.len) else .none,
+            .byte_array => if (ds.string_dict) |d| .{ .bytes = d.values } else .none,
+            .int96 => blk: {
+                const d = ds.int96_dict orelse break :blk .none;
+                const nanos = try self.allocator.alloc(u8, try mulSize(d.values.len, 8));
+                self.dict_owned = nanos;
+                for (d.values, 0..) |raw, i| {
+                    const v = types.Int96.fromBytes(raw).toNanos();
+                    @memcpy(nanos[i * 8 ..][0..8], std.mem.asBytes(&v));
+                }
+                break :blk fixedView(nanos, d.values.len);
+            },
+            .fixed_len_byte_array => blk: {
+                const d = ds.fixed_byte_array_dict orelse break :blk .none;
+                const w = d.fixed_len;
+                const bytes = try self.allocator.alloc(u8, try mulSize(d.values.len, w));
+                self.dict_owned = bytes;
+                for (d.values, 0..) |entry, i| @memcpy(bytes[i * w ..][0..w], entry[0..w]);
+                break :blk fixedView(bytes, d.values.len);
+            },
+            .boolean => .none,
+        };
+    }
+
+    fn fixedView(bytes: []const u8, count: usize) DictView {
+        return .{ .fixed = .{ .bytes = bytes, .count = count } };
+    }
+
+    fn decodeV1Page(self: *ChunkDecoder, b: *Builder, body: []const u8, dph: format.DataPageHeader, header: format.PageHeader) !void {
+        const n = safe.cast(dph.num_values) catch return error.InvalidPageSize;
+        if (n == 0) return;
+
+        const decompressed = if (self.codec != .uncompressed) blk: {
+            const size = safe.cast(header.uncompressed_page_size) catch return error.InvalidPageSize;
+            break :blk compress.decompress(self.allocator, body, self.codec, size) catch return error.DecompressionError;
+        } else body;
+        defer if (self.codec != .uncompressed) self.allocator.free(decompressed);
+
+        var data = decompressed;
+        var levels: ?[]const u32 = null;
+        var non_null = n;
+        if (self.info.max_def_level > 0) {
+            const lv = try self.levelBuffer(n);
+            var offset: usize = 0;
+            if (dph.definition_level_encoding == .bit_packed) {
+                const len = rle.bitPackedSize(n, 1);
+                try rle.decodeBitPackedLevelsInto(try safe.slice(data, 0, len), 1, lv);
+                offset = len;
+            } else {
+                if (data.len < 4) return error.EndOfData;
+                const len: usize = std.mem.readInt(u32, data[0..4], .little);
+                try rle.decodeInto(try safe.slice(data, 4, len), 1, lv);
+                offset = 4 + len;
+            }
+            data = data[offset..];
+            non_null = countPresent(lv);
+            levels = lv;
+        }
+        try self.decodeValues(b, data, n, levels, non_null, dph.encoding);
+    }
+
+    fn decodeV2Page(self: *ChunkDecoder, b: *Builder, body: []const u8, v2: format.DataPageHeaderV2, header: format.PageHeader) !void {
+        const n = safe.cast(v2.num_values) catch return error.InvalidPageSize;
+        if (n == 0) return;
+        const rep_len = safe.cast(v2.repetition_levels_byte_length) catch return error.InvalidPageSize;
+        const def_len = safe.cast(v2.definition_levels_byte_length) catch return error.InvalidPageSize;
+        const levels_len = std.math.add(usize, rep_len, def_len) catch return error.EndOfData;
+        if (levels_len > body.len) return error.EndOfData;
+        const def_data = body[rep_len..levels_len];
+        const values_raw = body[levels_len..];
+
+        var allocated = false;
+        const data = if (v2.is_compressed and self.codec != .uncompressed) blk: {
+            const total = safe.cast(header.uncompressed_page_size) catch return error.InvalidPageSize;
+            if (total < levels_len) return error.EndOfData;
+            const size = total - levels_len;
+            if (size == 0 or values_raw.len == 0) break :blk values_raw;
+            allocated = true;
+            break :blk compress.decompress(self.allocator, values_raw, self.codec, size) catch return error.DecompressionError;
+        } else values_raw;
+        defer if (allocated) self.allocator.free(data);
+
+        var levels: ?[]const u32 = null;
+        var non_null = n;
+        if (self.info.max_def_level > 0 and def_data.len > 0) {
+            const lv = try self.levelBuffer(n);
+            try rle.decodeInto(def_data, 1, lv);
+            non_null = countPresent(lv);
+            levels = lv;
+        }
+        try self.decodeValues(b, data, n, levels, non_null, v2.encoding);
+    }
+
+    fn levelBuffer(self: *ChunkDecoder, n: usize) ![]u32 {
+        try self.levels.resize(self.allocator, n);
+        return self.levels.items;
+    }
+
+    fn countPresent(levels: []const u32) usize {
+        var count: usize = 0;
+        for (levels) |lv| count += @intFromBool(lv != 0);
+        return count;
+    }
+
+    /// Decodes the value section of a page with `n` entries, `non_null` of them present
+    /// (`levels[i] != 0`; all present when `levels` is null).
+    fn decodeValues(
+        self: *ChunkDecoder,
+        b: *Builder,
+        data: []const u8,
+        n: usize,
+        levels: ?[]const u32,
+        non_null: usize,
+        encoding: format.Encoding,
+    ) !void {
+        try b.reserve(n);
+        // A page without nulls takes the same path as a required column.
+        const lv = if (non_null == n) null else levels;
+
+        switch (encoding) {
+            .plain_dictionary, .rle_dictionary => {
+                const indices = try self.decodeIndices(data, non_null);
+                switch (self.dict) {
+                    .none => return error.InvalidPageData,
+                    .fixed => |d| try appendFixedDict(b, d.bytes, d.count, lv, n, indices),
+                    .bytes => |entries| try appendBytesDict(b, entries, lv, n, indices),
+                }
+            },
+            .plain => switch (b.kind) {
+                .bits => {
+                    if (data.len < bitBytes(non_null)) return error.EndOfData;
+                    appendBits(b, lv, n, PlainBits{ .data = data });
+                },
+                .bytes => try appendBytesPlain(b, lv, n, data),
+                .fixed => |w| {
+                    if (self.physical == .int96) {
+                        const dense = try self.int96ToNanos(data, non_null);
+                        try appendFixedDense(b, 8, lv, n, dense);
+                    } else {
+                        const len = try mulSize(non_null, w);
+                        if (data.len < len) return error.EndOfData;
+                        const dense = if (native_little or self.physical == .fixed_len_byte_array)
+                            data[0..len]
+                        else
+                            try self.swapToNative(data[0..len], w);
+                        try appendFixedDense(b, w, lv, n, dense);
+                    }
+                },
+            },
+            .rle => {
+                if (b.kind != .bits) return error.UnsupportedEncoding;
+                // RLE-encoded booleans are prefixed with their length (4 bytes, little-endian).
+                if (non_null > 0) {
+                    if (data.len < 4) return error.EndOfData;
+                    const len: usize = std.mem.readInt(u32, data[0..4], .little);
+                    const encoded = try safe.slice(data, 4, len);
+                    const bits = try self.indexBuffer(non_null);
+                    try rle.decodeInto(encoded, 1, bits);
+                    appendBits(b, lv, n, ListBits{ .values = bits });
+                } else {
+                    appendBits(b, lv, n, ListBits{ .values = &.{} });
+                }
+            },
+            .delta_binary_packed => switch (self.physical) {
+                .int32 => try self.appendDeltaInts(i32, b, data, lv, n, non_null),
+                .int64 => try self.appendDeltaInts(i64, b, data, lv, n, non_null),
+                else => return error.UnsupportedEncoding,
+            },
+            .delta_length_byte_array => {
+                var result = delta_length_byte_array.decode(self.allocator, data) catch |e| return mapEncodingError(e);
+                defer result.deinit();
+                try self.appendByteValues(b, lv, n, non_null, result.values);
+            },
+            .delta_byte_array => {
+                var result = delta_byte_array.decode(self.allocator, data) catch |e| return mapEncodingError(e);
+                defer result.deinit();
+                try self.appendByteValues(b, lv, n, non_null, result.values);
+            },
+            .byte_stream_split => switch (b.kind) {
+                .fixed => |w| {
+                    if (self.physical == .int96) return error.UnsupportedEncoding;
+                    const dense = try self.byteStreamSplit(data, non_null, w);
+                    try appendFixedDense(b, w, lv, n, dense);
+                },
+                else => return error.UnsupportedEncoding,
+            },
+            else => return error.UnsupportedEncoding,
+        }
+    }
+
+    /// Appends entries decoded by a DELTA_LENGTH_BYTE_ARRAY or DELTA_BYTE_ARRAY decoder.
+    fn appendByteValues(self: *ChunkDecoder, b: *Builder, levels: ?[]const u32, n: usize, non_null: usize, values: []const []const u8) !void {
+        if (values.len < non_null) return error.EndOfData;
+        switch (b.kind) {
+            .bytes => try appendBytesList(b, levels, n, values),
+            .fixed => |w| {
+                if (self.physical != .fixed_len_byte_array) return error.UnsupportedEncoding;
+                const dense = try self.scratchBuffer(try mulSize(non_null, w));
+                for (values[0..non_null], 0..) |v, i| {
+                    if (v.len != w) return error.InvalidPageData;
+                    @memcpy(dense[i * w ..][0..w], v);
+                }
+                try appendFixedDense(b, w, levels, n, dense);
+            },
+            .bits => return error.UnsupportedEncoding,
+        }
+    }
+
+    fn indexBuffer(self: *ChunkDecoder, n: usize) ![]u32 {
+        try self.indices.resize(self.allocator, n);
+        return self.indices.items;
+    }
+
+    fn scratchBuffer(self: *ChunkDecoder, n: usize) ![]u8 {
+        try self.scratch.resize(self.allocator, n);
+        return self.scratch.items;
+    }
+
+    /// Decodes `count` dictionary indices: one bit-width byte followed by RLE/bit-packed data.
+    /// The bit width is validated whenever it is present, also on pages without values.
+    fn decodeIndices(self: *ChunkDecoder, data: []const u8, count: usize) ![]const u32 {
+        if (data.len > 0 and data[0] > 31) return error.InvalidBitWidth;
+        if (count == 0) return &.{};
+        if (data.len == 0) return error.EndOfData;
+        const bit_width: u5 = @intCast(data[0]);
+        const out = try self.indexBuffer(count);
+        try rle.decodeInto(data[1..], bit_width, out);
+        return out;
+    }
+
+    fn int96ToNanos(self: *ChunkDecoder, data: []const u8, count: usize) ![]const u8 {
+        if (data.len < try mulSize(count, 12)) return error.EndOfData;
+        const out = try self.scratchBuffer(try mulSize(count, 8));
+        for (0..count) |i| {
+            const v = types.Int96.fromBytes(data[i * 12 ..][0..12].*).toNanos();
+            @memcpy(out[i * 8 ..][0..8], std.mem.asBytes(&v));
+        }
+        return out;
+    }
+
+    fn swapToNative(self: *ChunkDecoder, data: []const u8, w: usize) ![]const u8 {
+        const out = try self.scratchBuffer(data.len);
+        var i: usize = 0;
+        while (i < data.len) : (i += w) {
+            for (0..w) |j| out[i + j] = data[i + w - 1 - j];
+        }
+        return out;
+    }
+
+    /// BYTE_STREAM_SPLIT: byte j of entry i is at `data[j * count + i]`.
+    fn byteStreamSplit(self: *ChunkDecoder, data: []const u8, count: usize, w: usize) ![]const u8 {
+        if (data.len < try mulSize(count, w)) return error.EndOfData;
+        const out = try self.scratchBuffer(count * w);
+        for (0..w) |j| {
+            const stream = data[j * count ..][0..count];
+            for (stream, 0..) |byte, i| out[i * w + j] = byte;
+        }
+        return out;
+    }
+
+    fn appendDeltaInts(self: *ChunkDecoder, comptime T: type, b: *Builder, data: []const u8, levels: ?[]const u32, n: usize, non_null: usize) !void {
+        const decoded = (if (T == i32)
+            delta_binary_packed.decodeInt32(self.allocator, data)
+        else
+            delta_binary_packed.decodeInt64(self.allocator, data)) catch |e| return mapEncodingError(e);
+        defer self.allocator.free(decoded);
+        if (decoded.len < non_null) return error.EndOfData;
+        try appendFixedDense(b, @sizeOf(T), levels, n, std.mem.sliceAsBytes(decoded[0..non_null]));
+    }
+};
+
+fn mapEncodingError(e: anyerror) error{ OutOfMemory, InvalidPageData } {
+    return if (e == error.OutOfMemory) error.OutOfMemory else error.InvalidPageData;
+}
+
+// =============================================================================
+// Appending a page's entries
+// =============================================================================
+
+/// Appends `n` fixed-width entries. `dense` holds the non-null entries back to back.
+/// `levels` is null when all entries are present.
+fn appendFixedDense(b: *Builder, w: usize, levels: ?[]const u32, n: usize, dense: []const u8) !void {
+    const lv = levels orelse {
+        b.values.appendSliceAssumeCapacity(dense[0 .. n * w]);
+        b.validRun(n);
+        return;
+    };
+    switch (w) {
+        inline 4, 8 => |cw| scatterFixed(cw, b, lv, dense),
+        else => scatterFixedRuntime(w, b, lv, dense),
+    }
+}
+
+fn scatterFixed(comptime w: usize, b: *Builder, levels: []const u32, dense: []const u8) void {
+    var k: usize = 0;
+    for (levels) |lv| {
+        const present = lv != 0;
+        const dst = b.values.addManyAsArrayAssumeCapacity(w);
+        if (present) {
+            dst.* = dense[k * w ..][0..w].*;
+            k += 1;
+        } else {
+            dst.* = @splat(0);
+        }
+        b.pushValidity(present);
+    }
+}
+
+fn scatterFixedRuntime(w: usize, b: *Builder, levels: []const u32, dense: []const u8) void {
+    var k: usize = 0;
+    for (levels) |lv| {
+        const present = lv != 0;
+        const dst = b.values.addManyAsSliceAssumeCapacity(w);
+        if (present) {
+            @memcpy(dst, dense[k * w ..][0..w]);
+            k += 1;
+        } else {
+            @memset(dst, 0);
+        }
+        b.pushValidity(present);
+    }
+}
+
+/// Appends `n` fixed-width entries looked up in a dictionary of `count` entries.
+fn appendFixedDict(b: *Builder, dict: []const u8, count: usize, levels: ?[]const u32, n: usize, indices: []const u32) !void {
+    const w = b.kind.fixed;
+    switch (w) {
+        inline 4, 8 => |cw| try lookupFixed(cw, b, dict, count, levels, n, indices),
+        else => try lookupFixedRuntime(w, b, dict, count, levels, n, indices),
+    }
+}
+
+fn lookupFixed(comptime w: usize, b: *Builder, dict: []const u8, count: usize, levels: ?[]const u32, n: usize, indices: []const u32) !void {
+    if (levels) |lvs| {
+        var k: usize = 0;
+        for (lvs) |lv| {
+            const present = lv != 0;
+            const dst = b.values.addManyAsArrayAssumeCapacity(w);
+            if (present) {
+                const idx = indices[k];
+                if (idx >= count) return error.InvalidPageData;
+                dst.* = dict[idx * w ..][0..w].*;
+                k += 1;
+            } else {
+                dst.* = @splat(0);
+            }
+            b.pushValidity(present);
+        }
+    } else {
+        for (indices[0..n]) |idx| {
+            if (idx >= count) return error.InvalidPageData;
+            b.values.addManyAsArrayAssumeCapacity(w).* = dict[idx * w ..][0..w].*;
+        }
+        b.validRun(n);
+    }
+}
+
+fn lookupFixedRuntime(w: usize, b: *Builder, dict: []const u8, count: usize, levels: ?[]const u32, n: usize, indices: []const u32) !void {
+    var k: usize = 0;
+    for (0..n) |i| {
+        const present = if (levels) |lvs| lvs[i] != 0 else true;
+        const dst = b.values.addManyAsSliceAssumeCapacity(w);
+        if (present) {
+            const idx = indices[k];
+            if (idx >= count) return error.InvalidPageData;
+            @memcpy(dst, dict[idx * w ..][0..w]);
+            k += 1;
+        } else {
+            @memset(dst, 0);
+        }
+        b.pushValidity(present);
+    }
+}
+
+/// Appends `n` PLAIN byte-array entries: each non-null entry is a 4-byte little-endian length
+/// followed by that many bytes.
+fn appendBytesPlain(b: *Builder, levels: ?[]const u32, n: usize, data: []const u8) !void {
+    // The entries' bytes cannot exceed the page's value section.
+    try b.values.ensureUnusedCapacity(b.allocator, data.len);
+    var pos: usize = 0;
+    for (0..n) |i| {
+        const present = if (levels) |lvs| lvs[i] != 0 else true;
+        if (present) {
+            if (data.len - pos < 4) return error.EndOfData;
+            const len: usize = std.mem.readInt(u32, data[pos..][0..4], .little);
+            pos += 4;
+            if (data.len - pos < len) return error.EndOfData;
+            b.values.appendSliceAssumeCapacity(data[pos..][0..len]);
+            pos += len;
+        }
+        try b.pushOffset();
+        b.pushValidity(present);
+    }
+}
+
+/// Appends `n` byte-array entries looked up in a dictionary.
+fn appendBytesDict(b: *Builder, entries: []const []const u8, levels: ?[]const u32, n: usize, indices: []const u32) !void {
+    var total: usize = 0;
+    for (indices) |idx| {
+        if (idx >= entries.len) return error.InvalidPageData;
+        total = std.math.add(usize, total, entries[idx].len) catch return error.OutOfMemory;
+    }
+    try b.values.ensureUnusedCapacity(b.allocator, total);
+    var k: usize = 0;
+    for (0..n) |i| {
+        const present = if (levels) |lvs| lvs[i] != 0 else true;
+        if (present) {
+            b.values.appendSliceAssumeCapacity(entries[indices[k]]);
+            k += 1;
+        }
+        try b.pushOffset();
+        b.pushValidity(present);
+    }
+}
+
+/// Appends `n` byte-array entries from decoded values (non-null entries in order).
+fn appendBytesList(b: *Builder, levels: ?[]const u32, n: usize, values: []const []const u8) !void {
+    var k: usize = 0;
+    for (0..n) |i| {
+        const present = if (levels) |lvs| lvs[i] != 0 else true;
+        if (present) {
+            try b.values.appendSlice(b.allocator, values[k]);
+            k += 1;
+        }
+        try b.pushOffset();
+        b.pushValidity(present);
+    }
+}
+
+/// PLAIN booleans: bit k of `data` is the k-th non-null entry.
+const PlainBits = struct {
+    data: []const u8,
+    fn get(self: PlainBits, k: usize) bool {
+        return (self.data[k / 8] >> @intCast(k % 8)) & 1 == 1;
+    }
+};
+
+/// RLE booleans decoded to one u32 per non-null entry.
+const ListBits = struct {
+    values: []const u32,
+    fn get(self: ListBits, k: usize) bool {
+        return self.values[k] != 0;
+    }
+};
+
+/// Appends `n` boolean entries. The source must hold one bit per non-null entry.
+fn appendBits(b: *Builder, levels: ?[]const u32, n: usize, src: anytype) void {
+    var k: usize = 0;
+    for (0..n) |i| {
+        const present = if (levels) |lvs| lvs[i] != 0 else true;
+        if (present) {
+            b.pushBit(src.get(k));
+            k += 1;
+        } else {
+            b.pushBit(false);
+        }
+        b.pushValidity(present);
+    }
+}

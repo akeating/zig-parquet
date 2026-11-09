@@ -21,6 +21,7 @@ const types = @import("types.zig");
 const thrift = @import("thrift/mod.zig");
 const compress = @import("compress/mod.zig");
 const dictionary = @import("encoding/dictionary.zig");
+const flat_column = @import("flat_column.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -786,9 +787,18 @@ fn arrowStructToColumnDef(allocator: Allocator, schema: *const ArrowSchema, name
 // Private data for ArrowArray release callback
 // ============================================================================
 
+/// Alignment of every buffer this module allocates for an ArrowArray. The Arrow C Data
+/// Interface requires at least 8 bytes and recommends 64.
+pub const buffer_alignment: std.mem.Alignment = .@"64";
+pub const Buffer = []align(buffer_alignment.toByteUnits()) u8;
+
+fn allocBuffer(allocator: Allocator, len: usize) Allocator.Error!Buffer {
+    return allocator.alignedAlloc(u8, buffer_alignment, len);
+}
+
 const ArrayPrivateData = struct {
     allocator: Allocator,
-    buffer_allocs: [3]?[]u8,
+    buffer_allocs: [3]?Buffer,
     children_alloc: ?[]ArrowArray,
     children_ptrs_alloc: ?[]*ArrowArray,
     buffers_alloc: []?*anyopaque,
@@ -1383,12 +1393,12 @@ fn readListColumnAsArrow(
     }
 
     // Build offsets
-    const offsets_buf = allocator.alloc(u8, (num_rows + 1) * 4) catch return error.OutOfMemory;
+    const offsets_buf = allocBuffer(allocator, (num_rows + 1) * 4) catch return error.OutOfMemory;
     errdefer allocator.free(offsets_buf);
     const offsets: [*]i32 = @ptrCast(@alignCast(offsets_buf.ptr));
 
     const parent_bitmap_len = (num_rows + 7) / 8;
-    const parent_validity = allocator.alloc(u8, parent_bitmap_len) catch return error.OutOfMemory;
+    const parent_validity = allocBuffer(allocator, parent_bitmap_len) catch return error.OutOfMemory;
     errdefer allocator.free(parent_validity);
     @memset(parent_validity, 0xFF);
 
@@ -1459,7 +1469,7 @@ fn readStructColumnAsArrow(
     const nullable = if (schema_elem.repetition_type) |rt| rt == .optional else false;
 
     const bitmap_len = (num_rows + 7) / 8;
-    const validity = allocator.alloc(u8, bitmap_len) catch return error.OutOfMemory;
+    const validity = allocBuffer(allocator, bitmap_len) catch return error.OutOfMemory;
     errdefer allocator.free(validity);
     @memset(validity, 0xFF);
 
@@ -1531,12 +1541,12 @@ fn readMapColumnAsArrow(
     }
 
     // Build offsets from key rep levels
-    const offsets_buf = allocator.alloc(u8, (num_rows + 1) * 4) catch return error.OutOfMemory;
+    const offsets_buf = allocBuffer(allocator, (num_rows + 1) * 4) catch return error.OutOfMemory;
     errdefer allocator.free(offsets_buf);
     const offsets: [*]i32 = @ptrCast(@alignCast(offsets_buf.ptr));
 
     const parent_bitmap_len = (num_rows + 7) / 8;
-    const parent_validity = allocator.alloc(u8, parent_bitmap_len) catch return error.OutOfMemory;
+    const parent_validity = allocBuffer(allocator, parent_bitmap_len) catch return error.OutOfMemory;
     errdefer allocator.free(parent_validity);
     @memset(parent_validity, 0xFF);
 
@@ -1603,7 +1613,7 @@ fn readMapColumnAsArrow(
     key_array.release = null; // ownership transferred to entries_children
     val_array.release = null; // ownership transferred to entries_children
 
-    const entries_validity = allocator.alloc(u8, (num_entries + 7) / 8) catch return error.OutOfMemory;
+    const entries_validity = allocBuffer(allocator, (num_entries + 7) / 8) catch return error.OutOfMemory;
     var entries_validity_owned = true;
     errdefer if (entries_validity_owned) allocator.free(entries_validity);
     @memset(entries_validity, 0xFF);
@@ -1625,8 +1635,8 @@ fn buildListArray(
     allocator: Allocator,
     length: usize,
     null_count: i64,
-    validity: []u8,
-    offsets: []u8,
+    validity: Buffer,
+    offsets: Buffer,
     child: *ArrowArray,
 ) !ArrowArray {
     const pd = allocator.create(ArrayPrivateData) catch return error.OutOfMemory;
@@ -1675,7 +1685,7 @@ fn buildStructArray(
     allocator: Allocator,
     length: usize,
     null_count: i64,
-    validity: []u8,
+    validity: Buffer,
     children: []ArrowArray,
 ) !ArrowArray {
     const pd = allocator.create(ArrayPrivateData) catch return error.OutOfMemory;
@@ -1732,6 +1742,40 @@ fn readColumnAsArrow(
     const column_info = format.getColumnInfo(metadata.schema, col_idx) orelse
         return error.InvalidArgument;
 
+    if (flat_column.isFlat(column_info)) {
+        return decodeFlatChunk(allocator, page_data, meta, column_info);
+    }
+    return decodeLeafChunkViaValues(allocator, page_data, meta, column_info);
+}
+
+/// Decodes a flat column chunk (see `flat_column.isFlat`) directly into an ArrowArray.
+pub fn decodeFlatChunk(
+    allocator: Allocator,
+    page_data: []const u8,
+    meta: format.ColumnMetaData,
+    column_info: format.ColumnInfo,
+) ReaderError!ArrowArray {
+    var bufs = try flat_column.decodeChunk(allocator, page_data, meta, column_info);
+    const null_count = safe.castTo(i64, bufs.null_count) catch unreachable; // null_count <= length, an allocated entry count
+    const array = if (bufs.offsets) |offsets|
+        buildVariableArray(allocator, bufs.length, null_count, bufs.validity, offsets, bufs.values)
+    else
+        buildPrimitiveArray(allocator, bufs.length, null_count, bufs.validity, bufs.values);
+    return array catch |e| {
+        bufs.deinit(allocator);
+        return e;
+    };
+}
+
+/// Decodes a leaf column chunk through `Value`s. Used for leaf columns that are not flat
+/// (repeated, or nested under optional groups), and as the reference for `decodeFlatChunk`
+/// in tests.
+pub fn decodeLeafChunkViaValues(
+    allocator: Allocator,
+    page_data: []const u8,
+    meta: format.ColumnMetaData,
+    column_info: format.ColumnInfo,
+) !ArrowArray {
     var all_values: std.ArrayListUnmanaged(Value) = .empty;
     errdefer {
         for (all_values.items) |v| v.deinit(allocator);
@@ -1769,11 +1813,11 @@ fn boolValuesToArrow(allocator: Allocator, values: []const Value) !ArrowArray {
     const n = values.len;
     const bitmap_len = (n + 7) / 8;
 
-    const validity = try allocator.alloc(u8, bitmap_len);
+    const validity = try allocBuffer(allocator, bitmap_len);
     errdefer allocator.free(validity);
     @memset(validity, 0xFF);
 
-    const data = try allocator.alloc(u8, bitmap_len);
+    const data = try allocBuffer(allocator, bitmap_len);
     errdefer allocator.free(data);
     @memset(data, 0);
 
@@ -1805,11 +1849,11 @@ fn int32ValuesToArrow(allocator: Allocator, values: []const Value) !ArrowArray {
     const n = values.len;
     const bitmap_len = (n + 7) / 8;
 
-    const validity = try allocator.alloc(u8, bitmap_len);
+    const validity = try allocBuffer(allocator, bitmap_len);
     errdefer allocator.free(validity);
     @memset(validity, 0xFF);
 
-    const data = try allocator.alloc(u8, n * 4);
+    const data = try allocBuffer(allocator, n * 4);
     errdefer allocator.free(data);
     const typed: [*]i32 = @ptrCast(@alignCast(data.ptr));
 
@@ -1837,11 +1881,11 @@ fn int64ValuesToArrow(allocator: Allocator, values: []const Value) !ArrowArray {
     const n = values.len;
     const bitmap_len = (n + 7) / 8;
 
-    const validity = try allocator.alloc(u8, bitmap_len);
+    const validity = try allocBuffer(allocator, bitmap_len);
     errdefer allocator.free(validity);
     @memset(validity, 0xFF);
 
-    const data = try allocator.alloc(u8, n * 8);
+    const data = try allocBuffer(allocator, n * 8);
     errdefer allocator.free(data);
     const typed: [*]i64 = @ptrCast(@alignCast(data.ptr));
 
@@ -1869,11 +1913,11 @@ fn floatValuesToArrow(allocator: Allocator, values: []const Value) !ArrowArray {
     const n = values.len;
     const bitmap_len = (n + 7) / 8;
 
-    const validity = try allocator.alloc(u8, bitmap_len);
+    const validity = try allocBuffer(allocator, bitmap_len);
     errdefer allocator.free(validity);
     @memset(validity, 0xFF);
 
-    const data = try allocator.alloc(u8, n * 4);
+    const data = try allocBuffer(allocator, n * 4);
     errdefer allocator.free(data);
     const typed: [*]f32 = @ptrCast(@alignCast(data.ptr));
 
@@ -1901,11 +1945,11 @@ fn doubleValuesToArrow(allocator: Allocator, values: []const Value) !ArrowArray 
     const n = values.len;
     const bitmap_len = (n + 7) / 8;
 
-    const validity = try allocator.alloc(u8, bitmap_len);
+    const validity = try allocBuffer(allocator, bitmap_len);
     errdefer allocator.free(validity);
     @memset(validity, 0xFF);
 
-    const data = try allocator.alloc(u8, n * 8);
+    const data = try allocBuffer(allocator, n * 8);
     errdefer allocator.free(data);
     const typed: [*]f64 = @ptrCast(@alignCast(data.ptr));
 
@@ -1933,7 +1977,7 @@ fn byteArrayValuesToArrow(allocator: Allocator, values: []const Value) !ArrowArr
     const n = values.len;
     const bitmap_len = (n + 7) / 8;
 
-    const validity = try allocator.alloc(u8, bitmap_len);
+    const validity = try allocBuffer(allocator, bitmap_len);
     errdefer allocator.free(validity);
     @memset(validity, 0xFF);
 
@@ -1947,12 +1991,12 @@ fn byteArrayValuesToArrow(allocator: Allocator, values: []const Value) !ArrowArr
     }
 
     // Offsets buffer (n+1 int32 values)
-    const offsets_buf = try allocator.alloc(u8, (n + 1) * 4);
+    const offsets_buf = try allocBuffer(allocator, (n + 1) * 4);
     errdefer allocator.free(offsets_buf);
     const offsets: [*]i32 = @ptrCast(@alignCast(offsets_buf.ptr));
 
     // Data buffer
-    const data_buf = try allocator.alloc(u8, if (total_len > 0) total_len else 1);
+    const data_buf = try allocBuffer(allocator, if (total_len > 0) total_len else 1);
     errdefer allocator.free(data_buf);
 
     var null_count: i64 = 0;
@@ -1984,11 +2028,11 @@ fn fixedByteArrayValuesToArrow(allocator: Allocator, values: []const Value, elem
     const n = values.len;
     const bitmap_len = (n + 7) / 8;
 
-    const validity = try allocator.alloc(u8, bitmap_len);
+    const validity = try allocBuffer(allocator, bitmap_len);
     errdefer allocator.free(validity);
     @memset(validity, 0xFF);
 
-    const data = try allocator.alloc(u8, n * tl);
+    const data = try allocBuffer(allocator, n * tl);
     errdefer allocator.free(data);
     @memset(data, 0);
 
@@ -2021,8 +2065,8 @@ fn buildPrimitiveArray(
     allocator: Allocator,
     length: usize,
     null_count: i64,
-    validity: []u8,
-    data: []u8,
+    validity: Buffer,
+    data: Buffer,
 ) !ArrowArray {
     const pd = try allocator.create(ArrayPrivateData);
     errdefer allocator.destroy(pd);
@@ -2059,9 +2103,9 @@ fn buildVariableArray(
     allocator: Allocator,
     length: usize,
     null_count: i64,
-    validity: []u8,
-    offsets: []u8,
-    data: []u8,
+    validity: Buffer,
+    offsets: Buffer,
+    data: Buffer,
 ) !ArrowArray {
     const pd = try allocator.create(ArrayPrivateData);
     errdefer allocator.destroy(pd);
@@ -4396,7 +4440,7 @@ test "ownership: local release must be null after transfer to struct children" {
     try std.testing.expect(key_array.release == null);
     try std.testing.expect(val_array.release == null);
 
-    const validity = try allocator.alloc(u8, 1);
+    const validity = try allocBuffer(allocator, 1);
     @memset(validity, 0xFF);
     var entries_struct = try buildStructArray(allocator, 1, 0, validity, entries_children);
     entries_struct.doRelease();
