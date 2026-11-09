@@ -1,0 +1,16 @@
+.{
+    .name = .bench_column_read,
+    .version = "0.1.0",
+    .fingerprint = 0x4329a21090ee3df,
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+        .parquet = .{
+            .path = "../../",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
