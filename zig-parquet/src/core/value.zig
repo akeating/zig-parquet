@@ -9,9 +9,10 @@ const std = @import("std");
 /// Thread-local override for byte payload allocations. When set (typically by
 /// `DynamicReader.readRowsInternal`), all `bytes_val` / `fixed_bytes_val`
 /// payloads produced via `dupeBytes` go into this allocator instead of the
-/// per-value allocator. Paired with `Row.bytes_borrowed = true` so per-value
-/// frees in `deinit` skip these payloads; the producer frees the arena en
-/// masse. Save/restore the prior value at each entry point — the pattern is:
+/// per-value allocator. Rows whose payloads live in such an arena hold a
+/// reference to it in `Row.bytes_owner`, so per-value frees in `deinit` skip
+/// these payloads and the arena is freed with its last row. Save/restore the
+/// prior value at each entry point — the pattern is:
 ///
 ///     const prev = value_mod.bytes_arena_allocator;
 ///     value_mod.bytes_arena_allocator = arena.allocator();
@@ -245,7 +246,7 @@ pub const Value = union(enum) {
     }
 
     /// Like `deinit` but with explicit byte-payload freeing control.
-    /// Callers holding a `Row` with `bytes_borrowed = true` pass
+    /// Callers holding a `Row` with `bytes_owner` set pass
     /// `.{ .skip_bytes = true }` so the arena-owned payloads are preserved.
     pub fn deinitWithOptions(self: Value, allocator: std.mem.Allocator, opts: DeinitOptions) void {
         switch (self) {
@@ -276,15 +277,49 @@ pub const Value = union(enum) {
     }
 };
 
+/// Byte storage shared by the rows of one read (see `bytes_arena_allocator`).
+/// Each row holds a reference; the arena is freed when the last reference is
+/// released.
+pub const SharedBytes = struct {
+    arena: std.heap.ArenaAllocator,
+    refs: std.atomic.Value(usize),
+    allocator: std.mem.Allocator,
+
+    /// Creates the storage with one reference, held by the caller.
+    pub fn create(allocator: std.mem.Allocator) std.mem.Allocator.Error!*SharedBytes {
+        const self = try allocator.create(SharedBytes);
+        self.* = .{
+            .arena = std.heap.ArenaAllocator.init(allocator),
+            .refs = std.atomic.Value(usize).init(1),
+            .allocator = allocator,
+        };
+        return self;
+    }
+
+    /// Adds a reference and returns `self`.
+    pub fn retain(self: *SharedBytes) *SharedBytes {
+        _ = self.refs.fetchAdd(1, .monotonic);
+        return self;
+    }
+
+    /// Drops a reference; the last one frees the arena.
+    pub fn release(self: *SharedBytes) void {
+        if (self.refs.fetchSub(1, .acq_rel) == 1) {
+            self.arena.deinit();
+            self.allocator.destroy(self);
+        }
+    }
+};
+
 /// A row of values, one per column
 pub const Row = struct {
     values: []Value,
     allocator: std.mem.Allocator,
-    /// When true, bytes_val / fixed_bytes_val payloads live in an arena
-    /// owned by the producer (e.g. DynamicReader.bytes_arena) and must
-    /// NOT be freed per-value. List/map/struct container slices and
-    /// struct field names are still freed through `allocator`.
-    bytes_borrowed: bool = false,
+    /// When set, bytes_val / fixed_bytes_val payloads live in this shared
+    /// arena and are not freed per-value; `deinit` releases the row's
+    /// reference instead. List/map/struct container slices and struct field
+    /// names are still freed through `allocator`.
+    bytes_owner: ?*SharedBytes = null,
 
     /// Get the value for a specific column index
     pub fn getColumn(self: Row, col_idx: usize) ?Value {
@@ -309,9 +344,10 @@ pub const Row = struct {
 
     /// Free all memory owned by this row
     pub fn deinit(self: Row) void {
-        const opts: Value.DeinitOptions = .{ .skip_bytes = self.bytes_borrowed };
+        const opts: Value.DeinitOptions = .{ .skip_bytes = self.bytes_owner != null };
         for (self.values) |v| v.deinitWithOptions(self.allocator, opts);
         self.allocator.free(self.values);
+        if (self.bytes_owner) |owner| owner.release();
     }
 };
 

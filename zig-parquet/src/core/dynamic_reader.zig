@@ -30,6 +30,7 @@ const thrift = @import("thrift/mod.zig");
 const compress = @import("compress/mod.zig");
 const dictionary = @import("encoding/dictionary.zig");
 const column_decoder = @import("column_decoder.zig");
+const leaf_decoder = @import("leaf_decoder.zig");
 const value_mod = @import("value.zig");
 const seekable_reader = @import("seekable_reader.zig");
 const parquet_reader = @import("parquet_reader.zig");
@@ -85,11 +86,10 @@ pub const DynamicReader = struct {
     footer_data: []u8,
     checksum_options: ChecksumOptions,
     _backend_cleanup: ?BackendCleanup = null,
-    /// Arena for `bytes_val` / `fixed_bytes_val` payloads decoded into rows.
-    /// Lives as long as the reader — caller must deinit rows before the reader.
-    /// Rows produced by the reader set `bytes_borrowed = true` so their byte
-    /// payloads are not freed per-value; the arena is freed en masse in deinit.
-    bytes_arena: std.heap.ArenaAllocator,
+    /// Byte storage of the read in progress: `bytes_val` / `fixed_bytes_val`
+    /// payloads go into its arena, and each row built holds a reference to it.
+    /// Set by `beginBytes` for the duration of one read call.
+    bytes_owner: ?*value_mod.SharedBytes = null,
 
     const Self = @This();
 
@@ -115,7 +115,6 @@ pub const DynamicReader = struct {
             .metadata = info.metadata,
             .footer_data = info.footer_data,
             .checksum_options = options.checksum,
-            .bytes_arena = std.heap.ArenaAllocator.init(allocator),
         };
     }
 
@@ -170,8 +169,6 @@ pub const DynamicReader = struct {
         }
 
         self.allocator.free(self.footer_data);
-
-        self.bytes_arena.deinit();
 
         if (self._backend_cleanup) |cleanup| {
             cleanup.deinit_fn(cleanup.ptr, self.allocator);
@@ -381,10 +378,9 @@ pub const DynamicReader = struct {
             return try self.allocator.alloc(Row, 0);
         }
 
-        // Route bytes through reader-owned arena, mirroring readRowsInternal.
-        const prev_bytes_alloc = value_mod.bytes_arena_allocator;
-        value_mod.bytes_arena_allocator = self.bytes_arena.allocator();
-        defer value_mod.bytes_arena_allocator = prev_bytes_alloc;
+        // Route bytes into storage shared by the rows of this read.
+        const bytes = try self.beginBytes();
+        defer self.endBytes(bytes);
 
         const rg = &self.metadata.row_groups[row_group_index];
         const num_rows = try safeRowCount(rg.num_rows);
@@ -539,19 +535,43 @@ pub const DynamicReader = struct {
         return self.assembleFlatRows(canonical.len, num_leaf_columns, column_values, null);
     }
 
+    const BytesScope = struct {
+        owner: *value_mod.SharedBytes,
+        prev_alloc: ?std.mem.Allocator,
+        prev_owner: ?*value_mod.SharedBytes,
+    };
+
+    /// Creates byte storage for one read and routes `value_mod.dupeBytes` to it.
+    fn beginBytes(self: *Self) !BytesScope {
+        const owner = try value_mod.SharedBytes.create(self.allocator);
+        const scope: BytesScope = .{
+            .owner = owner,
+            .prev_alloc = value_mod.bytes_arena_allocator,
+            .prev_owner = self.bytes_owner,
+        };
+        value_mod.bytes_arena_allocator = owner.arena.allocator();
+        self.bytes_owner = owner;
+        return scope;
+    }
+
+    /// Restores the previous byte routing and drops the read's reference; the storage stays
+    /// alive while rows hold references to it.
+    fn endBytes(self: *Self, scope: BytesScope) void {
+        value_mod.bytes_arena_allocator = scope.prev_alloc;
+        self.bytes_owner = scope.prev_owner;
+        scope.owner.release();
+    }
+
     fn readRowsInternal(self: *Self, row_group_index: usize, col_indices: ?[]const usize) ![]Row {
         if (row_group_index >= self.metadata.row_groups.len) {
             return try self.allocator.alloc(Row, 0);
         }
 
-        // Route byte payloads produced via `value_mod.dupeBytes` into the
-        // reader-owned arena for the duration of this decode. The emitted
-        // Rows below are marked `bytes_borrowed = true` so their byte
-        // slices are not individually freed; the arena is released by
-        // `DynamicReader.deinit`.
-        const prev_bytes_alloc = value_mod.bytes_arena_allocator;
-        value_mod.bytes_arena_allocator = self.bytes_arena.allocator();
-        defer value_mod.bytes_arena_allocator = prev_bytes_alloc;
+        // Route byte payloads produced via `value_mod.dupeBytes` into storage
+        // shared by the rows of this read. Each row holds a reference
+        // (`Row.bytes_owner`); the storage is freed with the last row.
+        const bytes = try self.beginBytes();
+        defer self.endBytes(bytes);
 
         const rg = &self.metadata.row_groups[row_group_index];
         const num_rows = try safeRowCount(rg.num_rows);
@@ -708,285 +728,25 @@ pub const DynamicReader = struct {
         defer if (owned_page_data) |pd| self.allocator.free(pd);
         const page_data: []const u8 = owned_page_data orelse override_page_data.?;
 
-        var pos: usize = 0;
-
-        // Check if we have a dictionary page
-        var string_dict: ?dictionary.StringDictionary = null;
-        defer if (string_dict) |*d| d.deinit();
-        var int32_dict: ?dictionary.Int32Dictionary = null;
-        defer if (int32_dict) |*d| d.deinit();
-        var int64_dict: ?dictionary.Int64Dictionary = null;
-        defer if (int64_dict) |*d| d.deinit();
-        var float32_dict: ?dictionary.Float32Dictionary = null;
-        defer if (float32_dict) |*d| d.deinit();
-        var float64_dict: ?dictionary.Float64Dictionary = null;
-        defer if (float64_dict) |*d| d.deinit();
-        var fixed_byte_array_dict: ?dictionary.FixedByteArrayDictionary = null;
-        defer if (fixed_byte_array_dict) |*d| d.deinit();
-        var int96_dict: ?dictionary.Int96Dictionary = null;
-        defer if (int96_dict) |*d| d.deinit();
-
-        // Check for dictionary page - might be indicated by metadata OR by first page in stream
-        // Some writers don't set dictionary_page_offset but still include dictionary pages
-        {
-            // Check if first page is a dictionary page (consumes header if so)
-            var peek_thrift = thrift.CompactReader.init(page_data[pos..]);
-            const first_header = try format.PageHeader.parse(self.allocator, &peek_thrift);
-            defer self.freePageHeaderContents(&first_header);
-
-            if (first_header.dictionary_page_header) |dph| {
-                // This is a dictionary page - consume it
-                pos += peek_thrift.pos;
-
-                const dict_compressed_size = try safePageSize(first_header.compressed_page_size);
-                const dict_uncompressed_size = try safePageSize(first_header.uncompressed_page_size);
-                const dict_num_values = try safePageSize(dph.num_values);
-
-                const dict_compressed = try safe.slice(page_data, pos, dict_compressed_size);
-                pos += dict_compressed_size;
-
-                // Validate CRC32 checksum if enabled
-                if (self.checksum_options.validate_page_checksum) {
-                    if (first_header.crc) |expected_crc| {
-                        const actual_crc = computePageCrc(dict_compressed);
-                        if (actual_crc != expected_crc) {
-                            return error.PageChecksumMismatch;
-                        }
-                    } else if (self.checksum_options.strict_checksum) {
-                        return error.MissingPageChecksum;
-                    }
-                }
-
-                // Decompress dictionary page if needed
-                const dict_data = if (meta.codec != .uncompressed) blk: {
-                    break :blk try self.decompressData(dict_compressed, meta.codec, dict_uncompressed_size);
-                } else dict_compressed;
-                defer if (meta.codec != .uncompressed) self.allocator.free(dict_data);
-
-                // Build dictionaries based on physical type
-                const column_info_for_dict = format.getColumnInfo(self.metadata.schema, column_index);
-                if (column_info_for_dict) |info| {
-                    if (info.element.type_) |phys_type| {
-                        switch (phys_type) {
-                            .byte_array => {
-                                string_dict = try dictionary.StringDictionary.fromPlain(self.allocator, dict_data, dict_num_values);
-                            },
-                            .int32 => {
-                                int32_dict = try dictionary.Int32Dictionary.fromPlain(self.allocator, dict_data, dict_num_values);
-                            },
-                            .int64 => {
-                                int64_dict = try dictionary.Int64Dictionary.fromPlain(self.allocator, dict_data, dict_num_values);
-                            },
-                            .float => {
-                                float32_dict = try dictionary.Float32Dictionary.fromPlain(self.allocator, dict_data, dict_num_values);
-                            },
-                            .double => {
-                                float64_dict = try dictionary.Float64Dictionary.fromPlain(self.allocator, dict_data, dict_num_values);
-                            },
-                            .fixed_len_byte_array => {
-                                const fixed_len = try safeTypeLength(info.element.type_length);
-                                if (fixed_len > 0) {
-                                    fixed_byte_array_dict = try dictionary.FixedByteArrayDictionary.fromPlain(self.allocator, dict_data, dict_num_values, fixed_len);
-                                }
-                            },
-                            .int96 => {
-                                int96_dict = try dictionary.Int96Dictionary.fromPlain(self.allocator, dict_data, dict_num_values);
-                            },
-                            else => {},
-                        }
-                    }
-                }
-            }
-            // If not a dictionary page, pos is unchanged and we'll process it as data
-        }
-
-        // Get column info
         const column_info = format.getColumnInfo(self.metadata.schema, column_index) orelse
             return error.InvalidArgument;
 
-        // Accumulate values from all data pages
-        var all_values: std.ArrayListUnmanaged(Value) = .empty;
+        var leaf = try leaf_decoder.decodeLeaf(self.allocator, page_data, meta, column_info, .{
+            .keep_levels = true,
+            .checksum = self.checksum_options,
+            .large_offsets = true,
+        });
+        defer leaf.buffers.deinit(self.allocator);
         errdefer {
-            for (all_values.items) |v| v.deinit(self.allocator);
-            all_values.deinit(self.allocator);
+            if (leaf.def_levels) |l| self.allocator.free(l);
+            if (leaf.rep_levels) |l| self.allocator.free(l);
         }
 
-        var all_def_levels: std.ArrayListUnmanaged(u32) = .empty;
-        errdefer all_def_levels.deinit(self.allocator);
-
-        var all_rep_levels: std.ArrayListUnmanaged(u32) = .empty;
-        errdefer all_rep_levels.deinit(self.allocator);
-
-        // Loop through all data pages
-        while (pos < page_data.len) {
-            // Parse data page header
-            var thrift_reader = thrift.CompactReader.init(page_data[pos..]);
-            const page_header = try format.PageHeader.parse(self.allocator, &thrift_reader);
-            defer self.freePageHeaderContents(&page_header);
-
-            pos += thrift_reader.pos;
-
-            // Skip non-data pages (neither V1 nor V2)
-            if (page_header.data_page_header == null and page_header.data_page_header_v2 == null) {
-                const skip_size = try safePageSize(page_header.compressed_page_size);
-                if (pos + skip_size > page_data.len) return error.EndOfData;
-                pos += skip_size;
-                continue;
-            }
-
-            const compressed_size = try safePageSize(page_header.compressed_page_size);
-            if (pos + compressed_size > page_data.len) return error.EndOfData;
-            const compressed_body = try safe.slice(page_data, pos, compressed_size);
-            pos += compressed_size;
-
-            // Validate CRC32 checksum if enabled
-            if (self.checksum_options.validate_page_checksum) {
-                if (page_header.crc) |expected_crc| {
-                    const actual_crc = computePageCrc(compressed_body);
-                    if (actual_crc != expected_crc) {
-                        return error.PageChecksumMismatch;
-                    }
-                } else if (self.checksum_options.strict_checksum) {
-                    return error.MissingPageChecksum;
-                }
-            }
-
-            // Handle V2 vs V1 page format differently
-            if (page_header.data_page_header_v2) |v2| {
-                // DataPageV2: levels are uncompressed, stored before values
-                const rep_len = try safePageSize(v2.repetition_levels_byte_length);
-                const def_len = try safePageSize(v2.definition_levels_byte_length);
-                const num_values = try safePageSize(v2.num_values);
-
-                if (num_values == 0) continue;
-
-                // Extract level data (uncompressed, at start of page body)
-                const rep_levels_data = try safe.slice(compressed_body, 0, rep_len);
-                const def_levels_data = try safe.slice(compressed_body, rep_len, def_len);
-                const levels_total = std.math.add(usize, rep_len, def_len) catch return error.EndOfData;
-                if (levels_total > compressed_body.len) return error.EndOfData;
-                const values_compressed = compressed_body[levels_total..];
-
-                // Decompress only the values section if needed
-                // For V2, uncompressed_page_size is the size of the ENTIRE uncompressed page
-                // But the levels are already uncompressed, so we need to calculate values size differently
-                // The compressed_page_size in header is: rep_len + def_len + compressed_values_len
-                // The uncompressed_page_size is: rep_len + def_len + uncompressed_values_len
-                var values_data_allocated = false;
-                const values_data = if (v2.is_compressed and meta.codec != .uncompressed) blk: {
-                    const uncompressed_size = try safePageSize(page_header.uncompressed_page_size);
-                    // Levels are uncompressed, so uncompressed values size = total - levels
-                    if (uncompressed_size < levels_total) return error.EndOfData;
-                    const values_uncompressed_size = uncompressed_size - levels_total;
-                    // Handle empty values case - skip decompression for empty data pages
-                    if (values_uncompressed_size == 0 or values_compressed.len == 0) {
-                        break :blk values_compressed; // Return empty slice, no decompression needed
-                    }
-                    values_data_allocated = true;
-                    break :blk try self.decompressData(values_compressed, meta.codec, values_uncompressed_size);
-                } else values_compressed;
-                defer if (values_data_allocated) self.allocator.free(values_data);
-
-                // Get value encoding from page header (used for delta encodings)
-                const value_encoding = v2.encoding;
-                const uses_dict = string_dict != null or int32_dict != null or int64_dict != null or float32_dict != null or float64_dict != null or int96_dict != null;
-
-                // Decode with V2 format (levels already extracted, no length prefix)
-                var page_result = try column_decoder.decodeColumnDynamicV2(
-                    self.allocator,
-                    column_info.element,
-                    rep_levels_data,
-                    def_levels_data,
-                    values_data,
-                    num_values,
-                    column_info.max_def_level,
-                    column_info.max_rep_level,
-                    uses_dict or fixed_byte_array_dict != null,
-                    if (string_dict) |*d| d else null,
-                    if (int32_dict) |*d| d else null,
-                    if (int64_dict) |*d| d else null,
-                    if (float32_dict) |*d| d else null,
-                    if (float64_dict) |*d| d else null,
-                    if (fixed_byte_array_dict) |*d| d else null,
-                    if (int96_dict) |*d| d else null,
-                    value_encoding,
-                );
-
-                // Append values (transfer ownership)
-                try all_values.appendSlice(self.allocator, page_result.values);
-                self.allocator.free(page_result.values);
-                page_result.values = &.{};
-
-                // Append levels
-                if (page_result.def_levels) |dl| {
-                    try all_def_levels.appendSlice(self.allocator, dl);
-                    self.allocator.free(dl);
-                }
-                if (page_result.rep_levels) |rl| {
-                    try all_rep_levels.appendSlice(self.allocator, rl);
-                    self.allocator.free(rl);
-                }
-            } else if (page_header.data_page_header) |dph| {
-                // DataPageV1: levels are inside compressed data with length prefixes
-
-                // Decompress entire page if needed
-                const value_data = if (meta.codec != .uncompressed) blk: {
-                    const uncompressed_size = try safePageSize(page_header.uncompressed_page_size);
-                    break :blk try self.decompressData(compressed_body, meta.codec, uncompressed_size);
-                } else compressed_body;
-                defer if (meta.codec != .uncompressed) self.allocator.free(value_data);
-
-                const num_values = try safePageSize(dph.num_values);
-                if (num_values == 0) continue;
-
-                // Get encodings from page header
-                const uses_dict_v1 = string_dict != null or int32_dict != null or int64_dict != null or float32_dict != null or float64_dict != null or fixed_byte_array_dict != null or int96_dict != null;
-                const def_level_encoding = dph.definition_level_encoding;
-                const rep_level_encoding = dph.repetition_level_encoding;
-                const value_encoding_v1 = dph.encoding;
-
-                // Decode dynamically with level and value encodings
-                var page_result = try column_decoder.decodeColumnDynamicWithValueEncoding(
-                    self.allocator,
-                    column_info.element,
-                    value_data,
-                    num_values,
-                    column_info.max_def_level,
-                    column_info.max_rep_level,
-                    uses_dict_v1,
-                    if (string_dict) |*d| d else null,
-                    if (int32_dict) |*d| d else null,
-                    if (int64_dict) |*d| d else null,
-                    if (float32_dict) |*d| d else null,
-                    if (float64_dict) |*d| d else null,
-                    if (fixed_byte_array_dict) |*d| d else null,
-                    if (int96_dict) |*d| d else null,
-                    def_level_encoding,
-                    rep_level_encoding,
-                    value_encoding_v1,
-                );
-
-                // Append values (transfer ownership)
-                try all_values.appendSlice(self.allocator, page_result.values);
-                self.allocator.free(page_result.values);
-                page_result.values = &.{};
-
-                // Append levels
-                if (page_result.def_levels) |dl| {
-                    try all_def_levels.appendSlice(self.allocator, dl);
-                    self.allocator.free(dl);
-                }
-                if (page_result.rep_levels) |rl| {
-                    try all_rep_levels.appendSlice(self.allocator, rl);
-                    self.allocator.free(rl);
-                }
-            }
-        }
-
+        const values = try leafValues(self.allocator, &leaf.buffers, column_info.element);
         return .{
-            .values = try all_values.toOwnedSlice(self.allocator),
-            .def_levels = if (all_def_levels.items.len > 0) try all_def_levels.toOwnedSlice(self.allocator) else null,
-            .rep_levels = if (all_rep_levels.items.len > 0) try all_rep_levels.toOwnedSlice(self.allocator) else null,
+            .values = values,
+            .def_levels = leaf.def_levels,
+            .rep_levels = leaf.rep_levels,
         };
     }
 
@@ -1092,7 +852,7 @@ pub const DynamicReader = struct {
                 vals_initialized += 1;
             }
 
-            rows[row_idx] = .{ .values = values, .allocator = self.allocator, .bytes_borrowed = true };
+            rows[row_idx] = .{ .values = values, .allocator = self.allocator, .bytes_owner = self.bytes_owner.?.retain() };
             rows_initialized += 1;
         }
 
@@ -1147,7 +907,7 @@ pub const DynamicReader = struct {
                 vals_initialized += 1;
             }
 
-            rows[row_idx] = .{ .values = values, .allocator = self.allocator, .bytes_borrowed = true };
+            rows[row_idx] = .{ .values = values, .allocator = self.allocator, .bytes_owner = self.bytes_owner.?.retain() };
             rows_initialized += 1;
         }
         return rows;
@@ -1296,4 +1056,38 @@ test "nested row assembly groups values by rep_level" {
     const row1_start = row_starts.items[1];
     const row1_end = col_values.len;
     try std.testing.expectEqual(@as(usize, 3), row1_end - row1_start);
+}
+
+/// One `Value` per decoded entry: `null_val` for null entries, otherwise the value in the
+/// physical type's `Value` form (INT96 as nanoseconds in `int64_val`). Byte arrays are copied
+/// with `value_mod.dupeBytes`, so they go to the reader's bytes arena when one is set.
+fn leafValues(allocator: std.mem.Allocator, b: *const leaf_decoder.Buffers, element: format.SchemaElement) ![]Value {
+    const physical = element.type_ orelse return error.InvalidSchema;
+    const values = try allocator.alloc(Value, b.length);
+    var done: usize = 0;
+    errdefer {
+        // Bytes in the reader's arena are freed with the arena.
+        const opts: Value.DeinitOptions = .{ .skip_bytes = value_mod.bytes_arena_allocator != null };
+        for (values[0..done]) |v| v.deinitWithOptions(allocator, opts);
+        allocator.free(values);
+    }
+    const width: usize = switch (physical) {
+        .fixed_len_byte_array => safe.cast(element.type_length orelse 0) catch return error.InvalidTypeLength,
+        else => 0,
+    };
+    for (values, 0..) |*v, i| {
+        if (!b.isValid(i)) {
+            v.* = .{ .null_val = {} };
+        } else v.* = switch (physical) {
+            .boolean => .{ .bool_val = (b.values[i / 8] >> @intCast(i % 8)) & 1 == 1 },
+            .int32 => .{ .int32_val = std.mem.bytesToValue(i32, b.values[i * 4 ..][0..4]) },
+            .int64, .int96 => .{ .int64_val = std.mem.bytesToValue(i64, b.values[i * 8 ..][0..8]) },
+            .float => .{ .float_val = std.mem.bytesToValue(f32, b.values[i * 4 ..][0..4]) },
+            .double => .{ .double_val = std.mem.bytesToValue(f64, b.values[i * 8 ..][0..8]) },
+            .byte_array => .{ .bytes_val = try value_mod.dupeBytes(allocator, b.bytesAt(i)) },
+            .fixed_len_byte_array => .{ .fixed_bytes_val = try value_mod.dupeBytes(allocator, b.values[i * width ..][0..width]) },
+        };
+        done += 1;
+    }
+    return values;
 }
