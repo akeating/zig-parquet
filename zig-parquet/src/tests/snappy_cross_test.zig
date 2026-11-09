@@ -253,3 +253,48 @@ test "edge: two bytes" {
 test "edge: three bytes" {
     try zigRoundTrip(std.testing.allocator, "ABC");
 }
+
+test "cross-impl: C compress, Zig decompress, repetitive data with short and long matches" {
+    if (!both_enabled) return;
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(42);
+    const random = prng.random();
+    for (0..20) |round| {
+        // Runs of repeated short patterns (overlapping copies), repeated earlier blocks (long
+        // offsets) and random bytes (literals).
+        var data: std.ArrayList(u8) = .empty;
+        defer data.deinit(allocator);
+        while (data.items.len < 200_000) {
+            switch (random.uintLessThan(u8, 3)) {
+                0 => {
+                    var pattern: [16]u8 = undefined;
+                    random.bytes(&pattern);
+                    const period = random.intRangeAtMost(usize, 1, 16);
+                    for (0..random.intRangeAtMost(usize, 4, 300)) |i| try data.append(allocator, pattern[i % period]);
+                },
+                1 => if (data.items.len > 100) {
+                    const start = random.uintLessThan(usize, data.items.len - 64);
+                    const len = random.intRangeAtMost(usize, 4, 64);
+                    // Copy first: appending can move `data.items`.
+                    var block: [64]u8 = undefined;
+                    @memcpy(block[0..len], data.items[start..][0..len]);
+                    try data.appendSlice(allocator, block[0..len]);
+                },
+                else => {
+                    var noise: [32]u8 = undefined;
+                    random.bytes(&noise);
+                    try data.appendSlice(allocator, noise[0..random.intRangeAtMost(usize, 1, 32)]);
+                },
+            }
+        }
+        const compressed = try c_snappy.compress(allocator, data.items);
+        defer allocator.free(compressed);
+        const decompressed = try zig_snappy.decompress(allocator, compressed, data.items.len);
+        defer allocator.free(decompressed);
+        std.testing.expectEqualSlices(u8, data.items, decompressed) catch |e| {
+            std.debug.print("round {d}\n", .{round});
+            return e;
+        };
+    }
+}
+

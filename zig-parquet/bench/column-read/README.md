@@ -92,3 +92,20 @@ After list, map and leaf assembly in `arrow_batch.zig` stopped building `Value`s
 | arrow all | 306 | 2,950 | 811 | 136.0 | 156.2 | 134.7 |
 
 Medians varied by about 5% between runs (arrow all: 288-306 ms). For `ints`, about 40% of profile samples are in snappy decompression.
+
+## Snappy decoder with block copies (2026-11-09, same machine and files)
+
+The pure-Zig snappy decoder copies literals of up to 16 bytes and back-references in 8- or 16-byte blocks instead of `@memcpy` calls and byte loops, byte by byte only in the last 16 bytes of output.
+
+| Case | median ms | PyArrow ms |
+|---|---|---|
+| arrow id | 52 | 39.4 |
+| arrow score | 46 | 39.0 |
+| arrow category | 64 | 91.8 |
+| arrow all (flat) | 163 | 178.8 |
+| arrow ints | 99 | 54.7 |
+| arrow point | 32 | 29.6 |
+| arrow attrs | 141 | 72.3 |
+| arrow all (nested) | 272 | 156.2 |
+
+Decompression alone (PyArrow-compressed inputs, GB/s of output, Zig before → after, C snappy): int64 ids 0.86 → 2.2 (2.0), int64 timestamps 0.90 → 2.2 (2.1), strings 2.5 → 4.3 (5.3), JSON-like text 1.5 → 2.7 (4.6), random doubles 20.7 → 20.4 (20.4).

@@ -261,7 +261,12 @@ fn snappyDecode(src: []const u8, dst: []u8) error{DecompressionError}!usize {
 
                 if (sp + lit_len > src.len) return error.DecompressionError;
                 if (dp + lit_len > expected_len) return error.DecompressionError;
-                @memcpy(dst[dp..][0..lit_len], src[sp..][0..lit_len]);
+                if (lit_len <= 16 and src.len - sp >= 16 and expected_len - dp >= 16) {
+                    // Copy 16 bytes; the bytes past `lit_len` are overwritten by what follows.
+                    dst[dp..][0..16].* = src[sp..][0..16].*;
+                } else {
+                    @memcpy(dst[dp..][0..lit_len], src[sp..][0..lit_len]);
+                }
                 sp += lit_len;
                 dp += lit_len;
             },
@@ -273,7 +278,7 @@ fn snappyDecode(src: []const u8, dst: []u8) error{DecompressionError}!usize {
 
                 if (offset == 0 or offset > dp) return error.DecompressionError;
                 if (dp + length > expected_len) return error.DecompressionError;
-                copyAtOffset(dst, dp, offset, length);
+                copyAtOffset(dst[0..expected_len], dp, offset, length);
                 dp += length;
             },
             2 => { // Copy with 2-byte offset
@@ -284,7 +289,7 @@ fn snappyDecode(src: []const u8, dst: []u8) error{DecompressionError}!usize {
 
                 if (offset == 0 or offset > dp) return error.DecompressionError;
                 if (dp + length > expected_len) return error.DecompressionError;
-                copyAtOffset(dst, dp, offset, length);
+                copyAtOffset(dst[0..expected_len], dp, offset, length);
                 dp += length;
             },
             3 => { // Copy with 4-byte offset
@@ -295,7 +300,7 @@ fn snappyDecode(src: []const u8, dst: []u8) error{DecompressionError}!usize {
 
                 if (offset == 0 or offset > dp) return error.DecompressionError;
                 if (dp + length > expected_len) return error.DecompressionError;
-                copyAtOffset(dst, dp, offset, length);
+                copyAtOffset(dst[0..expected_len], dp, offset, length);
                 dp += length;
             },
         }
@@ -305,16 +310,37 @@ fn snappyDecode(src: []const u8, dst: []u8) error{DecompressionError}!usize {
     return dp;
 }
 
-/// Copy `length` bytes from `dst[pos - offset..]` to `dst[pos..]`.
-/// Handles the overlapping case (length > offset) which acts as RLE.
+/// Bytes that must remain in `dst` after a copy for `copyAtOffset` to use block copies,
+/// which write up to 15 bytes past the copy.
+const copy_slack = 16;
+
+/// Copy `length` bytes from `dst[pos - offset..]` to `dst[pos..]`. The source and destination
+/// overlap when `length > offset`; the result repeats the `offset` bytes before `pos` (RLE).
+/// The caller checks that `offset <= pos` and `pos + length <= dst.len`.
 fn copyAtOffset(dst: []u8, pos: usize, offset: usize, length: usize) void {
-    const copy_src = pos - offset;
-    if (offset >= length) {
-        @memcpy(dst[pos..][0..length], dst[copy_src..][0..length]);
+    const from = pos - offset;
+    if (dst.len - pos - length < copy_slack) {
+        // Near the end of the output: byte by byte, writing nothing past `pos + length`.
+        for (0..length) |i| dst[pos + i] = dst[from + i];
+        return;
+    }
+    // Block copies. Each block reads bytes before the position it writes (blocks are at most
+    // `offset` bytes, or the source repeats with a period that is), so it reads output already
+    // written. Up to 15 bytes past `pos + length` are written and later overwritten.
+    if (offset >= 16) {
+        var i: usize = 0;
+        while (i < length) : (i += 16) dst[pos + i ..][0..16].* = dst[from + i ..][0..16].*;
+    } else if (offset >= 8) {
+        var i: usize = 0;
+        while (i < length) : (i += 8) dst[pos + i ..][0..8].* = dst[from + i ..][0..8].*;
     } else {
-        for (0..length) |i| {
-            dst[pos + i] = dst[copy_src + i];
-        }
+        // Write the first 8 bytes one at a time. From there on the output repeats with period
+        // `offset`, so `step`, the smallest multiple of `offset` that is at least 8, works as
+        // the offset of 8-byte blocks.
+        for (0..8) |i| dst[pos + i] = dst[from + i];
+        const step = offset * ((8 + offset - 1) / offset);
+        var i: usize = 8;
+        while (i < length) : (i += 8) dst[pos + i ..][0..8].* = dst[pos + i - step ..][0..8].*;
     }
 }
 
@@ -509,4 +535,87 @@ test "snappy varint round-trip at u32 max" {
     const n = writeVarint(&buf, std.math.maxInt(u32));
     const result = try readVarint(buf[0..n]);
     try std.testing.expectEqual(std.math.maxInt(u32), result.value);
+}
+
+/// Builds a snappy stream of random literals and copies with offsets 1..max_offset and lengths
+/// 4..max_length, and the output it decodes to (computed byte by byte).
+fn testStream(allocator: std.mem.Allocator, seed: u64, ops: usize, max_offset: usize, max_length: usize) !struct { stream: []u8, expected: []u8 } {
+    var prng = std.Random.DefaultPrng.init(seed);
+    const random = prng.random();
+    var expected: std.ArrayList(u8) = .empty;
+    errdefer expected.deinit(allocator);
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(allocator);
+    var scratch: [64 * 1024]u8 = undefined;
+
+    for (0..ops) |op| {
+        if (op == 0 or random.uintLessThan(u8, 4) == 0) {
+            const len = random.intRangeAtMost(usize, 1, 100);
+            const lit = scratch[0..len];
+            random.bytes(lit);
+            var tmp: [128]u8 = undefined;
+            const n = emitLiteral(&tmp, 0, lit);
+            try body.appendSlice(allocator, tmp[0..n]);
+            try expected.appendSlice(allocator, lit);
+        } else {
+            const offset = random.intRangeAtMost(usize, 1, @min(max_offset, expected.items.len));
+            const length = random.intRangeAtMost(usize, 4, max_length);
+            var tmp: [64]u8 = undefined;
+            const n = emitCopy(&tmp, 0, offset, length);
+            try body.appendSlice(allocator, tmp[0..n]);
+            const start = expected.items.len - offset;
+            for (0..length) |i| try expected.append(allocator, expected.items[start + i]);
+        }
+    }
+    var header: [5]u8 = undefined;
+    const hn = writeVarint(&header, safe.castTo(u32, expected.items.len) catch unreachable); // test sizes are far below 4 GiB
+    const stream = try std.mem.concat(allocator, u8, &.{ header[0..hn], body.items });
+    return .{ .stream = stream, .expected = try expected.toOwnedSlice(allocator) };
+}
+
+test "snappy decode: copies at offsets 1-20 (overlapping) and up to 70 bytes" {
+    const allocator = std.testing.allocator;
+    for (0..50) |seed| {
+        const t = try testStream(allocator, seed, 300, 20, 70);
+        defer allocator.free(t.stream);
+        defer allocator.free(t.expected);
+        const out = try decompress(allocator, t.stream, t.expected.len);
+        defer allocator.free(out);
+        try std.testing.expectEqualSlices(u8, t.expected, out);
+    }
+}
+
+test "snappy decode: copies at offsets up to 60000 and up to 200 bytes" {
+    const allocator = std.testing.allocator;
+    for (0..20) |seed| {
+        const t = try testStream(allocator, 1000 + seed, 600, 60000, 200);
+        defer allocator.free(t.stream);
+        defer allocator.free(t.expected);
+        const out = try decompress(allocator, t.stream, t.expected.len);
+        defer allocator.free(out);
+        try std.testing.expectEqualSlices(u8, t.expected, out);
+    }
+}
+
+test "snappy decode: truncated and corrupted streams return errors without out-of-bounds access" {
+    // In Debug builds an out-of-bounds slice access panics, which fails the test.
+    const allocator = std.testing.allocator;
+    const t = try testStream(allocator, 7, 80, 20, 70);
+    defer allocator.free(t.stream);
+    defer allocator.free(t.expected);
+
+    for (0..t.stream.len) |len| {
+        if (decompress(allocator, t.stream[0..len], t.expected.len)) |out| allocator.free(out) else |_| {}
+    }
+
+    const corrupt = try allocator.dupe(u8, t.stream);
+    defer allocator.free(corrupt);
+    var prng = std.Random.DefaultPrng.init(99);
+    const random = prng.random();
+    for (0..2000) |_| {
+        @memcpy(corrupt, t.stream);
+        const pos = random.uintLessThan(usize, corrupt.len);
+        corrupt[pos] = random.int(u8);
+        if (decompress(allocator, corrupt, t.expected.len)) |out| allocator.free(out) else |_| {}
+    }
 }
