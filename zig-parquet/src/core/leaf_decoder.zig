@@ -1,8 +1,11 @@
-//! Decoding of flat column chunks into Arrow-layout buffers.
+//! Decoding of leaf column chunks into Arrow-layout buffers.
 //!
-//! A flat column is a leaf with no repetition and a maximum definition level of 0 or 1: a
-//! top-level primitive column, required or optional. Each page is decoded directly into the
-//! output buffers; no `Value` is built per entry.
+//! Each data page is decoded directly into the output buffers; no `Value` is built per entry.
+//! The output has one entry per level entry (per value slot in the column chunk). An entry is
+//! non-null when its definition level equals the column's maximum definition level. For a flat
+//! column (no repetition, maximum definition level 0 or 1) entries are rows, and the buffers
+//! form an Arrow array. For other leaves, `decodeLeaf` also returns the definition and
+//! repetition levels, from which callers assemble lists, structs and maps.
 //!
 //! Output (Arrow C Data Interface layout, native byte order):
 //! - `validity`: one bit per entry, LSB first, set when the entry is non-null. Bits past
@@ -15,7 +18,8 @@
 //!     BYTE_ARRAY: the entries' bytes back to back (at least 1 byte is allocated).
 //!   Null entries hold zero bytes (fixed width) or a zero bit (BOOLEAN), or add no bytes
 //!   (BYTE_ARRAY).
-//! - `offsets` (BYTE_ARRAY only): `length + 1` i32 offsets into `values`.
+//! - `offsets` (BYTE_ARRAY only): `length + 1` offsets into `values`, i32 by default or i64
+//!   with `Options.large_offsets` (Arrow "large" binary layout).
 //!
 //! Supported: PLAIN, PLAIN_DICTIONARY / RLE_DICTIONARY, RLE (BOOLEAN), DELTA_BINARY_PACKED
 //! (INT32, INT64), DELTA_LENGTH_BYTE_ARRAY (BYTE_ARRAY), DELTA_BYTE_ARRAY (BYTE_ARRAY,
@@ -57,29 +61,76 @@ pub const Buffer = []align(buffer_alignment.toByteUnits()) u8;
 const BufferList = std.array_list.Aligned(u8, buffer_alignment);
 
 /// Decoded column chunk. All slices are owned and allocated with the allocator passed to
-/// `decodeChunk`.
+/// `decodeChunk` or `decodeLeaf`.
 pub const Buffers = struct {
     length: usize,
     null_count: usize,
     validity: Buffer,
     values: Buffer,
     offsets: ?Buffer,
+    /// Offsets are i64 instead of i32.
+    large_offsets: bool = false,
 
     pub fn deinit(self: *Buffers, allocator: Allocator) void {
         allocator.free(self.validity);
         allocator.free(self.values);
         if (self.offsets) |o| allocator.free(o);
     }
+
+    pub fn isValid(self: *const Buffers, i: usize) bool {
+        return (self.validity[i / 8] >> @intCast(i % 8)) & 1 == 1;
+    }
+
+    /// Bytes of BYTE_ARRAY entry `i`.
+    pub fn bytesAt(self: *const Buffers, i: usize) []const u8 {
+        const o = self.offsets.?;
+        const start: usize, const end: usize = if (self.large_offsets) .{
+            @intCast(std.mem.bytesToValue(i64, o[i * 8 ..][0..8])),
+            @intCast(std.mem.bytesToValue(i64, o[(i + 1) * 8 ..][0..8])),
+        } else .{
+            @intCast(std.mem.bytesToValue(i32, o[i * 4 ..][0..4])),
+            @intCast(std.mem.bytesToValue(i32, o[(i + 1) * 4 ..][0..4])),
+        };
+        return self.values[start..end];
+    }
 };
 
-/// Whether `decodeChunk` handles this column.
+/// Whether the column's entries are rows: no repetition and a maximum definition level of 0
+/// or 1. `decodeChunk` handles these columns.
 pub fn isFlat(info: format.ColumnInfo) bool {
     return info.max_rep_level == 0 and info.max_def_level <= 1;
 }
 
-/// Decodes all data pages of a flat column chunk. `page_data` is the column chunk's bytes as
-/// stored in the file (page headers and page bodies, starting with the dictionary page if
-/// there is one).
+pub const Options = struct {
+    /// Return the definition and repetition levels of all pages.
+    keep_levels: bool = false,
+    /// Page CRC32 validation. Pages without a `crc` field pass unless `strict_checksum` is set.
+    checksum: parquet_reader.ChecksumOptions = .{},
+    /// i64 BYTE_ARRAY offsets. With i32 offsets, a chunk whose entries total more than
+    /// 2^31 - 1 bytes returns `error.IntegerOverflow`.
+    large_offsets: bool = false,
+};
+
+/// A decoded leaf column chunk.
+pub const Leaf = struct {
+    buffers: Buffers,
+    /// Definition level of each entry. Null when not requested or when the column's maximum
+    /// definition level is 0.
+    def_levels: ?[]u32,
+    /// Repetition level of each entry. Null when not requested or when the column's maximum
+    /// repetition level is 0.
+    rep_levels: ?[]u32,
+
+    pub fn deinit(self: *Leaf, allocator: Allocator) void {
+        self.buffers.deinit(allocator);
+        if (self.def_levels) |l| allocator.free(l);
+        if (self.rep_levels) |l| allocator.free(l);
+    }
+};
+
+/// Decodes all data pages of a flat column chunk (see `isFlat`). `page_data` is the column
+/// chunk's bytes as stored in the file (page headers and page bodies, starting with the
+/// dictionary page if there is one).
 pub fn decodeChunk(
     allocator: Allocator,
     page_data: []const u8,
@@ -87,10 +138,23 @@ pub fn decodeChunk(
     info: format.ColumnInfo,
 ) !Buffers {
     if (!isFlat(info)) return error.InvalidArgument;
+    const leaf = try decodeLeaf(allocator, page_data, meta, info, .{});
+    return leaf.buffers;
+}
+
+/// Decodes all data pages of any leaf column chunk.
+pub fn decodeLeaf(
+    allocator: Allocator,
+    page_data: []const u8,
+    meta: format.ColumnMetaData,
+    info: format.ColumnInfo,
+    options: Options,
+) !Leaf {
     const physical = info.element.type_ orelse return error.InvalidSchema;
 
     var builder = Builder{
         .allocator = allocator,
+        .large_offsets = options.large_offsets,
         .kind = switch (physical) {
             .boolean => .bits,
             .int32, .float => .{ .fixed = 4 },
@@ -108,6 +172,9 @@ pub fn decodeChunk(
         .info = info,
         .codec = meta.codec,
         .dict_set = parquet_reader.DictionarySet.init(allocator),
+        .def_bits = format.computeBitWidth(info.max_def_level),
+        .rep_bits = format.computeBitWidth(info.max_rep_level),
+        .keep_levels = options.keep_levels,
     };
     defer dec.deinit();
 
@@ -124,6 +191,7 @@ pub fn decodeChunk(
             const size = safe.cast(first.compressed_page_size) catch return error.InvalidPageSize;
             const body = try safe.slice(page_data, pos, size);
             pos += size;
+            try checkCrc(options.checksum, first, body);
             const uncompressed = safe.cast(first.uncompressed_page_size) catch return error.InvalidPageSize;
             const count = safe.cast(dph.num_values) catch return error.InvalidPageSize;
             try dec.dict_set.initFromPage(body, count, physical, info.element.type_length, meta.codec, uncompressed);
@@ -145,6 +213,7 @@ pub fn decodeChunk(
         }
         const body = try safe.slice(page_data, pos, size);
         pos += size;
+        try checkCrc(options.checksum, header, body);
 
         if (header.data_page_header) |dph| {
             try dec.decodeV1Page(&builder, body, dph, header);
@@ -153,7 +222,22 @@ pub fn decodeChunk(
         }
     }
 
-    return builder.finish();
+    var buffers = try builder.finish();
+    errdefer buffers.deinit(allocator);
+    const def_levels = if (dec.keep_levels and info.max_def_level > 0) try dec.out_def.toOwnedSlice(allocator) else null;
+    errdefer if (def_levels) |l| allocator.free(l);
+    const rep_levels = if (dec.keep_levels and info.max_rep_level > 0) try dec.out_rep.toOwnedSlice(allocator) else null;
+    return .{ .buffers = buffers, .def_levels = def_levels, .rep_levels = rep_levels };
+}
+
+fn checkCrc(options: parquet_reader.ChecksumOptions, header: format.PageHeader, body: []const u8) !void {
+    if (!options.validate_page_checksum) return;
+    if (header.crc) |expected| {
+        const actual: i32 = @bitCast(std.hash.Crc32.hash(body));
+        if (actual != expected) return error.PageChecksumMismatch;
+    } else if (options.strict_checksum) {
+        return error.MissingPageChecksum;
+    }
 }
 
 fn fixedLength(element: format.SchemaElement) !usize {
@@ -186,6 +270,7 @@ const Kind = union(enum) {
 const Builder = struct {
     allocator: Allocator,
     kind: Kind,
+    large_offsets: bool = false,
     length: usize = 0,
     null_count: usize = 0,
     validity: BufferList = .empty,
@@ -198,8 +283,8 @@ const Builder = struct {
             .bits => try self.values.ensureTotalCapacityPrecise(self.allocator, bitBytes(entries)),
             .fixed => |w| try self.values.ensureTotalCapacityPrecise(self.allocator, try mulSize(entries, w)),
             .bytes => {
-                try self.offsets.ensureTotalCapacityPrecise(self.allocator, try mulSize(entries + 1, 4));
-                self.offsets.appendSliceAssumeCapacity(std.mem.asBytes(&@as(i32, 0)));
+                try self.offsets.ensureTotalCapacityPrecise(self.allocator, try mulSize(entries + 1, self.offsetWidth()));
+                self.offsets.appendNTimesAssumeCapacity(0, self.offsetWidth());
             },
         }
     }
@@ -218,7 +303,7 @@ const Builder = struct {
         switch (self.kind) {
             .bits => try self.values.ensureTotalCapacity(self.allocator, bitBytes(total)),
             .fixed => |w| try self.values.ensureTotalCapacity(self.allocator, try mulSize(total, w)),
-            .bytes => try self.offsets.ensureTotalCapacity(self.allocator, try mulSize(total + 1, 4)),
+            .bytes => try self.offsets.ensureTotalCapacity(self.allocator, try mulSize(total + 1, self.offsetWidth())),
         }
     }
 
@@ -250,9 +335,11 @@ const Builder = struct {
 
     /// Appends the current data length as the next offset. Requires `reserve`.
     fn pushOffset(self: *Builder) !void {
-        if (self.values.items.len > std.math.maxInt(i32)) return error.IntegerOverflow;
-        const end: i32 = @intCast(self.values.items.len);
-        self.offsets.appendSliceAssumeCapacity(std.mem.asBytes(&end));
+        try pushOffsetAt(self, self.values.items.len);
+    }
+
+    fn offsetWidth(self: *const Builder) usize {
+        return if (self.large_offsets) 8 else 4;
     }
 
     fn finish(self: *Builder) !Buffers {
@@ -272,6 +359,7 @@ const Builder = struct {
             .validity = validity,
             .values = values,
             .offsets = offsets,
+            .large_offsets = self.large_offsets,
         };
     }
 };
@@ -327,8 +415,20 @@ const ChunkDecoder = struct {
     dict_owned: ?[]u8 = null,
     /// BYTE_ARRAY dictionary offsets built by `buildDictView`.
     dict_offsets: ?[]usize = null,
+    /// Bit widths of the definition and repetition levels.
+    def_bits: u5,
+    rep_bits: u5,
+    /// Whether to collect all pages' levels in `out_def` and `out_rep`.
+    keep_levels: bool,
     /// Definition levels of the current page.
     levels: std.ArrayList(u32) = .empty,
+    /// Repetition levels of the current page.
+    rep: std.ArrayList(u32) = .empty,
+    /// Presence of each entry of the current page (1 when the definition level is the
+    /// maximum), when the maximum definition level is above 1.
+    mask: std.ArrayList(u32) = .empty,
+    out_def: std.ArrayList(u32) = .empty,
+    out_rep: std.ArrayList(u32) = .empty,
     /// Dictionary indices or RLE booleans of the current page.
     indices: std.ArrayList(u32) = .empty,
     /// Dense values of the current page when they must be converted before copying.
@@ -339,6 +439,10 @@ const ChunkDecoder = struct {
         if (self.dict_owned) |d| self.allocator.free(d);
         if (self.dict_offsets) |o| self.allocator.free(o);
         self.levels.deinit(self.allocator);
+        self.rep.deinit(self.allocator);
+        self.mask.deinit(self.allocator);
+        self.out_def.deinit(self.allocator);
+        self.out_rep.deinit(self.allocator);
         self.indices.deinit(self.allocator);
         self.scratch.deinit(self.allocator);
     }
@@ -402,27 +506,35 @@ const ChunkDecoder = struct {
         } else body;
         defer if (self.codec != .uncompressed) self.allocator.free(decompressed);
 
-        var data = decompressed;
-        var levels: ?[]const u32 = null;
-        var non_null = n;
-        if (self.info.max_def_level > 0) {
-            const lv = try self.levelBuffer(n);
-            var offset: usize = 0;
-            if (dph.definition_level_encoding == .bit_packed) {
-                const len = rle.bitPackedSize(n, 1);
-                try rle.decodeBitPackedLevelsInto(try safe.slice(data, 0, len), 1, lv);
-                offset = len;
-            } else {
-                if (data.len < 4) return error.EndOfData;
-                const len: usize = std.mem.readInt(u32, data[0..4], .little);
-                try rle.decodeInto(try safe.slice(data, 4, len), 1, lv);
-                offset = 4 + len;
-            }
-            data = data[offset..];
-            non_null = countPresent(lv);
-            levels = lv;
+        var data: []const u8 = decompressed;
+        // Repetition levels come before definition levels.
+        var rep: ?[]const u32 = null;
+        if (self.info.max_rep_level > 0) {
+            const out = try resizeList(self.allocator, &self.rep, n);
+            data = try decodeV1Levels(data, dph.repetition_level_encoding, self.rep_bits, out);
+            rep = out;
         }
-        try self.decodeValues(b, data, n, levels, non_null, dph.encoding);
+        var def: ?[]const u32 = null;
+        if (self.info.max_def_level > 0) {
+            const out = try resizeList(self.allocator, &self.levels, n);
+            data = try decodeV1Levels(data, dph.definition_level_encoding, self.def_bits, out);
+            def = out;
+        }
+        try self.decodePage(b, data, n, def, rep, dph.encoding);
+    }
+
+    /// Decodes V1 levels at the start of `data` into `out` and returns the data after them.
+    /// BIT_PACKED levels have no length prefix; RLE levels have a 4-byte little-endian length.
+    fn decodeV1Levels(data: []const u8, encoding: format.Encoding, bit_width: u5, out: []u32) ![]const u8 {
+        if (encoding == .bit_packed) {
+            const len = rle.bitPackedSize(out.len, bit_width);
+            try rle.decodeBitPackedLevelsInto(try safe.slice(data, 0, len), bit_width, out);
+            return data[len..];
+        }
+        if (data.len < 4) return error.EndOfData;
+        const len: usize = std.mem.readInt(u32, data[0..4], .little);
+        try rle.decodeInto(try safe.slice(data, 4, len), bit_width, out);
+        return data[4 + len ..];
     }
 
     fn decodeV2Page(self: *ChunkDecoder, b: *Builder, body: []const u8, v2: format.DataPageHeaderV2, header: format.PageHeader) !void {
@@ -432,6 +544,7 @@ const ChunkDecoder = struct {
         const def_len = safe.cast(v2.definition_levels_byte_length) catch return error.InvalidPageSize;
         const levels_len = std.math.add(usize, rep_len, def_len) catch return error.EndOfData;
         if (levels_len > body.len) return error.EndOfData;
+        const rep_data = body[0..rep_len];
         const def_data = body[rep_len..levels_len];
         const values_raw = body[levels_len..];
 
@@ -446,20 +559,58 @@ const ChunkDecoder = struct {
         } else values_raw;
         defer if (allocated) self.allocator.free(data);
 
-        var levels: ?[]const u32 = null;
-        var non_null = n;
-        if (self.info.max_def_level > 0 and def_data.len > 0) {
-            const lv = try self.levelBuffer(n);
-            try rle.decodeInto(def_data, 1, lv);
-            non_null = countPresent(lv);
-            levels = lv;
+        // V2 levels are RLE without a length prefix. An empty level section means all levels
+        // are 0 (repetition) or the maximum (definition).
+        var rep: ?[]const u32 = null;
+        if (self.info.max_rep_level > 0) {
+            const out = try resizeList(self.allocator, &self.rep, n);
+            if (rep_data.len > 0) try rle.decodeInto(rep_data, self.rep_bits, out) else @memset(out, 0);
+            rep = out;
         }
-        try self.decodeValues(b, data, n, levels, non_null, v2.encoding);
+        var def: ?[]const u32 = null;
+        if (self.info.max_def_level > 0) {
+            const out = try resizeList(self.allocator, &self.levels, n);
+            if (def_data.len > 0) try rle.decodeInto(def_data, self.def_bits, out) else @memset(out, self.info.max_def_level);
+            def = out;
+        }
+        try self.decodePage(b, data, n, def, rep, v2.encoding);
     }
 
-    fn levelBuffer(self: *ChunkDecoder, n: usize) ![]u32 {
-        try self.levels.resize(self.allocator, n);
-        return self.levels.items;
+    /// Records the page's levels (when kept), derives which entries are present, and decodes
+    /// the value section.
+    fn decodePage(
+        self: *ChunkDecoder,
+        b: *Builder,
+        data: []const u8,
+        n: usize,
+        def: ?[]const u32,
+        rep: ?[]const u32,
+        encoding: format.Encoding,
+    ) !void {
+        if (self.keep_levels) {
+            if (def) |d| try self.out_def.appendSlice(self.allocator, d);
+            if (rep) |r| try self.out_rep.appendSlice(self.allocator, r);
+        }
+        var present: ?[]const u32 = null;
+        var non_null = n;
+        if (def) |d| {
+            const max_def = self.info.max_def_level;
+            if (max_def == 1) {
+                // Levels are 0 or 1 (bit width 1), so they serve as the presence mask.
+                present = d;
+            } else {
+                const m = try resizeList(self.allocator, &self.mask, n);
+                for (d, m) |lv, *p| p.* = @intFromBool(lv == max_def);
+                present = m;
+            }
+            non_null = countPresent(present.?);
+        }
+        try self.decodeValues(b, data, n, present, non_null, encoding);
+    }
+
+    fn resizeList(allocator: Allocator, list: *std.ArrayList(u32), n: usize) ![]u32 {
+        try list.resize(allocator, n);
+        return list.items;
     }
 
     fn countPresent(levels: []const u32) usize {
@@ -799,9 +950,14 @@ fn appendBytesDict(b: *Builder, dict: BytesDict, levels: ?[]const u32, n: usize,
 
 /// Appends `end` as the next byte-array offset. Requires `reserve`.
 fn pushOffsetAt(b: *Builder, end: usize) !void {
-    if (end > std.math.maxInt(i32)) return error.IntegerOverflow;
-    const v: i32 = @intCast(end);
-    b.offsets.appendSliceAssumeCapacity(std.mem.asBytes(&v));
+    if (b.large_offsets) {
+        const v: i64 = @intCast(end);
+        b.offsets.appendSliceAssumeCapacity(std.mem.asBytes(&v));
+    } else {
+        if (end > std.math.maxInt(i32)) return error.IntegerOverflow;
+        const v: i32 = @intCast(end);
+        b.offsets.appendSliceAssumeCapacity(std.mem.asBytes(&v));
+    }
 }
 
 /// Appends `n` byte-array entries from decoded values (non-null entries in order).

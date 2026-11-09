@@ -21,7 +21,7 @@ const types = @import("types.zig");
 const thrift = @import("thrift/mod.zig");
 const compress = @import("compress/mod.zig");
 const dictionary = @import("encoding/dictionary.zig");
-const flat_column = @import("flat_column.zig");
+const leaf_decoder = @import("leaf_decoder.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -1013,14 +1013,14 @@ fn buildLogicalStruct(allocator: Allocator, schema: []const format.SchemaElement
 // Raw Physical Column Data (preserves rep/def levels)
 // ============================================================================
 
-const RawColumnData = struct {
+pub const RawColumnData = struct {
     values: []Value,
     def_levels: []u32,
     rep_levels: []u32,
     column_info: format.ColumnInfo,
     allocator: Allocator,
 
-    fn deinit(self: *RawColumnData) void {
+    pub fn deinit(self: *RawColumnData) void {
         for (self.values) |v| v.deinit(self.allocator);
         self.allocator.free(self.values);
         self.allocator.free(self.def_levels);
@@ -1110,6 +1110,17 @@ fn readPhysicalColumnRaw(
     const column_info = format.getColumnInfo(metadata.schema, col_idx) orelse
         return error.InvalidArgument;
 
+    return decodeRawColumn(allocator, page_data, meta, column_info);
+}
+
+/// Decodes a leaf column chunk into one `Value` per level entry plus the definition and
+/// repetition levels.
+pub fn decodeRawColumn(
+    allocator: Allocator,
+    page_data: []const u8,
+    meta: format.ColumnMetaData,
+    column_info: format.ColumnInfo,
+) BatchError!RawColumnData {
     var all_values: std.ArrayListUnmanaged(Value) = .empty;
     errdefer {
         for (all_values.items) |v| v.deinit(allocator);
@@ -1742,20 +1753,20 @@ fn readColumnAsArrow(
     const column_info = format.getColumnInfo(metadata.schema, col_idx) orelse
         return error.InvalidArgument;
 
-    if (flat_column.isFlat(column_info)) {
+    if (leaf_decoder.isFlat(column_info)) {
         return decodeFlatChunk(allocator, page_data, meta, column_info);
     }
     return decodeLeafChunkViaValues(allocator, page_data, meta, column_info);
 }
 
-/// Decodes a flat column chunk (see `flat_column.isFlat`) directly into an ArrowArray.
+/// Decodes a flat column chunk (see `leaf_decoder.isFlat`) directly into an ArrowArray.
 pub fn decodeFlatChunk(
     allocator: Allocator,
     page_data: []const u8,
     meta: format.ColumnMetaData,
     column_info: format.ColumnInfo,
 ) ReaderError!ArrowArray {
-    var bufs = try flat_column.decodeChunk(allocator, page_data, meta, column_info);
+    var bufs = try leaf_decoder.decodeChunk(allocator, page_data, meta, column_info);
     const null_count = safe.castTo(i64, bufs.null_count) catch unreachable; // null_count <= length, an allocated entry count
     const array = if (bufs.offsets) |offsets|
         buildVariableArray(allocator, bufs.length, null_count, bufs.validity, offsets, bufs.values)

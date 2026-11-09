@@ -11,7 +11,7 @@ const io = std.testing.io;
 const parquet = @import("../lib.zig");
 const format = parquet.format;
 const arrow_batch = @import("../core/arrow_batch.zig");
-const flat_column = @import("../core/flat_column.zig");
+const leaf_decoder = @import("../core/leaf_decoder.zig");
 const parquet_reader = @import("../core/parquet_reader.zig");
 const ArrowArray = parquet.ArrowArray;
 
@@ -102,7 +102,7 @@ fn compareFile(allocator: std.mem.Allocator, root: []const u8, dir: std.Io.Dir, 
     for (md.row_groups, 0..) |rg, rg_idx| {
         for (rg.columns, 0..) |*chunk, col| {
             const info = format.getColumnInfo(md.schema, col) orelse continue;
-            if (!flat_column.isFlat(info)) continue;
+            if (!leaf_decoder.isFlat(info)) continue;
             const meta = chunk.meta_data orelse continue;
             const page_data = parquet_reader.readColumnChunkData(ref, source, chunk) catch continue;
             totals.chunks += 1;
@@ -292,4 +292,130 @@ fn diffArrays(buf: []u8, a: *const ArrowArray, b: *const ArrowArray, info: forma
 
 fn getBit(bits: [*]const u8, i: usize) bool {
     return (bits[i / 8] >> @intCast(i % 8)) & 1 == 1;
+}
+
+// =============================================================================
+// All leaf columns: values and levels
+// =============================================================================
+
+test "leaf decoder matches Value decoder on all leaf columns, with levels" {
+    const allocator = std.testing.allocator;
+    var totals: Totals = .{};
+
+    for (roots) |root| {
+        var dir = std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true }) catch continue;
+        defer dir.close(io);
+        var walker = try dir.walk(allocator);
+        defer walker.deinit();
+        while (try walker.next(io)) |entry| {
+            if (entry.kind != .file or !std.mem.endsWith(u8, entry.basename, ".parquet")) continue;
+            if (std.mem.indexOf(u8, entry.path, ".venv") != null) continue;
+            totals.files += 1;
+            try compareLeafFile(allocator, root, entry.dir, entry.basename, entry.path, &totals);
+        }
+    }
+
+    std.debug.print(
+        "\nleaf comparison: {d} files ({d} unreadable), {d} leaf chunks: {d} equal, {d} both error, {d} differ ({d} expected)\n",
+        .{ totals.files, totals.files_unreadable, totals.chunks, totals.both_ok, totals.both_error, totals.differences, totals.expected },
+    );
+    try std.testing.expectEqual(totals.expected, totals.differences);
+    try std.testing.expect(totals.chunks > 0);
+}
+
+fn compareLeafFile(allocator: std.mem.Allocator, root: []const u8, dir: std.Io.Dir, basename: []const u8, path: []const u8, totals: *Totals) !void {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const ref = arena.allocator();
+
+    const file = dir.openFile(io, basename, .{}) catch {
+        totals.files_unreadable += 1;
+        return;
+    };
+    defer file.close(io);
+    var reader = parquet.openFileDynamic(ref, file, io, .{}) catch {
+        totals.files_unreadable += 1;
+        return;
+    };
+    defer reader.deinit();
+
+    const md = reader.metadata;
+    const source = reader.getSource();
+    for (md.row_groups, 0..) |rg, rg_idx| {
+        for (rg.columns, 0..) |*chunk, col| {
+            const info = format.getColumnInfo(md.schema, col) orelse continue;
+            const meta = chunk.meta_data orelse continue;
+            const page_data = parquet_reader.readColumnChunkData(ref, source, chunk) catch continue;
+            totals.chunks += 1;
+
+            var new = leaf_decoder.decodeLeaf(allocator, page_data, meta, info, .{ .keep_levels = true, .large_offsets = true });
+            defer if (new) |*l| l.deinit(allocator) else |_| {};
+            const old = arrow_batch.decodeRawColumn(ref, page_data, meta, info);
+
+            var why_buf: [256]u8 = undefined;
+            const why: ?[]const u8 = blk: {
+                const leaf = new catch |ne| {
+                    _ = old catch {
+                        totals.both_error += 1;
+                        break :blk null;
+                    };
+                    break :blk std.fmt.bufPrint(&why_buf, "new error {s}, old ok", .{@errorName(ne)}) catch "new error";
+                };
+                const raw = old catch |oe| {
+                    break :blk std.fmt.bufPrint(&why_buf, "old error {s}, new ok", .{@errorName(oe)}) catch "old error";
+                };
+                break :blk diffLeaf(&why_buf, &leaf, &raw, info);
+            };
+
+            if (why) |reason| {
+                totals.differences += 1;
+                const expected = isExpected(path, col);
+                if (expected) totals.expected += 1;
+                std.debug.print("{s}{s}/{s} rg {d} col {d} ({s}, {s}, def {d}, rep {d}): {s}\n", .{
+                    if (expected) "expected: " else "DIFF: ", root, path, rg_idx, col, info.element.name,
+                    @tagName(info.element.type_ orelse .int32), info.max_def_level, info.max_rep_level, reason,
+                });
+            } else if (new) |_| {
+                if (old) |_| totals.both_ok += 1 else |_| {}
+            } else |_| {}
+        }
+    }
+}
+
+/// Compares a decoded leaf (one slot per level entry) with the Value decoder's output.
+fn diffLeaf(buf: []u8, leaf: *const leaf_decoder.Leaf, raw: *const arrow_batch.RawColumnData, info: format.ColumnInfo) ?[]const u8 {
+    const b = &leaf.buffers;
+    const n = raw.values.len;
+    if (b.length != n) return std.fmt.bufPrint(buf, "entries {d} vs {d}", .{ b.length, n }) catch "entries";
+    if (raw.def_levels.len != n or raw.rep_levels.len != n) return "old level count differs from value count";
+    for (0..n) |i| {
+        const d = if (leaf.def_levels) |l| l[i] else info.max_def_level;
+        if (d != raw.def_levels[i]) return std.fmt.bufPrint(buf, "def level {d}: {d} vs {d}", .{ i, d, raw.def_levels[i] }) catch "def";
+        const r = if (leaf.rep_levels) |l| l[i] else 0;
+        if (r != raw.rep_levels[i]) return std.fmt.bufPrint(buf, "rep level {d}: {d} vs {d}", .{ i, r, raw.rep_levels[i] }) catch "rep";
+    }
+
+    const physical = info.element.type_ orelse return "no physical type";
+    for (raw.values, 0..) |v, i| {
+        const valid = b.isValid(i);
+        if (v == .null_val) {
+            if (valid) return std.fmt.bufPrint(buf, "entry {d}: old null, new valid", .{i}) catch "null";
+            continue;
+        }
+        if (!valid) return std.fmt.bufPrint(buf, "entry {d}: old {s}, new null", .{ i, @tagName(v) }) catch "null";
+        const same = switch (physical) {
+            .boolean => v == .bool_val and v.bool_val == getBit(b.values.ptr, i),
+            .int32 => v == .int32_val and v.int32_val == std.mem.bytesToValue(i32, b.values[i * 4 ..][0..4]),
+            .int64, .int96 => v == .int64_val and v.int64_val == std.mem.bytesToValue(i64, b.values[i * 8 ..][0..8]),
+            .float => v == .float_val and @as(u32, @bitCast(v.float_val)) == std.mem.bytesToValue(u32, b.values[i * 4 ..][0..4]),
+            .double => v == .double_val and @as(u64, @bitCast(v.double_val)) == std.mem.bytesToValue(u64, b.values[i * 8 ..][0..8]),
+            .byte_array => v == .bytes_val and std.mem.eql(u8, v.bytes_val, b.bytesAt(i)),
+            .fixed_len_byte_array => blk: {
+                const w: usize = @intCast(info.element.type_length orelse 0);
+                break :blk v == .fixed_bytes_val and std.mem.eql(u8, v.fixed_bytes_val, b.values[i * w ..][0..w]);
+            },
+        };
+        if (!same) return std.fmt.bufPrint(buf, "entry {d} differs (old {s})", .{ i, @tagName(v) }) catch "value";
+    }
+    return null;
 }
