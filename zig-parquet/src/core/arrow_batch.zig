@@ -1009,94 +1009,6 @@ fn buildLogicalStruct(allocator: Allocator, schema: []const format.SchemaElement
 }
 
 // ============================================================================
-// Raw Physical Column Data (preserves rep/def levels)
-// ============================================================================
-
-pub const RawColumnData = struct {
-    values: []Value,
-    def_levels: []u32,
-    rep_levels: []u32,
-    column_info: format.ColumnInfo,
-    allocator: Allocator,
-
-    pub fn deinit(self: *RawColumnData) void {
-        for (self.values) |v| v.deinit(self.allocator);
-        self.allocator.free(self.values);
-        self.allocator.free(self.def_levels);
-        self.allocator.free(self.rep_levels);
-    }
-};
-
-fn readPhysicalColumnRaw(
-    allocator: Allocator,
-    source: SeekableReader,
-    metadata: format.FileMetaData,
-    rg: *const format.RowGroup,
-    col_idx: usize,
-) BatchError!RawColumnData {
-    if (col_idx >= rg.columns.len) return error.InvalidArgument;
-
-    const chunk = &rg.columns[col_idx];
-    const meta = chunk.meta_data orelse return error.InvalidArgument;
-
-    const page_data = parquet_reader.readColumnChunkData(allocator, source, chunk) catch return error.InputOutput;
-    defer allocator.free(page_data);
-
-    const column_info = format.getColumnInfo(metadata.schema, col_idx) orelse
-        return error.InvalidArgument;
-
-    return decodeLeafRaw(allocator, page_data, meta, column_info) catch |e| return asBatchError(e);
-}
-
-/// Decodes a leaf column chunk with `leaf_decoder` into one `Value` per level entry plus the
-/// definition and repetition levels (filled with the maximum and 0 when the column has none).
-fn decodeLeafRaw(
-    allocator: Allocator,
-    page_data: []const u8,
-    meta: format.ColumnMetaData,
-    column_info: format.ColumnInfo,
-) !RawColumnData {
-    var leaf = try leaf_decoder.decodeLeaf(allocator, page_data, meta, column_info, .{
-        .keep_levels = true,
-        .large_offsets = true,
-    });
-    defer leaf.buffers.deinit(allocator);
-    errdefer {
-        if (leaf.def_levels) |l| allocator.free(l);
-        if (leaf.rep_levels) |l| allocator.free(l);
-    }
-    const n = leaf.buffers.length;
-    const def_levels = leaf.def_levels orelse blk: {
-        const l = try allocator.alloc(u32, n);
-        @memset(l, column_info.max_def_level);
-        break :blk l;
-    };
-    leaf.def_levels = def_levels;
-    const rep_levels = leaf.rep_levels orelse blk: {
-        const l = try allocator.alloc(u32, n);
-        @memset(l, 0);
-        break :blk l;
-    };
-    leaf.rep_levels = rep_levels;
-    const values = try leaf_decoder.toValues(allocator, &leaf.buffers, column_info.element);
-    return .{
-        .values = values,
-        .def_levels = def_levels,
-        .rep_levels = rep_levels,
-        .column_info = column_info,
-        .allocator = allocator,
-    };
-}
-
-/// Returns `e` when it is in `BatchError`, otherwise `error.InvalidPageData`.
-fn asBatchError(e: anyerror) BatchError {
-    inline for (@typeInfo(BatchError).error_set.error_names.?) |name| {
-        if (e == @field(anyerror, name)) return @field(BatchError, name);
-    }
-    return error.InvalidPageData;
-}
-
-// ============================================================================
 // Read Path: Parquet → ArrowArray
 // ============================================================================
 
@@ -1173,79 +1085,6 @@ fn readLogicalColumnAsArrow(
     };
 }
 
-fn readListColumnAsArrow(
-    allocator: Allocator,
-    source: SeekableReader,
-    metadata: format.FileMetaData,
-    rg: *const format.RowGroup,
-    logical_col: *const LogicalColumn,
-) ReaderError!ArrowArray {
-    var raw = try readPhysicalColumnRaw(allocator, source, metadata, rg, logical_col.physical_col_start);
-    defer raw.deinit();
-
-    const max_def: u32 = raw.column_info.max_def_level;
-    const element_level: u32 = if (max_def >= 2) 2 else 1;
-
-    var num_rows: usize = 0;
-    for (raw.rep_levels) |rep| {
-        if (rep == 0) num_rows += 1;
-    }
-
-    var num_elements: usize = 0;
-    for (raw.def_levels) |def| {
-        if (def >= element_level) num_elements += 1;
-    }
-
-    // Build offsets
-    const offsets_buf = allocBuffer(allocator, (num_rows + 1) * 4) catch return error.OutOfMemory;
-    errdefer allocator.free(offsets_buf);
-    const offsets: [*]i32 = @ptrCast(@alignCast(offsets_buf.ptr));
-
-    const parent_bitmap_len = (num_rows + 7) / 8;
-    const parent_validity = allocBuffer(allocator, parent_bitmap_len) catch return error.OutOfMemory;
-    errdefer allocator.free(parent_validity);
-    @memset(parent_validity, 0xFF);
-
-    var row_idx: usize = 0;
-    var elem_count: usize = 0;
-    var parent_null_count: i64 = 0;
-
-    for (raw.def_levels, raw.rep_levels, 0..) |def, rep, i| {
-        if (rep == 0) {
-            if (i > 0) {
-                row_idx += 1;
-            }
-            offsets[row_idx] = try safe.castTo(i32, elem_count);
-            if (def == 0) {
-                arrow.clearBit(parent_validity, row_idx);
-                parent_null_count += 1;
-            }
-        }
-        if (def >= element_level) {
-            elem_count += 1;
-        }
-    }
-    offsets[num_rows] = try safe.castTo(i32, elem_count);
-
-    // Build child element values (only entries where def >= element_level)
-    var element_values = allocator.alloc(Value, num_elements) catch return error.OutOfMemory;
-    var elem_idx: usize = 0;
-    for (raw.def_levels, raw.values) |def, val| {
-        if (def >= element_level) {
-            element_values[elem_idx] = val;
-            elem_idx += 1;
-        }
-    }
-    defer allocator.free(element_values);
-
-    // Convert element values to ArrowArray (child)
-    var child_array = try valuesToArrowArray(allocator, element_values, raw.column_info.element);
-    errdefer child_array.doRelease();
-
-    // Build parent list array
-    return buildListArray(allocator, num_rows, parent_null_count, parent_validity, offsets_buf, &child_array);
-}
-
 fn readStructColumnAsArrow(
     allocator: Allocator,
     source: SeekableReader,
@@ -1309,6 +1148,130 @@ fn readStructColumnAsArrow(
     return buildStructArray(allocator, num_rows, null_count, validity, children);
 }
 
+/// A leaf column chunk decoded with its levels. `def_levels` and `rep_levels` have one entry
+/// per decoded entry; when the column has no definition (repetition) levels they are filled
+/// with the maximum definition level (0).
+const LeafWithLevels = struct {
+    buffers: leaf_decoder.Buffers,
+    def_levels: []u32,
+    rep_levels: []u32,
+    column_info: format.ColumnInfo,
+
+    fn deinit(self: *LeafWithLevels, allocator: Allocator) void {
+        self.buffers.deinit(allocator);
+        allocator.free(self.def_levels);
+        allocator.free(self.rep_levels);
+    }
+};
+
+fn readLeafWithLevels(
+    allocator: Allocator,
+    source: SeekableReader,
+    metadata: format.FileMetaData,
+    rg: *const format.RowGroup,
+    col_idx: usize,
+) ReaderError!LeafWithLevels {
+    if (col_idx >= rg.columns.len) return error.InvalidArgument;
+    const chunk = &rg.columns[col_idx];
+    const meta = chunk.meta_data orelse return error.InvalidArgument;
+    const page_data = try parquet_reader.readColumnChunkData(allocator, source, chunk);
+    defer allocator.free(page_data);
+    const column_info = format.getColumnInfo(metadata.schema, col_idx) orelse return error.InvalidArgument;
+
+    var leaf = leaf_decoder.decodeLeaf(allocator, page_data, meta, column_info, .{ .keep_levels = true }) catch |e|
+        return asErrorOf(ReaderError, e);
+    errdefer leaf.deinit(allocator);
+    const n = leaf.buffers.length;
+    if (leaf.def_levels == null) {
+        const l = try allocator.alloc(u32, n);
+        @memset(l, column_info.max_def_level);
+        leaf.def_levels = l;
+    }
+    if (leaf.rep_levels == null) {
+        const l = try allocator.alloc(u32, n);
+        @memset(l, 0);
+        leaf.rep_levels = l;
+    }
+    return .{
+        .buffers = leaf.buffers,
+        .def_levels = leaf.def_levels.?,
+        .rep_levels = leaf.rep_levels.?,
+        .column_info = column_info,
+    };
+}
+
+/// List offsets and validity from a leaf's levels: a row starts at each repetition level 0,
+/// is null when its definition level is 0, and gains an element at each definition level of
+/// at least `element_level`.
+const ListShape = struct {
+    num_rows: usize,
+    num_elements: usize,
+    offsets: Buffer,
+    validity: Buffer,
+    null_count: i64,
+};
+
+fn listShape(allocator: Allocator, def_levels: []const u32, rep_levels: []const u32, element_level: u32) ReaderError!ListShape {
+    var num_rows: usize = 0;
+    for (rep_levels) |rep| num_rows += @intFromBool(rep == 0);
+
+    const offsets_buf = try allocBuffer(allocator, (num_rows + 1) * 4);
+    errdefer allocator.free(offsets_buf);
+    const offsets: [*]i32 = @ptrCast(@alignCast(offsets_buf.ptr));
+    const validity = try allocBuffer(allocator, (num_rows + 7) / 8);
+    errdefer allocator.free(validity);
+    @memset(validity, 0xFF);
+
+    var row_idx: usize = 0;
+    var elem_count: usize = 0;
+    var null_count: i64 = 0;
+    for (def_levels, rep_levels, 0..) |def, rep, i| {
+        if (rep == 0) {
+            if (i > 0) row_idx += 1;
+            offsets[row_idx] = try safe.castTo(i32, elem_count);
+            if (def == 0) {
+                arrow.clearBit(validity, row_idx);
+                null_count += 1;
+            }
+        }
+        if (def >= element_level) elem_count += 1;
+    }
+    offsets[num_rows] = try safe.castTo(i32, elem_count);
+    return .{ .num_rows = num_rows, .num_elements = elem_count, .offsets = offsets_buf, .validity = validity, .null_count = null_count };
+}
+
+fn readListColumnAsArrow(
+    allocator: Allocator,
+    source: SeekableReader,
+    metadata: format.FileMetaData,
+    rg: *const format.RowGroup,
+    logical_col: *const LogicalColumn,
+) ReaderError!ArrowArray {
+    var leaf = try readLeafWithLevels(allocator, source, metadata, rg, logical_col.physical_col_start);
+    defer leaf.deinit(allocator);
+
+    const max_def: u32 = leaf.column_info.max_def_level;
+    const element_level: u32 = if (max_def >= 2) 2 else 1;
+
+    const shape = try listShape(allocator, leaf.def_levels, leaf.rep_levels, element_level);
+    var shape_owned = true;
+    errdefer if (shape_owned) {
+        allocator.free(shape.offsets);
+        allocator.free(shape.validity);
+    };
+
+    // Elements: entries with a definition level of at least `element_level`; an element is
+    // null when its definition level is below the maximum.
+    const elements = leaf.buffers.take(allocator, leaf.def_levels, element_level, std.math.maxInt(usize)) catch |e|
+        return asErrorOf(ReaderError, e);
+    var child = try buffersToArrow(allocator, elements);
+    errdefer child.doRelease();
+
+    const list = try buildListArray(allocator, shape.num_rows, shape.null_count, shape.validity, shape.offsets, &child);
+    shape_owned = false;
+    return list;
+}
+
 fn readMapColumnAsArrow(
     allocator: Allocator,
     source: SeekableReader,
@@ -1316,119 +1279,87 @@ fn readMapColumnAsArrow(
     rg: *const format.RowGroup,
     logical_col: *const LogicalColumn,
 ) ReaderError!ArrowArray {
-    // MAP reads like a LIST but has 2 children (key, value) inside an entries struct
-    // Read the key and value physical columns with levels
     if (logical_col.children.len != 2) return error.InvalidSchema;
 
-    const key_phys_idx = logical_col.children[0].physical_col_start;
-    const val_phys_idx = logical_col.children[1].physical_col_start;
+    // Keys determine the entries (offsets and validity) through their levels.
+    var key = try readLeafWithLevels(allocator, source, metadata, rg, logical_col.children[0].physical_col_start);
+    defer key.deinit(allocator);
+    var val = try readLeafWithLevels(allocator, source, metadata, rg, logical_col.children[1].physical_col_start);
+    defer val.deinit(allocator);
 
-    // Read key column (keys determine the list structure via rep/def levels)
-    var key_raw = try readPhysicalColumnRaw(allocator, source, metadata, rg, key_phys_idx);
-    defer key_raw.deinit();
+    const key_level: u32 = if (key.column_info.max_def_level >= 2) 2 else 1;
+    const val_level: u32 = if (val.column_info.max_def_level >= 2) 2 else 1;
 
-    var val_raw = try readPhysicalColumnRaw(allocator, source, metadata, rg, val_phys_idx);
-    defer val_raw.deinit();
+    const shape = try listShape(allocator, key.def_levels, key.rep_levels, key_level);
+    var shape_owned = true;
+    errdefer if (shape_owned) {
+        allocator.free(shape.offsets);
+        allocator.free(shape.validity);
+    };
+    const num_entries = shape.num_elements;
 
-    const key_max_def: u32 = key_raw.column_info.max_def_level;
-    const element_level: u32 = if (key_max_def >= 2) 2 else 1;
+    const key_elements = key.buffers.take(allocator, key.def_levels, key_level, num_entries) catch |e|
+        return asErrorOf(ReaderError, e);
+    var key_array = try buffersToArrow(allocator, key_elements);
+    errdefer if (key_array.release != null) key_array.doRelease();
 
-    // Count rows and elements from key rep/def levels
-    var num_rows: usize = 0;
-    for (key_raw.rep_levels) |rep| {
-        if (rep == 0) num_rows += 1;
+    // Values beyond `num_entries` are ignored; fewer values than entries is malformed.
+    const val_elements = val.buffers.take(allocator, val.def_levels, val_level, num_entries) catch |e|
+        return asErrorOf(ReaderError, e);
+    if (val_elements.length != num_entries) {
+        var v = val_elements;
+        v.deinit(allocator);
+        return error.InvalidPageData;
     }
+    var val_array = try buffersToArrow(allocator, val_elements);
+    errdefer if (val_array.release != null) val_array.doRelease();
 
-    var num_entries: usize = 0;
-    for (key_raw.def_levels) |def| {
-        if (def >= element_level) num_entries += 1;
-    }
-
-    // Build offsets from key rep levels
-    const offsets_buf = allocBuffer(allocator, (num_rows + 1) * 4) catch return error.OutOfMemory;
-    errdefer allocator.free(offsets_buf);
-    const offsets: [*]i32 = @ptrCast(@alignCast(offsets_buf.ptr));
-
-    const parent_bitmap_len = (num_rows + 7) / 8;
-    const parent_validity = allocBuffer(allocator, parent_bitmap_len) catch return error.OutOfMemory;
-    errdefer allocator.free(parent_validity);
-    @memset(parent_validity, 0xFF);
-
-    var row_idx: usize = 0;
-    var entry_count: usize = 0;
-    var parent_null_count: i64 = 0;
-
-    for (key_raw.def_levels, key_raw.rep_levels, 0..) |def, rep, i| {
-        if (rep == 0) {
-            if (i > 0) row_idx += 1;
-            offsets[row_idx] = try safe.castTo(i32, entry_count);
-            if (def == 0) {
-                arrow.clearBit(parent_validity, row_idx);
-                parent_null_count += 1;
-            }
-        }
-        if (def >= element_level) {
-            entry_count += 1;
-        }
-    }
-    offsets[num_rows] = try safe.castTo(i32, entry_count);
-
-    // Filter key and value values to only entries
-    var key_elements = allocator.alloc(Value, num_entries) catch return error.OutOfMemory;
-    defer allocator.free(key_elements);
-    var key_elem_idx: usize = 0;
-    for (key_raw.def_levels, key_raw.values) |def, val| {
-        if (def >= element_level) {
-            key_elements[key_elem_idx] = val;
-            key_elem_idx += 1;
-        }
-    }
-
-    const val_max_def: u32 = val_raw.column_info.max_def_level;
-    const val_element_level: u32 = if (val_max_def >= 2) 2 else 1;
-    var val_elements = allocator.alloc(Value, num_entries) catch return error.OutOfMemory;
-    defer allocator.free(val_elements);
-    var val_elem_idx: usize = 0;
-    for (val_raw.def_levels, val_raw.values) |def, val| {
-        if (def >= val_element_level) {
-            if (val_elem_idx < num_entries) {
-                val_elements[val_elem_idx] = val;
-                val_elem_idx += 1;
-            }
-        }
-    }
-
-    // Convert to ArrowArrays
-    var key_array = try valuesToArrowArray(allocator, key_elements, key_raw.column_info.element);
-    errdefer key_array.doRelease();
-
-    var val_array = try valuesToArrowArray(allocator, val_elements, val_raw.column_info.element);
-    errdefer val_array.doRelease();
-
-    // Build entries struct with key and value children
-    var entries_children = allocator.alloc(ArrowArray, 2) catch return error.OutOfMemory;
+    var entries_children = try allocator.alloc(ArrowArray, 2);
     var entries_children_owned = true;
     errdefer if (entries_children_owned) {
-        for (entries_children) |*child| child.doRelease();
+        for (entries_children) |*c| c.doRelease();
         allocator.free(entries_children);
     };
     entries_children[0] = key_array;
     entries_children[1] = val_array;
     key_array.release = null; // ownership transferred to entries_children
-    val_array.release = null; // ownership transferred to entries_children
+    val_array.release = null;
 
-    const entries_validity = allocBuffer(allocator, (num_entries + 7) / 8) catch return error.OutOfMemory;
+    const entries_validity = try allocBuffer(allocator, (num_entries + 7) / 8);
     var entries_validity_owned = true;
     errdefer if (entries_validity_owned) allocator.free(entries_validity);
     @memset(entries_validity, 0xFF);
 
-    var entries_struct = try buildStructArray(allocator, num_entries, 0, entries_validity, entries_children);
+    var entries = try buildStructArray(allocator, num_entries, 0, entries_validity, entries_children);
     entries_children_owned = false;
     entries_validity_owned = false;
-    errdefer entries_struct.doRelease();
+    errdefer entries.doRelease();
 
-    // Build map array (like a list array with entries struct as child)
-    return buildListArray(allocator, num_rows, parent_null_count, parent_validity, offsets_buf, &entries_struct);
+    const map = try buildListArray(allocator, shape.num_rows, shape.null_count, shape.validity, shape.offsets, &entries);
+    shape_owned = false;
+    return map;
+}
+
+/// Wraps decoded buffers in an ArrowArray, taking ownership of them (they are freed on error).
+fn buffersToArrow(allocator: Allocator, bufs: leaf_decoder.Buffers) ReaderError!ArrowArray {
+    var b = bufs;
+    const null_count = safe.castTo(i64, b.null_count) catch unreachable; // null_count <= length, an allocated entry count
+    const array = if (b.offsets) |offsets|
+        buildVariableArray(allocator, b.length, null_count, b.validity, offsets, b.values)
+    else
+        buildPrimitiveArray(allocator, b.length, null_count, b.validity, b.values);
+    return array catch |e| {
+        b.deinit(allocator);
+        return e;
+    };
+}
+
+/// Returns `e` when it is in `Set`, otherwise `error.InvalidPageData`.
+fn asErrorOf(comptime Set: type, e: anyerror) Set {
+    inline for (@typeInfo(Set).error_set.error_names.?) |name| {
+        if (e == @field(anyerror, name)) return @field(Set, name);
+    }
+    return error.InvalidPageData;
 }
 
 // ============================================================================
@@ -1528,32 +1459,25 @@ fn buildStructArray(
     };
 }
 
+/// Decodes a leaf column chunk into an ArrowArray with one entry per level entry, null where
+/// the definition level is below the maximum. For flat columns the entries are rows.
 fn readColumnAsArrow(
     allocator: Allocator,
     source: SeekableReader,
     metadata: format.FileMetaData,
     rg: *const format.RowGroup,
     col_idx: usize,
-) !ArrowArray {
+) ReaderError!ArrowArray {
     if (col_idx >= rg.columns.len) return error.InvalidArgument;
-
     const chunk = &rg.columns[col_idx];
     const meta = chunk.meta_data orelse return error.InvalidArgument;
-
     const page_data = try parquet_reader.readColumnChunkData(allocator, source, chunk);
     defer allocator.free(page_data);
+    const column_info = format.getColumnInfo(metadata.schema, col_idx) orelse return error.InvalidArgument;
 
-    const column_info = format.getColumnInfo(metadata.schema, col_idx) orelse
-        return error.InvalidArgument;
-
-    if (leaf_decoder.isFlat(column_info)) {
-        return decodeFlatChunk(allocator, page_data, meta, column_info);
-    }
-    // A leaf that is not flat (a repeated primitive without a LIST annotation): one array
-    // entry per level entry, as before.
-    var raw = try decodeLeafRaw(allocator, page_data, meta, column_info);
-    defer raw.deinit();
-    return valuesToArrowArray(allocator, raw.values, column_info.element);
+    const leaf = leaf_decoder.decodeLeaf(allocator, page_data, meta, column_info, .{}) catch |e|
+        return asErrorOf(ReaderError, e);
+    return buffersToArrow(allocator, leaf.buffers);
 }
 
 /// Decodes a flat column chunk (see `leaf_decoder.isFlat`) directly into an ArrowArray.
@@ -1563,281 +1487,8 @@ pub fn decodeFlatChunk(
     meta: format.ColumnMetaData,
     column_info: format.ColumnInfo,
 ) ReaderError!ArrowArray {
-    var bufs = try leaf_decoder.decodeChunk(allocator, page_data, meta, column_info);
-    const null_count = safe.castTo(i64, bufs.null_count) catch unreachable; // null_count <= length, an allocated entry count
-    const array = if (bufs.offsets) |offsets|
-        buildVariableArray(allocator, bufs.length, null_count, bufs.validity, offsets, bufs.values)
-    else
-        buildPrimitiveArray(allocator, bufs.length, null_count, bufs.validity, bufs.values);
-    return array catch |e| {
-        bufs.deinit(allocator);
-        return e;
-    };
-}
-
-// ============================================================================
-// Value[] → ArrowArray conversion
-// ============================================================================
-
-fn valuesToArrowArray(allocator: Allocator, values: []const Value, elem: format.SchemaElement) !ArrowArray {
-    const pt = elem.type_ orelse return error.InvalidSchema;
-    return switch (pt) {
-        .boolean => boolValuesToArrow(allocator, values),
-        .int32 => int32ValuesToArrow(allocator, values),
-        .int64, .int96 => int64ValuesToArrow(allocator, values),
-        .float => floatValuesToArrow(allocator, values),
-        .double => doubleValuesToArrow(allocator, values),
-        .byte_array => byteArrayValuesToArrow(allocator, values),
-        .fixed_len_byte_array => fixedByteArrayValuesToArrow(allocator, values, elem),
-    };
-}
-
-fn boolValuesToArrow(allocator: Allocator, values: []const Value) !ArrowArray {
-    const n = values.len;
-    const bitmap_len = (n + 7) / 8;
-
-    const validity = try allocBuffer(allocator, bitmap_len);
-    errdefer allocator.free(validity);
-    @memset(validity, 0xFF);
-
-    const data = try allocBuffer(allocator, bitmap_len);
-    errdefer allocator.free(data);
-    @memset(data, 0);
-
-    var null_count: i64 = 0;
-    for (values, 0..) |v, i| {
-        switch (v) {
-            .bool_val => |b| {
-                if (b) {
-                    const byte_idx = i / 8;
-                    const bit_idx: u3 = safe.castTo(u3, i % 8) catch unreachable; // i % 8 is 0-7
-                    data[byte_idx] |= @as(u8, 1) << bit_idx;
-                }
-            },
-            .null_val => {
-                arrow.clearBit(validity, i);
-                null_count += 1;
-            },
-            else => {
-                arrow.clearBit(validity, i);
-                null_count += 1;
-            },
-        }
-    }
-
-    return buildPrimitiveArray(allocator, n, null_count, validity, data);
-}
-
-fn int32ValuesToArrow(allocator: Allocator, values: []const Value) !ArrowArray {
-    const n = values.len;
-    const bitmap_len = (n + 7) / 8;
-
-    const validity = try allocBuffer(allocator, bitmap_len);
-    errdefer allocator.free(validity);
-    @memset(validity, 0xFF);
-
-    const data = try allocBuffer(allocator, n * 4);
-    errdefer allocator.free(data);
-    const typed: [*]i32 = @ptrCast(@alignCast(data.ptr));
-
-    var null_count: i64 = 0;
-    for (values, 0..) |v, i| {
-        switch (v) {
-            .int32_val => |x| typed[i] = x,
-            .null_val => {
-                typed[i] = 0;
-                arrow.clearBit(validity, i);
-                null_count += 1;
-            },
-            else => {
-                typed[i] = 0;
-                arrow.clearBit(validity, i);
-                null_count += 1;
-            },
-        }
-    }
-
-    return buildPrimitiveArray(allocator, n, null_count, validity, data);
-}
-
-fn int64ValuesToArrow(allocator: Allocator, values: []const Value) !ArrowArray {
-    const n = values.len;
-    const bitmap_len = (n + 7) / 8;
-
-    const validity = try allocBuffer(allocator, bitmap_len);
-    errdefer allocator.free(validity);
-    @memset(validity, 0xFF);
-
-    const data = try allocBuffer(allocator, n * 8);
-    errdefer allocator.free(data);
-    const typed: [*]i64 = @ptrCast(@alignCast(data.ptr));
-
-    var null_count: i64 = 0;
-    for (values, 0..) |v, i| {
-        switch (v) {
-            .int64_val => |x| typed[i] = x,
-            .null_val => {
-                typed[i] = 0;
-                arrow.clearBit(validity, i);
-                null_count += 1;
-            },
-            else => {
-                typed[i] = 0;
-                arrow.clearBit(validity, i);
-                null_count += 1;
-            },
-        }
-    }
-
-    return buildPrimitiveArray(allocator, n, null_count, validity, data);
-}
-
-fn floatValuesToArrow(allocator: Allocator, values: []const Value) !ArrowArray {
-    const n = values.len;
-    const bitmap_len = (n + 7) / 8;
-
-    const validity = try allocBuffer(allocator, bitmap_len);
-    errdefer allocator.free(validity);
-    @memset(validity, 0xFF);
-
-    const data = try allocBuffer(allocator, n * 4);
-    errdefer allocator.free(data);
-    const typed: [*]f32 = @ptrCast(@alignCast(data.ptr));
-
-    var null_count: i64 = 0;
-    for (values, 0..) |v, i| {
-        switch (v) {
-            .float_val => |x| typed[i] = x,
-            .null_val => {
-                typed[i] = 0;
-                arrow.clearBit(validity, i);
-                null_count += 1;
-            },
-            else => {
-                typed[i] = 0;
-                arrow.clearBit(validity, i);
-                null_count += 1;
-            },
-        }
-    }
-
-    return buildPrimitiveArray(allocator, n, null_count, validity, data);
-}
-
-fn doubleValuesToArrow(allocator: Allocator, values: []const Value) !ArrowArray {
-    const n = values.len;
-    const bitmap_len = (n + 7) / 8;
-
-    const validity = try allocBuffer(allocator, bitmap_len);
-    errdefer allocator.free(validity);
-    @memset(validity, 0xFF);
-
-    const data = try allocBuffer(allocator, n * 8);
-    errdefer allocator.free(data);
-    const typed: [*]f64 = @ptrCast(@alignCast(data.ptr));
-
-    var null_count: i64 = 0;
-    for (values, 0..) |v, i| {
-        switch (v) {
-            .double_val => |x| typed[i] = x,
-            .null_val => {
-                typed[i] = 0;
-                arrow.clearBit(validity, i);
-                null_count += 1;
-            },
-            else => {
-                typed[i] = 0;
-                arrow.clearBit(validity, i);
-                null_count += 1;
-            },
-        }
-    }
-
-    return buildPrimitiveArray(allocator, n, null_count, validity, data);
-}
-
-fn byteArrayValuesToArrow(allocator: Allocator, values: []const Value) !ArrowArray {
-    const n = values.len;
-    const bitmap_len = (n + 7) / 8;
-
-    const validity = try allocBuffer(allocator, bitmap_len);
-    errdefer allocator.free(validity);
-    @memset(validity, 0xFF);
-
-    // First pass: compute total data size
-    var total_len: usize = 0;
-    for (values) |v| {
-        switch (v) {
-            .bytes_val => |b| total_len += b.len,
-            else => {},
-        }
-    }
-
-    // Offsets buffer (n+1 int32 values)
-    const offsets_buf = try allocBuffer(allocator, (n + 1) * 4);
-    errdefer allocator.free(offsets_buf);
-    const offsets: [*]i32 = @ptrCast(@alignCast(offsets_buf.ptr));
-
-    // Data buffer
-    const data_buf = try allocBuffer(allocator, if (total_len > 0) total_len else 1);
-    errdefer allocator.free(data_buf);
-
-    var null_count: i64 = 0;
-    var data_pos: usize = 0;
-    for (values, 0..) |v, i| {
-        offsets[i] = try safe.castTo(i32, data_pos);
-        switch (v) {
-            .bytes_val => |b| {
-                @memcpy(data_buf[data_pos..][0..b.len], b);
-                data_pos += b.len;
-            },
-            .null_val => {
-                arrow.clearBit(validity, i);
-                null_count += 1;
-            },
-            else => {
-                arrow.clearBit(validity, i);
-                null_count += 1;
-            },
-        }
-    }
-    offsets[n] = try safe.castTo(i32, data_pos);
-
-    return buildVariableArray(allocator, n, null_count, validity, offsets_buf, data_buf);
-}
-
-fn fixedByteArrayValuesToArrow(allocator: Allocator, values: []const Value, elem: format.SchemaElement) !ArrowArray {
-    const tl = safe.cast(elem.type_length orelse return error.InvalidSchema) catch return error.InvalidTypeLength;
-    const n = values.len;
-    const bitmap_len = (n + 7) / 8;
-
-    const validity = try allocBuffer(allocator, bitmap_len);
-    errdefer allocator.free(validity);
-    @memset(validity, 0xFF);
-
-    const data = try allocBuffer(allocator, n * tl);
-    errdefer allocator.free(data);
-    @memset(data, 0);
-
-    var null_count: i64 = 0;
-    for (values, 0..) |v, i| {
-        switch (v) {
-            .fixed_bytes_val => |b| {
-                const copy_len = @min(b.len, tl);
-                @memcpy(data[i * tl ..][0..copy_len], b[0..copy_len]);
-            },
-            .null_val => {
-                arrow.clearBit(validity, i);
-                null_count += 1;
-            },
-            else => {
-                arrow.clearBit(validity, i);
-                null_count += 1;
-            },
-        }
-    }
-
-    return buildPrimitiveArray(allocator, n, null_count, validity, data);
+    const bufs = try leaf_decoder.decodeChunk(allocator, page_data, meta, column_info);
+    return buffersToArrow(allocator, bufs);
 }
 
 // ============================================================================
@@ -3655,82 +3306,6 @@ test "import schema from arrow - flat types" {
     try std.testing.expectEqual(true, col_defs[1].optional);
 }
 
-test "values to arrow array - int32" {
-    const allocator = std.testing.allocator;
-
-    const values = [_]Value{
-        .{ .int32_val = 10 },
-        .{ .int32_val = 20 },
-        .null_val,
-        .{ .int32_val = 40 },
-    };
-
-    var arr = try int32ValuesToArrow(allocator, &values);
-    defer arr.doRelease();
-
-    try std.testing.expectEqual(@as(i64, 4), arr.length);
-    try std.testing.expectEqual(@as(i64, 1), arr.null_count);
-    try std.testing.expectEqual(@as(i64, 2), arr.n_buffers);
-
-    // Check values
-    const data: [*]const i32 = @ptrCast(@alignCast(arr.buffers[1].?));
-    try std.testing.expectEqual(@as(i32, 10), data[0]);
-    try std.testing.expectEqual(@as(i32, 20), data[1]);
-    try std.testing.expectEqual(@as(i32, 40), data[3]);
-
-    // Check validity bitmap
-    const validity: [*]const u8 = @ptrCast(@alignCast(arr.buffers[0].?));
-    try std.testing.expect(arrow.getBit(validity[0..1], 0));
-    try std.testing.expect(arrow.getBit(validity[0..1], 1));
-    try std.testing.expect(!arrow.getBit(validity[0..1], 2));
-    try std.testing.expect(arrow.getBit(validity[0..1], 3));
-}
-
-test "values to arrow array - byte array" {
-    const allocator = std.testing.allocator;
-
-    const values = [_]Value{
-        .{ .bytes_val = "hello" },
-        .null_val,
-        .{ .bytes_val = "world" },
-    };
-
-    var arr = try byteArrayValuesToArrow(allocator, &values);
-    defer arr.doRelease();
-
-    try std.testing.expectEqual(@as(i64, 3), arr.length);
-    try std.testing.expectEqual(@as(i64, 1), arr.null_count);
-    try std.testing.expectEqual(@as(i64, 3), arr.n_buffers);
-
-    // Check offsets
-    const offsets: [*]const i32 = @ptrCast(@alignCast(arr.buffers[1].?));
-    try std.testing.expectEqual(@as(i32, 0), offsets[0]);
-    try std.testing.expectEqual(@as(i32, 5), offsets[1]);
-    try std.testing.expectEqual(@as(i32, 5), offsets[2]); // null value
-    try std.testing.expectEqual(@as(i32, 10), offsets[3]);
-
-    // Check data
-    const data: [*]const u8 = @ptrCast(@alignCast(arr.buffers[2].?));
-    try std.testing.expectEqualStrings("helloworld", data[0..10]);
-}
-
-test "values to arrow array - boolean" {
-    const allocator = std.testing.allocator;
-
-    const values = [_]Value{
-        .{ .bool_val = true },
-        .{ .bool_val = false },
-        .null_val,
-        .{ .bool_val = true },
-    };
-
-    var arr = try boolValuesToArrow(allocator, &values);
-    defer arr.doRelease();
-
-    try std.testing.expectEqual(@as(i64, 4), arr.length);
-    try std.testing.expectEqual(@as(i64, 1), arr.null_count);
-}
-
 // ============================================================================
 // Round-trip integration tests
 // ============================================================================
@@ -4199,17 +3774,24 @@ test "round-trip: MAP(string->int32)" {
     try std.testing.expectEqual(@as(i32, 3), val_data[2]);
 }
 
+/// A one-entry, non-null int32 ArrowArray.
+fn testInt32Array(allocator: Allocator, v: i32) !ArrowArray {
+    const validity = try allocBuffer(allocator, 1);
+    errdefer allocator.free(validity);
+    @memset(validity, 0xFF);
+    const data = try allocBuffer(allocator, 4);
+    errdefer allocator.free(data);
+    @memcpy(data, std.mem.asBytes(&v));
+    return buildPrimitiveArray(allocator, 1, 0, validity, data);
+}
+
 test "ownership: local release must be null after transfer to struct children" {
     const allocator = std.testing.allocator;
 
-    const int32_elem = format.SchemaElement{ .name = "k", .type_ = .int32 };
-    const key_vals = [_]Value{.{ .int32_val = 10 }};
-    const val_vals = [_]Value{.{ .int32_val = 20 }};
-
-    var key_array = try valuesToArrowArray(allocator, &key_vals, int32_elem);
+    var key_array = try testInt32Array(allocator, 10);
     errdefer key_array.doRelease();
 
-    var val_array = try valuesToArrowArray(allocator, &val_vals, int32_elem);
+    var val_array = try testInt32Array(allocator, 20);
     errdefer val_array.doRelease();
 
     var entries_children = try allocator.alloc(ArrowArray, 2);

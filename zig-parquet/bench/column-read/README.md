@@ -79,3 +79,16 @@ For `id`, about 84% of samples are in snappy decompression with the pure-Zig cod
 
 In a profile of `arrow ints` and `arrow attrs` (macOS `sample`, 5 s), about 60% of samples are in `Value` handling (`leaf_decoder.toValues`, `valuesToArrowArray`, `Value.deinit`, the list/map assembly, and the copies they make), and 20-25% in decompression and decoding.
 
+
+## Nested assembly from buffers (2026-11-09, same machine and file)
+
+After list, map and leaf assembly in `arrow_batch.zig` stopped building `Value`s: list and map children are taken from the decoded buffers by definition level, and every leaf (flat or not) is decoded directly into an Arrow array. The row path is unchanged.
+
+| Case | median ms | allocs | alloc MB | peak MB | PyArrow ms | PyArrow peak MB |
+|---|---|---|---|---|---|---|
+| arrow ints | 121 | 689 | 295 | 70.8 | 54.7 | 62.7 |
+| arrow point | 28 | 1,188 | 106 | 28.9 | 29.6 | 62.7 |
+| arrow attrs | 154 | 1,273 | 410 | 93.1 | 72.3 | 91.3 |
+| arrow all | 306 | 2,950 | 811 | 136.0 | 156.2 | 134.7 |
+
+Medians varied by about 5% between runs (arrow all: 288-306 ms). For `ints`, about 40% of profile samples are in snappy decompression.

@@ -72,6 +72,8 @@ pub const Buffers = struct {
     offsets: ?Buffer,
     /// Offsets are i64 instead of i32.
     large_offsets: bool = false,
+    /// How `values` holds entries.
+    layout: Layout,
 
     pub fn deinit(self: *Buffers, allocator: Allocator) void {
         allocator.free(self.validity);
@@ -95,6 +97,95 @@ pub const Buffers = struct {
         };
         return self.values[start..end];
     }
+
+    /// Copies the entries `i` with `levels[i] >= min_level`, in order and at most `limit` of
+    /// them, into new buffers with i32 offsets.
+    pub fn select(self: *const Buffers, allocator: Allocator, levels: []const u32, min_level: u32, limit: usize) !Buffers {
+        var count: usize = 0;
+        var bytes: usize = 0;
+        for (levels, 0..) |lv, i| {
+            if (lv < min_level) continue;
+            if (count == limit) break;
+            count += 1;
+            if (self.layout == .bytes) bytes += self.bytesAt(i).len;
+        }
+        var b = Builder{ .allocator = allocator, .kind = self.layout };
+        errdefer b.deinit();
+        try b.init(count);
+        try b.reserve(count);
+        if (self.layout == .bytes) try b.values.ensureTotalCapacity(allocator, bytes);
+        switch (self.layout) {
+            .fixed => |w| switch (w) {
+                inline 4, 8 => |cw| self.selectFixed(cw, &b, levels, min_level, count),
+                else => self.selectFixed(0, &b, levels, min_level, count),
+            },
+            .bits, .bytes => {
+                var taken: usize = 0;
+                for (levels, 0..) |lv, i| {
+                    if (lv < min_level) continue;
+                    if (taken == count) break;
+                    taken += 1;
+                    if (self.layout == .bits) {
+                        b.pushBit((self.values[i / 8] >> @intCast(i % 8)) & 1 == 1);
+                    } else {
+                        b.values.appendSliceAssumeCapacity(self.bytesAt(i));
+                        try b.pushOffset();
+                    }
+                    b.pushValidity(self.isValid(i));
+                }
+            },
+        }
+        return b.finish();
+    }
+
+    /// `select` for fixed-width entries. `comptime_width` is the width when known at compile
+    /// time (4 or 8), else 0.
+    fn selectFixed(self: *const Buffers, comptime comptime_width: usize, b: *Builder, levels: []const u32, min_level: u32, count: usize) void {
+        const w = if (comptime_width != 0) comptime_width else self.layout.fixed;
+        var taken: usize = 0;
+        for (levels, 0..) |lv, i| {
+            if (lv < min_level) continue;
+            if (taken == count) break;
+            taken += 1;
+            if (comptime_width != 0) {
+                b.values.addManyAsArrayAssumeCapacity(comptime_width).* = self.values[i * w ..][0..comptime_width].*;
+            } else {
+                b.values.appendSliceAssumeCapacity(self.values[i * w ..][0..w]);
+            }
+            b.pushValidity(self.isValid(i));
+        }
+    }
+
+    /// Like `select`, but when every entry is selected and offsets are i32, moves the buffers
+    /// out of `self` (leaving it empty) instead of copying them.
+    pub fn take(self: *Buffers, allocator: Allocator, levels: []const u32, min_level: u32, limit: usize) !Buffers {
+        var all = levels.len == self.length and self.length <= limit and !self.large_offsets;
+        if (all) {
+            for (levels) |lv| {
+                if (lv < min_level) {
+                    all = false;
+                    break;
+                }
+            }
+        }
+        if (!all) return self.select(allocator, levels, min_level, limit);
+        const moved = self.*;
+        self.validity = self.validity[0..0];
+        self.values = self.values[0..0];
+        if (self.offsets) |o| self.offsets = o[0..0];
+        self.length = 0;
+        return moved;
+    }
+};
+
+/// How a `Buffers` holds its entries.
+pub const Layout = union(enum) {
+    /// BOOLEAN: one bit per entry.
+    bits,
+    /// Fixed width in bytes.
+    fixed: usize,
+    /// BYTE_ARRAY: offsets and data.
+    bytes,
 };
 
 /// Whether the column's entries are rows: no repetition and a maximum definition level of 0
@@ -260,14 +351,7 @@ fn bitBytes(n: usize) usize {
 // Output buffers
 // =============================================================================
 
-const Kind = union(enum) {
-    /// BOOLEAN: one bit per entry.
-    bits,
-    /// Fixed width in bytes.
-    fixed: usize,
-    /// BYTE_ARRAY: offsets and data.
-    bytes,
-};
+const Kind = Layout;
 
 const Builder = struct {
     allocator: Allocator,
@@ -362,6 +446,7 @@ const Builder = struct {
             .values = values,
             .offsets = offsets,
             .large_offsets = self.large_offsets,
+            .layout = self.kind,
         };
     }
 };
