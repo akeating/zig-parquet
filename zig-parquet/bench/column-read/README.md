@@ -1,15 +1,16 @@
 # Column read benchmark
 
-Measures reading every row group of a Parquet file through `readRowGroupAsArrow` (Arrow path) and `readRowsProjected` / `readAllRows` (row path), one column at a time and all columns together. Reports wall time and allocator activity, and compares with PyArrow on the same file.
+Measures reading every row group of a Parquet file through `readRowGroupAsArrow` (Arrow path) and `readRowsProjected` / `readAllRows` (row path), one top-level column at a time and all columns together. Reports wall time and allocator activity, and compares with PyArrow on the same file.
 
 ## Run
 
 From the repo root:
 
 ```bash
-# 1. Generate the test file (10M rows, 10 row groups, snappy; ~125 MB)
+# 1. Generate the test files (snappy, 1Mi rows per row group)
 cd test-files-arrow
-uv run python -I ../zig-parquet/bench/column-read/scripts/gen_bench.py /tmp/bench_10m.parquet
+uv run python -I ../zig-parquet/bench/column-read/scripts/gen_bench.py /tmp/bench_10m.parquet             # flat, 10M rows, ~125 MB
+uv run python -I ../zig-parquet/bench/column-read/scripts/gen_bench.py /tmp/bench_nested_2m.parquet --nested  # list/struct/map, 2M rows, ~59 MB
 
 # 2. zig-parquet (builds ReleaseFast by default)
 cd ../zig-parquet/bench/column-read
@@ -60,3 +61,21 @@ Arrow path after flat columns were moved to `flat_column.zig`, with block copies
 | arrow all | 237 | 180 | 17,172 | 896 | 46.5 | 178.8 |
 
 For `id`, about 84% of samples are in snappy decompression with the pure-Zig codec (macOS `sample`, 5 s).
+
+## Nested file baseline (2026-11-09, same machine)
+
+`bench_nested_2m.parquet`: `ints` list<int64> (0-5 elements, 10% null), `point` struct<x: double, label: string> (10% null), `attrs` map<string, int64> (0-3 entries). Leaf columns are decoded by `leaf_decoder`; list, struct and map assembly in `arrow_batch.zig` still builds a `Value` per entry.
+
+| Case | median ms | allocs | alloc MB | peak MB | PyArrow ms | PyArrow peak MB |
+|---|---|---|---|---|---|---|
+| arrow ints | 154 | 693 | 512 | 156.3 | 54.7 | 62.7 |
+| arrow point | 92 | 1,801,120 | 325 | 65.4 | 29.6 | 62.7 |
+| arrow attrs | 228 | 3,001,107 | 730 | 227.7 | 72.3 | 91.3 |
+| arrow all | 479 | 4,802,720 | 1,567 | 270.6 | 156.2 | 134.7 |
+| rows ints | 334 | 6,500,587 | 946 | 275.9 | | |
+| rows point | 401 | 14,600,352 | 1,058 | 331.7 | | |
+| rows attrs | 491 | 6,001,427 | 1,155 | 376.9 | | |
+| rows all | 1,237 | 23,102,284 | 3,025 | 913.2 | | |
+
+In a profile of `arrow ints` and `arrow attrs` (macOS `sample`, 5 s), about 60% of samples are in `Value` handling (`leaf_decoder.toValues`, `valuesToArrowArray`, `Value.deinit`, the list/map assembly, and the copies they make), and 20-25% in decompression and decoding.
+

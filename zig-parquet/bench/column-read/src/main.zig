@@ -110,8 +110,10 @@ pub fn main(init: std.process.Init) !void {
     defer reader.deinit();
 
     const num_rgs = reader.getNumRowGroups();
-    const num_cols = reader.getNumColumns();
-    std.debug.print("file: {s}\nrows: {d}, row groups: {d}, columns: {d}, measured runs: {d}\n\n", .{
+    // readRowGroupAsArrow and readRowsProjected take top-level column indices.
+    const col_names = try topLevelNames(init.arena.allocator(), reader.metadata.schema);
+    const num_cols = col_names.len;
+    std.debug.print("file: {s}\nrows: {d}, row groups: {d}, top-level columns: {d}, measured runs: {d}\n\n", .{
         path, reader.getTotalNumRows(), num_rgs, num_cols, runs,
     });
 
@@ -123,7 +125,7 @@ pub fn main(init: std.process.Init) !void {
         for (0..num_cols + 1) |c| {
             const column: ?usize = if (c < num_cols) c else null;
             if (filter) |f| {
-                const col_name = if (column) |ci| reader.getLeafSchemaElement(ci).?.name else "all";
+                const col_name = if (column) |ci| col_names[ci] else "all";
                 var buf: [64]u8 = undefined;
                 const name = try std.fmt.bufPrint(&buf, "{s}:{s}", .{ @tagName(p), col_name });
                 if (!std.mem.eql(u8, name, f)) continue;
@@ -160,11 +162,7 @@ pub fn main(init: std.process.Init) !void {
         }
         std.mem.sort(u64, times, {}, std.sort.asc(u64));
 
-        var col_buf: [16]u8 = undefined;
-        const col_name = if (case.column) |c|
-            reader.getLeafSchemaElement(c).?.name
-        else
-            try std.fmt.bufPrint(&col_buf, "all", .{});
+        const col_name = if (case.column) |c| col_names[c] else "all";
 
         std.debug.print("{s:<6} {s:<10} {d:>10.1} {d:>10.1} {d:>12} {d:>10} {d:>12.1} {d:>11.1} {d:>12.1} {x:>10}\n", .{
             @tagName(case.path),
@@ -179,6 +177,27 @@ pub fn main(init: std.process.Init) !void {
             check & 0xffffffff,
         });
     }
+}
+
+/// Names of the top-level columns: the root's children in the flattened schema.
+fn topLevelNames(allocator: std.mem.Allocator, schema: []const parquet.format.SchemaElement) ![]const []const u8 {
+    if (schema.len == 0) return &.{};
+    const count: usize = @intCast(schema[0].num_children orelse 0);
+    const names = try allocator.alloc([]const u8, count);
+    var idx: usize = 1;
+    for (names) |*name| {
+        name.* = schema[idx].name;
+        idx = skipSubtree(schema, idx);
+    }
+    return names;
+}
+
+/// Index of the element after the subtree rooted at `idx`.
+fn skipSubtree(schema: []const parquet.format.SchemaElement, idx: usize) usize {
+    const children: usize = @intCast(schema[idx].num_children orelse 0);
+    var next = idx + 1;
+    for (0..children) |_| next = skipSubtree(schema, next);
+    return next;
 }
 
 fn nsToMs(ns: u64) f64 {
