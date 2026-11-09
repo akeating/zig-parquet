@@ -290,8 +290,31 @@ const DictView = union(enum) {
     /// `count` entries of the column's fixed width, back to back, native byte order.
     fixed: struct { bytes: []const u8, count: usize },
     /// BYTE_ARRAY entries.
-    bytes: []const []const u8,
+    bytes: BytesDict,
 };
+
+/// BYTE_ARRAY dictionary: entry i is `data[offsets[i]..offsets[i + 1]]`. `data` has
+/// `copy_block` bytes of padding after the last entry, so `copyBlocks` can read whole blocks.
+const BytesDict = struct {
+    data: []const u8,
+    offsets: []const usize,
+
+    fn count(self: BytesDict) usize {
+        return self.offsets.len - 1;
+    }
+};
+
+/// Byte arrays are copied in blocks of this many bytes; see `copyBlocks`.
+const copy_block = 16;
+
+/// Copies `len` bytes in `copy_block`-byte blocks, so up to `copy_block - 1` bytes past `len`
+/// are read from `src` and written to `dst`. Both must have that much room.
+inline fn copyBlocks(dst: [*]u8, src: [*]const u8, len: usize) void {
+    var i: usize = 0;
+    while (i < len) : (i += copy_block) {
+        dst[i..][0..copy_block].* = src[i..][0..copy_block].*;
+    }
+}
 
 const ChunkDecoder = struct {
     allocator: Allocator,
@@ -300,8 +323,10 @@ const ChunkDecoder = struct {
     codec: format.CompressionCodec,
     dict_set: parquet_reader.DictionarySet,
     dict: DictView = .none,
-    /// Dictionary bytes built by `buildDictView` (INT96, FIXED_LEN_BYTE_ARRAY).
+    /// Dictionary bytes built by `buildDictView` (INT96, FIXED_LEN_BYTE_ARRAY, BYTE_ARRAY).
     dict_owned: ?[]u8 = null,
+    /// BYTE_ARRAY dictionary offsets built by `buildDictView`.
+    dict_offsets: ?[]usize = null,
     /// Definition levels of the current page.
     levels: std.ArrayList(u32) = .empty,
     /// Dictionary indices or RLE booleans of the current page.
@@ -312,6 +337,7 @@ const ChunkDecoder = struct {
     fn deinit(self: *ChunkDecoder) void {
         self.dict_set.deinit();
         if (self.dict_owned) |d| self.allocator.free(d);
+        if (self.dict_offsets) |o| self.allocator.free(o);
         self.levels.deinit(self.allocator);
         self.indices.deinit(self.allocator);
         self.scratch.deinit(self.allocator);
@@ -324,7 +350,22 @@ const ChunkDecoder = struct {
             .int64 => if (ds.int64_dict) |d| fixedView(std.mem.sliceAsBytes(d.values), d.values.len) else .none,
             .float => if (ds.float32_dict) |d| fixedView(std.mem.sliceAsBytes(d.values), d.values.len) else .none,
             .double => if (ds.float64_dict) |d| fixedView(std.mem.sliceAsBytes(d.values), d.values.len) else .none,
-            .byte_array => if (ds.string_dict) |d| .{ .bytes = d.values } else .none,
+            .byte_array => blk: {
+                const d = ds.string_dict orelse break :blk .none;
+                const offsets = try self.allocator.alloc(usize, d.values.len + 1);
+                self.dict_offsets = offsets;
+                var total: usize = 0;
+                for (d.values, 0..) |entry, i| {
+                    offsets[i] = total;
+                    total = std.math.add(usize, total, entry.len) catch return error.OutOfMemory;
+                }
+                offsets[d.values.len] = total;
+                const data = try self.allocator.alloc(u8, std.math.add(usize, total, copy_block) catch return error.OutOfMemory);
+                self.dict_owned = data;
+                for (d.values, 0..) |entry, i| @memcpy(data[offsets[i]..][0..entry.len], entry);
+                @memset(data[total..], 0);
+                break :blk .{ .bytes = .{ .data = data, .offsets = offsets } };
+            },
             .int96 => blk: {
                 const d = ds.int96_dict orelse break :blk .none;
                 const nanos = try self.allocator.alloc(u8, try mulSize(d.values.len, 8));
@@ -448,7 +489,7 @@ const ChunkDecoder = struct {
                 switch (self.dict) {
                     .none => return error.InvalidPageData,
                     .fixed => |d| try appendFixedDict(b, d.bytes, d.count, lv, n, indices),
-                    .bytes => |entries| try appendBytesDict(b, entries, lv, n, indices),
+                    .bytes => |dict| try appendBytesDict(b, dict, lv, n, indices),
                 }
             },
             .plain => switch (b.kind) {
@@ -701,7 +742,9 @@ fn lookupFixedRuntime(w: usize, b: *Builder, dict: []const u8, count: usize, lev
 /// followed by that many bytes.
 fn appendBytesPlain(b: *Builder, levels: ?[]const u32, n: usize, data: []const u8) !void {
     // The entries' bytes cannot exceed the page's value section.
-    try b.values.ensureUnusedCapacity(b.allocator, data.len);
+    try b.values.ensureUnusedCapacity(b.allocator, std.math.add(usize, data.len, copy_block) catch return error.OutOfMemory);
+    var out = b.values.items.len;
+    const dst = b.values.items.ptr;
     var pos: usize = 0;
     for (0..n) |i| {
         const present = if (levels) |lvs| lvs[i] != 0 else true;
@@ -710,32 +753,55 @@ fn appendBytesPlain(b: *Builder, levels: ?[]const u32, n: usize, data: []const u
             const len: usize = std.mem.readInt(u32, data[pos..][0..4], .little);
             pos += 4;
             if (data.len - pos < len) return error.EndOfData;
-            b.values.appendSliceAssumeCapacity(data[pos..][0..len]);
+            if (data.len - pos >= len + copy_block) {
+                copyBlocks(dst + out, data.ptr + pos, len);
+            } else {
+                @memcpy(dst[out..][0..len], data[pos..][0..len]);
+            }
+            out += len;
             pos += len;
         }
-        try b.pushOffset();
-        b.pushValidity(present);
+        try pushOffsetAt(b, out);
+        if (levels != null) b.pushValidity(present);
     }
+    b.values.items.len = out;
+    if (levels == null) b.validRun(n);
 }
 
 /// Appends `n` byte-array entries looked up in a dictionary.
-fn appendBytesDict(b: *Builder, entries: []const []const u8, levels: ?[]const u32, n: usize, indices: []const u32) !void {
+fn appendBytesDict(b: *Builder, dict: BytesDict, levels: ?[]const u32, n: usize, indices: []const u32) !void {
+    const count = dict.count();
     var total: usize = 0;
     for (indices) |idx| {
-        if (idx >= entries.len) return error.InvalidPageData;
-        total = std.math.add(usize, total, entries[idx].len) catch return error.OutOfMemory;
+        if (idx >= count) return error.InvalidPageData;
+        total = std.math.add(usize, total, dict.offsets[idx + 1] - dict.offsets[idx]) catch return error.OutOfMemory;
     }
-    try b.values.ensureUnusedCapacity(b.allocator, total);
+    try b.values.ensureUnusedCapacity(b.allocator, std.math.add(usize, total, copy_block) catch return error.OutOfMemory);
+    var out = b.values.items.len;
+    const dst = b.values.items.ptr;
     var k: usize = 0;
     for (0..n) |i| {
         const present = if (levels) |lvs| lvs[i] != 0 else true;
         if (present) {
-            b.values.appendSliceAssumeCapacity(entries[indices[k]]);
+            const idx = indices[k];
             k += 1;
+            const start = dict.offsets[idx];
+            const len = dict.offsets[idx + 1] - start;
+            copyBlocks(dst + out, dict.data.ptr + start, len);
+            out += len;
         }
-        try b.pushOffset();
-        b.pushValidity(present);
+        try pushOffsetAt(b, out);
+        if (levels != null) b.pushValidity(present);
     }
+    b.values.items.len = out;
+    if (levels == null) b.validRun(n);
+}
+
+/// Appends `end` as the next byte-array offset. Requires `reserve`.
+fn pushOffsetAt(b: *Builder, end: usize) !void {
+    if (end > std.math.maxInt(i32)) return error.IntegerOverflow;
+    const v: i32 = @intCast(end);
+    b.offsets.appendSliceAssumeCapacity(std.mem.asBytes(&v));
 }
 
 /// Appends `n` byte-array entries from decoded values (non-null entries in order).

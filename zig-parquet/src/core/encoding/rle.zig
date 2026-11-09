@@ -76,10 +76,8 @@ pub fn decodeInto(data: []const u8, bit_width: u5, result: []u32) !void {
             pos += value_bytes;
 
             // Fill with repeated value
-            for (0..values_to_write) |_| {
-                result[out_idx] = value;
-                out_idx += 1;
-            }
+            @memset(result[out_idx..][0..values_to_write], value);
+            out_idx += values_to_write;
         }
     }
 
@@ -156,33 +154,41 @@ fn readVarInt(data: []const u8) !VarIntResult {
     return error.EndOfData;
 }
 
+/// Unpacks `output.len` values of `bit_width` bits, LSB first. Values past the end of `data`
+/// are 0, and bytes missing from a value at the end of `data` count as 0.
 fn decodeBitPacked(data: []const u8, bit_width: u5, output: []u32) !void {
+    if (bit_width == 0) {
+        @memset(output, 0);
+        return;
+    }
+    const mask = (@as(u64, 1) << bit_width) - 1;
     var bit_pos: usize = 0;
+    var i: usize = 0;
 
-    for (output) |*out| {
+    // While 8 bytes are available at the value's first byte, read them as one u64. A value
+    // spans at most 5 bytes (bit offset up to 7 plus up to 31 bits).
+    while (i < output.len) : (i += 1) {
         const byte_pos = bit_pos / 8;
-        const bit_offset: u3 = safe.castTo(u3, bit_pos % 8) catch return error.EndOfData;
+        if (data.len < 8 or byte_pos > data.len - 8) break;
+        const word = std.mem.readInt(u64, data[byte_pos..][0..8], .little);
+        output[i] = @intCast((word >> @intCast(bit_pos % 8)) & mask);
+        bit_pos += bit_width;
+    }
 
+    // Remaining values: read byte by byte, treating bytes past the end of `data` as 0.
+    while (i < output.len) : (i += 1) {
+        const byte_pos = bit_pos / 8;
         if (byte_pos >= data.len) {
-            out.* = 0;
-            continue;
+            @memset(output[i..], 0);
+            return;
         }
-
-        // Read up to 5 bytes to get 32 bits
-        var value: u64 = 0;
+        const bit_offset: u6 = @intCast(bit_pos % 8);
         const bytes_needed = (bit_offset + bit_width + 7) / 8;
-
-        for (0..bytes_needed) |i| {
-            if (byte_pos + i < data.len) {
-                value |= @as(u64, data[byte_pos + i]) << (safe.castTo(u6, i * 8) catch return error.EndOfData);
-            }
+        var value: u64 = 0;
+        for (0..bytes_needed) |j| {
+            if (byte_pos + j < data.len) value |= @as(u64, data[byte_pos + j]) << @intCast(j * 8);
         }
-
-        // Shift and mask
-        value >>= bit_offset;
-        const mask = (@as(u64, 1) << bit_width) - 1;
-        out.* = safe.castTo(@TypeOf(out.*), value & mask) catch return error.EndOfData;
-
+        output[i] = @intCast((value >> bit_offset) & mask);
         bit_pos += bit_width;
     }
 }
@@ -269,4 +275,46 @@ test "RLE decode malicious indicator does not overflow" {
 
     // Should gracefully produce partial/zero results rather than panicking
     try std.testing.expect(result.len == 2);
+}
+
+/// The bit-unpacking loop `decodeBitPacked` replaced, kept as the reference for the test below.
+fn decodeBitPackedReference(data: []const u8, bit_width: u5, output: []u32) void {
+    var bit_pos: usize = 0;
+    for (output) |*out| {
+        const byte_pos = bit_pos / 8;
+        const bit_offset: u3 = @intCast(bit_pos % 8);
+        if (byte_pos >= data.len) {
+            out.* = 0;
+            continue;
+        }
+        var value: u64 = 0;
+        const bytes_needed = (@as(usize, bit_offset) + bit_width + 7) / 8;
+        for (0..bytes_needed) |i| {
+            if (byte_pos + i < data.len) value |= @as(u64, data[byte_pos + i]) << @intCast(i * 8);
+        }
+        value >>= bit_offset;
+        const mask = (@as(u64, 1) << bit_width) - 1;
+        out.* = @intCast(value & mask);
+        bit_pos += bit_width;
+    }
+}
+
+test "decodeBitPacked matches the reference for all bit widths and short data" {
+    var prng = std.Random.DefaultPrng.init(0x5eed);
+    const random = prng.random();
+    var data: [200]u8 = undefined;
+    var got: [300]u32 = undefined;
+    var want: [300]u32 = undefined;
+    for (1..32) |bw| {
+        const bit_width: u5 = @intCast(bw);
+        for (0..40) |_| {
+            const n = random.uintLessThan(usize, got.len + 1);
+            // Data lengths from empty up to more than the values need.
+            const len = random.uintLessThan(usize, data.len + 1);
+            random.bytes(data[0..len]);
+            try decodeBitPacked(data[0..len], bit_width, got[0..n]);
+            decodeBitPackedReference(data[0..len], bit_width, want[0..n]);
+            try std.testing.expectEqualSlices(u32, want[0..n], got[0..n]);
+        }
+    }
 }

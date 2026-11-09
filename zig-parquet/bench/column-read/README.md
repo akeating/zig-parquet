@@ -47,3 +47,16 @@ uv run python -I ../zig-parquet/bench/column-read/scripts/pyarrow_ref.py /tmp/be
 | rows all | 1,228 | 10,022,881 | 6,529 | 1,632.1 | | |
 
 PyArrow peak is its memory pool's process-wide maximum, which only increases as cases run, so it is an upper bound for each case after the first. The row path's string cases retain memory between runs (`DynamicReader.bytes_arena` is freed only in `deinit`), which inflates their peak.
+
+## Flat-column decoder (2026-11-09, same machine and file)
+
+Arrow path after flat columns were moved to `flat_column.zig`, with block copies for byte arrays and u64 bit-unpacking. The row path is unchanged.
+
+| Case | median ms, Zig codecs | median ms, C codecs (`-Dcodecs=c-only`) | allocs | alloc MB | peak MB | PyArrow ms |
+|---|---|---|---|---|---|---|
+| arrow id | 114 | 63 | 2,800 | 208 | 14.4 | 39.4 |
+| arrow score | 51 | 50 | 2,855 | 235 | 17.7 | 39.0 |
+| arrow category | 72 | 71 | 11,897 | 453 | 30.2 | 91.8 |
+| arrow all | 237 | 180 | 17,172 | 896 | 46.5 | 178.8 |
+
+For `id`, about 84% of samples are in snappy decompression with the pure-Zig codec (macOS `sample`, 5 s).
