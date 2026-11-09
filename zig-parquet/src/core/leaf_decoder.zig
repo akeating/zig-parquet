@@ -169,6 +169,11 @@ pub const Buffers = struct {
             }
         }
         if (!all) return self.select(allocator, levels, min_level, limit);
+        return self.takeAll();
+    }
+
+    /// Moves the buffers out of `self`, leaving it empty.
+    pub fn takeAll(self: *Buffers) Buffers {
         const moved = self.*;
         self.validity = self.validity[0..0];
         self.values = self.values[0..0];

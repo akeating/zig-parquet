@@ -1514,6 +1514,11 @@ def main():
     
     print(f"\nDone! Generated {len(files)} test files.")
 
+    # PyArrow's reading of nested columns, compared by zig-parquet's tests
+    print("\nWriting nested column reference...")
+    import nested_reference
+    nested_reference.write("nested_reference.json")
+
 
 if __name__ == "__main__":
     main()

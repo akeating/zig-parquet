@@ -151,36 +151,28 @@ pub fn exportSchemaAsArrow(allocator: Allocator, metadata: format.FileMetaData) 
     const schema = metadata.schema;
     if (schema.len == 0) return error.InvalidSchema;
 
-    const root = schema[0];
-    const nc = root.num_children orelse return error.InvalidSchema;
-    const num_children = safe.castTo(usize, nc) catch return error.InvalidSchema;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const columns = try buildSchemaTree(arena.allocator(), schema);
 
-    var children = try allocator.alloc(ArrowSchema, num_children);
+    var children = try allocator.alloc(ArrowSchema, columns.len);
     var init_count: usize = 0;
     errdefer {
         for (children[0..init_count]) |*child| child.doRelease();
         allocator.free(children);
     }
 
-    var children_ptrs = try allocator.alloc(*ArrowSchema, num_children);
+    var children_ptrs = try allocator.alloc(*ArrowSchema, columns.len);
     errdefer allocator.free(children_ptrs);
 
-    var idx: usize = 1;
-    for (0..num_children) |i| {
-        const result = try buildSchemaSubtree(allocator, schema, idx);
-        children[i] = result.schema;
+    for (columns, 0..) |*column, i| {
+        children[i] = try nodeSchema(allocator, schema, column, null);
         children_ptrs[i] = &children[i];
-        idx = result.next_idx;
         init_count = i + 1;
     }
 
-    return createSchemaNode(allocator, "+s", root.name, false, children, children_ptrs);
+    return createSchemaNode(allocator, "+s", schema[0].name, false, children, children_ptrs);
 }
-
-const SubtreeResult = struct {
-    schema: ArrowSchema,
-    next_idx: usize,
-};
 
 const SchemaConvError = error{
     OutOfMemory,
@@ -188,159 +180,40 @@ const SchemaConvError = error{
     UnsupportedType,
 };
 
-fn buildSchemaSubtree(allocator: Allocator, schema: []const format.SchemaElement, idx: usize) SchemaConvError!SubtreeResult {
-    if (idx >= schema.len) return error.InvalidSchema;
-    const elem = schema[idx];
-    const nullable = if (elem.repetition_type) |rt| rt == .optional else false;
-
-    if (elem.num_children != null) {
-        return buildGroupSubtree(allocator, schema, idx, elem, nullable);
+/// ArrowSchema of a schema tree node. `name_override` replaces the schema element's name.
+fn nodeSchema(allocator: Allocator, schema: []const format.SchemaElement, node: *const Node, name_override: ?[]const u8) SchemaConvError!ArrowSchema {
+    const elem = schema[node.schema_idx];
+    const name = name_override orelse elem.name;
+    if (node.kind == .leaf) {
+        const fmt = try parquetTypeToArrowFormat(allocator, elem);
+        defer allocator.free(fmt);
+        return createSchemaNode(allocator, fmt, name, node.nullable, null, null);
     }
 
-    const fmt = try parquetTypeToArrowFormat(allocator, elem);
-    errdefer allocator.free(fmt);
-
-    const node = try createSchemaNode(allocator, fmt, elem.name, nullable, null, null);
-    allocator.free(fmt);
-    return .{ .schema = node, .next_idx = idx + 1 };
-}
-
-fn buildGroupSubtree(
-    allocator: Allocator,
-    schema: []const format.SchemaElement,
-    idx: usize,
-    elem: format.SchemaElement,
-    nullable: bool,
-) SchemaConvError!SubtreeResult {
-    const nc = safe.castTo(usize, elem.num_children.?) catch return error.InvalidSchema;
-
-    if (elem.converted_type) |ct| {
-        if (ct == format.ConvertedType.LIST) {
-            return buildListSubtree(allocator, schema, idx, elem.name, nullable, nc);
-        }
-        if (ct == format.ConvertedType.MAP or ct == format.ConvertedType.MAP_KEY_VALUE) {
-            return buildMapSubtree(allocator, schema, idx, elem.name, nullable, nc);
-        }
-    }
-
-    return buildStructSubtree(allocator, schema, idx, elem.name, nullable, nc);
-}
-
-fn buildListSubtree(
-    allocator: Allocator,
-    schema: []const format.SchemaElement,
-    idx: usize,
-    name: []const u8,
-    nullable: bool,
-    nc: usize,
-) SchemaConvError!SubtreeResult {
-    _ = nc;
-    // LIST: container → repeated group → element
-    // Skip the container and the repeated group, get the element
-    var inner_idx = idx + 1;
-    if (inner_idx >= schema.len) return error.InvalidSchema;
-
-    const repeated_group = schema[inner_idx];
-    if (repeated_group.num_children != null) {
-        inner_idx += 1;
-        if (inner_idx >= schema.len) return error.InvalidSchema;
-    }
-
-    const element_result = try buildSchemaSubtree(allocator, schema, inner_idx);
-    var element_schema = element_result.schema;
-    errdefer element_schema.doRelease();
-
-    var list_children = try allocator.alloc(ArrowSchema, 1);
-    errdefer allocator.free(list_children);
-    list_children[0] = element_schema;
-
-    var list_ptrs = try allocator.alloc(*ArrowSchema, 1);
-    errdefer allocator.free(list_ptrs);
-    list_ptrs[0] = &list_children[0];
-
-    const list_schema = try createSchemaNode(allocator, "+l", name, nullable, list_children, list_ptrs);
-    return .{ .schema = list_schema, .next_idx = element_result.next_idx };
-}
-
-fn buildMapSubtree(
-    allocator: Allocator,
-    schema: []const format.SchemaElement,
-    idx: usize,
-    name: []const u8,
-    nullable: bool,
-    nc: usize,
-) SchemaConvError!SubtreeResult {
-    _ = nc;
-    // MAP: container → key_value (repeated) → key, value
-    const kv_idx = idx + 1;
-    if (kv_idx >= schema.len) return error.InvalidSchema;
-
-    const kv_group = schema[kv_idx];
-    const kv_nc = safe.castTo(usize, kv_group.num_children orelse return error.InvalidSchema) catch return error.InvalidSchema;
-
-    var entries_children = try allocator.alloc(ArrowSchema, kv_nc);
-    var entries_init: usize = 0;
-    errdefer {
-        for (entries_children[0..entries_init]) |*c| c.doRelease();
-        allocator.free(entries_children);
-    }
-
-    var entries_ptrs = try allocator.alloc(*ArrowSchema, kv_nc);
-    errdefer allocator.free(entries_ptrs);
-
-    var child_idx = kv_idx + 1;
-    for (0..kv_nc) |i| {
-        const result = try buildSchemaSubtree(allocator, schema, child_idx);
-        entries_children[i] = result.schema;
-        entries_ptrs[i] = &entries_children[i];
-        child_idx = result.next_idx;
-        entries_init = i + 1;
-    }
-
-    var entries_schema = try createSchemaNode(allocator, "+s", "entries", false, entries_children, entries_ptrs);
-    errdefer entries_schema.doRelease();
-
-    var map_children = try allocator.alloc(ArrowSchema, 1);
-    errdefer allocator.free(map_children);
-    map_children[0] = entries_schema;
-
-    var map_ptrs = try allocator.alloc(*ArrowSchema, 1);
-    errdefer allocator.free(map_ptrs);
-    map_ptrs[0] = &map_children[0];
-
-    const map_schema = try createSchemaNode(allocator, "+m", name, nullable, map_children, map_ptrs);
-    return .{ .schema = map_schema, .next_idx = child_idx };
-}
-
-fn buildStructSubtree(
-    allocator: Allocator,
-    schema: []const format.SchemaElement,
-    idx: usize,
-    name: []const u8,
-    nullable: bool,
-    nc: usize,
-) SchemaConvError!SubtreeResult {
-    var children = try allocator.alloc(ArrowSchema, nc);
+    const n = node.children.len;
+    var children = try allocator.alloc(ArrowSchema, n);
     var init_count: usize = 0;
     errdefer {
         for (children[0..init_count]) |*c| c.doRelease();
         allocator.free(children);
     }
-
-    var ptrs = try allocator.alloc(*ArrowSchema, nc);
+    var ptrs = try allocator.alloc(*ArrowSchema, n);
     errdefer allocator.free(ptrs);
 
-    var child_idx = idx + 1;
-    for (0..nc) |i| {
-        const result = try buildSchemaSubtree(allocator, schema, child_idx);
-        children[i] = result.schema;
+    for (node.children, 0..) |*child, i| {
+        // An Arrow map's child is the struct "entries" (key, value).
+        children[i] = try nodeSchema(allocator, schema, child, if (node.kind == .map) "entries" else null);
         ptrs[i] = &children[i];
-        child_idx = result.next_idx;
         init_count = i + 1;
     }
 
-    const struct_schema = try createSchemaNode(allocator, "+s", name, nullable, children, ptrs);
-    return .{ .schema = struct_schema, .next_idx = child_idx };
+    const fmt: []const u8 = switch (node.kind) {
+        .struct_ => "+s",
+        .list => "+l",
+        .map => "+m",
+        .leaf => unreachable,
+    };
+    return createSchemaNode(allocator, fmt, name, node.nullable, children, ptrs);
 }
 
 /// Map a Parquet SchemaElement to an Arrow format string.
@@ -826,186 +699,228 @@ fn arrayRelease(array_ptr: *ArrowArray) callconv(.c) void {
 // Logical Column Mapping
 // ============================================================================
 
-const LogicalColumnKind = enum { leaf, list, struct_, map };
+/// Definition and repetition levels of a schema tree node, as in Arrow's Parquet reader
+/// (`LevelInfo` in parquet/level_conversion.h). For an entry of a leaf column under the node:
+/// - Entries with a definition level below `ancestor_def_level` (the level of the nearest
+///   repeated ancestor) or a repetition level above `rep_level` have no slot at the node.
+/// - Struct and leaf: every other entry is a slot, non-null when the definition level is at
+///   least `def_level`.
+/// - List and map: an entry whose repetition level equals `rep_level` adds an element to the
+///   current slot; an entry with a lower repetition level starts a slot, which is non-null
+///   when the definition level is at least `def_level - 1` and has a first element when it
+///   is at least `def_level`.
+const LevelInfo = struct {
+    def_level: u32 = 0,
+    rep_level: u32 = 0,
+    ancestor_def_level: u32 = 0,
 
-const LogicalColumn = struct {
-    kind: LogicalColumnKind,
+    /// Levels after a repeated field: one more definition and repetition level.
+    fn repeated(self: LevelInfo) LevelInfo {
+        return .{ .def_level = self.def_level + 1, .rep_level = self.rep_level + 1, .ancestor_def_level = self.ancestor_def_level };
+    }
+
+    /// Levels of the elements of a list or map with these levels.
+    fn elements(self: LevelInfo) LevelInfo {
+        return .{ .def_level = self.def_level, .rep_level = self.rep_level, .ancestor_def_level = self.def_level };
+    }
+};
+
+const NodeKind = enum { leaf, struct_, list, map };
+
+/// A node of the Arrow view of the Parquet schema.
+const Node = struct {
+    kind: NodeKind,
+    /// Schema element that names the node and, for a leaf, holds its type.
     schema_idx: usize,
-    physical_col_start: usize,
-    physical_col_count: usize,
-    children: []LogicalColumn,
-    allocator: Allocator,
-
-    fn deinit(self: *LogicalColumn) void {
-        for (self.children) |*child| child.deinit();
-        if (self.children.len > 0) self.allocator.free(self.children);
-    }
+    nullable: bool,
+    levels: LevelInfo,
+    /// Leaf columns under the node: `physical_start .. physical_start + physical_count`.
+    physical_start: usize,
+    physical_count: usize,
+    /// struct: fields. list: the element. map: the "entries" struct of key and value.
+    children: []Node,
 };
 
-const LogicalColumnBuildResult = struct {
-    column: LogicalColumn,
-    next_schema_idx: usize,
-    next_physical_idx: usize,
-};
-
-fn buildLogicalColumns(allocator: Allocator, schema: []const format.SchemaElement) BatchError![]LogicalColumn {
+/// Builds the top-level nodes of `schema`. Nodes are allocated with `allocator` and not freed
+/// individually; use an arena.
+fn buildSchemaTree(allocator: Allocator, schema: []const format.SchemaElement) BatchError![]Node {
     if (schema.len == 0) return error.InvalidSchema;
-    const root = schema[0];
-    const nc = safe.castTo(usize, root.num_children orelse return error.InvalidSchema) catch return error.InvalidSchema;
-
-    var result = allocator.alloc(LogicalColumn, nc) catch return error.OutOfMemory;
-    var init_count: usize = 0;
-    errdefer {
-        for (result[0..init_count]) |*c| c.deinit();
-        allocator.free(result);
-    }
-
-    var schema_idx: usize = 1;
-    var physical_idx: usize = 0;
-
-    for (0..nc) |i| {
-        const col_result = try buildLogicalColumn(allocator, schema, schema_idx, physical_idx);
-        result[i] = col_result.column;
-        schema_idx = col_result.next_schema_idx;
-        physical_idx = col_result.next_physical_idx;
-        init_count = i + 1;
-    }
-
-    return result;
+    const nc = safe.castTo(usize, schema[0].num_children orelse return error.InvalidSchema) catch return error.InvalidSchema;
+    var builder = TreeBuilder{ .allocator = allocator, .schema = schema };
+    const columns = try allocator.alloc(Node, nc);
+    for (columns) |*column| column.* = try builder.node(.{});
+    return columns;
 }
 
-fn buildLogicalColumn(allocator: Allocator, schema: []const format.SchemaElement, schema_idx: usize, physical_idx: usize) BatchError!LogicalColumnBuildResult {
-    if (schema_idx >= schema.len) return error.InvalidSchema;
-    const elem = schema[schema_idx];
+/// Reads schema elements in order (`next_idx`), assigning leaf columns in order
+/// (`next_physical`).
+const TreeBuilder = struct {
+    allocator: Allocator,
+    schema: []const format.SchemaElement,
+    next_idx: usize = 1,
+    next_physical: usize = 0,
 
-    if (elem.num_children == null) {
-        return .{
-            .column = .{
+    /// The node at `next_idx`, under a parent with levels `info`.
+    fn node(self: *TreeBuilder, info: LevelInfo) BatchError!Node {
+        if (self.next_idx >= self.schema.len) return error.InvalidSchema;
+        const idx = self.next_idx;
+        if (self.schema[idx].repetition_type == .repeated) {
+            // A repeated field outside a LIST or MAP annotation is a list of required elements.
+            const list_info = info.repeated();
+            const start = self.next_physical;
+            const children = try self.allocator.alloc(Node, 1);
+            children[0] = try self.plain(list_info.elements());
+            children[0].nullable = false;
+            return .{
+                .kind = .list,
+                .schema_idx = idx,
+                .nullable = false,
+                .levels = list_info,
+                .physical_start = start,
+                .physical_count = self.next_physical - start,
+                .children = children,
+            };
+        }
+        return self.plain(info);
+    }
+
+    /// The node at `next_idx`, ignoring a `repeated` repetition (already applied by the caller).
+    fn plain(self: *TreeBuilder, parent: LevelInfo) BatchError!Node {
+        const idx = self.next_idx;
+        const elem = self.schema[idx];
+        const optional = elem.repetition_type == .optional;
+        var info = parent;
+        if (optional) info.def_level += 1;
+
+        if (elem.num_children == null) {
+            self.next_idx += 1;
+            self.next_physical += 1;
+            return .{
                 .kind = .leaf,
-                .schema_idx = schema_idx,
-                .physical_col_start = physical_idx,
-                .physical_col_count = 1,
+                .schema_idx = idx,
+                .nullable = optional,
+                .levels = info,
+                .physical_start = self.next_physical - 1,
+                .physical_count = 1,
                 .children = &.{},
-                .allocator = allocator,
-            },
-            .next_schema_idx = schema_idx + 1,
-            .next_physical_idx = physical_idx + 1,
+            };
+        }
+
+        const nc = safe.castTo(usize, elem.num_children.?) catch return error.InvalidSchema;
+        if (nc == 0) return error.InvalidSchema;
+        if (elem.converted_type) |ct| {
+            if (ct == format.ConvertedType.LIST) return self.list(idx, info, optional);
+            if (ct == format.ConvertedType.MAP or ct == format.ConvertedType.MAP_KEY_VALUE) return self.map(idx, info, optional);
+        }
+
+        self.next_idx += 1;
+        const start = self.next_physical;
+        const children = try self.allocator.alloc(Node, nc);
+        for (children) |*child| child.* = try self.node(info);
+        return .{
+            .kind = .struct_,
+            .schema_idx = idx,
+            .nullable = optional,
+            .levels = info,
+            .physical_start = start,
+            .physical_count = self.next_physical - start,
+            .children = children,
         };
     }
 
-    const nc = safe.castTo(usize, elem.num_children.?) catch return error.InvalidSchema;
+    /// A LIST-annotated group at `idx` with levels `info`: a repeated field holding the
+    /// element. Backward-compatibility rules of the Parquet spec decide whether the repeated
+    /// field is the element itself (a primitive, a group with several fields, or a group with
+    /// one field named "array" or "<list name>_tuple") or a group whose only field is the
+    /// element.
+    fn list(self: *TreeBuilder, idx: usize, info: LevelInfo, nullable: bool) BatchError!Node {
+        const r_idx = idx + 1;
+        if (r_idx >= self.schema.len) return error.InvalidSchema;
+        const repeated = self.schema[r_idx];
+        if (repeated.repetition_type != .repeated) return error.InvalidSchema;
+        const list_info = info.repeated();
+        const start = self.next_physical;
+        const children = try self.allocator.alloc(Node, 1);
 
-    if (elem.converted_type) |ct| {
-        if (ct == format.ConvertedType.LIST) {
-            return buildLogicalList(allocator, schema, schema_idx, physical_idx);
+        self.next_idx = r_idx;
+        if (repeatedFieldIsElement(repeated, self.schema[idx].name)) {
+            children[0] = try self.plain(list_info.elements());
+            children[0].nullable = false;
+        } else {
+            self.next_idx = r_idx + 1;
+            children[0] = try self.node(list_info.elements());
         }
-        if (ct == format.ConvertedType.MAP or ct == format.ConvertedType.MAP_KEY_VALUE) {
-            return buildLogicalMap(allocator, schema, schema_idx, physical_idx);
-        }
-    }
-
-    return buildLogicalStruct(allocator, schema, schema_idx, physical_idx, nc);
-}
-
-fn buildLogicalList(allocator: Allocator, schema: []const format.SchemaElement, schema_idx: usize, physical_idx: usize) BatchError!LogicalColumnBuildResult {
-    var inner_idx = schema_idx + 1;
-    if (inner_idx >= schema.len) return error.InvalidSchema;
-
-    const repeated_group = schema[inner_idx];
-    if (repeated_group.num_children != null) {
-        inner_idx += 1;
-        if (inner_idx >= schema.len) return error.InvalidSchema;
-    }
-
-    const element_result = try buildLogicalColumn(allocator, schema, inner_idx, physical_idx);
-
-    var children = allocator.alloc(LogicalColumn, 1) catch return error.OutOfMemory;
-    children[0] = element_result.column;
-
-    return .{
-        .column = .{
+        return .{
             .kind = .list,
-            .schema_idx = schema_idx,
-            .physical_col_start = physical_idx,
-            .physical_col_count = element_result.column.physical_col_count,
+            .schema_idx = idx,
+            .nullable = nullable,
+            .levels = list_info,
+            .physical_start = start,
+            .physical_count = self.next_physical - start,
             .children = children,
-            .allocator = allocator,
-        },
-        .next_schema_idx = element_result.next_schema_idx,
-        .next_physical_idx = element_result.next_physical_idx,
-    };
-}
-
-fn buildLogicalMap(allocator: Allocator, schema: []const format.SchemaElement, schema_idx: usize, physical_idx: usize) BatchError!LogicalColumnBuildResult {
-    const kv_idx = schema_idx + 1;
-    if (kv_idx >= schema.len) return error.InvalidSchema;
-
-    const kv_group = schema[kv_idx];
-    const kv_nc = safe.castTo(usize, kv_group.num_children orelse return error.InvalidSchema) catch return error.InvalidSchema;
-    if (kv_nc != 2) return error.InvalidSchema;
-
-    var children = allocator.alloc(LogicalColumn, 2) catch return error.OutOfMemory;
-    errdefer allocator.free(children);
-
-    var child_schema_idx = kv_idx + 1;
-    var child_phys_idx = physical_idx;
-
-    for (0..2) |i| {
-        const child_result = try buildLogicalColumn(allocator, schema, child_schema_idx, child_phys_idx);
-        children[i] = child_result.column;
-        child_schema_idx = child_result.next_schema_idx;
-        child_phys_idx = child_result.next_physical_idx;
+        };
     }
 
-    const total_physical = child_phys_idx - physical_idx;
+    /// A MAP-annotated group at `idx` with levels `info`: a repeated group of two fields, key
+    /// and value. A repeated group with only a key is read as a list of keys, as PyArrow does.
+    fn map(self: *TreeBuilder, idx: usize, info: LevelInfo, nullable: bool) BatchError!Node {
+        const kv_idx = idx + 1;
+        if (kv_idx >= self.schema.len) return error.InvalidSchema;
+        const kv = self.schema[kv_idx];
+        const kv_nc = safe.castTo(usize, kv.num_children orelse return error.InvalidSchema) catch return error.InvalidSchema;
+        if (kv.repetition_type != .repeated) return error.InvalidSchema;
+        const map_info = info.repeated();
+        const entries_info = map_info.elements();
+        const start = self.next_physical;
 
-    return .{
-        .column = .{
-            .kind = .map,
-            .schema_idx = schema_idx,
-            .physical_col_start = physical_idx,
-            .physical_col_count = total_physical,
-            .children = children,
-            .allocator = allocator,
-        },
-        .next_schema_idx = child_schema_idx,
-        .next_physical_idx = child_phys_idx,
-    };
-}
+        if (kv_nc == 1) {
+            self.next_idx = kv_idx + 1;
+            const children = try self.allocator.alloc(Node, 1);
+            children[0] = try self.node(entries_info);
+            return .{
+                .kind = .list,
+                .schema_idx = idx,
+                .nullable = nullable,
+                .levels = map_info,
+                .physical_start = start,
+                .physical_count = self.next_physical - start,
+                .children = children,
+            };
+        }
+        if (kv_nc != 2) return error.InvalidSchema;
 
-fn buildLogicalStruct(allocator: Allocator, schema: []const format.SchemaElement, schema_idx: usize, physical_idx: usize, nc: usize) BatchError!LogicalColumnBuildResult {
-    var children = allocator.alloc(LogicalColumn, nc) catch return error.OutOfMemory;
-    var init_count: usize = 0;
-    errdefer {
-        for (children[0..init_count]) |*c| c.deinit();
-        allocator.free(children);
-    }
-
-    var child_schema_idx = schema_idx + 1;
-    var child_phys_idx = physical_idx;
-
-    for (0..nc) |i| {
-        const child_result = try buildLogicalColumn(allocator, schema, child_schema_idx, child_phys_idx);
-        children[i] = child_result.column;
-        child_schema_idx = child_result.next_schema_idx;
-        child_phys_idx = child_result.next_physical_idx;
-        init_count = i + 1;
-    }
-
-    const total_physical = child_phys_idx - physical_idx;
-
-    return .{
-        .column = .{
+        self.next_idx = kv_idx + 1;
+        const fields = try self.allocator.alloc(Node, 2);
+        for (fields) |*field| field.* = try self.node(entries_info);
+        const children = try self.allocator.alloc(Node, 1);
+        children[0] = .{
             .kind = .struct_,
-            .schema_idx = schema_idx,
-            .physical_col_start = physical_idx,
-            .physical_col_count = total_physical,
+            .schema_idx = kv_idx,
+            .nullable = false,
+            .levels = entries_info,
+            .physical_start = start,
+            .physical_count = self.next_physical - start,
+            .children = fields,
+        };
+        return .{
+            .kind = .map,
+            .schema_idx = idx,
+            .nullable = nullable,
+            .levels = map_info,
+            .physical_start = start,
+            .physical_count = self.next_physical - start,
             .children = children,
-            .allocator = allocator,
-        },
-        .next_schema_idx = child_schema_idx,
-        .next_physical_idx = child_phys_idx,
-    };
+        };
+    }
+};
+
+fn repeatedFieldIsElement(repeated: format.SchemaElement, list_name: []const u8) bool {
+    const nc = repeated.num_children orelse return true;
+    if (nc != 1) return true;
+    if (std.mem.eql(u8, repeated.name, "array")) return true;
+    return std.mem.endsWith(u8, repeated.name, "_tuple") and
+        repeated.name.len == list_name.len + "_tuple".len and
+        std.mem.startsWith(u8, repeated.name, list_name);
 }
 
 // ============================================================================
@@ -1038,13 +953,11 @@ pub fn readRowGroupAsArrow(
     if (rg_index >= metadata.row_groups.len) return error.InvalidArgument;
     const rg = &metadata.row_groups[rg_index];
 
-    var logical_cols = try buildLogicalColumns(allocator, metadata.schema);
-    defer {
-        for (logical_cols) |*lc| lc.deinit();
-        allocator.free(logical_cols);
-    }
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const columns = try buildSchemaTree(arena.allocator(), metadata.schema);
 
-    const num_cols = if (col_indices) |ci| ci.len else logical_cols.len;
+    const num_cols = if (col_indices) |ci| ci.len else columns.len;
 
     var arrays = try allocator.alloc(ArrowArray, num_cols);
     var init_count: usize = 0;
@@ -1055,8 +968,12 @@ pub fn readRowGroupAsArrow(
 
     for (0..num_cols) |i| {
         const col_idx = if (col_indices) |ci| ci[i] else i;
-        if (col_idx >= logical_cols.len) return error.InvalidArgument;
-        arrays[i] = try readLogicalColumnAsArrow(allocator, source, metadata, rg, &logical_cols[col_idx]);
+        if (col_idx >= columns.len) return error.InvalidArgument;
+        const column = &columns[col_idx];
+        arrays[i] = if (column.kind == .leaf)
+            try readColumnAsArrow(allocator, source, metadata, rg, column.physical_start)
+        else
+            try readNestedColumn(allocator, source, metadata, rg, column);
         init_count = i + 1;
     }
 
@@ -1070,274 +987,164 @@ pub fn readRowGroupAsArrow(
     };
 }
 
-fn readLogicalColumnAsArrow(
-    allocator: Allocator,
-    source: SeekableReader,
-    metadata: format.FileMetaData,
-    rg: *const format.RowGroup,
-    logical_col: *const LogicalColumn,
-) ReaderError!ArrowArray {
-    return switch (logical_col.kind) {
-        .leaf => readColumnAsArrow(allocator, source, metadata, rg, logical_col.physical_col_start),
-        .list => readListColumnAsArrow(allocator, source, metadata, rg, logical_col),
-        .struct_ => readStructColumnAsArrow(allocator, source, metadata, rg, logical_col),
-        .map => readMapColumnAsArrow(allocator, source, metadata, rg, logical_col),
-    };
-}
-
-fn readStructColumnAsArrow(
-    allocator: Allocator,
-    source: SeekableReader,
-    metadata: format.FileMetaData,
-    rg: *const format.RowGroup,
-    logical_col: *const LogicalColumn,
-) ReaderError!ArrowArray {
-    const nc = logical_col.children.len;
-
-    var children = allocator.alloc(ArrowArray, nc) catch return error.OutOfMemory;
-    var init_count: usize = 0;
-    errdefer {
-        for (children[0..init_count]) |*c| c.doRelease();
-        allocator.free(children);
-    }
-
-    for (0..nc) |i| {
-        children[i] = try readLogicalColumnAsArrow(allocator, source, metadata, rg, &logical_col.children[i]);
-        init_count = i + 1;
-    }
-
-    // Struct validity: null if struct-level def == 0. Use first child's raw data to determine.
-    const num_rows: usize = if (nc > 0) safe.castTo(usize, children[0].length) catch return error.IntegerOverflow else 0;
-    const schema_elem = metadata.schema[logical_col.schema_idx];
-    const nullable = if (schema_elem.repetition_type) |rt| rt == .optional else false;
-
-    const bitmap_len = (num_rows + 7) / 8;
-    const validity = allocBuffer(allocator, bitmap_len) catch return error.OutOfMemory;
-    errdefer allocator.free(validity);
-    @memset(validity, 0xFF);
-
-    var null_count: i64 = 0;
-
-    if (nullable and nc > 0) {
-        // Struct is null at row i if ALL children are null at i
-        for (0..num_rows) |i| {
-            var all_null = true;
-            for (children) |*child| {
-                if (child.null_count == 0) {
-                    all_null = false;
-                    break;
-                }
-                const child_validity: ?[*]const u8 = if (child.buffers[0]) |b| @ptrCast(@alignCast(b)) else null;
-                if (child_validity) |cv| {
-                    if (arrow.getBit(cv[0..bitmap_len], i)) {
-                        all_null = false;
-                        break;
-                    }
-                } else {
-                    all_null = false;
-                    break;
-                }
-            }
-            if (all_null) {
-                arrow.clearBit(validity, i);
-                null_count += 1;
-            }
-        }
-    }
-
-    return buildStructArray(allocator, num_rows, null_count, validity, children);
-}
-
-/// A leaf column chunk decoded with its levels. `def_levels` and `rep_levels` have one entry
-/// per decoded entry; when the column has no definition (repetition) levels they are filled
-/// with the maximum definition level (0).
-const LeafWithLevels = struct {
-    buffers: leaf_decoder.Buffers,
-    def_levels: []u32,
-    rep_levels: []u32,
-    column_info: format.ColumnInfo,
-
-    fn deinit(self: *LeafWithLevels, allocator: Allocator) void {
-        self.buffers.deinit(allocator);
-        allocator.free(self.def_levels);
-        allocator.free(self.rep_levels);
-    }
+/// A leaf column of a nested column, decoded with its levels.
+const NestedLeaf = struct {
+    leaf: leaf_decoder.Leaf,
+    /// Entries decoded. The buffers can be moved out before the levels are used.
+    entries: usize,
+    max_def: u32,
+    max_rep: u32,
 };
 
-fn readLeafWithLevels(
+/// Reads a list, map or struct column: decodes its leaf columns with levels and assembles
+/// the Arrow array from the levels (see `LevelInfo`).
+fn readNestedColumn(
     allocator: Allocator,
     source: SeekableReader,
     metadata: format.FileMetaData,
     rg: *const format.RowGroup,
-    col_idx: usize,
-) ReaderError!LeafWithLevels {
-    if (col_idx >= rg.columns.len) return error.InvalidArgument;
-    const chunk = &rg.columns[col_idx];
-    const meta = chunk.meta_data orelse return error.InvalidArgument;
-    const page_data = try parquet_reader.readColumnChunkData(allocator, source, chunk);
-    defer allocator.free(page_data);
-    const column_info = format.getColumnInfo(metadata.schema, col_idx) orelse return error.InvalidArgument;
-
-    var leaf = leaf_decoder.decodeLeaf(allocator, page_data, meta, column_info, .{ .keep_levels = true }) catch |e|
-        return asErrorOf(ReaderError, e);
-    errdefer leaf.deinit(allocator);
-    const n = leaf.buffers.length;
-    if (leaf.def_levels == null) {
-        const l = try allocator.alloc(u32, n);
-        @memset(l, column_info.max_def_level);
-        leaf.def_levels = l;
+    node: *const Node,
+) ReaderError!ArrowArray {
+    if (node.physical_count == 0) return error.InvalidSchema;
+    const leaves = try allocator.alloc(NestedLeaf, node.physical_count);
+    var decoded: usize = 0;
+    defer {
+        for (leaves[0..decoded]) |*l| l.leaf.deinit(allocator);
+        allocator.free(leaves);
     }
-    if (leaf.rep_levels == null) {
-        const l = try allocator.alloc(u32, n);
-        @memset(l, 0);
-        leaf.rep_levels = l;
+    for (leaves, 0..) |*l, k| {
+        const col_idx = node.physical_start + k;
+        if (col_idx >= rg.columns.len) return error.InvalidArgument;
+        const chunk = &rg.columns[col_idx];
+        const meta = chunk.meta_data orelse return error.InvalidArgument;
+        const page_data = try parquet_reader.readColumnChunkData(allocator, source, chunk);
+        defer allocator.free(page_data);
+        const info = format.getColumnInfo(metadata.schema, col_idx) orelse return error.InvalidArgument;
+        l.leaf = leaf_decoder.decodeLeaf(allocator, page_data, meta, info, .{ .keep_levels = true }) catch |e|
+            return asErrorOf(ReaderError, e);
+        l.entries = l.leaf.buffers.length;
+        l.max_def = info.max_def_level;
+        l.max_rep = info.max_rep_level;
+        decoded = k + 1;
     }
-    return .{
-        .buffers = leaf.buffers,
-        .def_levels = leaf.def_levels.?,
-        .rep_levels = leaf.rep_levels.?,
-        .column_info = column_info,
-    };
+    return assembleNode(allocator, node, leaves, node.physical_start);
 }
 
-/// List offsets and validity from a leaf's levels: a row starts at each repetition level 0,
-/// is null when its definition level is 0, and gains an element at each definition level of
-/// at least `element_level`.
-const ListShape = struct {
-    num_rows: usize,
-    num_elements: usize,
-    offsets: Buffer,
+/// Assembles `node` from its decoded leaves; `leaves[k]` is leaf column `base + k`.
+/// Shapes are computed from the node's first leaf before the children take their buffers.
+fn assembleNode(allocator: Allocator, node: *const Node, leaves: []NestedLeaf, base: usize) ReaderError!ArrowArray {
+    const first = &leaves[node.physical_start - base];
+    switch (node.kind) {
+        .leaf => {
+            if (first.max_def != node.levels.def_level or first.max_rep != node.levels.rep_level) return error.InvalidSchema;
+            // Slots: entries at or above the nearest repeated ancestor's definition level.
+            const bufs = if (first.leaf.def_levels) |d|
+                first.leaf.buffers.take(allocator, d, node.levels.ancestor_def_level, std.math.maxInt(usize)) catch |e|
+                    return asErrorOf(ReaderError, e)
+            else
+                first.leaf.buffers.takeAll();
+            return buffersToArrow(allocator, bufs);
+        },
+        .struct_ => {
+            const shape = try levelShape(allocator, first, node.levels, false);
+            var shape_owned = true;
+            errdefer if (shape_owned) allocator.free(shape.validity);
+
+            const children = try allocator.alloc(ArrowArray, node.children.len);
+            var init_count: usize = 0;
+            var children_owned = true;
+            errdefer if (children_owned) {
+                for (children[0..init_count]) |*c| c.doRelease();
+                allocator.free(children);
+            };
+            for (node.children, 0..) |*child, i| {
+                children[i] = try assembleNode(allocator, child, leaves, base);
+                init_count = i + 1;
+                if (children[i].length != shape.length) return error.InvalidPageData;
+            }
+            const array = try buildStructArray(allocator, shape.length, shape.null_count, shape.validity, children);
+            shape_owned = false;
+            children_owned = false;
+            return array;
+        },
+        .list, .map => {
+            const shape = try levelShape(allocator, first, node.levels, true);
+            var shape_owned = true;
+            errdefer if (shape_owned) {
+                allocator.free(shape.validity);
+                allocator.free(shape.offsets.?);
+            };
+            var child = try assembleNode(allocator, &node.children[0], leaves, base);
+            errdefer if (child.release != null) child.doRelease();
+            if (child.length != shape.elements) return error.InvalidPageData;
+            const array = try buildListArray(allocator, shape.length, shape.null_count, shape.validity, shape.offsets.?, &child);
+            shape_owned = false;
+            return array;
+        },
+    }
+}
+
+/// Slots of a node computed from one leaf's levels (see `LevelInfo`).
+const LevelShape = struct {
+    length: usize,
+    /// List and map: total elements (the last offset).
+    elements: usize,
     validity: Buffer,
     null_count: i64,
+    /// List and map: `length + 1` i32 offsets.
+    offsets: ?Buffer,
 };
 
-fn listShape(allocator: Allocator, def_levels: []const u32, rep_levels: []const u32, element_level: u32) ReaderError!ListShape {
-    var num_rows: usize = 0;
-    for (rep_levels) |rep| num_rows += @intFromBool(rep == 0);
+fn levelShape(allocator: Allocator, l: *const NestedLeaf, info: LevelInfo, is_list: bool) ReaderError!LevelShape {
+    const def = l.leaf.def_levels;
+    const rep = l.leaf.rep_levels;
 
-    const offsets_buf = try allocBuffer(allocator, (num_rows + 1) * 4);
-    errdefer allocator.free(offsets_buf);
-    const offsets: [*]i32 = @ptrCast(@alignCast(offsets_buf.ptr));
-    const validity = try allocBuffer(allocator, (num_rows + 7) / 8);
+    var length: usize = 0;
+    for (0..l.entries) |i| {
+        const d = if (def) |x| x[i] else 0;
+        const r = if (rep) |x| x[i] else 0;
+        if (r > info.rep_level or d < info.ancestor_def_level) continue;
+        if (is_list and r == info.rep_level) continue;
+        length += 1;
+    }
+
+    const validity = try allocBuffer(allocator, (length + 7) / 8);
     errdefer allocator.free(validity);
     @memset(validity, 0xFF);
+    const offsets_buf: ?Buffer = if (is_list) try allocBuffer(allocator, (length + 1) * 4) else null;
+    errdefer if (offsets_buf) |o| allocator.free(o);
+    const offsets: [*]i32 = if (offsets_buf) |o| @ptrCast(@alignCast(o.ptr)) else undefined;
 
-    var row_idx: usize = 0;
-    var elem_count: usize = 0;
+    var slot: usize = 0;
+    var end: usize = 0;
     var null_count: i64 = 0;
-    for (def_levels, rep_levels, 0..) |def, rep, i| {
-        if (rep == 0) {
-            if (i > 0) row_idx += 1;
-            offsets[row_idx] = try safe.castTo(i32, elem_count);
-            if (def == 0) {
-                arrow.clearBit(validity, row_idx);
-                null_count += 1;
+    for (0..l.entries) |i| {
+        const d = if (def) |x| x[i] else 0;
+        const r = if (rep) |x| x[i] else 0;
+        if (r > info.rep_level or d < info.ancestor_def_level) continue;
+        var valid: bool = undefined;
+        if (is_list) {
+            if (r == info.rep_level) {
+                // Another element of the current slot.
+                if (slot == 0) return error.InvalidPageData;
+                end += 1;
+                continue;
             }
+            offsets[slot] = try safe.castTo(i32, end);
+            if (d >= info.def_level) end += 1;
+            valid = d + 1 >= info.def_level;
+        } else {
+            valid = d >= info.def_level;
         }
-        if (def >= element_level) elem_count += 1;
+        if (!valid) {
+            arrow.clearBit(validity, slot);
+            null_count += 1;
+        }
+        slot += 1;
     }
-    offsets[num_rows] = try safe.castTo(i32, elem_count);
-    return .{ .num_rows = num_rows, .num_elements = elem_count, .offsets = offsets_buf, .validity = validity, .null_count = null_count };
-}
+    if (is_list) offsets[length] = try safe.castTo(i32, end);
 
-fn readListColumnAsArrow(
-    allocator: Allocator,
-    source: SeekableReader,
-    metadata: format.FileMetaData,
-    rg: *const format.RowGroup,
-    logical_col: *const LogicalColumn,
-) ReaderError!ArrowArray {
-    var leaf = try readLeafWithLevels(allocator, source, metadata, rg, logical_col.physical_col_start);
-    defer leaf.deinit(allocator);
-
-    const max_def: u32 = leaf.column_info.max_def_level;
-    const element_level: u32 = if (max_def >= 2) 2 else 1;
-
-    const shape = try listShape(allocator, leaf.def_levels, leaf.rep_levels, element_level);
-    var shape_owned = true;
-    errdefer if (shape_owned) {
-        allocator.free(shape.offsets);
-        allocator.free(shape.validity);
-    };
-
-    // Elements: entries with a definition level of at least `element_level`; an element is
-    // null when its definition level is below the maximum.
-    const elements = leaf.buffers.take(allocator, leaf.def_levels, element_level, std.math.maxInt(usize)) catch |e|
-        return asErrorOf(ReaderError, e);
-    var child = try buffersToArrow(allocator, elements);
-    errdefer child.doRelease();
-
-    const list = try buildListArray(allocator, shape.num_rows, shape.null_count, shape.validity, shape.offsets, &child);
-    shape_owned = false;
-    return list;
-}
-
-fn readMapColumnAsArrow(
-    allocator: Allocator,
-    source: SeekableReader,
-    metadata: format.FileMetaData,
-    rg: *const format.RowGroup,
-    logical_col: *const LogicalColumn,
-) ReaderError!ArrowArray {
-    if (logical_col.children.len != 2) return error.InvalidSchema;
-
-    // Keys determine the entries (offsets and validity) through their levels.
-    var key = try readLeafWithLevels(allocator, source, metadata, rg, logical_col.children[0].physical_col_start);
-    defer key.deinit(allocator);
-    var val = try readLeafWithLevels(allocator, source, metadata, rg, logical_col.children[1].physical_col_start);
-    defer val.deinit(allocator);
-
-    const key_level: u32 = if (key.column_info.max_def_level >= 2) 2 else 1;
-    const val_level: u32 = if (val.column_info.max_def_level >= 2) 2 else 1;
-
-    const shape = try listShape(allocator, key.def_levels, key.rep_levels, key_level);
-    var shape_owned = true;
-    errdefer if (shape_owned) {
-        allocator.free(shape.offsets);
-        allocator.free(shape.validity);
-    };
-    const num_entries = shape.num_elements;
-
-    const key_elements = key.buffers.take(allocator, key.def_levels, key_level, num_entries) catch |e|
-        return asErrorOf(ReaderError, e);
-    var key_array = try buffersToArrow(allocator, key_elements);
-    errdefer if (key_array.release != null) key_array.doRelease();
-
-    // Values beyond `num_entries` are ignored; fewer values than entries is malformed.
-    const val_elements = val.buffers.take(allocator, val.def_levels, val_level, num_entries) catch |e|
-        return asErrorOf(ReaderError, e);
-    if (val_elements.length != num_entries) {
-        var v = val_elements;
-        v.deinit(allocator);
-        return error.InvalidPageData;
-    }
-    var val_array = try buffersToArrow(allocator, val_elements);
-    errdefer if (val_array.release != null) val_array.doRelease();
-
-    var entries_children = try allocator.alloc(ArrowArray, 2);
-    var entries_children_owned = true;
-    errdefer if (entries_children_owned) {
-        for (entries_children) |*c| c.doRelease();
-        allocator.free(entries_children);
-    };
-    entries_children[0] = key_array;
-    entries_children[1] = val_array;
-    key_array.release = null; // ownership transferred to entries_children
-    val_array.release = null;
-
-    const entries_validity = try allocBuffer(allocator, (num_entries + 7) / 8);
-    var entries_validity_owned = true;
-    errdefer if (entries_validity_owned) allocator.free(entries_validity);
-    @memset(entries_validity, 0xFF);
-
-    var entries = try buildStructArray(allocator, num_entries, 0, entries_validity, entries_children);
-    entries_children_owned = false;
-    entries_validity_owned = false;
-    errdefer entries.doRelease();
-
-    const map = try buildListArray(allocator, shape.num_rows, shape.null_count, shape.validity, shape.offsets, &entries);
-    shape_owned = false;
-    return map;
+    return .{ .length = length, .elements = end, .validity = validity, .null_count = null_count, .offsets = offsets_buf };
 }
 
 /// Wraps decoded buffers in an ArrowArray, taking ownership of them (they are freed on error).
@@ -4683,4 +4490,229 @@ test "round-trip: arrow write then read - time32 seconds and millis" {
     try std.testing.expectEqual(@as(i32, 3600000), read_ttm[0]);
     try std.testing.expectEqual(@as(i32, 0), read_ttm[1]);
     try std.testing.expectEqual(@as(i64, 1), result.arrays[1].null_count);
+}
+
+// ============================================================================
+// Nested columns compared with PyArrow
+// ============================================================================
+
+const NestedTotals = struct {
+    files: usize = 0,
+    pyarrow_errors: usize = 0,
+    columns: usize = 0,
+    equal: usize = 0,
+    differ: usize = 0,
+    read_errors: usize = 0,
+};
+
+// test-files-arrow/nested_reference.json holds PyArrow's reading of every column of the test
+// files that have a list, map or struct column (first 2,000 rows per row group), as canonical
+// text; see test-files-arrow/nested_reference.py. generate.py writes it.
+test "Arrow arrays match PyArrow on the test files with nested columns" {
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const json_text = std.Io.Dir.cwd().readFileAlloc(io, "../test-files-arrow/nested_reference.json", arena, .limited(1 << 30)) catch |err| {
+        std.debug.print("cannot read ../test-files-arrow/nested_reference.json ({s}); regenerate the test files: cd test-files-arrow && uv run python generate.py\n", .{@errorName(err)});
+        return err;
+    };
+    const reference = try std.json.parseFromSliceLeaky(std.json.Value, arena, json_text, .{});
+
+    var totals: NestedTotals = .{};
+    var it = reference.object.iterator();
+    while (it.next()) |entry| {
+        const columns = entry.value_ptr.*.object;
+        if (columns.get("error") != null) {
+            totals.pyarrow_errors += 1;
+            continue;
+        }
+        totals.files += 1;
+        try compareFileWithReference(entry.key_ptr.*, columns, &totals);
+    }
+    std.debug.print("\nPyArrow comparison: {d} files ({d} more unreadable by PyArrow), {d} columns: {d} equal, {d} differ, {d} read errors\n", .{
+        totals.files, totals.pyarrow_errors, totals.columns, totals.equal, totals.differ, totals.read_errors,
+    });
+    try std.testing.expectEqual(@as(usize, 0), totals.differ);
+    try std.testing.expectEqual(@as(usize, 0), totals.read_errors);
+}
+
+fn compareFileWithReference(path: []const u8, reference: std.json.ObjectMap, totals: *NestedTotals) !void {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    // The reader uses an arena (footer parsing leaks on some malformed files); the Arrow read
+    // uses the testing allocator.
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const file = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    var reader = @import("../lib.zig").openFileDynamic(arena, file, io, .{}) catch |err| {
+        totals.read_errors += 1;
+        std.debug.print("READ ERROR {s}: {s}\n", .{ path, @errorName(err) });
+        return;
+    };
+    defer reader.deinit();
+    const md = reader.metadata;
+    const tree = buildSchemaTree(arena, md.schema) catch |err| {
+        totals.read_errors += 1;
+        std.debug.print("READ ERROR {s}: schema: {s}\n", .{ path, @errorName(err) });
+        return;
+    };
+
+    for (0..md.row_groups.len) |rg| {
+        for (tree, 0..) |*node, c| {
+            var key_buf: [32]u8 = undefined;
+            const key = try std.fmt.bufPrint(&key_buf, "{d}:{d}", .{ rg, c });
+            const expected = (reference.get(key) orelse continue).string;
+            totals.columns += 1;
+
+            var result = readRowGroupAsArrow(allocator, reader.getSource(), md, rg, &.{c}) catch |err| {
+                totals.read_errors += 1;
+                std.debug.print("READ ERROR {s} {s} ({s}): {s}\n", .{ path, key, md.schema[node.schema_idx].name, @errorName(err) });
+                continue;
+            };
+            defer result.deinit();
+
+            var out: std.Io.Writer.Allocating = .init(allocator);
+            defer out.deinit();
+            const arr = &result.arrays[0];
+            const rows = @min(@as(usize, @intCast(arr.length)), 2000);
+            for (0..rows) |i| {
+                if (i > 0) try out.writer.writeByte('\n');
+                try canonEntry(&out.writer, md.schema, node, arr, i);
+            }
+            const got = out.written();
+            if (std.mem.eql(u8, got, expected)) {
+                totals.equal += 1;
+            } else {
+                totals.differ += 1;
+                var gl = std.mem.splitScalar(u8, got, '\n');
+                var el = std.mem.splitScalar(u8, expected, '\n');
+                var row: usize = 0;
+                while (true) : (row += 1) {
+                    const g = gl.next();
+                    const e = el.next();
+                    if (g == null and e == null) break;
+                    if (g == null or e == null or !std.mem.eql(u8, g.?, e.?)) {
+                        const gs = g orelse "<none>";
+                        const es = e orelse "<none>";
+                        const at = std.mem.indexOfDiff(u8, gs, es) orelse 0;
+                        std.debug.print("DIFF {s} {s} ({s}) row {d}, from character {d}:\n  zig     {s}\n  pyarrow {s}\n", .{
+                            path, key, md.schema[node.schema_idx].name, row, at, window(gs, at), window(es, at),
+                        });
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Up to 80 characters before and 120 from `at`.
+fn window(s: []const u8, at: usize) []const u8 {
+    const start = at -| 80;
+    return s[@min(start, s.len)..@min(at + 120, s.len)];
+}
+
+/// Writes entry `i` of `arr` (the Arrow array of `node`) in the canonical text of
+/// test-files-arrow/nested_reference.py.
+fn canonEntry(w: *std.Io.Writer, schema: []const format.SchemaElement, node: *const Node, arr: *const ArrowArray, i: usize) !void {
+    if (arr.buffers[0]) |v| {
+        const bits: [*]const u8 = @ptrCast(v);
+        if ((bits[i / 8] >> @intCast(i % 8)) & 1 == 0) return w.writeAll("n");
+    }
+    switch (node.kind) {
+        .leaf => try canonLeaf(w, schema[node.schema_idx], arr, i),
+        .struct_ => {
+            try w.writeByte('{');
+            for (node.children, 0..) |*child, k| {
+                if (k > 0) try w.writeByte(',');
+                try canonEntry(w, schema, child, arr.children.?[k], i);
+            }
+            try w.writeByte('}');
+        },
+        .list, .map => {
+            const offsets: [*]const i32 = @ptrCast(@alignCast(arr.buffers[1].?));
+            const child = arr.children.?[0];
+            try w.writeByte('[');
+            const start: usize = @intCast(offsets[i]);
+            const end: usize = @intCast(offsets[i + 1]);
+            for (start..end) |j| {
+                if (j > start) try w.writeByte(',');
+                if (node.kind == .list) {
+                    try canonEntry(w, schema, &node.children[0], child, j);
+                } else {
+                    const entries = &node.children[0];
+                    try w.writeByte('(');
+                    try canonEntry(w, schema, &entries.children[0], child.children.?[0], j);
+                    try w.writeByte(':');
+                    try canonEntry(w, schema, &entries.children[1], child.children.?[1], j);
+                    try w.writeByte(')');
+                }
+            }
+            try w.writeByte(']');
+        },
+    }
+}
+
+/// How nested_reference.py writes a leaf of this schema element (from PyArrow's type for it).
+const LeafCategory = enum { boolean, int, float, double, bytes, other };
+
+fn leafCategory(elem: format.SchemaElement) LeafCategory {
+    const physical = elem.type_ orelse return .other;
+    return switch (physical) {
+        .boolean => .boolean,
+        .int32, .int64 => blk: {
+            if (elem.logical_type) |lt| break :blk if (lt == .int) .int else .other;
+            if (elem.converted_type) |ct| break :blk if (ct >= format.ConvertedType.UINT_8 and ct <= format.ConvertedType.INT_64) .int else .other;
+            break :blk .int;
+        },
+        .float => .float,
+        .double => .double,
+        .byte_array => blk: {
+            if (elem.logical_type) |lt| if (lt == .decimal) break :blk .other;
+            if (elem.converted_type) |ct| if (ct == format.ConvertedType.DECIMAL) break :blk .other;
+            break :blk .bytes;
+        },
+        .fixed_len_byte_array => blk: {
+            if (elem.logical_type) |lt| break :blk if (lt == .uuid) .bytes else .other;
+            if (elem.converted_type != null) break :blk .other;
+            break :blk .bytes;
+        },
+        .int96 => .other,
+    };
+}
+
+fn canonLeaf(w: *std.Io.Writer, elem: format.SchemaElement, arr: *const ArrowArray, i: usize) !void {
+    const data: [*]const u8 = @ptrCast(arr.buffers[1].?);
+    switch (leafCategory(elem)) {
+        .boolean => try w.writeAll(if ((data[i / 8] >> @intCast(i % 8)) & 1 == 1) "t" else "f"),
+        .int => if (elem.type_.? == .int32)
+            try w.print("i{d}", .{std.mem.bytesToValue(i32, data[i * 4 ..][0..4])})
+        else
+            try w.print("i{d}", .{std.mem.bytesToValue(i64, data[i * 8 ..][0..8])}),
+        .float => try writeDouble(w, std.mem.bytesToValue(f32, data[i * 4 ..][0..4])),
+        .double => try writeDouble(w, std.mem.bytesToValue(f64, data[i * 8 ..][0..8])),
+        .bytes => {
+            try w.writeByte('x');
+            const bytes = if (elem.type_.? == .byte_array) blk: {
+                const offsets: [*]const i32 = @ptrCast(@alignCast(data));
+                const values: [*]const u8 = @ptrCast(arr.buffers[2].?);
+                break :blk values[@intCast(offsets[i])..@intCast(offsets[i + 1])];
+            } else blk: {
+                const width: usize = @intCast(elem.type_length.?);
+                break :blk data[i * width ..][0..width];
+            };
+            for (bytes) |b| try w.print("{x:0>2}", .{b});
+        },
+        .other => try w.writeByte('v'),
+    }
+}
+
+fn writeDouble(w: *std.Io.Writer, v: f64) !void {
+    try w.writeByte('d');
+    for (std.mem.toBytes(std.mem.nativeToLittle(u64, @bitCast(v)))) |b| try w.print("{x:0>2}", .{b});
 }

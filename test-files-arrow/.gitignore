@@ -2,6 +2,7 @@
 *.parquet
 !interop/*.parquet
 manifest.json
+nested_reference.json
 
 # Python
 __pycache__/

@@ -216,22 +216,23 @@ pub fn Decoder(comptime T: type) type {
                 const byte_pos = bit_pos / 8;
                 const bit_offset: u6 = safe.castTo(u6, bit_pos % 8) catch unreachable; // bit_pos % 8 is strictly 0-7, fits u6
 
-                // Read up to 8 bytes (enough for 64 bits)
-                var value: u64 = 0;
-                const bytes_needed = (bit_offset + bit_width + 7) / 8;
-
-                        const bytes_to_read = @min(bytes_needed, packed_data.len - byte_pos);
-                        for (0..@min(bytes_to_read, 8)) |i| {
-                            value |= @as(u64, packed_data[byte_pos + i]) << (safe.castTo(u6, i * 8) catch unreachable); // i < 8, so i * 8 <= 56, fits u6
-                        }
+                // A value starts at a bit offset of up to 7 and spans up to 64 bits, so up to 9
+                // bytes: accumulate them in a u128. Bytes past the end of `packed_data` count as 0.
+                var bits: u128 = 0;
+                const bytes_needed = (@as(usize, bit_offset) + bit_width + 7) / 8;
+                const bytes_to_read = @min(bytes_needed, packed_data.len -| byte_pos);
+                for (0..bytes_to_read) |i| {
+                    bits |= @as(u128, packed_data[byte_pos + i]) << (safe.castTo(u7, i * 8) catch unreachable); // i < 9, so i * 8 <= 64, fits u7
+                }
 
                 // Shift and mask
-                value = (value >> bit_offset) & mask;
+                const value: u64 = @truncate(bits >> bit_offset);
+                const masked = value & mask;
 
                 // Add min_delta and accumulate
                 // The packed value is an unsigned offset from min_delta
                 // Do all arithmetic in i128 to avoid overflow, then truncate to T
-                const delta_i128: i128 = @as(i128, min_delta) + @as(i128, value);
+                const delta_i128: i128 = @as(i128, min_delta) + @as(i128, masked);
                 const last_i128: i128 = @as(i128, last_value.*);
                 const new_value_i128 = last_i128 + delta_i128;
                 const new_value: T = @truncate(@as(i64, @truncate(new_value_i128)));
@@ -353,4 +354,33 @@ test "delta binary packed i64" {
     try std.testing.expectEqual(@as(i64, 100), result[0]);
     try std.testing.expectEqual(@as(i64, 101), result[1]);
     try std.testing.expectEqual(@as(i64, 102), result[2]);
+}
+
+test "delta binary packed: 63-bit mini-block values spanning 9 bytes" {
+    // Header: block_size 128, 4 mini-blocks, 3 values, first value 0.
+    // Block: min_delta 0, bit widths [63, 0, 0, 0]; the first mini-block holds deltas
+    // 1 and 2^62 + 5. The second delta starts at bit 63 (bit offset 7 in byte 7 of the
+    // mini-block) and spans its bytes 7..15, nine bytes.
+    const allocator = std.testing.allocator;
+    var data: [10 + 252]u8 = @splat(0);
+    data[0] = 0x80; // block_size 128 (varint 0x80 0x01)
+    data[1] = 0x01;
+    data[2] = 4; // mini-blocks
+    data[3] = 3; // total values
+    data[4] = 0; // first value 0 (zigzag)
+    data[5] = 0; // min_delta 0 (zigzag)
+    data[6] = 63; // bit widths: data[6..10]
+    const mini_block = data[10..][0..252]; // 32 values of 63 bits
+    const deltas = [_]u64{ 1, (@as(u64, 1) << 62) + 5 };
+    for (deltas, 0..) |d, k| {
+        for (0..63) |b| {
+            if ((d >> @intCast(b)) & 1 == 1) {
+                const bit = k * 63 + b;
+                mini_block[bit / 8] |= @as(u8, 1) << @intCast(bit % 8);
+            }
+        }
+    }
+    const values = try decodeInt64(allocator, &data);
+    defer allocator.free(values);
+    try std.testing.expectEqualSlices(i64, &.{ 0, 1, 1 + (@as(i64, 1) << 62) + 5 }, values);
 }

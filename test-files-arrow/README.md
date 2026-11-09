@@ -29,7 +29,9 @@ test-files-arrow/
 ├── multipage/                # Multi-page column chunks
 ├── interop/                  # Interop: files written by zig-parquet, validated by PyArrow
 ├── manifest.json             # Expected metadata for validation
+├── nested_reference.json     # PyArrow's reading of nested columns (written by nested_reference.py)
 ├── generate.py               # Regeneration script
+├── nested_reference.py       # Writes nested_reference.json; generate.py runs it
 └── test_interop.py           # PyArrow validation of interop/ files
 ```
 
@@ -86,6 +88,15 @@ validated by `test_interop.py` to confirm cross-implementation compatibility.
 | `logical_types/float16.parquet` | FLOAT16 (IEEE 754 half-precision) |
 | `logical_types/enum.parquet` | ENUM (dictionary-encoded strings) |
 | `logical_types/json.parquet` | JSON (large string) |
+
+## Nested column reference
+
+`nested_reference.json` holds PyArrow's reading of every column of the files in this directory
+and in `../test-files-wild` that have a list, map or struct column (first 2,000 rows of each
+row group), as canonical text. zig-parquet's test "Arrow arrays match PyArrow on the test files
+with nested columns" (`zig-parquet/src/core/arrow_batch.zig`) compares `readRowGroupAsArrow`
+with it. `generate.py` writes it after the test files; `nested_reference.py` describes the
+format.
 
 ## Manifest
 
