@@ -742,7 +742,7 @@ pub const DynamicReader = struct {
             if (leaf.rep_levels) |l| self.allocator.free(l);
         }
 
-        const values = try leafValues(self.allocator, &leaf.buffers, column_info.element);
+        const values = try leaf_decoder.toValues(self.allocator, &leaf.buffers, column_info.element);
         return .{
             .values = values,
             .def_levels = leaf.def_levels,
@@ -1058,36 +1058,3 @@ test "nested row assembly groups values by rep_level" {
     try std.testing.expectEqual(@as(usize, 3), row1_end - row1_start);
 }
 
-/// One `Value` per decoded entry: `null_val` for null entries, otherwise the value in the
-/// physical type's `Value` form (INT96 as nanoseconds in `int64_val`). Byte arrays are copied
-/// with `value_mod.dupeBytes`, so they go to the reader's bytes arena when one is set.
-fn leafValues(allocator: std.mem.Allocator, b: *const leaf_decoder.Buffers, element: format.SchemaElement) ![]Value {
-    const physical = element.type_ orelse return error.InvalidSchema;
-    const values = try allocator.alloc(Value, b.length);
-    var done: usize = 0;
-    errdefer {
-        // Bytes in the reader's arena are freed with the arena.
-        const opts: Value.DeinitOptions = .{ .skip_bytes = value_mod.bytes_arena_allocator != null };
-        for (values[0..done]) |v| v.deinitWithOptions(allocator, opts);
-        allocator.free(values);
-    }
-    const width: usize = switch (physical) {
-        .fixed_len_byte_array => safe.cast(element.type_length orelse 0) catch return error.InvalidTypeLength,
-        else => 0,
-    };
-    for (values, 0..) |*v, i| {
-        if (!b.isValid(i)) {
-            v.* = .{ .null_val = {} };
-        } else v.* = switch (physical) {
-            .boolean => .{ .bool_val = (b.values[i / 8] >> @intCast(i % 8)) & 1 == 1 },
-            .int32 => .{ .int32_val = std.mem.bytesToValue(i32, b.values[i * 4 ..][0..4]) },
-            .int64, .int96 => .{ .int64_val = std.mem.bytesToValue(i64, b.values[i * 8 ..][0..8]) },
-            .float => .{ .float_val = std.mem.bytesToValue(f32, b.values[i * 4 ..][0..4]) },
-            .double => .{ .double_val = std.mem.bytesToValue(f64, b.values[i * 8 ..][0..8]) },
-            .byte_array => .{ .bytes_val = try value_mod.dupeBytes(allocator, b.bytesAt(i)) },
-            .fixed_len_byte_array => .{ .fixed_bytes_val = try value_mod.dupeBytes(allocator, b.values[i * width ..][0..width]) },
-        };
-        done += 1;
-    }
-    return values;
-}

@@ -42,6 +42,8 @@ const types = @import("types.zig");
 const thrift = @import("thrift/mod.zig");
 const compress = @import("compress/mod.zig");
 const parquet_reader = @import("parquet_reader.zig");
+const value_mod = @import("value.zig");
+const Value = value_mod.Value;
 const rle = @import("encoding/rle.zig");
 const delta_binary_packed = @import("encoding/delta_binary_packed.zig");
 const delta_length_byte_array = @import("encoding/delta_length_byte_array.zig");
@@ -1003,4 +1005,38 @@ fn appendBits(b: *Builder, levels: ?[]const u32, n: usize, src: anytype) void {
         }
         b.pushValidity(present);
     }
+}
+
+/// One `Value` per decoded entry: `null_val` for null entries, otherwise the value in the
+/// physical type's `Value` form (INT96 as nanoseconds in `int64_val`). Byte arrays are copied
+/// with `value_mod.dupeBytes`, so they go to the reader's bytes arena when one is set.
+pub fn toValues(allocator: std.mem.Allocator, b: *const Buffers, element: format.SchemaElement) ![]Value {
+    const physical = element.type_ orelse return error.InvalidSchema;
+    const values = try allocator.alloc(Value, b.length);
+    var done: usize = 0;
+    errdefer {
+        // Bytes in the reader's arena are freed with the arena.
+        const opts: Value.DeinitOptions = .{ .skip_bytes = value_mod.bytes_arena_allocator != null };
+        for (values[0..done]) |v| v.deinitWithOptions(allocator, opts);
+        allocator.free(values);
+    }
+    const width: usize = switch (physical) {
+        .fixed_len_byte_array => safe.cast(element.type_length orelse 0) catch return error.InvalidTypeLength,
+        else => 0,
+    };
+    for (values, 0..) |*v, i| {
+        if (!b.isValid(i)) {
+            v.* = .{ .null_val = {} };
+        } else v.* = switch (physical) {
+            .boolean => .{ .bool_val = (b.values[i / 8] >> @intCast(i % 8)) & 1 == 1 },
+            .int32 => .{ .int32_val = std.mem.bytesToValue(i32, b.values[i * 4 ..][0..4]) },
+            .int64, .int96 => .{ .int64_val = std.mem.bytesToValue(i64, b.values[i * 8 ..][0..8]) },
+            .float => .{ .float_val = std.mem.bytesToValue(f32, b.values[i * 4 ..][0..4]) },
+            .double => .{ .double_val = std.mem.bytesToValue(f64, b.values[i * 8 ..][0..8]) },
+            .byte_array => .{ .bytes_val = try value_mod.dupeBytes(allocator, b.bytesAt(i)) },
+            .fixed_len_byte_array => .{ .fixed_bytes_val = try value_mod.dupeBytes(allocator, b.values[i * width ..][0..width]) },
+        };
+        done += 1;
+    }
+    return values;
 }

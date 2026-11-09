@@ -1110,7 +1110,55 @@ fn readPhysicalColumnRaw(
     const column_info = format.getColumnInfo(metadata.schema, col_idx) orelse
         return error.InvalidArgument;
 
-    return decodeRawColumn(allocator, page_data, meta, column_info);
+    return decodeLeafRaw(allocator, page_data, meta, column_info) catch |e| return asBatchError(e);
+}
+
+/// Decodes a leaf column chunk with `leaf_decoder` into one `Value` per level entry plus the
+/// definition and repetition levels (filled with the maximum and 0 when the column has none).
+fn decodeLeafRaw(
+    allocator: Allocator,
+    page_data: []const u8,
+    meta: format.ColumnMetaData,
+    column_info: format.ColumnInfo,
+) !RawColumnData {
+    var leaf = try leaf_decoder.decodeLeaf(allocator, page_data, meta, column_info, .{
+        .keep_levels = true,
+        .large_offsets = true,
+    });
+    defer leaf.buffers.deinit(allocator);
+    errdefer {
+        if (leaf.def_levels) |l| allocator.free(l);
+        if (leaf.rep_levels) |l| allocator.free(l);
+    }
+    const n = leaf.buffers.length;
+    const def_levels = leaf.def_levels orelse blk: {
+        const l = try allocator.alloc(u32, n);
+        @memset(l, column_info.max_def_level);
+        break :blk l;
+    };
+    leaf.def_levels = def_levels;
+    const rep_levels = leaf.rep_levels orelse blk: {
+        const l = try allocator.alloc(u32, n);
+        @memset(l, 0);
+        break :blk l;
+    };
+    leaf.rep_levels = rep_levels;
+    const values = try leaf_decoder.toValues(allocator, &leaf.buffers, column_info.element);
+    return .{
+        .values = values,
+        .def_levels = def_levels,
+        .rep_levels = rep_levels,
+        .column_info = column_info,
+        .allocator = allocator,
+    };
+}
+
+/// Returns `e` when it is in `BatchError`, otherwise `error.InvalidPageData`.
+fn asBatchError(e: anyerror) BatchError {
+    inline for (@typeInfo(BatchError).error_set.error_names.?) |name| {
+        if (e == @field(anyerror, name)) return @field(BatchError, name);
+    }
+    return error.InvalidPageData;
 }
 
 /// Decodes a leaf column chunk into one `Value` per level entry plus the definition and
