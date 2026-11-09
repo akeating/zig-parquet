@@ -166,7 +166,7 @@ pub const internals = struct {
     pub const thrift = @import("core/thrift/mod.zig");
     pub const compress = @import("core/compress/mod.zig");
     pub const reader = @import("core/reader_mod.zig");
-    pub const column_decoder = reader.column_decoder;
+    pub const leaf_decoder = reader.leaf_decoder;
     pub const encoding = struct {
         pub const plain = @import("core/encoding/plain.zig");
         pub const plain_encoder = @import("core/encoding/plain_encoder.zig");
@@ -662,7 +662,7 @@ test {
     _ = internals.thrift;
     _ = format;
     _ = internals.compress;
-    _ = internals.column_decoder;
+    _ = internals.leaf_decoder;
     _ = internals.encoding.plain;
     _ = internals.encoding.plain_encoder;
     _ = internals.encoding.rle;

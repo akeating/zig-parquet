@@ -16,7 +16,7 @@ zig-parquet is a native Parquet library written in Zig 0.17 (minimum 0.17.0). It
 
 - `zig-parquet/src/lib.zig` - Library exports (package root)
 - `zig-parquet/src/core/dynamic_reader.zig` - DynamicReader (schema-agnostic row reading)
-- `zig-parquet/src/core/column_decoder.zig` - Column value decoding (encodings, levels, types)
+- `zig-parquet/src/core/leaf_decoder.zig` - Column chunk decoding into Arrow-layout buffers (all encodings, levels, page versions); used by the Arrow path and the row API
 - `zig-parquet/src/core/writer.zig` - High-level typed Parquet writer
 - `zig-parquet/src/core/dynamic_writer.zig` - DynamicWriter (runtime-schema row writing)
 - `zig-parquet/src/core/format.zig` - Parquet format types (re-exports from format/)
@@ -278,7 +278,6 @@ pub fn writeColumn(values: []const T) !void {
 
 ### Common Safe Casting Helpers
 
-- `safePageSize(i32) -> error{InvalidPageSize}!usize`
-- `safeRowCount(i64) -> error{InvalidRowCount}!usize`
-- `extractBitWidth([]const u8, usize) -> error{InvalidBitWidth, EndOfData}!u5`
-- `safeTypeLength(?i32) -> error{InvalidTypeLength}!usize`
+- `safe.cast(v) -> error{IntegerOverflow}!usize` and `safe.castTo(T, v)` (`safe.zig`) — any integer from the file
+- `safe.slice(data, offset, len) -> error{EndOfData}![]const u8` (`safe.zig`)
+- `safeRowCount(i64) -> error{InvalidRowCount}!usize` (`dynamic_reader.zig`)

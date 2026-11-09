@@ -13,7 +13,6 @@ const std = @import("std");
 const safe = @import("safe.zig");
 const format = @import("format.zig");
 const arrow = @import("arrow.zig");
-const column_decoder = @import("column_decoder.zig");
 const parquet_reader = @import("parquet_reader.zig");
 const column_def_mod = @import("column_def.zig");
 const value_mod = @import("value.zig");
@@ -1028,70 +1027,6 @@ pub const RawColumnData = struct {
     }
 };
 
-fn decodeDataPages(
-    allocator: Allocator,
-    page_data: []const u8,
-    meta: format.ColumnMetaData,
-    column_info: format.ColumnInfo,
-    all_values: *std.ArrayListUnmanaged(Value),
-    all_def_levels: ?*std.ArrayListUnmanaged(u32),
-    all_rep_levels: ?*std.ArrayListUnmanaged(u32),
-) !void {
-    var dict_set = parquet_reader.DictionarySet.init(allocator);
-    defer dict_set.deinit();
-
-    var pos: usize = 0;
-
-    if (pos < page_data.len) {
-        var peek_thrift = thrift.CompactReader.init(page_data[pos..]);
-        const first_header = try format.PageHeader.parse(allocator, &peek_thrift);
-        defer parquet_reader.freePageHeaderContents(allocator, &first_header);
-
-        if (first_header.dictionary_page_header) |dph| {
-            pos += peek_thrift.pos;
-            const dict_size = safe.cast(first_header.compressed_page_size) catch return error.InvalidPageSize;
-            const dict_body = try safe.slice(page_data, pos, dict_size);
-            pos += dict_size;
-
-            const uncompressed_size = safe.cast(first_header.uncompressed_page_size) catch return error.InvalidPageSize;
-            const num_values = safe.cast(dph.num_values) catch return error.InvalidPageSize;
-            try dict_set.initFromPage(
-                dict_body,
-                num_values,
-                column_info.element.type_,
-                column_info.element.type_length,
-                meta.codec,
-                uncompressed_size,
-            );
-        }
-    }
-
-    while (pos < page_data.len) {
-        var thrift_reader = thrift.CompactReader.init(page_data[pos..]);
-        const header = try format.PageHeader.parse(allocator, &thrift_reader);
-        defer parquet_reader.freePageHeaderContents(allocator, &header);
-
-        pos += thrift_reader.pos;
-
-        if (header.data_page_header == null and header.data_page_header_v2 == null) {
-            const skip = safe.cast(header.compressed_page_size) catch return error.InvalidPageSize;
-            pos += skip;
-            continue;
-        }
-
-        const compressed_size = safe.cast(header.compressed_page_size) catch return error.InvalidPageSize;
-        if (pos + compressed_size > page_data.len) return error.EndOfData;
-        const compressed_body = try safe.slice(page_data, pos, compressed_size);
-        pos += compressed_size;
-
-        if (header.data_page_header_v2) |v2| {
-            try decodeV2PageUnified(allocator, all_values, all_def_levels, all_rep_levels, compressed_body, v2, header, meta, column_info, &dict_set);
-        } else if (header.data_page_header) |dph| {
-            try decodeV1PageUnified(allocator, all_values, all_def_levels, all_rep_levels, compressed_body, dph, header, meta, column_info, &dict_set);
-        }
-    }
-}
-
 fn readPhysicalColumnRaw(
     allocator: Allocator,
     source: SeekableReader,
@@ -1159,196 +1094,6 @@ fn asBatchError(e: anyerror) BatchError {
         if (e == @field(anyerror, name)) return @field(BatchError, name);
     }
     return error.InvalidPageData;
-}
-
-/// Decodes a leaf column chunk into one `Value` per level entry plus the definition and
-/// repetition levels.
-pub fn decodeRawColumn(
-    allocator: Allocator,
-    page_data: []const u8,
-    meta: format.ColumnMetaData,
-    column_info: format.ColumnInfo,
-) BatchError!RawColumnData {
-    var all_values: std.ArrayListUnmanaged(Value) = .empty;
-    errdefer {
-        for (all_values.items) |v| v.deinit(allocator);
-        all_values.deinit(allocator);
-    }
-    var all_def_levels: std.ArrayListUnmanaged(u32) = .empty;
-    errdefer all_def_levels.deinit(allocator);
-    var all_rep_levels: std.ArrayListUnmanaged(u32) = .empty;
-    errdefer all_rep_levels.deinit(allocator);
-
-    decodeDataPages(allocator, page_data, meta, column_info, &all_values, &all_def_levels, &all_rep_levels) catch return error.EndOfData;
-
-    const values = all_values.toOwnedSlice(allocator) catch return error.OutOfMemory;
-    errdefer {
-        for (values) |v| v.deinit(allocator);
-        allocator.free(values);
-    }
-    const def_levels = all_def_levels.toOwnedSlice(allocator) catch return error.OutOfMemory;
-    errdefer allocator.free(def_levels);
-    const rep_levels = all_rep_levels.toOwnedSlice(allocator) catch return error.OutOfMemory;
-
-    return .{
-        .values = values,
-        .def_levels = def_levels,
-        .rep_levels = rep_levels,
-        .column_info = column_info,
-        .allocator = allocator,
-    };
-}
-
-fn decodeV2PageUnified(
-    allocator: Allocator,
-    all_values: *std.ArrayListUnmanaged(Value),
-    all_def_levels: ?*std.ArrayListUnmanaged(u32),
-    all_rep_levels: ?*std.ArrayListUnmanaged(u32),
-    compressed_body: []const u8,
-    v2: format.DataPageHeaderV2,
-    header: format.PageHeader,
-    meta: format.ColumnMetaData,
-    column_info: format.ColumnInfo,
-    dict_set: *parquet_reader.DictionarySet,
-) !void {
-    const rep_len = safe.cast(v2.repetition_levels_byte_length) catch return error.InvalidPageSize;
-    const def_len = safe.cast(v2.definition_levels_byte_length) catch return error.InvalidPageSize;
-    const num_values = safe.cast(v2.num_values) catch return error.InvalidPageSize;
-    if (num_values == 0) return;
-
-    const rep_data = safe.slice(compressed_body, 0, rep_len) catch return error.EndOfData;
-    const def_data = safe.slice(compressed_body, rep_len, def_len) catch return error.EndOfData;
-    const levels_total = std.math.add(usize, rep_len, def_len) catch return error.EndOfData;
-    if (levels_total > compressed_body.len) return error.EndOfData;
-    const values_compressed = compressed_body[levels_total..];
-
-    var values_allocated = false;
-    const values_data = if (v2.is_compressed and meta.codec != .uncompressed) blk: {
-        const uncompressed = safe.cast(header.uncompressed_page_size) catch return error.InvalidPageSize;
-        if (uncompressed < levels_total) return error.EndOfData;
-        const val_size = uncompressed - levels_total;
-        if (val_size == 0 or values_compressed.len == 0) break :blk values_compressed;
-        values_allocated = true;
-        break :blk compress.decompress(allocator, values_compressed, meta.codec, val_size) catch return error.DecompressionError;
-    } else values_compressed;
-    defer if (values_allocated) allocator.free(values_data);
-
-    const has_dict = dict_set.hasDictionary();
-    const result = column_decoder.decodeColumnDynamicV2(
-        allocator,
-        column_info.element,
-        rep_data,
-        def_data,
-        values_data,
-        num_values,
-        column_info.max_def_level,
-        column_info.max_rep_level,
-        has_dict,
-        if (dict_set.string_dict) |*d| d else null,
-        if (dict_set.int32_dict) |*d| d else null,
-        if (dict_set.int64_dict) |*d| d else null,
-        if (dict_set.float32_dict) |*d| d else null,
-        if (dict_set.float64_dict) |*d| d else null,
-        if (dict_set.fixed_byte_array_dict) |*d| d else null,
-        if (dict_set.int96_dict) |*d| d else null,
-        v2.encoding,
-    ) catch return error.EndOfData;
-
-    const n_vals = result.values.len;
-    all_values.appendSlice(allocator, result.values) catch return error.OutOfMemory;
-    allocator.free(result.values);
-
-    if (all_def_levels) |adl| {
-        if (result.def_levels) |dl| {
-            adl.appendSlice(allocator, dl) catch return error.OutOfMemory;
-            allocator.free(dl);
-        } else {
-            adl.appendNTimes(allocator, column_info.max_def_level, n_vals) catch return error.OutOfMemory;
-        }
-    } else {
-        if (result.def_levels) |dl| allocator.free(dl);
-    }
-
-    if (all_rep_levels) |arl| {
-        if (result.rep_levels) |rl| {
-            arl.appendSlice(allocator, rl) catch return error.OutOfMemory;
-            allocator.free(rl);
-        } else {
-            arl.appendNTimes(allocator, 0, n_vals) catch return error.OutOfMemory;
-        }
-    } else {
-        if (result.rep_levels) |rl| allocator.free(rl);
-    }
-}
-
-fn decodeV1PageUnified(
-    allocator: Allocator,
-    all_values: *std.ArrayListUnmanaged(Value),
-    all_def_levels: ?*std.ArrayListUnmanaged(u32),
-    all_rep_levels: ?*std.ArrayListUnmanaged(u32),
-    compressed_body: []const u8,
-    dph: format.DataPageHeader,
-    header: format.PageHeader,
-    meta: format.ColumnMetaData,
-    column_info: format.ColumnInfo,
-    dict_set: *parquet_reader.DictionarySet,
-) !void {
-    const value_data = if (meta.codec != .uncompressed) blk: {
-        const uncompressed = safe.cast(header.uncompressed_page_size) catch return error.InvalidPageSize;
-        break :blk compress.decompress(allocator, compressed_body, meta.codec, uncompressed) catch return error.DecompressionError;
-    } else compressed_body;
-    defer if (meta.codec != .uncompressed) allocator.free(value_data);
-
-    const num_values = safe.cast(dph.num_values) catch return error.InvalidPageSize;
-    if (num_values == 0) return;
-
-    const has_dict = dict_set.hasDictionary();
-
-    const result = column_decoder.decodeColumnDynamicWithValueEncoding(
-        allocator,
-        column_info.element,
-        value_data,
-        num_values,
-        column_info.max_def_level,
-        column_info.max_rep_level,
-        has_dict,
-        if (dict_set.string_dict) |*d| d else null,
-        if (dict_set.int32_dict) |*d| d else null,
-        if (dict_set.int64_dict) |*d| d else null,
-        if (dict_set.float32_dict) |*d| d else null,
-        if (dict_set.float64_dict) |*d| d else null,
-        if (dict_set.fixed_byte_array_dict) |*d| d else null,
-        if (dict_set.int96_dict) |*d| d else null,
-        dph.definition_level_encoding,
-        dph.repetition_level_encoding,
-        dph.encoding,
-    ) catch return error.EndOfData;
-
-    const n_vals = result.values.len;
-    all_values.appendSlice(allocator, result.values) catch return error.OutOfMemory;
-    allocator.free(result.values);
-
-    if (all_def_levels) |adl| {
-        if (result.def_levels) |dl| {
-            adl.appendSlice(allocator, dl) catch return error.OutOfMemory;
-            allocator.free(dl);
-        } else {
-            adl.appendNTimes(allocator, column_info.max_def_level, n_vals) catch return error.OutOfMemory;
-        }
-    } else {
-        if (result.def_levels) |dl| allocator.free(dl);
-    }
-
-    if (all_rep_levels) |arl| {
-        if (result.rep_levels) |rl| {
-            arl.appendSlice(allocator, rl) catch return error.OutOfMemory;
-            allocator.free(rl);
-        } else {
-            arl.appendNTimes(allocator, 0, n_vals) catch return error.OutOfMemory;
-        }
-    } else {
-        if (result.rep_levels) |rl| allocator.free(rl);
-    }
 }
 
 // ============================================================================
@@ -1804,7 +1549,11 @@ fn readColumnAsArrow(
     if (leaf_decoder.isFlat(column_info)) {
         return decodeFlatChunk(allocator, page_data, meta, column_info);
     }
-    return decodeLeafChunkViaValues(allocator, page_data, meta, column_info);
+    // A leaf that is not flat (a repeated primitive without a LIST annotation): one array
+    // entry per level entry, as before.
+    var raw = try decodeLeafRaw(allocator, page_data, meta, column_info);
+    defer raw.deinit();
+    return valuesToArrowArray(allocator, raw.values, column_info.element);
 }
 
 /// Decodes a flat column chunk (see `leaf_decoder.isFlat`) directly into an ArrowArray.
@@ -1825,31 +1574,6 @@ pub fn decodeFlatChunk(
         return e;
     };
 }
-
-/// Decodes a leaf column chunk through `Value`s. Used for leaf columns that are not flat
-/// (repeated, or nested under optional groups), and as the reference for `decodeFlatChunk`
-/// in tests.
-pub fn decodeLeafChunkViaValues(
-    allocator: Allocator,
-    page_data: []const u8,
-    meta: format.ColumnMetaData,
-    column_info: format.ColumnInfo,
-) !ArrowArray {
-    var all_values: std.ArrayListUnmanaged(Value) = .empty;
-    errdefer {
-        for (all_values.items) |v| v.deinit(allocator);
-        all_values.deinit(allocator);
-    }
-
-    try decodeDataPages(allocator, page_data, meta, column_info, &all_values, null, null);
-
-    // Convert Value[] to ArrowArray, then free the intermediate Values
-    const result = try valuesToArrowArray(allocator, all_values.items, column_info.element);
-    for (all_values.items) |v| v.deinit(allocator);
-    all_values.deinit(allocator);
-    return result;
-}
-
 
 // ============================================================================
 // Value[] → ArrowArray conversion

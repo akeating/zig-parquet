@@ -2,14 +2,12 @@
 //!
 //! Low-level components used by the Parquet reader.
 
-pub const column_decoder = @import("column_decoder.zig");
+pub const leaf_decoder = @import("leaf_decoder.zig");
 pub const dynamic_reader = @import("dynamic_reader.zig");
 pub const seekable_reader = @import("seekable_reader.zig");
 pub const parquet_reader = @import("parquet_reader.zig");
 
 // Re-export commonly used types
-pub const decodeColumnDynamic = column_decoder.decodeColumnDynamic;
-pub const DynamicDecodeResult = column_decoder.DynamicDecodeResult;
 pub const DynamicReader = dynamic_reader.DynamicReader;
 pub const DynamicReaderError = dynamic_reader.DynamicReaderError;
 pub const DynamicReaderOptions = dynamic_reader.DynamicReaderOptions;

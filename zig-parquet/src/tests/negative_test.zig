@@ -6,8 +6,9 @@
 
 const std = @import("std");
 const parquet = @import("../lib.zig");
-const column_decoder = @import("../core/column_decoder.zig");
+const leaf_decoder = @import("../core/leaf_decoder.zig");
 const format = @import("../core/format.zig");
+const thrift = @import("../core/thrift/mod.zig");
 
 const TypeInfo = parquet.TypeInfo;
 const ColumnProperties = parquet.DynamicWriter.ColumnProperties;
@@ -24,29 +25,35 @@ fn makeSchemaElem(physical_type: format.PhysicalType) format.SchemaElement {
     };
 }
 
+/// Decodes a column chunk holding one uncompressed V1 data page with one value of
+/// `physical_type` in `value_encoding`, and expects `error.UnsupportedEncoding`. V1 and V2
+/// pages share the value decoding (`leaf_decoder` `decodeValues`), so this covers both.
 fn expectDecoderUnsupportedEncoding(
     physical_type: format.PhysicalType,
     value_encoding: format.Encoding,
 ) !void {
     const allocator = std.testing.allocator;
-    const schema_elem = makeSchemaElem(physical_type);
-    const dummy_data = &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0 };
+    const body: [16]u8 = @splat(0);
+    const header = format.PageHeader{
+        .type_ = .data_page,
+        .uncompressed_page_size = body.len,
+        .compressed_page_size = body.len,
+        .data_page_header = .{ .num_values = 1, .encoding = value_encoding },
+    };
+    var writer = thrift.CompactWriter.init(allocator);
+    defer writer.deinit();
+    try header.serialize(&writer);
+    const page_data = try std.mem.concat(allocator, u8, &.{ writer.getWritten(), &body });
+    defer allocator.free(page_data);
 
-    const result = column_decoder.decodeColumnDynamicWithValueEncoding(
-        allocator,
-        schema_elem,
-        dummy_data,
-        0,
-        0, // max_def_level
-        0, // max_rep_level
-        false, // uses_dict
-        null, null, null, null, null, null, null,
-        .rle, // def_level_encoding (irrelevant for max_def=0)
-        .rle, // rep_level_encoding
-        value_encoding,
-    );
-
-    try std.testing.expectError(error.UnsupportedEncoding, result);
+    const info = format.ColumnInfo{
+        .element = makeSchemaElem(physical_type),
+        .max_def_level = 0,
+        .max_rep_level = 0,
+        .column_index = 0,
+    };
+    const meta = format.ColumnMetaData{ .type_ = physical_type, .codec = .uncompressed, .num_values = 1 };
+    try std.testing.expectError(error.UnsupportedEncoding, leaf_decoder.decodeLeaf(allocator, page_data, meta, info, .{}));
 }
 
 test "V1 decoder: RLE encoding on INT32 returns UnsupportedEncoding" {
@@ -294,91 +301,19 @@ test "DynamicWriter: close with no columns returns InvalidState" {
 }
 
 // =========================================================================
-// Decoder: V2 unsupported encoding / type combinations
+// Decoder: unsupported encoding / type combinations (other encodings)
 // =========================================================================
 
-test "V2 decoder: delta_binary_packed on BYTE_ARRAY returns UnsupportedEncoding" {
-    const allocator = std.testing.allocator;
-    const schema_elem = makeSchemaElem(.byte_array);
-    const dummy_data = &@as([8]u8, @splat(0));
-
-    const result = column_decoder.decodeColumnDynamicV2(
-        allocator,
-        schema_elem,
-        &.{}, // rep_levels_data
-        &.{}, // def_levels_data
-        dummy_data,
-        0,
-        0, 0,
-        false,
-        null, null, null, null, null, null, null,
-        .delta_binary_packed,
-    );
-
-    try std.testing.expectError(error.UnsupportedEncoding, result);
+test "decoder: delta_binary_packed on BYTE_ARRAY returns UnsupportedEncoding" {
+    try expectDecoderUnsupportedEncoding(.byte_array, .delta_binary_packed);
 }
 
-test "V2 decoder: byte_stream_split on BOOLEAN returns UnsupportedEncoding" {
-    const allocator = std.testing.allocator;
-    const schema_elem = makeSchemaElem(.boolean);
-    const dummy_data = &@as([8]u8, @splat(0));
-
-    const result = column_decoder.decodeColumnDynamicV2(
-        allocator,
-        schema_elem,
-        &.{},
-        &.{},
-        dummy_data,
-        0,
-        0, 0,
-        false,
-        null, null, null, null, null, null, null,
-        .byte_stream_split,
-    );
-
-    try std.testing.expectError(error.UnsupportedEncoding, result);
+test "decoder: byte_stream_split on BOOLEAN returns UnsupportedEncoding" {
+    try expectDecoderUnsupportedEncoding(.boolean, .byte_stream_split);
 }
 
-test "V2 decoder: RLE on INT32 returns UnsupportedEncoding" {
-    const allocator = std.testing.allocator;
-    const schema_elem = makeSchemaElem(.int32);
-    const dummy_data = &@as([8]u8, @splat(0));
-
-    const result = column_decoder.decodeColumnDynamicV2(
-        allocator,
-        schema_elem,
-        &.{},
-        &.{},
-        dummy_data,
-        0,
-        0, 0,
-        false,
-        null, null, null, null, null, null, null,
-        .rle,
-    );
-
-    try std.testing.expectError(error.UnsupportedEncoding, result);
-}
-
-test "V2 decoder: unknown encoding (bit_packed) returns UnsupportedEncoding" {
-    const allocator = std.testing.allocator;
-    const schema_elem = makeSchemaElem(.int32);
-    const dummy_data = &@as([8]u8, @splat(0));
-
-    const result = column_decoder.decodeColumnDynamicV2(
-        allocator,
-        schema_elem,
-        &.{},
-        &.{},
-        dummy_data,
-        0,
-        0, 0,
-        false,
-        null, null, null, null, null, null, null,
-        .bit_packed,
-    );
-
-    try std.testing.expectError(error.UnsupportedEncoding, result);
+test "decoder: delta_length_byte_array on INT32 returns UnsupportedEncoding" {
+    try expectDecoderUnsupportedEncoding(.int32, .delta_length_byte_array);
 }
 
 // =========================================================================

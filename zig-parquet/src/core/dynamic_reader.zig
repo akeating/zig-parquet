@@ -26,10 +26,6 @@
 const std = @import("std");
 const safe = @import("safe.zig");
 const format = @import("format.zig");
-const thrift = @import("thrift/mod.zig");
-const compress = @import("compress/mod.zig");
-const dictionary = @import("encoding/dictionary.zig");
-const column_decoder = @import("column_decoder.zig");
 const leaf_decoder = @import("leaf_decoder.zig");
 const value_mod = @import("value.zig");
 const seekable_reader = @import("seekable_reader.zig");
@@ -61,22 +57,11 @@ pub const DynamicReaderOptions = struct {
 pub const DynamicReaderError = errors_mod.DynamicReaderError;
 
 
-/// Compute CRC32 checksum for page data (per Parquet spec, covers compressed data)
-fn computePageCrc(data: []const u8) i32 {
-    return @bitCast(std.hash.Crc32.hash(data));
-}
-
-/// Safely cast i32 page size/count to usize, validating non-negative.
-fn safePageSize(size: i32) error{InvalidPageSize}!usize {
-    return safe.cast(size) catch return error.InvalidPageSize;
-}
-
 /// Safely cast i64 row count to usize, validating non-negative.
 fn safeRowCount(count: i64) error{InvalidRowCount}!usize {
     return safe.cast(count) catch return error.InvalidRowCount;
 }
 
-const safeTypeLength = column_decoder.safeTypeLength;
 
 /// Schema-agnostic Parquet reader
 pub const DynamicReader = struct {
@@ -698,7 +683,7 @@ pub const DynamicReader = struct {
     }
 
     /// Read a single column dynamically
-    fn readColumnDynamic(self: *Self, column_index: usize, row_group_index: usize) !column_decoder.DynamicDecodeResult {
+    fn readColumnDynamic(self: *Self, column_index: usize, row_group_index: usize) !ColumnValues {
         return self.readColumnDynamicWithData(column_index, row_group_index, null);
     }
 
@@ -713,7 +698,7 @@ pub const DynamicReader = struct {
         column_index: usize,
         row_group_index: usize,
         override_page_data: ?[]const u8,
-    ) !column_decoder.DynamicDecodeResult {
+    ) !ColumnValues {
         const rg = &self.metadata.row_groups[row_group_index];
         if (column_index >= rg.columns.len) return error.InvalidArgument;
 
@@ -924,23 +909,6 @@ pub const DynamicReader = struct {
             };
         };
     }
-
-    /// Decompress page data
-    fn decompressData(self: *Self, compressed: []const u8, codec: format.CompressionCodec, uncompressed_size: usize) ![]u8 {
-        return compress.decompress(self.allocator, compressed, codec, uncompressed_size) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.DecompressionError => return error.DecompressionError,
-            error.UnsupportedCompression => return error.UnsupportedCompression,
-        };
-    }
-
-    /// Free the allocated contents within a PageHeader (statistics min/max values).
-    /// Does NOT free the PageHeader struct itself.
-    fn freePageHeaderContents(self: *Self, header: *const format.PageHeader) void {
-        // Use mutable copy to call deinit
-        var mutable_header = header.*;
-        mutable_header.deinit(self.allocator);
-    }
 };
 
 /// Clone a Value, allocating new memory for any heap data
@@ -1058,3 +1026,18 @@ test "nested row assembly groups values by rep_level" {
     try std.testing.expectEqual(@as(usize, 3), row1_end - row1_start);
 }
 
+/// One decoded leaf column chunk: a `Value` per level entry and the levels.
+const ColumnValues = struct {
+    values: []Value,
+    /// Null when the column's maximum definition level is 0.
+    def_levels: ?[]u32,
+    /// Null when the column's maximum repetition level is 0.
+    rep_levels: ?[]u32,
+
+    pub fn deinit(self: *ColumnValues, allocator: std.mem.Allocator) void {
+        for (self.values) |v| v.deinit(allocator);
+        allocator.free(self.values);
+        if (self.def_levels) |dl| allocator.free(dl);
+        if (self.rep_levels) |rl| allocator.free(rl);
+    }
+};

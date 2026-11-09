@@ -686,11 +686,13 @@ const ChunkDecoder = struct {
                 else => return error.UnsupportedEncoding,
             },
             .delta_length_byte_array => {
+                if (self.physical != .byte_array) return error.UnsupportedEncoding;
                 var result = delta_length_byte_array.decode(self.allocator, data) catch |e| return mapEncodingError(e);
                 defer result.deinit();
                 try self.appendByteValues(b, lv, n, non_null, result.values);
             },
             .delta_byte_array => {
+                if (self.physical != .byte_array and self.physical != .fixed_len_byte_array) return error.UnsupportedEncoding;
                 var result = delta_byte_array.decode(self.allocator, data) catch |e| return mapEncodingError(e);
                 defer result.deinit();
                 try self.appendByteValues(b, lv, n, non_null, result.values);

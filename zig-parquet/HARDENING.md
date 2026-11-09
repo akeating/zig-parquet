@@ -38,7 +38,7 @@ All production code uses `safe.cast()` — zero `@intCast` remaining:
 
 | Area | Files | `@intCast` Count |
 |------|-------|-----------------|
-| Reader | `reader.zig`, `column_decoder.zig`, `parquet_reader.zig`, `dynamic_reader.zig`, `row_reader.zig`, `seekable_reader.zig` | 0 |
+| Reader | `leaf_decoder.zig`, `parquet_reader.zig`, `dynamic_reader.zig`, `arrow_batch.zig`, `seekable_reader.zig` | 0 |
 | Writer | `writer.zig`, `column_writer.zig`, `column_write_*.zig`, `row_writer.zig` | 0 |
 | Encoding | `encoding/*.zig` | 0 |
 | Thrift | `thrift/*.zig` | 0 |
@@ -73,11 +73,11 @@ const bit_idx: u3 = safe.castTo(u3, i % 8) catch unreachable;
 **Boolean decoding** (`src/encoding/plain.zig`):
 Check `byte_idx < data.len` before accessing bool bit. Returns `EndOfData`.
 
-**Level decoding** (`src/reader/column_decoder.zig`):
+**Level decoding** (`src/core/leaf_decoder.zig`):
 Bounds checks before reading rep/def level length prefixes and data slices. Returns `EndOfData`.
 
-**Fixed-length byte arrays** (`src/reader/column_decoder.zig`):
-Check `data_offset + fixed_len <= value_data.len` before slicing. Returns `EndOfData`.
+**Value sections** (`src/core/leaf_decoder.zig`):
+A value section shorter than the page's non-null entries need, or a delta-encoded page with fewer values than non-null entries, returns `EndOfData`. A dictionary index outside the dictionary, or a dictionary-encoded page without a dictionary, returns `InvalidPageData`. A dictionary bit width above 31 returns `InvalidBitWidth`.
 
 **Page size underflow** (`src/reader/dynamic_reader.zig`):
 Check `uncompressed_size >= rep_len + def_len` before subtraction. Returns `EndOfData`.
@@ -87,10 +87,7 @@ Call sites convert `[]const u8` from column decoder to fixed-size arrays (`[16]u
 
 ### Integer Cast Safety
 
-**Safe casting helpers** (`src/reader/column_decoder.zig`, `src/reader/row_reader.zig`, `src/reader/dynamic_reader.zig`):
-- `extractBitWidth(data, offset) -> !u5` — validates bit width from external data
-- `safeTypeLength(type_length) -> !usize` — validates type length field
-- `safePageSize(size) -> !usize` — validates i32 page size to usize
+**Safe casting helpers** (`src/core/dynamic_reader.zig`):
 - `safeRowCount(count) -> !usize` — validates i64 row count to usize
 
 **Thrift reader** (`src/thrift/compact.zig`):
@@ -204,7 +201,7 @@ std.math.sub(usize, a, b) catch return error.Underflow;
 ### Reader
 1. **Never `@intCast` external data** — use `safe.cast` / `safe.castTo`
 2. **Bounds-check before slicing** — `if (offset + len > data.len) return error.EndOfData`
-3. **Use helpers** — `safePageSize`, `extractBitWidth`, etc.
+3. **Use helpers** — `safe.cast`, `safe.castTo`, `safe.slice`, `safeRowCount`
 4. **Specific errors** — `InvalidBitWidth` over generic `InvalidData`
 5. **Comment `catch unreachable`** — explain the mathematical invariant
 
