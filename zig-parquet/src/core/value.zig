@@ -9,10 +9,9 @@ const std = @import("std");
 /// Thread-local override for byte payload allocations. When set (typically by
 /// `DynamicReader.readRowsInternal`), all `bytes_val` / `fixed_bytes_val`
 /// payloads produced via `dupeBytes` go into this allocator instead of the
-/// per-value allocator. Rows whose payloads live in such an arena hold a
-/// reference to it in `Row.bytes_owner`, so per-value frees in `deinit` skip
-/// these payloads and the arena is freed with its last row. Save/restore the
-/// prior value at each entry point — the pattern is:
+/// per-value allocator. `DynamicReader` sets it to the arena of the read's
+/// `RowStorage`, which rows hold a reference to in `Row.storage`. Save/restore
+/// the prior value at each entry point — the pattern is:
 ///
 ///     const prev = value_mod.bytes_arena_allocator;
 ///     value_mod.bytes_arena_allocator = arena.allocator();
@@ -245,9 +244,8 @@ pub const Value = union(enum) {
         self.deinitWithOptions(allocator, .{ .skip_bytes = bytes_arena_allocator != null });
     }
 
-    /// Like `deinit` but with explicit byte-payload freeing control.
-    /// Callers holding a `Row` with `bytes_owner` set pass
-    /// `.{ .skip_bytes = true }` so the arena-owned payloads are preserved.
+    /// Like `deinit` but with explicit byte-payload freeing control: pass
+    /// `.{ .skip_bytes = true }` for values whose byte payloads live in an arena.
     pub fn deinitWithOptions(self: Value, allocator: std.mem.Allocator, opts: DeinitOptions) void {
         switch (self) {
             .null_val, .bool_val, .int32_val, .int64_val, .float_val, .double_val => {},
@@ -277,17 +275,21 @@ pub const Value = union(enum) {
     }
 };
 
-/// Byte storage shared by the rows of one read (see `bytes_arena_allocator`).
-/// Each row holds a reference; the arena is freed when the last reference is
+/// Memory shared by the rows of one read: their `values` arrays, nested list,
+/// map and struct arrays, struct field names and byte payloads, allocated in
+/// `arena`, plus decoded byte buffers that byte payloads point into (`buffers`).
+/// Each row holds a reference; everything is freed when the last reference is
 /// released.
-pub const SharedBytes = struct {
+pub const RowStorage = struct {
     arena: std.heap.ArenaAllocator,
     refs: std.atomic.Value(usize),
     allocator: std.mem.Allocator,
+    /// Buffers allocated with `allocator`, freed with the storage.
+    buffers: std.ArrayList([]align(64) u8) = .empty,
 
     /// Creates the storage with one reference, held by the caller.
-    pub fn create(allocator: std.mem.Allocator) std.mem.Allocator.Error!*SharedBytes {
-        const self = try allocator.create(SharedBytes);
+    pub fn create(allocator: std.mem.Allocator) std.mem.Allocator.Error!*RowStorage {
+        const self = try allocator.create(RowStorage);
         self.* = .{
             .arena = std.heap.ArenaAllocator.init(allocator),
             .refs = std.atomic.Value(usize).init(1),
@@ -297,14 +299,29 @@ pub const SharedBytes = struct {
     }
 
     /// Adds a reference and returns `self`.
-    pub fn retain(self: *SharedBytes) *SharedBytes {
+    pub fn retain(self: *RowStorage) *RowStorage {
         _ = self.refs.fetchAdd(1, .monotonic);
         return self;
     }
 
-    /// Drops a reference; the last one frees the arena.
-    pub fn release(self: *SharedBytes) void {
-        if (self.refs.fetchSub(1, .acq_rel) == 1) {
+    /// Adds `n` references.
+    pub fn retainMany(self: *RowStorage, n: usize) void {
+        _ = self.refs.fetchAdd(n, .monotonic);
+    }
+
+    /// Takes ownership of `buf` (allocated with `allocator`); it is freed with the storage.
+    pub fn adopt(self: *RowStorage, buf: []align(64) u8) std.mem.Allocator.Error!void {
+        try self.buffers.append(self.allocator, buf);
+    }
+
+    /// Drops a reference; the last one frees the arena and the adopted buffers.
+    pub fn release(self: *RowStorage) void {
+        // Release on each drop, acquire on the last, so the frees below see every
+        // thread's writes to the storage.
+        if (self.refs.fetchSub(1, .release) == 1) {
+            _ = self.refs.load(.acquire);
+            for (self.buffers.items) |buf| self.allocator.free(buf);
+            self.buffers.deinit(self.allocator);
             self.arena.deinit();
             self.allocator.destroy(self);
         }
@@ -315,11 +332,11 @@ pub const SharedBytes = struct {
 pub const Row = struct {
     values: []Value,
     allocator: std.mem.Allocator,
-    /// When set, bytes_val / fixed_bytes_val payloads live in this shared
-    /// arena and are not freed per-value; `deinit` releases the row's
-    /// reference instead. List/map/struct container slices and struct field
-    /// names are still freed through `allocator`.
-    bytes_owner: ?*SharedBytes = null,
+    /// When set, all of the row's memory (`values` and everything the values
+    /// point to) lives in this storage; `deinit` releases the row's reference
+    /// instead of freeing anything. When null, `deinit` frees `values` and the
+    /// values' memory through `allocator`.
+    storage: ?*RowStorage = null,
 
     /// Get the value for a specific column index
     pub fn getColumn(self: Row, col_idx: usize) ?Value {
@@ -344,10 +361,12 @@ pub const Row = struct {
 
     /// Free all memory owned by this row
     pub fn deinit(self: Row) void {
-        const opts: Value.DeinitOptions = .{ .skip_bytes = self.bytes_owner != null };
-        for (self.values) |v| v.deinitWithOptions(self.allocator, opts);
+        if (self.storage) |storage| {
+            storage.release();
+            return;
+        }
+        for (self.values) |v| v.deinit(self.allocator);
         self.allocator.free(self.values);
-        if (self.bytes_owner) |owner| owner.release();
     }
 };
 

@@ -232,16 +232,13 @@ fn readRows(allocator: std.mem.Allocator, reader: *parquet.DynamicReader, num_rg
             for (rows) |row| row.deinit();
             allocator.free(rows);
         }
-        const num_values = if (rows.len > 0) rows[0].columnCount() else 0;
-        for (0..num_values) |i| {
-            var nulls: u64 = 0;
-            for (rows) |row| {
-                if (row.getColumn(i)) |v| {
-                    if (v == .null_val) nulls += 1;
-                } else nulls += 1;
-            }
-            check +%= @as(u64, rows.len) *% 31 +% nulls;
+        // One pass over the rows, as a row consumer reads them; null counts per column.
+        var nulls: [64]u64 = @splat(0);
+        const num_values = if (rows.len > 0) @min(rows[0].columnCount(), nulls.len) else 0;
+        for (rows) |row| {
+            for (row.values[0..num_values], 0..) |v, i| nulls[i] += @intFromBool(v == .null_val);
         }
+        for (nulls[0..num_values]) |n| check +%= @as(u64, rows.len) *% 31 +% n;
     }
     return check;
 }

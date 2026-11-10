@@ -1103,32 +1103,48 @@ fn appendBits(b: *Builder, levels: ?[]const u32, n: usize, src: anytype) void {
 /// physical type's `Value` form (INT96 as nanoseconds in `int64_val`). Byte arrays are copied
 /// with `value_mod.dupeBytes`, so they go to the reader's bytes arena when one is set.
 pub fn toValues(allocator: std.mem.Allocator, b: *const Buffers, element: format.SchemaElement) ![]Value {
-    const physical = element.type_ orelse return error.InvalidSchema;
     const values = try allocator.alloc(Value, b.length);
-    var done: usize = 0;
-    errdefer {
-        // Bytes in the reader's arena are freed with the arena.
-        const opts: Value.DeinitOptions = .{ .skip_bytes = value_mod.bytes_arena_allocator != null };
-        for (values[0..done]) |v| v.deinitWithOptions(allocator, opts);
-        allocator.free(values);
-    }
+    errdefer allocator.free(values);
+    // On error, copied byte payloads are left to the bytes arena (the only caller sets one).
+    try writeValues(allocator, b, element, values, 1, .copy);
+    return values;
+}
+
+pub const BytesMode = enum {
+    /// Copy byte payloads with `value_mod.dupeBytes`.
+    copy,
+    /// Reference byte payloads in `b.values`; the caller keeps `b.values` alive as long as the
+    /// values.
+    borrow,
+};
+
+/// Writes entry `i` of `b` as a `Value` to `out[i * stride]`, for every entry (`out` must
+/// have room). See `toValues` for the value forms.
+pub fn writeValues(allocator: std.mem.Allocator, b: *const Buffers, element: format.SchemaElement, out: []Value, stride: usize, bytes: BytesMode) !void {
+    const physical = element.type_ orelse return error.InvalidSchema;
+    if (b.length > 0 and (b.length - 1) * stride >= out.len) return error.InvalidArgument;
     const width: usize = switch (physical) {
         .fixed_len_byte_array => safe.cast(element.type_length orelse 0) catch return error.InvalidTypeLength,
         else => 0,
     };
-    for (values, 0..) |*v, i| {
+    for (0..b.length) |i| {
+        const v = &out[i * stride];
         if (!b.isValid(i)) {
             v.* = .{ .null_val = {} };
-        } else v.* = switch (physical) {
+            continue;
+        }
+        v.* = switch (physical) {
             .boolean => .{ .bool_val = (b.values[i / 8] >> @intCast(i % 8)) & 1 == 1 },
             .int32 => .{ .int32_val = std.mem.bytesToValue(i32, b.values[i * 4 ..][0..4]) },
             .int64, .int96 => .{ .int64_val = std.mem.bytesToValue(i64, b.values[i * 8 ..][0..8]) },
             .float => .{ .float_val = std.mem.bytesToValue(f32, b.values[i * 4 ..][0..4]) },
             .double => .{ .double_val = std.mem.bytesToValue(f64, b.values[i * 8 ..][0..8]) },
-            .byte_array => .{ .bytes_val = try value_mod.dupeBytes(allocator, b.bytesAt(i)) },
-            .fixed_len_byte_array => .{ .fixed_bytes_val = try value_mod.dupeBytes(allocator, b.values[i * width ..][0..width]) },
+            .byte_array => .{ .bytes_val = if (bytes == .borrow) b.bytesAt(i) else try value_mod.dupeBytes(allocator, b.bytesAt(i)) },
+            .fixed_len_byte_array => blk: {
+                const raw = b.values[i * width ..][0..width];
+                break :blk .{ .fixed_bytes_val = if (bytes == .borrow) raw else try value_mod.dupeBytes(allocator, raw) };
+            },
         };
-        done += 1;
     }
-    return values;
 }
+

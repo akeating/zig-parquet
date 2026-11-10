@@ -71,10 +71,11 @@ pub const DynamicReader = struct {
     footer_data: []u8,
     checksum_options: ChecksumOptions,
     _backend_cleanup: ?BackendCleanup = null,
-    /// Byte storage of the read in progress: `bytes_val` / `fixed_bytes_val`
-    /// payloads go into its arena, and each row built holds a reference to it.
-    /// Set by `beginBytes` for the duration of one read call.
-    bytes_owner: ?*value_mod.SharedBytes = null,
+    /// Storage of the read in progress (see `value_mod.RowStorage`): rows'
+    /// `values` arrays, nested values and byte payloads are allocated in its
+    /// arena, and each row built holds a reference to it. Set by
+    /// `beginStorage` for the duration of one read call.
+    storage: ?*value_mod.RowStorage = null,
 
     const Self = @This();
 
@@ -363,9 +364,9 @@ pub const DynamicReader = struct {
             return try self.allocator.alloc(Row, 0);
         }
 
-        // Route bytes into storage shared by the rows of this read.
-        const bytes = try self.beginBytes();
-        defer self.endBytes(bytes);
+        // Allocate the rows' memory in storage shared by the rows of this read.
+        const storage = try self.beginStorage();
+        defer self.endStorage(storage);
 
         const rg = &self.metadata.row_groups[row_group_index];
         const num_rows = try safeRowCount(rg.num_rows);
@@ -520,31 +521,36 @@ pub const DynamicReader = struct {
         return self.assembleFlatRows(canonical.len, num_leaf_columns, column_values, null);
     }
 
-    const BytesScope = struct {
-        owner: *value_mod.SharedBytes,
+    const StorageScope = struct {
+        storage: *value_mod.RowStorage,
         prev_alloc: ?std.mem.Allocator,
-        prev_owner: ?*value_mod.SharedBytes,
+        prev_storage: ?*value_mod.RowStorage,
     };
 
-    /// Creates byte storage for one read and routes `value_mod.dupeBytes` to it.
-    fn beginBytes(self: *Self) !BytesScope {
-        const owner = try value_mod.SharedBytes.create(self.allocator);
-        const scope: BytesScope = .{
-            .owner = owner,
+    /// Creates row storage for one read and routes `value_mod.dupeBytes` to its arena.
+    fn beginStorage(self: *Self) !StorageScope {
+        const storage = try value_mod.RowStorage.create(self.allocator);
+        const scope: StorageScope = .{
+            .storage = storage,
             .prev_alloc = value_mod.bytes_arena_allocator,
-            .prev_owner = self.bytes_owner,
+            .prev_storage = self.storage,
         };
-        value_mod.bytes_arena_allocator = owner.arena.allocator();
-        self.bytes_owner = owner;
+        value_mod.bytes_arena_allocator = storage.arena.allocator();
+        self.storage = storage;
         return scope;
     }
 
-    /// Restores the previous byte routing and drops the read's reference; the storage stays
-    /// alive while rows hold references to it.
-    fn endBytes(self: *Self, scope: BytesScope) void {
+    /// Restores the previous routing and drops the read's reference; the storage stays alive
+    /// while rows hold references to it.
+    fn endStorage(self: *Self, scope: StorageScope) void {
         value_mod.bytes_arena_allocator = scope.prev_alloc;
-        self.bytes_owner = scope.prev_owner;
-        scope.owner.release();
+        self.storage = scope.prev_storage;
+        scope.storage.release();
+    }
+
+    /// Allocator for memory owned by the rows of the read in progress.
+    fn rowAllocator(self: *Self) std.mem.Allocator {
+        return self.storage.?.arena.allocator();
     }
 
     fn readRowsInternal(self: *Self, row_group_index: usize, col_indices: ?[]const usize) ![]Row {
@@ -552,11 +558,12 @@ pub const DynamicReader = struct {
             return try self.allocator.alloc(Row, 0);
         }
 
-        // Route byte payloads produced via `value_mod.dupeBytes` into storage
-        // shared by the rows of this read. Each row holds a reference
-        // (`Row.bytes_owner`); the storage is freed with the last row.
-        const bytes = try self.beginBytes();
-        defer self.endBytes(bytes);
+        // Allocate the rows' memory (values arrays, nested values, byte
+        // payloads via `value_mod.dupeBytes`) in storage shared by the rows of
+        // this read. Each row holds a reference (`Row.storage`); the storage is
+        // freed with the last row.
+        const storage = try self.beginStorage();
+        defer self.endStorage(storage);
 
         const rg = &self.metadata.row_groups[row_group_index];
         const num_rows = try safeRowCount(rg.num_rows);
@@ -582,10 +589,9 @@ pub const DynamicReader = struct {
             }
         }
 
-        // Compute top-level-to-leaf mapping for nested schemas
-        var schema_arena = std.heap.ArenaAllocator.init(self.allocator);
-        defer schema_arena.deinit();
-        const sa = schema_arena.allocator();
+        // Compute top-level-to-leaf mapping for nested schemas. The schema nodes are built in
+        // the row storage: struct values in the rows reference their field names.
+        const sa = self.rowAllocator();
 
         const top_infos = if (!is_flat) blk: {
             const infos = try self.allocator.alloc(TopColInfo, num_top);
@@ -610,76 +616,144 @@ pub const DynamicReader = struct {
         } else null;
         defer if (top_infos) |ti| self.allocator.free(ti);
 
-        // Build set of leaf columns to read
-        const leaf_needed = try self.allocator.alloc(bool, num_leaf_columns);
-        defer self.allocator.free(leaf_needed);
+        // Every row's values in one block of the row storage, filled one output column at a
+        // time.
+        const output_indices = col_indices orelse blk: {
+            const all = try self.allocator.alloc(usize, num_top_columns);
+            for (all, 0..) |*v, i| v.* = i;
+            break :blk all;
+        };
+        defer if (col_indices == null) self.allocator.free(output_indices);
+        const num_out = output_indices.len;
+        const all_values = try self.rowAllocator().alloc(Value, try std.math.mul(usize, num_rows, num_out));
 
-        if (col_indices) |indices| {
-            @memset(leaf_needed, false);
-            if (is_flat) {
-                for (indices) |idx| leaf_needed[idx] = true;
-            } else {
-                for (indices) |top_idx| {
-                    const info = top_infos.?[top_idx];
-                    for (info.leaf_start..info.leaf_start + info.leaf_count) |leaf| {
-                        if (leaf < num_leaf_columns) leaf_needed[leaf] = true;
-                    }
+        for (output_indices, 0..) |top_idx, out_idx| {
+            const column_out = all_values[out_idx..];
+            if (top_infos) |infos| {
+                const info = infos[top_idx];
+                if (info.is_nested) {
+                    try self.readNestedIntoRows(info, row_group_index, num_leaf_columns, column_out, num_out, num_rows);
+                } else {
+                    try self.readLeafIntoRows(info.leaf_start, row_group_index, column_out, num_out, num_rows);
                 }
+            } else {
+                try self.readLeafIntoRows(top_idx, row_group_index, column_out, num_out, num_rows);
             }
-        } else {
-            @memset(leaf_needed, true);
         }
 
-        // Read needed leaf columns into fixed-size arrays
-        const column_values = try self.allocator.alloc([]Value, num_leaf_columns);
-        @memset(column_values, &.{});
+        const rows = try self.allocator.alloc(Row, num_rows);
+        for (rows, 0..) |*row, r| {
+            row.* = .{ .values = all_values[r * num_out ..][0..num_out], .allocator = self.allocator, .storage = self.storage };
+        }
+        self.storage.?.retainMany(num_rows);
+        return rows;
+    }
+
+    const RowLeaf = struct {
+        leaf: leaf_decoder.Leaf,
+        /// The decoded values buffer. For byte arrays it is owned by the row storage and
+        /// `leaf.buffers.values` is empty; otherwise it is `leaf.buffers.values`.
+        values: leaf_decoder.Buffer,
+        element: format.SchemaElement,
+
+        /// The buffers with `values` in place, limited to the first `max_len` entries.
+        fn view(self: *const RowLeaf, max_len: usize) leaf_decoder.Buffers {
+            var v = self.leaf.buffers;
+            v.values = self.values;
+            v.length = @min(v.length, max_len);
+            return v;
+        }
+    };
+
+    /// Decodes leaf column `leaf_idx` of a row group for the row API. Byte-array data is handed
+    /// to the row storage, so row values can reference it.
+    fn decodeRowLeaf(self: *Self, leaf_idx: usize, row_group_index: usize, keep_levels: bool) !RowLeaf {
+        const rg = &self.metadata.row_groups[row_group_index];
+        if (leaf_idx >= rg.columns.len) return error.InvalidArgument;
+        const chunk = &rg.columns[leaf_idx];
+        const meta = chunk.meta_data orelse return error.InvalidArgument;
+        const info = format.getColumnInfo(self.metadata.schema, leaf_idx) orelse return error.InvalidArgument;
+        const physical = info.element.type_ orelse return error.InvalidSchema;
+        const page_data = try self.readColumnChunkData(chunk);
+        defer self.allocator.free(page_data);
+
+        var leaf = try leaf_decoder.decodeLeaf(self.allocator, page_data, meta, info, .{
+            .keep_levels = keep_levels,
+            .checksum = self.checksum_options,
+            .large_offsets = true,
+        });
+        const values = leaf.buffers.values;
+        if (physical == .byte_array or physical == .fixed_len_byte_array) {
+            self.storage.?.adopt(values) catch |e| {
+                leaf.deinit(self.allocator);
+                return e;
+            };
+            leaf.buffers.values = &.{};
+        }
+        return .{ .leaf = leaf, .values = values, .element = info.element };
+    }
+
+    /// Decodes a top-level primitive column and writes its values to `out[r * stride]` for
+    /// `r < num_rows`; rows past the column's entries get null.
+    fn readLeafIntoRows(self: *Self, leaf_idx: usize, row_group_index: usize, out: []Value, stride: usize, num_rows: usize) !void {
+        var rl = try self.decodeRowLeaf(leaf_idx, row_group_index, false);
+        defer rl.leaf.deinit(self.allocator);
+        const view = rl.view(num_rows);
+        try leaf_decoder.writeValues(self.rowAllocator(), &view, rl.element, out, stride, .borrow);
+        for (view.length..num_rows) |r| out[r * stride] = .{ .null_val = {} };
+    }
+
+    /// Reads a nested top-level column's leaves, assembles its values into the row storage and
+    /// writes them to `out[r * stride]` for the first `num_rows` rows.
+    fn readNestedIntoRows(
+        self: *Self,
+        info: TopColInfo,
+        row_group_index: usize,
+        num_leaf_columns: usize,
+        out: []Value,
+        stride: usize,
+        num_rows: usize,
+    ) !void {
+        const columns = try self.allocator.alloc(ColumnValues, info.leaf_count);
+        @memset(columns, .{ .values = &.{}, .def_levels = null, .rep_levels = null });
         defer {
-            for (column_values) |vals| {
-                for (vals) |v| v.deinit(self.allocator);
-                if (vals.len > 0) self.allocator.free(vals);
+            // Byte payloads are in the row storage; only the arrays are freed.
+            for (columns) |*c| {
+                self.allocator.free(c.values);
+                if (c.def_levels) |l| self.allocator.free(l);
+                if (c.rep_levels) |l| self.allocator.free(l);
             }
-            self.allocator.free(column_values);
+            self.allocator.free(columns);
         }
+        const slices = try self.allocator.alloc(nested_mod.FlatColumnSlice, info.leaf_count);
+        defer self.allocator.free(slices);
 
-        const column_def_levels = try self.allocator.alloc(?[]u32, num_leaf_columns);
-        @memset(column_def_levels, null);
-        defer {
-            for (column_def_levels) |levels| {
-                if (levels) |l| self.allocator.free(l);
+        for (columns, slices, 0..) |*c, *slice, li| {
+            const phys = info.leaf_start + li;
+            if (phys >= num_leaf_columns) {
+                slice.* = .{ .values = &.{}, .def_levels = &.{}, .rep_levels = &.{} };
+                continue;
             }
-            self.allocator.free(column_def_levels);
+            var rl = try self.decodeRowLeaf(phys, row_group_index, true);
+            defer rl.leaf.deinit(self.allocator);
+            const view = rl.view(std.math.maxInt(usize));
+            const values = try self.allocator.alloc(Value, view.length);
+            errdefer self.allocator.free(values);
+            try leaf_decoder.writeValues(self.rowAllocator(), &view, rl.element, values, 1, .borrow);
+            c.* = .{ .values = values, .def_levels = rl.leaf.def_levels, .rep_levels = rl.leaf.rep_levels };
+            rl.leaf.def_levels = null;
+            rl.leaf.rep_levels = null;
+            slice.* = .{
+                .values = c.values,
+                .def_levels = c.def_levels orelse &.{},
+                .rep_levels = c.rep_levels orelse &.{},
+            };
         }
 
-        const column_rep_levels = try self.allocator.alloc(?[]u32, num_leaf_columns);
-        @memset(column_rep_levels, null);
-        defer {
-            for (column_rep_levels) |levels| {
-                if (levels) |l| self.allocator.free(l);
-            }
-            self.allocator.free(column_rep_levels);
-        }
-
-        for (0..num_leaf_columns) |col_idx| {
-            if (!leaf_needed[col_idx]) continue;
-            const result = try self.readColumnDynamic(col_idx, row_group_index);
-            column_values[col_idx] = result.values;
-            column_def_levels[col_idx] = result.def_levels;
-            column_rep_levels[col_idx] = result.rep_levels;
-        }
-
-        // Assemble rows
-        if (is_flat) {
-            return self.assembleFlatRows(num_rows, num_leaf_columns, column_values, col_indices);
-        }
-        return self.assembleNestedRows(
-            num_rows,
-            num_leaf_columns,
-            column_values,
-            column_def_levels,
-            column_rep_levels,
-            top_infos.?,
-            col_indices,
-        );
+        const assembled = try self.allocator.alloc(Value, num_rows);
+        defer self.allocator.free(assembled);
+        try nested_mod.assembleValuesBorrowed(self.rowAllocator(), self.allocator, info.schema_node, slices, assembled);
+        for (assembled, 0..) |v, r| out[r * stride] = v;
     }
 
     /// Read a single column dynamically
@@ -735,124 +809,6 @@ pub const DynamicReader = struct {
         };
     }
 
-    /// Assemble rows from columnar data.
-    /// Uses the file schema to reconstruct logical top-level columns, properly
-    /// rebuilding nested types (structs, maps, nested lists) via assembleValues.
-    fn assembleNestedRows(
-        self: *Self,
-        num_rows: usize,
-        num_leaf_columns: usize,
-        column_values: [][]Value,
-        column_def_levels: []?[]u32,
-        column_rep_levels: []?[]u32,
-        top_infos: []const TopColInfo,
-        projected_top_indices: ?[]const usize,
-    ) ![]Row {
-        const num_top = top_infos.len;
-
-        // Phase 1: For each nested top-level column, assemble all rows at once.
-        const assembled_cols = try self.allocator.alloc(?[]Value, num_top);
-        defer {
-            for (assembled_cols) |opt_vals| {
-                if (opt_vals) |vals| {
-                    for (vals) |v| v.deinit(self.allocator);
-                    self.allocator.free(vals);
-                }
-            }
-            self.allocator.free(assembled_cols);
-        }
-        @memset(assembled_cols, null);
-
-        for (0..num_top) |top_idx| {
-            const info = top_infos[top_idx];
-            if (!info.is_nested) continue;
-            if (projected_top_indices) |indices| {
-                var needed = false;
-                for (indices) |pi| {
-                    if (pi == top_idx) { needed = true; break; }
-                }
-                if (!needed) continue;
-            }
-
-            const slices = try self.allocator.alloc(nested_mod.FlatColumnSlice, info.leaf_count);
-            defer self.allocator.free(slices);
-
-            for (0..info.leaf_count) |li| {
-                const phys = info.leaf_start + li;
-                if (phys < num_leaf_columns) {
-                    slices[li] = .{
-                        .values = column_values[phys],
-                        .def_levels = column_def_levels[phys] orelse &.{},
-                        .rep_levels = column_rep_levels[phys] orelse &.{},
-                    };
-                } else {
-                    slices[li] = .{ .values = &.{}, .def_levels = &.{}, .rep_levels = &.{} };
-                }
-            }
-
-            assembled_cols[top_idx] = try nested_mod.assembleValues(
-                self.allocator,
-                info.schema_node,
-                slices,
-                num_rows,
-            );
-        }
-
-        // Phase 2: Build rows with only the projected columns
-        const output_indices = projected_top_indices orelse blk: {
-            const all = try self.allocator.alloc(usize, num_top);
-            for (0..num_top) |i| all[i] = i;
-            break :blk all;
-        };
-        defer if (projected_top_indices == null) self.allocator.free(output_indices);
-
-        const num_output_cols = output_indices.len;
-        const rows = try self.allocator.alloc(Row, num_rows);
-        errdefer self.allocator.free(rows);
-        var rows_initialized: usize = 0;
-        errdefer {
-            for (rows[0..rows_initialized]) |row| row.deinit();
-        }
-
-        for (0..num_rows) |row_idx| {
-            const values = try self.allocator.alloc(Value, num_output_cols);
-            errdefer self.allocator.free(values);
-            var vals_initialized: usize = 0;
-            errdefer {
-                for (values[0..vals_initialized]) |v| v.deinit(self.allocator);
-            }
-
-            for (output_indices, 0..) |top_idx, out_idx| {
-                const info = top_infos[top_idx];
-                if (assembled_cols[top_idx]) |assembled| {
-                    values[out_idx] = try cloneValue(self.allocator, assembled[row_idx]);
-                } else {
-                    const phys = info.leaf_start;
-                    if (phys < num_leaf_columns and row_idx < column_values[phys].len) {
-                        values[out_idx] = try cloneValue(self.allocator, column_values[phys][row_idx]);
-                    } else {
-                        values[out_idx] = .{ .null_val = {} };
-                    }
-                }
-                vals_initialized += 1;
-            }
-
-            rows[row_idx] = .{ .values = values, .allocator = self.allocator, .bytes_owner = self.bytes_owner.?.retain() };
-            rows_initialized += 1;
-        }
-
-        // Free assembled_cols now (will be freed by defer, setting to null avoids double-free)
-        for (0..num_top) |top_idx| {
-            if (assembled_cols[top_idx]) |vals| {
-                for (vals) |v| v.deinit(self.allocator);
-                self.allocator.free(vals);
-                assembled_cols[top_idx] = null;
-            }
-        }
-
-        return rows;
-    }
-
     fn assembleFlatRows(
         self: *Self,
         num_rows: usize,
@@ -867,34 +823,22 @@ pub const DynamicReader = struct {
         };
         defer if (projected_col_indices == null) self.allocator.free(output_indices);
 
+        // Every row's values in one block of the row storage; the column values are moved in.
         const num_output_cols = output_indices.len;
+        const all_values = try self.rowAllocator().alloc(Value, try std.math.mul(usize, num_rows, num_output_cols));
         const rows = try self.allocator.alloc(Row, num_rows);
-        var rows_initialized: usize = 0;
-        errdefer {
-            for (rows[0..rows_initialized]) |row| row.deinit();
-            self.allocator.free(rows);
-        }
 
-        for (0..num_rows) |row_idx| {
-            const values = try self.allocator.alloc(Value, num_output_cols);
-            var vals_initialized: usize = 0;
-            errdefer {
-                for (values[0..vals_initialized]) |val| val.deinit(self.allocator);
-                self.allocator.free(values);
-            }
-
+        for (rows, 0..) |*row, row_idx| {
+            const values = all_values[row_idx * num_output_cols ..][0..num_output_cols];
             for (output_indices, 0..) |col_idx, out_idx| {
-                if (row_idx < column_values[col_idx].len) {
-                    values[out_idx] = try cloneValue(self.allocator, column_values[col_idx][row_idx]);
-                } else {
-                    values[out_idx] = .{ .null_val = {} };
-                }
-                vals_initialized += 1;
+                values[out_idx] = if (row_idx < column_values[col_idx].len)
+                    column_values[col_idx][row_idx]
+                else
+                    .{ .null_val = {} };
             }
-
-            rows[row_idx] = .{ .values = values, .allocator = self.allocator, .bytes_owner = self.bytes_owner.?.retain() };
-            rows_initialized += 1;
+            row.* = .{ .values = values, .allocator = self.allocator, .storage = self.storage };
         }
+        self.storage.?.retainMany(num_rows);
         return rows;
     }
 
@@ -910,121 +854,6 @@ pub const DynamicReader = struct {
         };
     }
 };
-
-/// Clone a Value, allocating new memory for any heap data
-fn cloneValue(allocator: std.mem.Allocator, v: Value) !Value {
-    return switch (v) {
-        .null_val => .{ .null_val = {} },
-        .bool_val => |b| .{ .bool_val = b },
-        .int32_val => |i| .{ .int32_val = i },
-        .int64_val => |i| .{ .int64_val = i },
-        .float_val => |f| .{ .float_val = f },
-        .double_val => |d| .{ .double_val = d },
-        .bytes_val => |b| .{ .bytes_val = try value_mod.dupeBytes(allocator, b) },
-        .fixed_bytes_val => |b| .{ .fixed_bytes_val = try value_mod.dupeBytes(allocator, b) },
-        .list_val => |items| blk: {
-            const cloned = try allocator.alloc(Value, items.len);
-            var cloned_count: usize = 0;
-            errdefer {
-                for (cloned[0..cloned_count]) |cv| cv.deinit(allocator);
-                allocator.free(cloned);
-            }
-            for (items) |item| {
-                cloned[cloned_count] = try cloneValue(allocator, item);
-                cloned_count += 1;
-            }
-            break :blk .{ .list_val = cloned };
-        },
-        .map_val => |entries| blk: {
-            const cloned = try allocator.alloc(Value.MapEntryValue, entries.len);
-            var cloned_count: usize = 0;
-            errdefer {
-                for (cloned[0..cloned_count]) |e| {
-                    e.key.deinit(allocator);
-                    e.value.deinit(allocator);
-                }
-                allocator.free(cloned);
-            }
-            for (entries) |entry| {
-                const key = try cloneValue(allocator, entry.key);
-                errdefer key.deinit(allocator);
-                const value = try cloneValue(allocator, entry.value);
-                cloned[cloned_count] = .{ .key = key, .value = value };
-                cloned_count += 1;
-            }
-            break :blk .{ .map_val = cloned };
-        },
-        .struct_val => |fields| blk: {
-            const cloned = try allocator.alloc(Value.FieldValue, fields.len);
-            var cloned_count: usize = 0;
-            errdefer {
-                for (cloned[0..cloned_count]) |f| {
-                    allocator.free(f.name);
-                    f.value.deinit(allocator);
-                }
-                allocator.free(cloned);
-            }
-            for (fields) |field| {
-                const name = try allocator.dupe(u8, field.name);
-                errdefer allocator.free(name);
-                const value = try cloneValue(allocator, field.value);
-                cloned[cloned_count] = .{ .name = name, .value = value };
-                cloned_count += 1;
-            }
-            break :blk .{ .struct_val = cloned };
-        },
-    };
-}
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-test "nested row assembly groups values by rep_level" {
-    const allocator = std.testing.allocator;
-
-    // Simulate a nested column with rep_levels:
-    // rep=0 means new row, rep>0 means continuation
-    // Values: [a, b, c, d, e]
-    // Rep levels: [0, 1, 0, 1, 1]
-    // Expected: Row 0 = [a, b], Row 1 = [c, d, e]
-
-    const col_values = [_]Value{
-        .{ .bytes_val = "a" },
-        .{ .bytes_val = "b" },
-        .{ .bytes_val = "c" },
-        .{ .bytes_val = "d" },
-        .{ .bytes_val = "e" },
-    };
-
-    const rep_levels = [_]u32{ 0, 1, 0, 1, 1 };
-
-    // Test the row boundary detection logic that assembleNestedRows uses
-    // Find row boundaries (where rep_level == 0)
-    var row_starts: std.ArrayListUnmanaged(usize) = .empty;
-    defer row_starts.deinit(allocator);
-
-    for (rep_levels, 0..) |rl, i| {
-        if (rl == 0) {
-            try row_starts.append(allocator, i);
-        }
-    }
-
-    // Verify row boundaries
-    try std.testing.expectEqual(@as(usize, 2), row_starts.items.len);
-    try std.testing.expectEqual(@as(usize, 0), row_starts.items[0]);
-    try std.testing.expectEqual(@as(usize, 2), row_starts.items[1]);
-
-    // Verify row 0 would contain values[0..2] = [a, b]
-    const row0_start = row_starts.items[0];
-    const row0_end = row_starts.items[1];
-    try std.testing.expectEqual(@as(usize, 2), row0_end - row0_start);
-
-    // Verify row 1 would contain values[2..5] = [c, d, e]
-    const row1_start = row_starts.items[1];
-    const row1_end = col_values.len;
-    try std.testing.expectEqual(@as(usize, 3), row1_end - row1_start);
-}
 
 /// One decoded leaf column chunk: a `Value` per level entry and the levels.
 const ColumnValues = struct {
