@@ -270,33 +270,29 @@ fn snappyDecode(src: []const u8, dst: []u8) error{DecompressionError}!usize {
                 sp += lit_len;
                 dp += lit_len;
             },
-            1 => { // Copy with 1-byte offset
-                if (sp >= src.len) return error.DecompressionError;
-                const length: usize = @as(usize, (tag >> 2) & 7) + 4;
-                const offset: usize = (@as(usize, tag >> 5) << 8) | @as(usize, src[sp]);
-                sp += 1;
-
-                if (offset == 0 or offset > dp) return error.DecompressionError;
-                if (dp + length > expected_len) return error.DecompressionError;
-                copyAtOffset(dst[0..expected_len], dp, offset, length);
-                dp += length;
-            },
-            2 => { // Copy with 2-byte offset
-                if (sp + 2 > src.len) return error.DecompressionError;
-                const length: usize = @as(usize, tag >> 2) + 1;
-                const offset: usize = std.mem.readInt(u16, src[sp..][0..2], .little);
-                sp += 2;
-
-                if (offset == 0 or offset > dp) return error.DecompressionError;
-                if (dp + length > expected_len) return error.DecompressionError;
-                copyAtOffset(dst[0..expected_len], dp, offset, length);
-                dp += length;
-            },
-            3 => { // Copy with 4-byte offset
-                if (sp + 4 > src.len) return error.DecompressionError;
-                const length: usize = @as(usize, tag >> 2) + 1;
-                const offset: usize = std.mem.readInt(u32, src[sp..][0..4], .little);
-                sp += 4;
+            else => |kind| { // Copy: decode length and offset, then one shared copy
+                var length: usize = undefined;
+                var offset: usize = undefined;
+                switch (kind) {
+                    1 => { // 1-byte offset
+                        if (sp >= src.len) return error.DecompressionError;
+                        length = @as(usize, (tag >> 2) & 7) + 4;
+                        offset = (@as(usize, tag >> 5) << 8) | @as(usize, src[sp]);
+                        sp += 1;
+                    },
+                    2 => { // 2-byte offset
+                        if (sp + 2 > src.len) return error.DecompressionError;
+                        length = @as(usize, tag >> 2) + 1;
+                        offset = std.mem.readInt(u16, src[sp..][0..2], .little);
+                        sp += 2;
+                    },
+                    else => { // 4-byte offset
+                        if (sp + 4 > src.len) return error.DecompressionError;
+                        length = @as(usize, tag >> 2) + 1;
+                        offset = std.mem.readInt(u32, src[sp..][0..4], .little);
+                        sp += 4;
+                    },
+                }
 
                 if (offset == 0 or offset > dp) return error.DecompressionError;
                 if (dp + length > expected_len) return error.DecompressionError;
@@ -310,37 +306,49 @@ fn snappyDecode(src: []const u8, dst: []u8) error{DecompressionError}!usize {
     return dp;
 }
 
-/// Bytes that must remain in `dst` after a copy for `copyAtOffset` to use block copies,
-/// which write up to 15 bytes past the copy.
-const copy_slack = 16;
+/// Bytes that must remain in `dst` after the start of a copy for `copyAtOffset` to use block
+/// copies: blocks cover the copy's at most 64 bytes and write past its end.
+const copy_slack = 64;
 
 /// Copy `length` bytes from `dst[pos - offset..]` to `dst[pos..]`. The source and destination
 /// overlap when `length > offset`; the result repeats the `offset` bytes before `pos` (RLE).
-/// The caller checks that `offset <= pos` and `pos + length <= dst.len`.
-fn copyAtOffset(dst: []u8, pos: usize, offset: usize, length: usize) void {
+/// The caller checks that `offset <= pos`, `pos + length <= dst.len`, and `length <= 64`
+/// (the largest snappy copy element).
+inline fn copyAtOffset(dst: []u8, pos: usize, offset: usize, length: usize) void {
     const from = pos - offset;
-    if (dst.len - pos - length < copy_slack) {
+    if (dst.len - pos < copy_slack) {
         // Near the end of the output: byte by byte, writing nothing past `pos + length`.
         for (0..length) |i| dst[pos + i] = dst[from + i];
         return;
     }
-    // Block copies. Each block reads bytes before the position it writes (blocks are at most
-    // `offset` bytes, or the source repeats with a period that is), so it reads output already
-    // written. Up to 15 bytes past `pos + length` are written and later overwritten.
+    // Block copies of a fixed size where possible, so the work does not branch on the exact
+    // length. Each block reads bytes before the position it writes (blocks are at most `offset`
+    // bytes, or the source repeats with a period that is), so it reads output already written.
+    // Bytes written past `pos + length` are overwritten by later elements.
+    const p = dst.ptr;
     if (offset >= 16) {
-        var i: usize = 0;
-        while (i < length) : (i += 16) dst[pos + i ..][0..16].* = dst[from + i ..][0..16].*;
+        // Copies of 9-32 bytes at offsets of 64 or more dominate text and string data.
+        if (length <= 32) {
+            inline for (0..2) |k| p[pos + k * 16 ..][0..16].* = p[from + k * 16 ..][0..16].*;
+        } else {
+            inline for (0..4) |k| p[pos + k * 16 ..][0..16].* = p[from + k * 16 ..][0..16].*;
+        }
     } else if (offset >= 8) {
-        var i: usize = 0;
-        while (i < length) : (i += 8) dst[pos + i ..][0..8].* = dst[from + i ..][0..8].*;
+        // Copies of 4-8 bytes at offsets 8-15 dominate fixed-width integer data.
+        if (length <= 8) {
+            p[pos..][0..8].* = p[from..][0..8].*;
+        } else {
+            var i: usize = 0;
+            while (i < length) : (i += 8) p[pos + i ..][0..8].* = p[from + i ..][0..8].*;
+        }
     } else {
         // Write the first 8 bytes one at a time. From there on the output repeats with period
         // `offset`, so `step`, the smallest multiple of `offset` that is at least 8, works as
         // the offset of 8-byte blocks.
-        for (0..8) |i| dst[pos + i] = dst[from + i];
+        for (0..8) |i| p[pos + i] = p[from + i];
         const step = offset * ((8 + offset - 1) / offset);
         var i: usize = 8;
-        while (i < length) : (i += 8) dst[pos + i ..][0..8].* = dst[pos + i - step ..][0..8].*;
+        while (i < length) : (i += 8) p[pos + i ..][0..8].* = p[pos + i - step ..][0..8].*;
     }
 }
 
