@@ -31,8 +31,8 @@ const value_mod = @import("value.zig");
 const seekable_reader = @import("seekable_reader.zig");
 const parquet_reader = @import("parquet_reader.zig");
 const errors_mod = @import("errors.zig");
-const schema_mod = @import("schema.zig");
-const nested_mod = @import("nested.zig");
+const nested_rows = @import("nested_rows.zig");
+const schema_tree = @import("schema_tree.zig");
 const row_ranges_mod = @import("row_ranges.zig");
 const page_filter_mod = @import("page_filter.zig");
 const page_index_reader_mod = @import("page_index_reader.zig");
@@ -78,13 +78,6 @@ pub const DynamicReader = struct {
     storage: ?*value_mod.RowStorage = null,
 
     const Self = @This();
-
-    const TopColInfo = struct {
-        leaf_start: usize,
-        leaf_count: usize,
-        is_nested: bool,
-        schema_node: *const schema_mod.SchemaNode,
-    };
 
     /// Get the SeekableReader interface.
     pub fn getSource(self: *const Self) SeekableReader {
@@ -558,10 +551,9 @@ pub const DynamicReader = struct {
             return try self.allocator.alloc(Row, 0);
         }
 
-        // Allocate the rows' memory (values arrays, nested values, byte
-        // payloads via `value_mod.dupeBytes`) in storage shared by the rows of
-        // this read. Each row holds a reference (`Row.storage`); the storage is
-        // freed with the last row.
+        // The rows' memory (values, nested arrays and the decoded byte buffers the values
+        // reference) is in storage shared by the rows of this read. Each row holds a reference
+        // (`Row.storage`); the storage is freed with the last row.
         const storage = try self.beginStorage();
         defer self.endStorage(storage);
 
@@ -589,32 +581,10 @@ pub const DynamicReader = struct {
             }
         }
 
-        // Compute top-level-to-leaf mapping for nested schemas. The schema nodes are built in
-        // the row storage: struct values in the rows reference their field names.
-        const sa = self.rowAllocator();
-
-        const top_infos = if (!is_flat) blk: {
-            const infos = try self.allocator.alloc(TopColInfo, num_top);
-            errdefer self.allocator.free(infos);
-
-            var schema_idx: usize = 1;
-            var leaf_offset: usize = 0;
-            for (0..num_top) |top_idx| {
-                if (schema_idx >= schema.len) return error.InvalidSchema;
-                const build_result = try schema_mod.SchemaNode.buildFromElements(sa, schema, schema_idx);
-                const lc = build_result.node.countLeafColumns();
-                infos[top_idx] = .{
-                    .leaf_start = leaf_offset,
-                    .leaf_count = lc,
-                    .is_nested = lc > 1 or !build_result.node.unwrapOptional().isPrimitive(),
-                    .schema_node = build_result.node,
-                };
-                schema_idx = build_result.next_idx;
-                leaf_offset += lc;
-            }
-            break :blk infos;
-        } else null;
-        defer if (top_infos) |ti| self.allocator.free(ti);
+        // The Arrow view of the schema: nested columns are assembled from it (`nested_rows`).
+        var tree_arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer tree_arena.deinit();
+        const tree = if (is_flat) null else try schema_tree.buildSchemaTree(tree_arena.allocator(), schema);
 
         // Every row's values in one block of the row storage, filled one output column at a
         // time.
@@ -629,13 +599,12 @@ pub const DynamicReader = struct {
 
         for (output_indices, 0..) |top_idx, out_idx| {
             const column_out = all_values[out_idx..];
-            if (top_infos) |infos| {
-                const info = infos[top_idx];
-                if (info.is_nested) {
-                    try self.readNestedIntoRows(info, row_group_index, num_leaf_columns, column_out, num_out, num_rows);
-                } else {
-                    try self.readLeafIntoRows(info.leaf_start, row_group_index, column_out, num_out, num_rows);
-                }
+            if (tree) |columns| {
+                const node = &columns[top_idx];
+                if (node.kind == .leaf)
+                    try self.readLeafIntoRows(node.physical_start, row_group_index, column_out, num_out, num_rows)
+                else
+                    try self.readNodeIntoRows(node, row_group_index, column_out, num_out, num_rows);
             } else {
                 try self.readLeafIntoRows(top_idx, row_group_index, column_out, num_out, num_rows);
             }
@@ -655,6 +624,8 @@ pub const DynamicReader = struct {
         /// `leaf.buffers.values` is empty; otherwise it is `leaf.buffers.values`.
         values: leaf_decoder.Buffer,
         element: format.SchemaElement,
+        max_def: u32,
+        max_rep: u32,
 
         /// The buffers with `values` in place, limited to the first `max_len` entries.
         fn view(self: *const RowLeaf, max_len: usize) leaf_decoder.Buffers {
@@ -690,7 +661,7 @@ pub const DynamicReader = struct {
             };
             leaf.buffers.values = &.{};
         }
-        return .{ .leaf = leaf, .values = values, .element = info.element };
+        return .{ .leaf = leaf, .values = values, .element = info.element, .max_def = info.max_def_level, .max_rep = info.max_rep_level };
     }
 
     /// Decodes a top-level primitive column and writes its values to `out[r * stride]` for
@@ -703,62 +674,42 @@ pub const DynamicReader = struct {
         for (view.length..num_rows) |r| out[r * stride] = .{ .null_val = {} };
     }
 
-    /// Reads a nested top-level column's leaves, assembles its values into the row storage and
-    /// writes them to `out[r * stride]` for the first `num_rows` rows.
-    fn readNestedIntoRows(
-        self: *Self,
-        info: TopColInfo,
-        row_group_index: usize,
-        num_leaf_columns: usize,
-        out: []Value,
-        stride: usize,
-        num_rows: usize,
-    ) !void {
-        const columns = try self.allocator.alloc(ColumnValues, info.leaf_count);
-        @memset(columns, .{ .values = &.{}, .def_levels = null, .rep_levels = null });
+    /// Reads the leaves of nested top-level column `node`, assembles its values in the row
+    /// storage (see `nested_rows`) and writes them to `out[r * stride]` for `r < num_rows`;
+    /// rows past the column's values get null.
+    fn readNodeIntoRows(self: *Self, node: *const schema_tree.Node, row_group_index: usize, out: []Value, stride: usize, num_rows: usize) !void {
+        const n = node.physical_count;
+        const row_leaves = try self.allocator.alloc(RowLeaf, n);
+        var decoded: usize = 0;
         defer {
-            // Byte payloads are in the row storage; only the arrays are freed.
-            for (columns) |*c| {
-                self.allocator.free(c.values);
-                if (c.def_levels) |l| self.allocator.free(l);
-                if (c.rep_levels) |l| self.allocator.free(l);
-            }
-            self.allocator.free(columns);
+            for (row_leaves[0..decoded]) |*rl| rl.leaf.deinit(self.allocator);
+            self.allocator.free(row_leaves);
         }
-        const slices = try self.allocator.alloc(nested_mod.FlatColumnSlice, info.leaf_count);
-        defer self.allocator.free(slices);
-
-        for (columns, slices, 0..) |*c, *slice, li| {
-            const phys = info.leaf_start + li;
-            if (phys >= num_leaf_columns) {
-                slice.* = .{ .values = &.{}, .def_levels = &.{}, .rep_levels = &.{} };
-                continue;
-            }
-            var rl = try self.decodeRowLeaf(phys, row_group_index, true);
-            defer rl.leaf.deinit(self.allocator);
-            const view = rl.view(std.math.maxInt(usize));
-            const values = try self.allocator.alloc(Value, view.length);
-            errdefer self.allocator.free(values);
-            try leaf_decoder.writeValues(self.rowAllocator(), &view, rl.element, values, 1, .borrow);
-            c.* = .{ .values = values, .def_levels = rl.leaf.def_levels, .rep_levels = rl.leaf.rep_levels };
-            rl.leaf.def_levels = null;
-            rl.leaf.rep_levels = null;
-            slice.* = .{
-                .values = c.values,
-                .def_levels = c.def_levels orelse &.{},
-                .rep_levels = c.rep_levels orelse &.{},
+        const leaves = try self.allocator.alloc(nested_rows.Leaf, n);
+        defer self.allocator.free(leaves);
+        for (row_leaves, leaves, 0..) |*rl, *l, k| {
+            rl.* = try self.decodeRowLeaf(node.physical_start + k, row_group_index, true);
+            decoded = k + 1;
+            l.* = .{
+                .buffers = rl.view(std.math.maxInt(usize)),
+                .def_levels = rl.leaf.def_levels,
+                .rep_levels = rl.leaf.rep_levels,
+                .element = rl.element,
+                .max_def = rl.max_def,
+                .max_rep = rl.max_rep,
             };
         }
 
-        const assembled = try self.allocator.alloc(Value, num_rows);
-        defer self.allocator.free(assembled);
-        try nested_mod.assembleValuesBorrowed(self.rowAllocator(), self.allocator, info.schema_node, slices, assembled);
-        for (assembled, 0..) |v, r| out[r * stride] = v;
-    }
-
-    /// Read a single column dynamically
-    fn readColumnDynamic(self: *Self, column_index: usize, row_group_index: usize) !ColumnValues {
-        return self.readColumnDynamicWithData(column_index, row_group_index, null);
+        const ctx = nested_rows.Context{
+            .arena = self.rowAllocator(),
+            .scratch = self.allocator,
+            .schema = self.metadata.schema,
+            .leaves = leaves,
+            .base = node.physical_start,
+        };
+        const values = try nested_rows.nodeValues(&ctx, node, self.allocator);
+        defer self.allocator.free(values);
+        for (0..num_rows) |r| out[r * stride] = if (r < values.len) values[r] else .{ .null_val = {} };
     }
 
     /// Read a single column, optionally using caller-supplied page bytes.

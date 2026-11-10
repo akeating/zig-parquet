@@ -1121,30 +1121,56 @@ pub const BytesMode = enum {
 /// Writes entry `i` of `b` as a `Value` to `out[i * stride]`, for every entry (`out` must
 /// have room). See `toValues` for the value forms.
 pub fn writeValues(allocator: std.mem.Allocator, b: *const Buffers, element: format.SchemaElement, out: []Value, stride: usize, bytes: BytesMode) !void {
-    const physical = element.type_ orelse return error.InvalidSchema;
     if (b.length > 0 and (b.length - 1) * stride >= out.len) return error.InvalidArgument;
-    const width: usize = switch (physical) {
-        .fixed_len_byte_array => safe.cast(element.type_length orelse 0) catch return error.InvalidTypeLength,
-        else => 0,
-    };
-    for (0..b.length) |i| {
-        const v = &out[i * stride];
-        if (!b.isValid(i)) {
-            v.* = .{ .null_val = {} };
-            continue;
-        }
-        v.* = switch (physical) {
+    const reader = try ValueReader.init(b, element);
+    switch (reader.physical) {
+        inline else => |physical| for (0..b.length) |i| {
+            var v = reader.atType(physical, i);
+            if (bytes == .copy) switch (v) {
+                .bytes_val => |x| v = .{ .bytes_val = try value_mod.dupeBytes(allocator, x) },
+                .fixed_bytes_val => |x| v = .{ .fixed_bytes_val = try value_mod.dupeBytes(allocator, x) },
+                else => {},
+            };
+            out[i * stride] = v;
+        },
+    }
+}
+
+/// Reads single entries of decoded buffers as `Value`s (see `toValues` for the forms). Byte
+/// payloads reference `b.values`.
+pub const ValueReader = struct {
+    b: *const Buffers,
+    physical: format.PhysicalType,
+    width: usize,
+
+    pub fn init(b: *const Buffers, element: format.SchemaElement) !ValueReader {
+        const physical = element.type_ orelse return error.InvalidSchema;
+        const width: usize = switch (physical) {
+            .fixed_len_byte_array => safe.cast(element.type_length orelse 0) catch return error.InvalidTypeLength,
+            else => 0,
+        };
+        return .{ .b = b, .physical = physical, .width = width };
+    }
+
+    pub fn at(self: ValueReader, i: usize) Value {
+        return switch (self.physical) {
+            inline else => |physical| self.atType(physical, i),
+        };
+    }
+
+    /// `at` for a physical type known at compile time.
+    pub inline fn atType(self: ValueReader, comptime physical: format.PhysicalType, i: usize) Value {
+        const b = self.b;
+        if (!b.isValid(i)) return .{ .null_val = {} };
+        return switch (physical) {
             .boolean => .{ .bool_val = (b.values[i / 8] >> @intCast(i % 8)) & 1 == 1 },
             .int32 => .{ .int32_val = std.mem.bytesToValue(i32, b.values[i * 4 ..][0..4]) },
             .int64, .int96 => .{ .int64_val = std.mem.bytesToValue(i64, b.values[i * 8 ..][0..8]) },
             .float => .{ .float_val = std.mem.bytesToValue(f32, b.values[i * 4 ..][0..4]) },
             .double => .{ .double_val = std.mem.bytesToValue(f64, b.values[i * 8 ..][0..8]) },
-            .byte_array => .{ .bytes_val = if (bytes == .borrow) b.bytesAt(i) else try value_mod.dupeBytes(allocator, b.bytesAt(i)) },
-            .fixed_len_byte_array => blk: {
-                const raw = b.values[i * width ..][0..width];
-                break :blk .{ .fixed_bytes_val = if (bytes == .borrow) raw else try value_mod.dupeBytes(allocator, raw) };
-            },
+            .byte_array => .{ .bytes_val = b.bytesAt(i) },
+            .fixed_len_byte_array => .{ .fixed_bytes_val = b.values[i * self.width ..][0..self.width] },
         };
     }
-}
+};
 

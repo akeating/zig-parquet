@@ -15,6 +15,8 @@ parquet-testing/data/non_hadoop_lz4_compressed.parquet UnsupportedCompression
 
 # Intentionally malformed files
 parquet-testing/bad_data/ARROW-GH-41321.parquet InvalidBitWidth
+# Repetition level 1 at the start of a record (PyArrow also fails)
+parquet-testing/bad_data/ARROW-GH-45185.parquet InvalidPageData
 parquet-testing/bad_data/ARROW-RS-GH-6229-DICTHEADER.parquet InvalidPageSize
 parquet-testing/bad_data/PARQUET-1481.parquet SchemaParseError
 parquet-testing/data/nation.dict-malformed.parquet EndOfData

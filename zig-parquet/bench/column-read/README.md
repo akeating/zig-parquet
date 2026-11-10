@@ -34,9 +34,9 @@ uv run python -I ../zig-parquet/bench/column-read/scripts/pyarrow_ref.py /tmp/be
 | retained MB | Bytes still live when a run ends. Non-zero means memory held after the result is freed. |
 | check | Checksum of lengths and null counts; equal across paths when they read the same data. |
 
-## Current results (2026-11-09, commit 32643e1, Apple M2, Zig 0.17.1, ReleaseFast)
+## Current results (2026-11-09, Apple M2, Zig 0.17.1, ReleaseFast)
 
-Median of 5 runs. "Zig codecs" is the default build (pure-Zig decompressors); "C codecs" is `-Dcodecs=c-only`. PyArrow 23.0.1 with `use_threads=False`. Medians vary by about 5% between runs.
+Arrow path rows measured at commit 32643e1; row path rows at the commit that last changed them in this file. Median of 5 runs. "Zig codecs" is the default build (pure-Zig decompressors); "C codecs" is `-Dcodecs=c-only`. PyArrow 23.0.1 with `use_threads=False`. Medians vary by about 5% between runs.
 
 Flat file (`bench_10m.parquet`, 10M rows):
 
@@ -46,10 +46,10 @@ Flat file (`bench_10m.parquet`, 10M rows):
 | arrow score | 48 | 51 | 2,865 | 235 | 17.7 | 36.6 | 19.7 |
 | arrow category | 64 | 64 | 11,907 | 453 | 30.2 | 92.1 | 23.6 |
 | arrow all | 171 | 175 | 17,182 | 896 | 46.5 | 174.6 | 57.6 |
-| rows id | 360 | | 10,002,700 | 1,048 | 88.0 | | |
-| rows score | 380 | | 10,002,834 | 1,195 | 92.0 | | |
-| rows category | 555 | | 10,012,094 | 1,760 | 124.9 | | |
-| rows all | 996 | | 10,017,438 | 3,239 | 224.9 | | |
+| rows id | 150 | | 2,630 | 933 | 76.0 | | |
+| rows score | 145 | | 2,685 | 960 | 76.0 | | |
+| rows category | 167 | | 11,737 | 1,216 | 89.0 | | |
+| rows all | 332 | | 16,982 | 2,346 | 161.0 | | |
 
 Nested file (`bench_nested_2m.parquet`, 2M rows):
 
@@ -59,11 +59,11 @@ Nested file (`bench_nested_2m.parquet`, 2M rows):
 | arrow point | 32 | 33 | 1,222 | 156 | 37.4 | 29.5 | 62.7 |
 | arrow attrs | 138 | 146 | 1,275 | 410 | 93.1 | 71.9 | 91.3 |
 | arrow all | 268 | 291 | 2,988 | 861 | 136.0 | 155.6 | 134.7 |
-| rows ints | 304 | | 6,500,587 | 946 | 275.9 | | |
-| rows point | 381 | | 14,600,352 | 1,058 | 331.7 | | |
-| rows attrs | 477 | | 6,001,427 | 1,155 | 376.9 | | |
-| rows all | 1,167 | | 23,102,284 | 3,025 | 913.2 | | |
+| rows ints | 120 | | 591 | 708 | 239.4 | | |
+| rows point | 83 | | 1,128 | 778 | 266.5 | | |
+| rows attrs | 150 | | 1,161 | 994 | 365.1 | | |
+| rows all | 333 | | 2,856 | 1,893 | 526.1 | | |
 
-The row path builds a `Value` per entry and one `Row` per row, which accounts for its allocation counts.
+The row path writes a `Value` per entry and a `Row` per row. The values of a read are in one block of storage shared by its rows, and string values reference the decoded byte buffers.
 
-Arrow path reading all columns, first measurement → now: flat file 750 → 171 ms (first measured at commit b64724f, before the column-read changes); nested file 479 → 268 ms (first measured at commit 2eee218, when list, struct and map assembly still built a `Value` per entry). The commit messages on the branch record each change's effect.
+Arrow path reading all columns, first measurement → now: flat file 750 → 171 ms (first measured at commit b64724f, before the column-read changes); nested file 479 → 268 ms (first measured at commit 2eee218, when list, struct and map assembly still built a `Value` per entry). Row path reading all columns: flat file 996 → 332 ms, nested file 1,167 → 333 ms (before at commit 32643e1). The commit messages on the branch record each change's effect.

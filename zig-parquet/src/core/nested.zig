@@ -275,23 +275,6 @@ const AssembleContext = struct {
     columns: []const FlatColumnSlice,
     column_index: usize,
     positions: []usize, // current position in each column
-    /// Borrowing mode (`assembleValuesBorrowed`): `allocator` is an arena that outlives the
-    /// values, the leaf values' byte payloads and the schema's field names already live long
-    /// enough, so they are referenced instead of copied, and nothing is freed on error.
-    scratch: ?*Scratch = null,
-};
-
-/// Per-depth lists for collecting list items and map entries in borrowing mode; each finished
-/// list is copied into the arena at its exact size.
-const Scratch = struct {
-    allocator: std.mem.Allocator,
-    lists: [max_nesting_depth + 2]std.ArrayList(Value) = @splat(.empty),
-    maps: [max_nesting_depth + 2]std.ArrayList(Value.MapEntryValue) = @splat(.empty),
-
-    fn deinit(self: *Scratch) void {
-        for (&self.lists) |*l| l.deinit(self.allocator);
-        for (&self.maps) |*m| m.deinit(self.allocator);
-    }
 };
 
 /// A view into a flat column's data
@@ -370,39 +353,6 @@ pub fn assembleValues(
     return result;
 }
 
-/// Assembles `result.len` rows like `assembleValues`, into `result`, without copying: list,
-/// map and struct arrays are allocated in `arena`, byte payloads and struct field names are
-/// referenced from `columns` and `node`, which must live as long as the values. Nothing
-/// allocated in `arena` is freed, also on error. `scratch_allocator` holds temporary buffers.
-pub fn assembleValuesBorrowed(
-    arena: std.mem.Allocator,
-    scratch_allocator: std.mem.Allocator,
-    node: *const SchemaNode,
-    columns: []const FlatColumnSlice,
-    result: []Value,
-) !void {
-    if (columns.len < node.countLeafColumns()) return error.NotEnoughColumns;
-
-    const positions = try scratch_allocator.alloc(usize, columns.len);
-    defer scratch_allocator.free(positions);
-    @memset(positions, 0);
-
-    var scratch = Scratch{ .allocator = scratch_allocator };
-    defer scratch.deinit();
-
-    var ctx = AssembleContext{
-        .allocator = arena,
-        .columns = columns,
-        .column_index = 0,
-        .positions = positions,
-        .scratch = &scratch,
-    };
-    for (result) |*v| {
-        ctx.column_index = 0;
-        v.* = try assembleRecursive(node, &ctx, 0, 0, 0);
-    }
-}
-
 /// Assembles one value of `node` and moves `ctx.column_index` past the node's leaf columns.
 fn assembleRecursive(
     node: *const SchemaNode,
@@ -445,15 +395,11 @@ fn assembleRecursive(
                 return .{ .null_val = {} };
             }
 
-            // Assemble list elements (in borrowing mode into this depth's scratch list)
-            var local_items: std.ArrayList(Value) = .empty;
-            const items = if (ctx.scratch) |sc| &sc.lists[depth] else &local_items;
-            items.clearRetainingCapacity();
-            const items_allocator = if (ctx.scratch) |sc| sc.allocator else ctx.allocator;
-            errdefer if (ctx.scratch == null) {
+            var items: std.ArrayList(Value) = .empty;
+            errdefer {
                 for (items.items) |item| item.deinit(ctx.allocator);
                 items.deinit(ctx.allocator);
-            };
+            }
 
             // The first entry is at `pos`, so the loop either consumes an empty-list marker or
             // assembles an item, and either one leaves `column_index` past the element.
@@ -471,15 +417,14 @@ fn assembleRecursive(
                 }
 
                 const item = try assembleRecursive(element, ctx, def_threshold + 1, rep_threshold + 1, depth + 1);
-                try items.append(items_allocator, item);
+                items.append(ctx.allocator, item) catch |e| {
+                    item.deinit(ctx.allocator);
+                    return e;
+                };
                 first = false;
             }
 
-            const owned = if (ctx.scratch != null)
-                try ctx.allocator.dupe(Value, items.items)
-            else
-                try items.toOwnedSlice(ctx.allocator);
-            return .{ .list_val = owned };
+            return .{ .list_val = try items.toOwnedSlice(ctx.allocator) };
         },
         .map => |m| {
             const start = ctx.column_index;
@@ -498,17 +443,14 @@ fn assembleRecursive(
                 return .{ .null_val = {} };
             }
 
-            var local_entries: std.ArrayList(Value.MapEntryValue) = .empty;
-            const entries = if (ctx.scratch) |sc| &sc.maps[depth] else &local_entries;
-            entries.clearRetainingCapacity();
-            const entries_allocator = if (ctx.scratch) |sc| sc.allocator else ctx.allocator;
-            errdefer if (ctx.scratch == null) {
+            var entries: std.ArrayList(Value.MapEntryValue) = .empty;
+            errdefer {
                 for (entries.items) |entry| {
                     entry.key.deinit(ctx.allocator);
                     entry.value.deinit(ctx.allocator);
                 }
                 entries.deinit(ctx.allocator);
-            };
+            }
 
             // As for lists, the first iteration leaves `column_index` past the value columns.
             var first = true;
@@ -526,37 +468,31 @@ fn assembleRecursive(
                 }
 
                 const key = try assembleRecursive(m.key, ctx, def_threshold + 1, rep_threshold + 1, depth + 1);
-                errdefer if (ctx.scratch == null) key.deinit(ctx.allocator);
+                errdefer key.deinit(ctx.allocator);
                 const val = try assembleRecursive(m.value, ctx, def_threshold + 1, rep_threshold + 1, depth + 1);
-                errdefer if (ctx.scratch == null) val.deinit(ctx.allocator);
+                errdefer val.deinit(ctx.allocator);
 
-                try entries.append(entries_allocator, .{ .key = key, .value = val });
+                try entries.append(ctx.allocator, .{ .key = key, .value = val });
                 first = false;
             }
 
-            const owned = if (ctx.scratch != null)
-                try ctx.allocator.dupe(Value.MapEntryValue, entries.items)
-            else
-                try entries.toOwnedSlice(ctx.allocator);
-            return .{ .map_val = owned };
+            return .{ .map_val = try entries.toOwnedSlice(ctx.allocator) };
         },
         .struct_ => |s| {
-            const borrow = ctx.scratch != null;
             const fields = try ctx.allocator.alloc(Value.FieldValue, s.fields.len);
             var initialized: usize = 0;
-            errdefer if (!borrow) {
+            errdefer {
                 for (fields[0..initialized]) |f| {
                     ctx.allocator.free(f.name);
                     f.value.deinit(ctx.allocator);
                 }
                 ctx.allocator.free(fields);
-            };
+            }
 
             // Each field's assembly moves `column_index` to the next field's first leaf.
             for (s.fields, fields) |schema_field, *field| {
-                // In borrowing mode the name is the schema's, which outlives the values.
-                const name = if (borrow) schema_field.name else try ctx.allocator.dupe(u8, schema_field.name);
-                errdefer if (!borrow) ctx.allocator.free(name);
+                const name = try ctx.allocator.dupe(u8, schema_field.name);
+                errdefer ctx.allocator.free(name);
                 const field_value = try assembleRecursive(schema_field.node, ctx, def_threshold, rep_threshold, depth + 1);
                 field.* = .{ .name = name, .value = field_value };
                 initialized += 1;
@@ -574,8 +510,6 @@ fn assembleRecursive(
             }
             ctx.positions[idx] += 1;
             const v = col.values[pos];
-            // In borrowing mode the payloads already live as long as the values.
-            if (ctx.scratch != null) return v;
             return switch (v) {
                 .bytes_val => |b| .{ .bytes_val = try value_mod.dupeBytes(ctx.allocator, b) },
                 .fixed_bytes_val => |b| .{ .fixed_bytes_val = try value_mod.dupeBytes(ctx.allocator, b) },
