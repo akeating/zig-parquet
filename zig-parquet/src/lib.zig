@@ -86,6 +86,7 @@ pub const ArrowArrayStream = arrow.ArrowArrayStream;
 // Arrow batch API (runtime type dispatch for row group I/O)
 const arrow_batch = @import("core/arrow_batch.zig");
 pub const exportSchemaAsArrow = arrow_batch.exportSchemaAsArrow;
+pub const exportProjectedSchemaAsArrow = arrow_batch.exportProjectedSchemaAsArrow;
 pub const importSchemaFromArrow = arrow_batch.importSchemaFromArrow;
 pub const freeImportedColumnDefs = arrow_batch.freeImportedColumnDefs;
 pub const readRowGroupAsArrow = arrow_batch.readRowGroupAsArrow;
@@ -216,6 +217,7 @@ comptime {
         _ = &c_api.reader.zp_reader_error_code;
         _ = &c_api.reader.zp_reader_error_message;
         _ = &c_api.reader.zp_reader_get_stream;
+        _ = &c_api.reader.zp_reader_get_stream_columns;
         _ = &c_api.reader.zp_reader_has_statistics;
         _ = &c_api.reader.zp_reader_get_null_count;
         _ = &c_api.reader.zp_reader_get_distinct_count;
@@ -367,6 +369,7 @@ comptime {
             _ = &wasi.zp_reader_get_schema;
             _ = &wasi.zp_reader_read_row_group;
             _ = &wasi.zp_reader_get_stream;
+            _ = &wasi.zp_reader_get_stream_columns;
             _ = &wasi.zp_reader_error_code;
             _ = &wasi.zp_reader_error_message;
             _ = &wasi.zp_reader_has_statistics;

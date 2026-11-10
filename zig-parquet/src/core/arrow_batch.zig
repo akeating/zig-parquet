@@ -153,25 +153,38 @@ fn createSchemaNode(
 /// Convert a Parquet file schema to an ArrowSchema (struct type with column children).
 /// Caller must call `schema.doRelease()` when done.
 pub fn exportSchemaAsArrow(allocator: Allocator, metadata: format.FileMetaData) !ArrowSchema {
+    return exportProjectedSchemaAsArrow(allocator, metadata, null);
+}
+
+/// Like `exportSchemaAsArrow`, with only the top-level columns `col_indices`, in that order.
+/// If `col_indices` is null, all columns are included.
+pub fn exportProjectedSchemaAsArrow(allocator: Allocator, metadata: format.FileMetaData, col_indices: ?[]const usize) !ArrowSchema {
     const schema = metadata.schema;
     if (schema.len == 0) return error.InvalidSchema;
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const columns = try buildSchemaTree(arena.allocator(), schema);
+    return treeSchema(allocator, schema, columns, col_indices);
+}
 
-    var children = try allocator.alloc(ArrowSchema, columns.len);
+/// The ArrowSchema of the top-level columns `col_indices` of a schema tree, or of all of them.
+fn treeSchema(allocator: Allocator, schema: []const format.SchemaElement, columns: []const Node, col_indices: ?[]const usize) !ArrowSchema {
+    const n = if (col_indices) |ci| ci.len else columns.len;
+    var children = try allocator.alloc(ArrowSchema, n);
     var init_count: usize = 0;
     errdefer {
         for (children[0..init_count]) |*child| child.doRelease();
         allocator.free(children);
     }
 
-    var children_ptrs = try allocator.alloc(*ArrowSchema, columns.len);
+    var children_ptrs = try allocator.alloc(*ArrowSchema, n);
     errdefer allocator.free(children_ptrs);
 
-    for (columns, 0..) |*column, i| {
-        children[i] = try nodeSchema(allocator, schema, column, null);
+    for (0..n) |i| {
+        const col_idx = if (col_indices) |ci| ci[i] else i;
+        if (col_idx >= columns.len) return error.InvalidArgument;
+        children[i] = try nodeSchema(allocator, schema, &columns[col_idx], null);
         children_ptrs[i] = &children[i];
         init_count = i + 1;
     }
@@ -718,8 +731,8 @@ pub const ReadResult = struct {
 };
 
 /// Read a row group's columns as Arrow arrays with runtime type dispatch.
-/// Returns one ArrowArray per top-level logical column (matching the ArrowSchema structure).
-/// If `col_indices` is null, all logical columns are read.
+/// Returns one ArrowArray per top-level column read, and a schema whose children describe
+/// those columns in the same order. If `col_indices` is null, all top-level columns are read.
 pub fn readRowGroupAsArrow(
     allocator: Allocator,
     source: SeekableReader,
@@ -754,7 +767,7 @@ pub fn readRowGroupAsArrow(
         init_count = i + 1;
     }
 
-    var schema = try exportSchemaAsArrow(allocator, metadata);
+    var schema = try treeSchema(allocator, metadata.schema, columns, col_indices);
     errdefer schema.doRelease();
 
     return .{
@@ -2892,6 +2905,44 @@ test "round-trip: write parquet, read as arrow - int32 + string" {
 
     const str_validity: [*]const u8 = @ptrCast(@alignCast(str_arr.buffers[0].?));
     try std.testing.expect(!arrow.getBit(str_validity[0..1], 1));
+}
+
+test "projected read returns a schema of the selected columns" {
+    const allocator = std.testing.allocator;
+
+    var writer = try api_writer_mod.writeToBuffer(allocator, &.{
+        .{ .name = "id", .type_ = .int32, .optional = true },
+        .{ .name = "name", .type_ = .byte_array, .optional = true, .logical_type = .string },
+        .{ .name = "score", .type_ = .double, .optional = false },
+    });
+    try writer.writeColumnOptional(i32, 0, &.{ .{ .value = 1 }, .null_value });
+    try writer.writeColumnOptional([]const u8, 1, &.{ .{ .value = "a" }, .{ .value = "b" } });
+    try writer.writeColumn(f64, 2, &.{ 1.5, 2.5 });
+    try writer.close();
+    const buf = try writer.toOwnedSlice();
+    defer allocator.free(buf);
+    writer.deinit();
+
+    var dr = try api_reader_mod.openBufferDynamic(allocator, buf, .{});
+    defer dr.deinit();
+
+    var result = try readRowGroupAsArrow(allocator, dr.getSource(), dr.metadata, 0, &.{ 2, 0 });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), result.arrays.len);
+    try std.testing.expectEqual(@as(i64, 2), result.schema.n_children);
+    const children = result.schema.children.?;
+    try std.testing.expectEqualStrings("score", std.mem.span(children[0].name.?));
+    try std.testing.expectEqualStrings("g", std.mem.span(children[0].format));
+    try std.testing.expectEqualStrings("id", std.mem.span(children[1].name.?));
+    try std.testing.expectEqualStrings("i", std.mem.span(children[1].format));
+
+    var projected = try exportProjectedSchemaAsArrow(allocator, dr.metadata, &.{1});
+    defer projected.doRelease();
+    try std.testing.expectEqual(@as(i64, 1), projected.n_children);
+    try std.testing.expectEqualStrings("name", std.mem.span(projected.children.?[0].name.?));
+
+    try std.testing.expectError(error.InvalidArgument, exportProjectedSchemaAsArrow(allocator, dr.metadata, &.{3}));
 }
 
 test "round-trip: arrow write then arrow read - int64 + float64" {

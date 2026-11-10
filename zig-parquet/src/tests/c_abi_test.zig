@@ -133,6 +133,8 @@ test "C ABI: read specific columns" {
     defer schema.doRelease();
 
     try std.testing.expectEqual(@as(i64, 1), arr.n_children);
+    try std.testing.expectEqual(@as(i64, 1), schema.n_children);
+    try std.testing.expectEqualStrings("id", std.mem.span(schema.children.?[0].name.?));
 }
 
 // ============================================================================
@@ -643,6 +645,58 @@ test "C ABI: reader get_stream iterates row groups" {
     var end: ArrowArray = undefined;
     try std.testing.expectEqual(@as(c_int, 0), stream.get_next.?(&stream, &end));
     try std.testing.expect(end.release == null);
+}
+
+test "C ABI: reader get_stream_columns reads the selected columns" {
+    const allocator = std.testing.allocator;
+    const buf = try createTestParquetBuffer(allocator);
+    defer allocator.free(buf);
+
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(c_err.ZP_OK, c_reader.zp_reader_open_memory(buf.ptr, buf.len, &handle));
+    defer c_reader.zp_reader_close(handle);
+
+    var cols = [_]c_int{1};
+    var stream: ArrowArrayStream = undefined;
+    try std.testing.expectEqual(c_err.ZP_OK, c_reader.zp_reader_get_stream_columns(handle, &cols, 1, &stream));
+    defer stream.release.?(&stream);
+    // The stream keeps its own copy of the indices.
+    cols[0] = 0;
+
+    var schema: ArrowSchema = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), stream.get_schema.?(&stream, &schema));
+    defer schema.doRelease();
+    try std.testing.expectEqual(@as(i64, 1), schema.n_children);
+    try std.testing.expectEqualStrings("name", std.mem.span(schema.children.?[0].name.?));
+
+    var batch: ArrowArray = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), stream.get_next.?(&stream, &batch));
+    defer batch.doRelease();
+    try std.testing.expectEqual(@as(i64, 5), batch.length);
+    try std.testing.expectEqual(@as(i64, 1), batch.n_children);
+    // The name column has one null; the id column has none.
+    try std.testing.expectEqual(@as(i64, 1), batch.children.?[0].null_count);
+
+    var end: ArrowArray = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), stream.get_next.?(&stream, &end));
+    try std.testing.expect(end.release == null);
+}
+
+test "C ABI: reader get_stream_columns rejects out-of-range indices" {
+    const allocator = std.testing.allocator;
+    const buf = try createTestParquetBuffer(allocator);
+    defer allocator.free(buf);
+
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(c_err.ZP_OK, c_reader.zp_reader_open_memory(buf.ptr, buf.len, &handle));
+    defer c_reader.zp_reader_close(handle);
+
+    var stream: ArrowArrayStream = undefined;
+    const too_high = [_]c_int{ 0, 2 };
+    try std.testing.expectEqual(c_err.ZP_ERROR_INVALID_ARGUMENT, c_reader.zp_reader_get_stream_columns(handle, &too_high, 2, &stream));
+    const negative = [_]c_int{-1};
+    try std.testing.expectEqual(c_err.ZP_ERROR_INVALID_ARGUMENT, c_reader.zp_reader_get_stream_columns(handle, &negative, 1, &stream));
+    try std.testing.expectEqual(c_err.ZP_ERROR_INVALID_ARGUMENT, c_reader.zp_reader_get_stream_columns(handle, &too_high, 0, &stream));
 }
 
 test "C ABI: stream get_last_error returns null when no error" {

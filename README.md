@@ -323,9 +323,11 @@ Buffer layout:
 | Byte array / string | Validity bitmap | `i32` offsets, `length + 1` entries | Bytes |
 | List, struct, map | Validity bitmap | Offsets (list, map) | — (values are in `children`) |
 
-`result.schema` is a struct `ArrowSchema` whose children give each column's Arrow type (format string), name and nullability. It describes every column in the file, also when `col_indices` selects a subset, so index `schema.children` by the original column index. `result.deinit()` releases all arrays and the schema. The same function is available to C callers as `zp_reader_read_row_group`, and `zp_reader_get_stream` returns an `ArrowArrayStream` over all row groups.
+`result.schema` is a struct `ArrowSchema` whose children give each column's Arrow type (format string), name and nullability, for the columns read and in the order of `col_indices`. `parquet.exportSchemaAsArrow` returns the schema of all columns without reading data. `result.deinit()` releases all arrays and the schema.
 
-The reader decodes each column into an intermediate per-value array and then copies it into the Arrow buffers, so a read allocates that intermediate array in addition to the returned buffers.
+C callers have the same function as `zp_reader_read_row_group`. `zp_reader_get_stream` returns an `ArrowArrayStream` whose batches are the file's row groups, one per `get_next` call; `zp_reader_get_stream_columns` does the same for a subset of columns. A batch has as many rows as its row group.
+
+The reader loads a column chunk's compressed bytes whole, then decompresses and decodes one page at a time directly into the Arrow buffers.
 
 ## Supported Types
 

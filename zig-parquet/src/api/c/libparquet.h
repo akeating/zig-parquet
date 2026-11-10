@@ -197,7 +197,7 @@ int zp_reader_get_schema(zp_reader_t handle,
  * @param col_indices  Column indices to read, or NULL for all columns.
  * @param num_cols     Number of entries in col_indices (ignored if NULL).
  * @param arrays_out   Output: struct ArrowArray whose children are columns.
- * @param schema_out   Output: corresponding ArrowSchema.
+ * @param schema_out   Output: ArrowSchema of the columns read, in col_indices order.
  *
  * Both outputs must be released by the caller.
  * All-or-nothing: on error, no partial output is written.
@@ -281,6 +281,24 @@ const char* zp_reader_error_message(zp_reader_t handle);
  */
 int zp_reader_get_stream(zp_reader_t handle,
                          struct ArrowArrayStream* stream_out);
+
+/**
+ * Like zp_reader_get_stream(), reading only the top-level columns in
+ * col_indices, in that order. get_schema() describes those columns.
+ *
+ * Each batch is one row group of the selected columns; columns not
+ * selected are not read or decoded. The stream keeps its own copy of
+ * col_indices.
+ *
+ * @param handle       Reader handle (must stay open while stream is active).
+ * @param col_indices  Top-level column indices, or NULL for all columns.
+ * @param num_cols     Number of entries in col_indices (ignored if NULL).
+ * @param stream_out   Output: initialized ArrowArrayStream.
+ * @return ZP_OK, or ZP_ERROR_INVALID_ARGUMENT if an index is out of range.
+ */
+int zp_reader_get_stream_columns(zp_reader_t handle,
+                                 const int* col_indices, int num_cols,
+                                 struct ArrowArrayStream* stream_out);
 
 /** Close the reader and release all resources. */
 void zp_reader_close(zp_reader_t handle);

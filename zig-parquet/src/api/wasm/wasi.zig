@@ -239,30 +239,8 @@ export fn zp_reader_read_row_group(
     };
 
     var zig_indices: ?[]const usize = null;
-    var indices_buf: []usize = &.{};
-    defer if (indices_buf.len > 0) handle.allocator.free(indices_buf);
-
-    if (col_indices) |ci| {
-        if (num_cols <= 0) {
-            handle.err_ctx.setError(err.ZP_ERROR_INVALID_ARGUMENT, "num_cols must be positive when col_indices is provided");
-            return handle.err_ctx.code;
-        }
-        const nc = safe.castTo(usize, num_cols) catch {
-            handle.err_ctx.setError(err.ZP_ERROR_INVALID_ARGUMENT, "num_cols out of range");
-            return handle.err_ctx.code;
-        };
-        indices_buf = handle.allocator.alloc(usize, nc) catch {
-            handle.err_ctx.setError(err.ZP_ERROR_OUT_OF_MEMORY, "OutOfMemory");
-            return handle.err_ctx.code;
-        };
-        for (0..nc) |i| {
-            indices_buf[i] = safe.castTo(usize, ci[i]) catch {
-                handle.err_ctx.setErrorFmt(err.ZP_ERROR_INVALID_ARGUMENT, "invalid column index at position {d}", .{i});
-                return handle.err_ctx.code;
-            };
-        }
-        zig_indices = indices_buf;
-    }
+    defer if (zig_indices) |ci| handle.allocator.free(ci);
+    if (col_indices) |ci| zig_indices = columnIndices(handle, ci, num_cols) orelse return handle.err_ctx.code;
 
     var result = arrow_batch.readRowGroupAsArrow(
         handle.allocator,
@@ -461,17 +439,44 @@ export fn zp_reader_get_stream(
     handle_ptr: ?*anyopaque,
     stream_out: ?*ArrowArrayStream,
 ) i32 {
+    return zp_reader_get_stream_columns(handle_ptr, null, 0, stream_out);
+}
+
+/// Like `zp_reader_get_stream`, reading only the top-level columns `col_indices`, in that
+/// order. If `col_indices` is null, all columns are read and `num_cols` is ignored.
+export fn zp_reader_get_stream_columns(
+    handle_ptr: ?*anyopaque,
+    col_indices: ?[*]const i32,
+    num_cols: i32,
+    stream_out: ?*ArrowArrayStream,
+) i32 {
     const handle = castHandle(ReaderHandle, handle_ptr) orelse return err.ZP_ERROR_INVALID_ARGUMENT;
     const out = stream_out orelse return err.ZP_ERROR_INVALID_ARGUMENT;
     handle.err_ctx.setOk();
 
-    const pd = backing_allocator.create(StreamPrivateData) catch {
+    var indices: ?[]usize = null;
+    if (col_indices) |ci| {
+        const copy = columnIndices(handle, ci, num_cols) orelse return handle.err_ctx.code;
+        // The root's children are the top-level columns.
+        const root_children = if (handle.metadata.schema.len > 0) handle.metadata.schema[0].num_children orelse 0 else 0;
+        const num_top = safe.castTo(usize, root_children) catch 0;
+        for (copy, 0..) |c, i| if (c >= num_top) {
+            handle.allocator.free(copy);
+            handle.err_ctx.setErrorFmt(err.ZP_ERROR_INVALID_ARGUMENT, "column index at position {d} out of range", .{i});
+            return handle.err_ctx.code;
+        };
+        indices = copy;
+    }
+
+    const pd = handle.allocator.create(StreamPrivateData) catch {
+        if (indices) |ci| handle.allocator.free(ci);
         handle.err_ctx.setError(err.ZP_ERROR_OUT_OF_MEMORY, "OutOfMemory");
         return handle.err_ctx.code;
     };
     pd.* = .{
         .handle = handle,
         .rg_index = 0,
+        .col_indices = indices,
     };
 
     out.* = .{
@@ -482,6 +487,28 @@ export fn zp_reader_get_stream(
         .private_data = @ptrCast(pd),
     };
     return ZP_OK;
+}
+
+/// Copies `num_cols` column indices into a slice from the handle's allocator. On invalid
+/// input or allocation failure, sets the handle's error and returns null.
+fn columnIndices(handle: *ReaderHandle, col_indices: [*]const i32, num_cols: i32) ?[]usize {
+    if (num_cols <= 0) {
+        handle.err_ctx.setError(err.ZP_ERROR_INVALID_ARGUMENT, "num_cols must be positive when col_indices is provided");
+        return null;
+    }
+    const nc = safe.castTo(usize, num_cols) catch unreachable; // positive i32 fits in usize
+    const indices = handle.allocator.alloc(usize, nc) catch {
+        handle.err_ctx.setError(err.ZP_ERROR_OUT_OF_MEMORY, "OutOfMemory");
+        return null;
+    };
+    for (indices, 0..) |*idx, i| {
+        idx.* = safe.castTo(usize, col_indices[i]) catch {
+            handle.allocator.free(indices);
+            handle.err_ctx.setErrorFmt(err.ZP_ERROR_INVALID_ARGUMENT, "invalid column index at position {d}", .{i});
+            return null;
+        };
+    }
+    return indices;
 }
 
 export fn zp_reader_close(handle_ptr: ?*anyopaque) void {
@@ -2027,13 +2054,15 @@ const ArrowArrayStream = @import("../../core/arrow.zig").ArrowArrayStream;
 const StreamPrivateData = struct {
     handle: *ReaderHandle,
     rg_index: usize,
+    /// Top-level columns to read; null reads all. Owned by the stream.
+    col_indices: ?[]usize,
 };
 
 fn streamGetSchema(stream: *ArrowArrayStream, schema_out: *ArrowSchema) callconv(.c) c_int {
     const pd: *StreamPrivateData = @ptrCast(@alignCast(stream.private_data));
     const handle = pd.handle;
 
-    const schema = arrow_batch.exportSchemaAsArrow(handle.allocator, handle.metadata) catch |e| {
+    const schema = arrow_batch.exportProjectedSchemaAsArrow(handle.allocator, handle.metadata, pd.col_indices) catch |e| {
         handle.err_ctx.setError(err.mapError(e), err.errorMessage(e));
         return handle.err_ctx.code;
     };
@@ -2066,7 +2095,7 @@ fn streamGetNext(stream: *ArrowArrayStream, array_out: *ArrowArray) callconv(.c)
         handle.source,
         handle.metadata,
         pd.rg_index,
-        null,
+        pd.col_indices,
     ) catch |e| {
         handle.err_ctx.setErrorFmt(err.mapError(e), "readRowGroupAsArrow failed: {s}", .{err.errorMessage(e)});
         return handle.err_ctx.code;
@@ -2094,6 +2123,7 @@ fn streamGetLastError(stream: *ArrowArrayStream) callconv(.c) ?[*:0]const u8 {
 
 fn streamRelease(stream: *ArrowArrayStream) callconv(.c) void {
     const pd: *StreamPrivateData = @ptrCast(@alignCast(stream.private_data));
+    if (pd.col_indices) |ci| pd.handle.allocator.free(ci);
     pd.handle.allocator.destroy(pd);
     stream.release = null;
 }
