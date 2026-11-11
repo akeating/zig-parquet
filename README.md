@@ -340,7 +340,7 @@ while (try batches.next()) |batch| {
 }
 ```
 
-A batch does not span row groups, so the last batch of a row group can have fewer rows. For each row group, the reader holds the selected columns' compressed column chunks and decodes their pages as batches need them.
+A batch does not span row groups, so the last batch of a row group can have fewer rows. The reader reads and decodes pages as batches need them; between batches it holds, per leaf column, one compressed page, the dictionary, and at most one page of decoded entries.
 
 C callers have the same functions as `zp_reader_read_row_group` and `zp_reader_get_stream_columns`. The second returns an `ArrowArrayStream` over the selected columns with `batch_rows` rows per batch, or one batch per row group when `batch_rows` is 0; `zp_reader_get_stream` is the same with all columns and one batch per row group.
 

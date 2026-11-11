@@ -789,11 +789,10 @@ pub const BatchOptions = struct {
 
 /// Reads a file's columns as Arrow arrays, `batch_rows` rows at a time.
 ///
-/// For each row group, the column chunks of the selected columns are read whole when the
-/// row group's first batch is requested. Their pages are decoded as batches need them; a
-/// page's entries past the end of a batch are kept for the next one. Memory held between
-/// calls: the selected columns' compressed chunks of the current row group, their
-/// dictionaries, and at most one page of decoded entries per leaf column.
+/// Pages of the selected columns are read from the source and decoded as batches need them;
+/// a page's entries past the end of a batch are kept for the next one. Memory held between
+/// calls, per leaf column: one compressed page plus up to 1 KiB after it (the start of the
+/// next page header), the dictionary, and at most one page of decoded entries.
 ///
 /// After `next` returns an error, the reader's position is undefined; call `deinit`.
 pub const ArrowBatchReader = struct {
@@ -814,7 +813,6 @@ pub const ArrowBatchReader = struct {
     open: []BatchColumn = &.{},
 
     const BatchLeaf = struct {
-        page_data: []u8,
         cursor: leaf_decoder.ColumnCursor,
         max_def: u32,
         max_rep: u32,
@@ -934,7 +932,7 @@ pub const ArrowBatchReader = struct {
             const leaves = try allocator.alloc(BatchLeaf, node.physical_count);
             var leaf_count: usize = 0;
             errdefer {
-                for (leaves[0..leaf_count]) |*l| freeLeaf(allocator, l);
+                for (leaves[0..leaf_count]) |*l| freeLeaf(l);
                 allocator.free(leaves);
             }
             for (leaves, 0..) |*l, k| {
@@ -943,11 +941,11 @@ pub const ArrowBatchReader = struct {
                 const chunk = &rg.columns[col_idx];
                 const meta = chunk.meta_data orelse return error.InvalidArgument;
                 const info = format.getColumnInfo(self.metadata.schema, col_idx) orelse return error.InvalidArgument;
-                const page_data = try parquet_reader.readColumnChunkData(allocator, self.source, chunk);
-                errdefer allocator.free(page_data);
+                const range = try parquet_reader.columnChunkRange(chunk);
+                const pages = leaf_decoder.PageReader.fromSource(allocator, self.source, range.start, range.size);
                 const reserve = @min(self.batch_rows, safe.castTo(usize, meta.num_values) catch 0);
-                const cursor = try leaf_decoder.ColumnCursor.init(allocator, page_data, meta, info, .{ .keep_levels = node.kind != .leaf }, reserve);
-                l.* = .{ .page_data = page_data, .cursor = cursor, .max_def = info.max_def_level, .max_rep = info.max_rep_level };
+                const cursor = try leaf_decoder.ColumnCursor.init(allocator, pages, meta, info, .{ .keep_levels = node.kind != .leaf }, reserve);
+                l.* = .{ .cursor = cursor, .max_def = info.max_def_level, .max_rep = info.max_rep_level };
                 leaf_count = k + 1;
             }
             col.* = .{ .node = node, .leaves = leaves };
@@ -965,13 +963,12 @@ pub const ArrowBatchReader = struct {
     }
 
     fn freeColumn(allocator: Allocator, col: *BatchColumn) void {
-        for (col.leaves) |*l| freeLeaf(allocator, l);
+        for (col.leaves) |*l| freeLeaf(l);
         allocator.free(col.leaves);
     }
 
-    fn freeLeaf(allocator: Allocator, l: *BatchLeaf) void {
+    fn freeLeaf(l: *BatchLeaf) void {
         l.cursor.deinit();
-        allocator.free(l.page_data);
     }
 };
 

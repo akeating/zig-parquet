@@ -46,10 +46,10 @@ Flat file (`bench_10m.parquet`, 10M rows):
 | arrow score | 48 | 51 | 2,865 | 235 | 17.7 | 36.6 | 19.7 |
 | arrow category | 64 | 64 | 11,907 | 453 | 30.2 | 92.1 | 23.6 |
 | arrow all | 171 | 175 | 17,182 | 896 | 46.5 | 174.6 | 57.6 |
-| batches id | 63 | | 5,523 | 327 | 7.0 | 40.7 | 11.5 |
-| batches score | 54 | | 5,588 | 356 | 10.5 | 44.3 | 18.5 |
-| batches category | 62 | | 15,037 | 454 | 4.5 | 92.9 | 4.2 |
-| batches all | 182 | | 24,290 | 1,137 | 19.8 | 182.5 | 28.4 |
+| batches id | 61 | | 5,533 | 292 | 3.3 | 40.7 | 11.5 |
+| batches score | 50 | | 5,598 | 293 | 3.9 | 44.3 | 18.5 |
+| batches category | 59 | | 15,057 | 442 | 3.2 | 92.9 | 4.2 |
+| batches all | 173 | | 24,330 | 1,027 | 8.2 | 182.5 | 28.4 |
 | rows id | 150 | | 2,630 | 933 | 76.0 | | |
 | rows score | 145 | | 2,685 | 960 | 76.0 | | |
 | rows category | 167 | | 11,737 | 1,216 | 89.0 | | |
@@ -63,16 +63,16 @@ Nested file (`bench_nested_2m.parquet`, 2M rows):
 | arrow point | 32 | 33 | 1,222 | 156 | 37.4 | 29.5 | 51.9 |
 | arrow attrs | 138 | 146 | 1,275 | 410 | 93.1 | 71.9 | 91.3 |
 | arrow all | 268 | 291 | 2,988 | 861 | 136.0 | 155.6 | 134.7 |
-| batches ints | 112 | | 1,734 | 299 | 20.9 | 55.7 | 28.2 |
-| batches point | 33 | | 2,693 | 176 | 13.6 | 30.5 | 19.8 |
-| batches attrs | 161 | | 3,376 | 422 | 19.9 | 71.7 | 25.2 |
-| batches all | 311 | | 7,423 | 897 | 48.3 | 160.6 | 56.9 |
+| batches ints | 110 | | 1,736 | 277 | 9.3 | 55.7 | 28.2 |
+| batches point | 32 | | 2,700 | 162 | 6.0 | 30.5 | 19.8 |
+| batches attrs | 158 | | 3,388 | 404 | 10.3 | 71.7 | 25.2 |
+| batches all | 301 | | 7,444 | 843 | 19.6 | 160.6 | 56.9 |
 | rows ints | 120 | | 591 | 708 | 239.4 | | |
 | rows point | 83 | | 1,128 | 778 | 266.5 | | |
 | rows attrs | 150 | | 1,161 | 994 | 365.1 | | |
 | rows all | 333 | | 2,856 | 1,893 | 526.1 | | |
 
-The batches path holds the selected columns' compressed column chunks of the current row group (13.8 MB for all columns of a flat-file row group) and decodes pages as batches need them; its peak is that plus one batch. It takes 5–8% longer than reading each row group whole: entries past the end of a batch are copied, and there are more allocations.
+The batches path reads and decodes pages as batches need them. Between batches it holds, per leaf column, one compressed page, the dictionary and at most one page of decoded entries; its peak is that plus one batch. Reading all columns took 173 ms (flat) and 301 ms (nested) in batches, against 169 ms and 278 ms for whole row groups in the same run: entries past the end of a batch are copied, and there are more allocations.
 
 The row path writes a `Value` per entry and a `Row` per row. The values of a read are in one block of storage shared by its rows, and string values reference the decoded byte buffers.
 

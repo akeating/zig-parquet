@@ -42,6 +42,7 @@ const types = @import("types.zig");
 const thrift = @import("thrift/mod.zig");
 const compress = @import("compress/mod.zig");
 const parquet_reader = @import("parquet_reader.zig");
+const SeekableReader = parquet_reader.SeekableReader;
 const value_mod = @import("value.zig");
 const Value = value_mod.Value;
 const rle = @import("encoding/rle.zig");
@@ -248,10 +249,115 @@ pub fn decodeLeaf(
     info: format.ColumnInfo,
     options: Options,
 ) !Leaf {
-    var cursor = try ColumnCursor.init(allocator, page_data, meta, info, options, reservedEntries(meta.num_values));
+    var cursor = try ColumnCursor.init(allocator, PageReader.fromMemory(allocator, page_data), meta, info, options, reservedEntries(meta.num_values));
     defer cursor.deinit();
     return cursor.next(std.math.maxInt(usize));
 }
+
+/// The pages of a column chunk, from a buffer holding the whole chunk or read from a source
+/// one page at a time. `next` returns a page's header; its body is read by `body` or passed
+/// over by `skip`.
+pub const PageReader = struct {
+    allocator: Allocator,
+    /// Bytes at offsets `window_start..window_start + window.len`.
+    window: []const u8,
+    window_start: u64,
+    /// Offset of the next unread byte: a page header, or a body after `next`.
+    pos: u64,
+    /// Offset of the end of the chunk.
+    end: u64,
+    /// Size of the body of the header last returned by `next`.
+    body_size: usize = 0,
+    /// When set, `window` is filled from here, into `buf`.
+    source: ?SeekableReader = null,
+    buf: []u8 = &.{},
+
+    /// Bytes read for a page header, and read past a body for the next header. A header
+    /// longer than this is read again with a 4 times longer prefix.
+    const header_prefix: u64 = 1024;
+
+    /// Pages of a chunk held in `data` (offset 0 is the chunk's first byte). `data` is
+    /// borrowed and must outlive the reader.
+    pub fn fromMemory(allocator: Allocator, data: []const u8) PageReader {
+        return .{ .allocator = allocator, .window = data, .window_start = 0, .pos = 0, .end = data.len };
+    }
+
+    /// Pages of the chunk at `start..start + size` of `source`, read as they are needed.
+    pub fn fromSource(allocator: Allocator, source: SeekableReader, start: u64, size: u64) PageReader {
+        return .{ .allocator = allocator, .window = &.{}, .window_start = start, .pos = start, .end = start +| size, .source = source };
+    }
+
+    pub fn deinit(self: *PageReader) void {
+        self.allocator.free(self.buf);
+    }
+
+    /// Whether all pages have been returned.
+    pub fn done(self: *const PageReader) bool {
+        return self.pos >= self.end;
+    }
+
+    /// The next page's header. The caller frees its contents with
+    /// `parquet_reader.freePageHeaderContents`, and calls `body` or `skip` before `next`.
+    pub fn next(self: *PageReader) !format.PageHeader {
+        const remaining = self.end - self.pos;
+        // `@min` with a comptime bound has a narrow type; `want` grows past it.
+        var want: usize = @intCast(@min(remaining, header_prefix));
+        while (true) {
+            const bytes = try self.read(self.pos, want, 0);
+            // The header is skipped first, which does not allocate, to find out whether `bytes`
+            // holds all of it: `PageHeader.parse` does not free what it allocated before
+            // reaching the end of its input.
+            var probe = thrift.CompactReader.init(bytes);
+            probe.skip(.struct_) catch |e| {
+                if (e == error.EndOfData and want < remaining) {
+                    want = @intCast(@min(remaining, want *| 4));
+                    continue;
+                }
+            };
+            var r = thrift.CompactReader.init(bytes);
+            const header = try format.PageHeader.parse(self.allocator, &r);
+            errdefer parquet_reader.freePageHeaderContents(self.allocator, &header);
+            self.body_size = safe.cast(header.compressed_page_size) catch return error.InvalidPageSize;
+            self.pos += r.pos;
+            return header;
+        }
+    }
+
+    /// The body of the page whose header `next` returned, valid until the next call.
+    pub fn body(self: *PageReader) ![]const u8 {
+        if (self.body_size > self.end - self.pos) return error.EndOfData;
+        const bytes = try self.read(self.pos, self.body_size, header_prefix);
+        self.pos += self.body_size;
+        return bytes;
+    }
+
+    /// Passes over the body of the page whose header `next` returned.
+    pub fn skip(self: *PageReader) void {
+        self.pos = @min(self.end, self.pos +| self.body_size);
+    }
+
+    /// Bytes `at..at + n`. When they are not in the window, reads them from the source,
+    /// with up to `extra` more bytes of the chunk after them.
+    fn read(self: *PageReader, at: u64, n: usize, extra: u64) ![]const u8 {
+        if (at >= self.window_start and at - self.window_start <= self.window.len and n <= self.window.len - (at - self.window_start)) {
+            const from: usize = @intCast(at - self.window_start);
+            return self.window[from..][0..n];
+        }
+        const source = self.source orelse return error.EndOfData;
+        const more = @min(extra, self.end - (at + n));
+        const len = std.math.add(usize, n, @intCast(more)) catch return error.OutOfMemory;
+        if (self.buf.len < len) {
+            self.allocator.free(self.buf);
+            self.buf = &.{};
+            self.buf = try self.allocator.alloc(u8, len);
+        }
+        const got = source.readAt(at, self.buf[0..len]) catch return error.InputOutput;
+        if (got < n) return error.InputOutput;
+        self.window = self.buf[0..got];
+        self.window_start = at;
+        return self.window[0..n];
+    }
+};
 
 /// Decodes a leaf column chunk a number of rows at a time. Pages are decoded whole; entries
 /// of a page past the rows returned are kept for the next call, along with the dictionary.
@@ -260,26 +366,28 @@ pub fn decodeLeaf(
 /// before row `n` needs the start of row `n` to have been decoded. Such a column needs
 /// `Options.keep_levels`.
 pub const ColumnCursor = struct {
-    /// Chunk bytes as stored in the file; borrowed, must outlive the cursor.
-    page_data: []const u8,
-    /// Position of the next page header in `page_data`.
-    pos: usize,
+    pages: PageReader,
+    /// A data page header read by `init` while looking for a dictionary page; its body is
+    /// next in `pages`.
+    first: ?format.PageHeader = null,
     checksum: parquet_reader.ChecksumOptions,
     dec: ChunkDecoder,
     /// Entries decoded; those from `start` on are not yet returned.
     builder: Builder,
     start: usize = 0,
 
-    /// Reads the dictionary page, if any. `reserve` is the number of entries to allocate room
-    /// for before the first page.
+    /// Reads the dictionary page, if any. Takes ownership of `pages`, also on error.
+    /// `reserve` is the number of entries to allocate room for before the first page.
     pub fn init(
         allocator: Allocator,
-        page_data: []const u8,
+        pages_in: PageReader,
         meta: format.ColumnMetaData,
         info: format.ColumnInfo,
         options: Options,
         reserve: usize,
     ) !ColumnCursor {
+        var pages = pages_in;
+        errdefer pages.deinit();
         const physical = info.element.type_ orelse return error.InvalidSchema;
         var builder = Builder{
             .allocator = allocator,
@@ -307,29 +415,28 @@ pub const ColumnCursor = struct {
         };
         errdefer dec.deinit();
 
-        var pos: usize = 0;
         // A dictionary page can only be the first page of the chunk.
-        if (pos < page_data.len) {
-            var peek = thrift.CompactReader.init(page_data[pos..]);
-            const first = try format.PageHeader.parse(allocator, &peek);
-            defer parquet_reader.freePageHeaderContents(allocator, &first);
-
-            if (first.dictionary_page_header) |dph| {
-                pos += peek.pos;
-                const size = safe.cast(first.compressed_page_size) catch return error.InvalidPageSize;
-                const body = try safe.slice(page_data, pos, size);
-                pos += size;
-                try checkCrc(options.checksum, first, body);
-                const uncompressed = safe.cast(first.uncompressed_page_size) catch return error.InvalidPageSize;
+        var first: ?format.PageHeader = null;
+        if (!pages.done()) {
+            const header = try pages.next();
+            if (header.dictionary_page_header) |dph| {
+                defer parquet_reader.freePageHeaderContents(allocator, &header);
+                const body = try pages.body();
+                try checkCrc(options.checksum, header, body);
+                const uncompressed = safe.cast(header.uncompressed_page_size) catch return error.InvalidPageSize;
                 const count = safe.cast(dph.num_values) catch return error.InvalidPageSize;
                 try dec.dict_set.initFromPage(body, count, physical, info.element.type_length, meta.codec, uncompressed);
                 try dec.buildDictView();
+            } else {
+                first = header;
             }
         }
-        return .{ .page_data = page_data, .pos = pos, .checksum = options.checksum, .dec = dec, .builder = builder };
+        return .{ .pages = pages, .first = first, .checksum = options.checksum, .dec = dec, .builder = builder };
     }
 
     pub fn deinit(self: *ColumnCursor) void {
+        if (self.first) |*h| parquet_reader.freePageHeaderContents(self.dec.allocator, h);
+        self.pages.deinit();
         self.builder.deinit();
         self.dec.deinit();
     }
@@ -340,7 +447,7 @@ pub const ColumnCursor = struct {
         const repeated = self.dec.info.max_rep_level > 0;
         // A row of a repeated column is complete once the next row has started.
         const need = if (repeated) rows +| 1 else rows;
-        while (self.dec.row_starts < need and self.pos < self.page_data.len) try self.decodeNextPage();
+        while (self.dec.row_starts < need and (self.first != null or !self.pages.done())) try self.decodeNextPage();
         if (self.dec.row_starts < need) return self.take(self.builder.length - self.start, self.dec.row_starts);
         if (!repeated) return self.take(rows, rows);
         if (!self.dec.keep_levels) return error.InvalidArgument;
@@ -436,19 +543,16 @@ pub const ColumnCursor = struct {
     /// Decodes the next data page into `builder`. Other page types are skipped.
     fn decodeNextPage(self: *ColumnCursor) !void {
         const allocator = self.dec.allocator;
-        var reader = thrift.CompactReader.init(self.page_data[self.pos..]);
-        const header = try format.PageHeader.parse(allocator, &reader);
+        const header = if (self.first) |h| h else try self.pages.next();
+        self.first = null;
         defer parquet_reader.freePageHeaderContents(allocator, &header);
-        self.pos += reader.pos;
 
-        const size = safe.cast(header.compressed_page_size) catch return error.InvalidPageSize;
         if (header.data_page_header == null and header.data_page_header_v2 == null) {
             // Index pages and a second dictionary page are skipped.
-            self.pos = std.math.add(usize, self.pos, size) catch self.page_data.len;
+            self.pages.skip();
             return;
         }
-        const body = try safe.slice(self.page_data, self.pos, size);
-        self.pos += size;
+        const body = try self.pages.body();
         try checkCrc(self.checksum, header, body);
 
         if (header.data_page_header) |dph| {

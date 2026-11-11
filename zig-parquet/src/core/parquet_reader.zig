@@ -141,26 +141,31 @@ pub fn readColumnChunkData(
     source: SeekableReader,
     chunk: *const format.ColumnChunk,
 ) ReaderError![]u8 {
-    const meta = chunk.meta_data orelse return error.InvalidArgument;
-
-    // Determine where to start reading
-    // Note: Some writers set dictionary_page_offset=0 to mean "no dictionary"
-    // (0 is invalid as it's before the PAR1 magic bytes)
-    const start_offset: u64 = if (meta.dictionary_page_offset) |dict_off|
-        if (dict_off > 0) try safe.cast(dict_off) else try safe.cast(meta.data_page_offset)
-    else
-        try safe.cast(meta.data_page_offset);
-
-    const size = try safe.cast(meta.total_compressed_size);
+    const range = try columnChunkRange(chunk);
+    const size = try safe.cast(range.size);
 
     // Read the data
     const data = allocator.alloc(u8, size) catch return error.OutOfMemory;
     errdefer allocator.free(data);
 
-    const bytes_read = source.readAt(start_offset, data) catch return error.InputOutput;
+    const bytes_read = source.readAt(range.start, data) catch return error.InputOutput;
     if (bytes_read != size) return error.InputOutput;
 
     return data;
+}
+
+/// Byte range of a column chunk in the file: its first page (the dictionary page if there
+/// is one) and its compressed size.
+pub fn columnChunkRange(chunk: *const format.ColumnChunk) ReaderError!struct { start: u64, size: u64 } {
+    const meta = chunk.meta_data orelse return error.InvalidArgument;
+    // Some writers set dictionary_page_offset=0 to mean "no dictionary" (0 is before the
+    // PAR1 magic bytes).
+    const start: u64 = if (meta.dictionary_page_offset) |dict_off|
+        if (dict_off > 0) try safe.cast(dict_off) else try safe.cast(meta.data_page_offset)
+    else
+        try safe.cast(meta.data_page_offset);
+    const size: u64 = try safe.cast(meta.total_compressed_size);
+    return .{ .start = start, .size = size };
 }
 
 // ============================================================================

@@ -29,6 +29,8 @@ const Totals = struct {
     decoded: usize = 0,
     errors: usize = 0,
     skipped_large: usize = 0,
+    /// Page headers longer than the page reader's first read.
+    long_headers: usize = 0,
 };
 
 test "leaf decoder decodes every leaf column chunk of the test files without leaks" {
@@ -52,8 +54,8 @@ test "leaf decoder decodes every leaf column chunk of the test files without lea
     }
 
     std.debug.print(
-        "\nleaf decoder sweep: {d} files ({d} unreadable), {d} leaf chunks: {d} decoded, {d} errors, {d} skipped (over {d} MiB)\n",
-        .{ totals.files, totals.files_unreadable, totals.chunks, totals.decoded, totals.errors, totals.skipped_large, @divExact(max_sweep_chunk_bytes, 1024 * 1024) },
+        "\nleaf decoder sweep: {d} files ({d} unreadable), {d} leaf chunks: {d} decoded, {d} errors, {d} skipped (over {d} MiB); {d} page headers over 1 KiB\n",
+        .{ totals.files, totals.files_unreadable, totals.chunks, totals.decoded, totals.errors, totals.skipped_large, @divExact(max_sweep_chunk_bytes, 1024 * 1024), totals.long_headers },
     );
     try std.testing.expect(totals.decoded > 0);
 }
@@ -87,6 +89,11 @@ fn decodeFile(allocator: std.mem.Allocator, dir: std.Io.Dir, basename: []const u
                 continue;
             }
             const page_data = parquet_reader.readColumnChunkData(ref, reader.getSource(), chunk) catch continue;
+            const range = try parquet_reader.columnChunkRange(chunk);
+            expectSamePages(allocator, page_data, reader.getSource(), range.start, range.size, totals) catch |err| {
+                std.debug.print("page reader mismatch: {s} column {d}: {s}\n", .{ basename, col, @errorName(err) });
+                return err;
+            };
 
             var leaf = leaf_decoder.decodeLeaf(allocator, page_data, meta, info, .{ .keep_levels = true, .large_offsets = true }) catch {
                 totals.errors += 1;
@@ -125,7 +132,7 @@ fn expectCursorMatches(
     full: *const leaf_decoder.Leaf,
     rows: usize,
 ) !void {
-    var cursor = try leaf_decoder.ColumnCursor.init(allocator, page_data, meta, info, .{ .keep_levels = true, .large_offsets = true }, 0);
+    var cursor = try leaf_decoder.ColumnCursor.init(allocator, leaf_decoder.PageReader.fromMemory(allocator, page_data), meta, info, .{ .keep_levels = true, .large_offsets = true }, 0);
     defer cursor.deinit();
     var at: usize = 0;
     var short = false;
@@ -169,10 +176,89 @@ fn expectCursorMatches(
     try std.testing.expectEqual(full.buffers.length, at);
 }
 
+/// Reads a chunk's pages from memory and from the source, and checks that headers and bodies
+/// agree. Pages whose header cannot be parsed end the comparison, as in the decoder.
+fn expectSamePages(allocator: std.mem.Allocator, page_data: []const u8, source: parquet.SeekableReader, start: u64, size: u64, totals: *Totals) !void {
+    var mem = leaf_decoder.PageReader.fromMemory(allocator, page_data);
+    defer mem.deinit();
+    var src = leaf_decoder.PageReader.fromSource(allocator, source, start, size);
+    defer src.deinit();
+    while (!mem.done()) {
+        try std.testing.expect(!src.done());
+        const before = mem.pos;
+        const a = mem.next() catch |err| {
+            try std.testing.expectError(err, src.next());
+            return;
+        };
+        defer parquet_reader.freePageHeaderContents(allocator, &a);
+        const b = try src.next();
+        defer parquet_reader.freePageHeaderContents(allocator, &b);
+        if (mem.pos - before > 1024) totals.long_headers += 1;
+        try std.testing.expectEqual(a.compressed_page_size, b.compressed_page_size);
+        try std.testing.expectEqual(mem.pos, src.pos - start);
+        const body_a = mem.body() catch |err| {
+            try std.testing.expectError(err, src.body());
+            return;
+        };
+        try std.testing.expectEqualSlices(u8, body_a, try src.body());
+    }
+    try std.testing.expect(src.done());
+}
+
 fn countZeros(levels: []const u32) usize {
     var n: usize = 0;
     for (levels) |lv| n += @intFromBool(lv == 0);
     return n;
+}
+
+test "page reader reads headers longer than its first read" {
+    const allocator = std.testing.allocator;
+    const thrift = @import("../core/thrift/mod.zig");
+
+    // A required INT32 chunk of 3 PLAIN pages of 100 values, each header carrying 3000-byte
+    // statistics.
+    const long_stat: [3000]u8 = @splat('x');
+    var chunk: std.ArrayList(u8) = .empty;
+    defer chunk.deinit(allocator);
+    for (0..3) |p| {
+        var body: [400]u8 = undefined;
+        for (0..100) |i| std.mem.writeInt(i32, body[i * 4 ..][0..4], @intCast(p * 100 + i), .little);
+        const header: format.PageHeader = .{
+            .type_ = .data_page,
+            .uncompressed_page_size = body.len,
+            .compressed_page_size = body.len,
+            .data_page_header = .{ .num_values = 100, .statistics = .{ .max = &long_stat, .min = &long_stat } },
+        };
+        var w = thrift.CompactWriter.init(allocator);
+        defer w.deinit();
+        try header.serialize(&w);
+        try std.testing.expect(w.getWritten().len > 3000);
+        try chunk.appendSlice(allocator, w.getWritten());
+        try chunk.appendSlice(allocator, &body);
+    }
+
+    const meta: format.ColumnMetaData = .{ .type_ = .int32, .num_values = 300, .total_compressed_size = @intCast(chunk.items.len) };
+    const info: format.ColumnInfo = .{
+        .element = .{ .name = "v", .type_ = .int32, .repetition_type = .required },
+        .max_def_level = 0,
+        .max_rep_level = 0,
+        .column_index = 0,
+    };
+    var buffer_reader = parquet.io.BufferReader.init(chunk.items);
+    var cursor = try leaf_decoder.ColumnCursor.init(allocator, leaf_decoder.PageReader.fromSource(allocator, buffer_reader.reader(), 0, chunk.items.len), meta, info, .{}, 0);
+    defer cursor.deinit();
+
+    var expected: i32 = 0;
+    while (true) {
+        var batch = try cursor.next(64);
+        defer batch.deinit(allocator);
+        if (batch.buffers.length == 0) break;
+        for (0..batch.buffers.length) |i| {
+            try std.testing.expectEqual(expected, std.mem.readInt(i32, batch.buffers.values[i * 4 ..][0..4], .little));
+            expected += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(i32, 300), expected);
 }
 
 // =============================================================================
