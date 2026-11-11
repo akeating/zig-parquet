@@ -320,6 +320,7 @@ Buffer layout:
 |---|---|---|---|
 | Primitive (int, float, bool, date, timestamp) | Validity bitmap, LSB first; `null` when the column has no nulls | Values (bool: bit-packed) | — |
 | Fixed-length byte array (UUID, interval, …) | Validity bitmap | Bytes, fixed width per entry (`w:N` in the schema) | — |
+| Decimal | Validity bitmap | Little-endian two's complement: 16 bytes per entry up to precision 38 (`d:p,s`, decimal128), 32 above (`d:p,s,256`, decimal256), whatever the Parquet storage | — |
 | Byte array / string | Validity bitmap | `i32` offsets, `length + 1` entries | Bytes |
 | List, struct, map | Validity bitmap | Offsets (list, map) | — (values are in `children`) |
 

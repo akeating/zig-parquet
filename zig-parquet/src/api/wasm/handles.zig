@@ -305,7 +305,7 @@ pub const WriterHandle = struct {
             for (names) |n| allocator.free(n);
             allocator.free(names);
         }
-        if (self.column_defs) |defs| allocator.free(defs);
+        if (self.column_defs) |defs| arrow_batch.freeImportedColumnDefs(allocator, defs);
 
         switch (self.backend) {
             .buffer => |bt| {

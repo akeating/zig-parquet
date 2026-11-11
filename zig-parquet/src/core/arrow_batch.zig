@@ -241,7 +241,7 @@ fn nodeSchema(allocator: Allocator, schema: []const format.SchemaElement, node: 
 /// Caller must free the returned sentinel-terminated slice.
 fn parquetTypeToArrowFormat(allocator: Allocator, elem: format.SchemaElement) SchemaConvError![:0]u8 {
     if (elem.logical_type) |lt| {
-        return logicalTypeToArrowFormat(allocator, lt, elem);
+        return logicalTypeToArrowFormat(allocator, lt);
     }
 
     if (elem.converted_type) |ct| {
@@ -251,7 +251,7 @@ fn parquetTypeToArrowFormat(allocator: Allocator, elem: format.SchemaElement) Sc
     return physicalTypeToArrowFormat(allocator, elem);
 }
 
-fn logicalTypeToArrowFormat(allocator: Allocator, lt: format.LogicalType, elem: format.SchemaElement) SchemaConvError![:0]u8 {
+fn logicalTypeToArrowFormat(allocator: Allocator, lt: format.LogicalType) SchemaConvError![:0]u8 {
     return switch (lt) {
         .string => allocator.dupeSentinel(u8, "u", 0),
         .enum_ => allocator.dupeSentinel(u8, "u", 0),
@@ -295,16 +295,16 @@ fn logicalTypeToArrowFormat(allocator: Allocator, lt: format.LogicalType, elem: 
             .micros => allocator.dupeSentinel(u8, "ttu", 0),
             .nanos => allocator.dupeSentinel(u8, "ttn", 0),
         },
-        .decimal => |d| {
-            if (elem.type_) |pt| {
-                if (pt == .fixed_len_byte_array) {
-                    const tl = elem.type_length orelse 0;
-                    return fmtZ(allocator, "d:{d},{d},{d}", .{ d.precision, d.scale, tl });
-                }
-            }
-            return fmtZ(allocator, "d:{d},{d}", .{ d.precision, d.scale });
-        },
+        .decimal => |d| decimalFormat(allocator, d.precision, d.scale),
     };
+}
+
+/// Arrow format of a decimal read from Parquet: decimal128 ("d:p,s", 16 bytes per entry) up
+/// to precision 38, decimal256 ("d:p,s,256", 32 bytes) up to 76, as PyArrow reads them.
+fn decimalFormat(allocator: Allocator, precision: i32, scale: i32) SchemaConvError![:0]u8 {
+    if (precision < 1 or precision > 76) return error.UnsupportedType;
+    if (precision <= 38) return fmtZ(allocator, "d:{d},{d}", .{ precision, scale });
+    return fmtZ(allocator, "d:{d},{d},256", .{ precision, scale });
 }
 
 fn convertedTypeToArrowFormat(allocator: Allocator, ct: i32, elem: format.SchemaElement) SchemaConvError![:0]u8 {
@@ -327,11 +327,7 @@ fn convertedTypeToArrowFormat(allocator: Allocator, ct: i32, elem: format.Schema
         format.ConvertedType.JSON => allocator.dupeSentinel(u8, "u", 0),
         format.ConvertedType.BSON => allocator.dupeSentinel(u8, "z", 0),
         format.ConvertedType.INTERVAL => allocator.dupeSentinel(u8, "w:12", 0),
-        format.ConvertedType.DECIMAL => blk: {
-            const p = elem.precision orelse 0;
-            const s = elem.scale orelse 0;
-            break :blk fmtZ(allocator, "d:{d},{d}", .{ p, s });
-        },
+        format.ConvertedType.DECIMAL => decimalFormat(allocator, elem.precision orelse 0, elem.scale orelse 0),
         else => physicalTypeToArrowFormat(allocator, elem),
     };
 }
@@ -382,8 +378,30 @@ pub fn importSchemaFromArrow(allocator: Allocator, schema: *const ArrowSchema) !
 /// Free ColumnDef[] returned by importSchemaFromArrow, including any
 /// heap-allocated struct_fields within individual column definitions.
 pub fn freeImportedColumnDefs(allocator: Allocator, col_defs: []ColumnDef) void {
-    for (col_defs) |*cd| cd.freeStructFields(allocator);
+    for (col_defs) |*cd| {
+        cd.freeStructFields(allocator);
+        if (cd.schema_node) |node| freeSchemaNode(allocator, node);
+        cd.schema_node = null;
+    }
     allocator.free(col_defs);
+}
+
+/// Frees a schema node tree allocated by `arrowSchemaToSchemaNode`.
+fn freeSchemaNode(allocator: Allocator, node: *const SchemaNode) void {
+    switch (node.*) {
+        .optional => |inner| freeSchemaNode(allocator, inner),
+        .list => |element| freeSchemaNode(allocator, element),
+        .map => |m| {
+            freeSchemaNode(allocator, m.key);
+            freeSchemaNode(allocator, m.value);
+        },
+        .struct_ => |st| {
+            for (st.fields) |field| freeSchemaNode(allocator, field.node);
+            allocator.free(st.fields);
+        },
+        else => {},
+    }
+    allocator.destroy(node);
 }
 
 fn arrowSchemaToColumnDef(allocator: Allocator, schema: *const ArrowSchema) !ColumnDef {
@@ -408,10 +426,15 @@ fn hasNestedFormat(fmt: []const u8) bool {
     return fmt.len >= 2 and fmt[0] == '+';
 }
 
+/// Allocates the schema node tree of an Arrow schema; free it with `freeSchemaNode`.
 fn arrowSchemaToSchemaNode(allocator: Allocator, schema: *const ArrowSchema, nullable: bool) !*const SchemaNode {
     const fmt = std.mem.sliceTo(schema.format, 0);
 
+    // The optional wrapper is allocated first, so nothing can fail after the children exist.
+    const opt_node: ?*SchemaNode = if (nullable) allocator.create(SchemaNode) catch return error.OutOfMemory else null;
+    errdefer if (opt_node) |o| allocator.destroy(o);
     const node = allocator.create(SchemaNode) catch return error.OutOfMemory;
+    errdefer allocator.destroy(node);
 
     if (std.mem.eql(u8, fmt, "+l") or std.mem.eql(u8, fmt, "+L")) {
         if (schema.n_children != 1) return error.InvalidSchema;
@@ -424,6 +447,11 @@ fn arrowSchemaToSchemaNode(allocator: Allocator, schema: *const ArrowSchema, nul
         const nc = safe.castTo(usize, schema.n_children) catch return error.InvalidSchema;
         const children: [*]*ArrowSchema = schema.children orelse return error.InvalidSchema;
         const fields = allocator.alloc(SchemaNode.Field, nc) catch return error.OutOfMemory;
+        var built: usize = 0;
+        errdefer {
+            for (fields[0..built]) |f| freeSchemaNode(allocator, f.node);
+            allocator.free(fields);
+        }
         for (0..nc) |i| {
             const child = children[i];
             const child_name = if (child.name) |n| std.mem.sliceTo(n, 0) else "";
@@ -432,6 +460,7 @@ fn arrowSchemaToSchemaNode(allocator: Allocator, schema: *const ArrowSchema, nul
                 .name = child_name,
                 .node = try arrowSchemaToSchemaNode(allocator, child, child_nullable),
             };
+            built = i + 1;
         }
         node.* = .{ .struct_ = .{ .fields = fields } };
     } else if (std.mem.eql(u8, fmt, "+m")) {
@@ -441,6 +470,7 @@ fn arrowSchemaToSchemaNode(allocator: Allocator, schema: *const ArrowSchema, nul
         if (entries_sch.n_children != 2) return error.InvalidSchema;
         const kv_children: [*]*ArrowSchema = entries_sch.children orelse return error.InvalidSchema;
         const key_node = try arrowSchemaToSchemaNode(allocator, kv_children[0], false);
+        errdefer freeSchemaNode(allocator, key_node);
         const val_nullable = (kv_children[1].flags & arrow.ARROW_FLAG_NULLABLE) != 0;
         const val_node = try arrowSchemaToSchemaNode(allocator, kv_children[1], val_nullable);
         node.* = .{ .map = .{ .key = key_node, .value = val_node } };
@@ -448,12 +478,10 @@ fn arrowSchemaToSchemaNode(allocator: Allocator, schema: *const ArrowSchema, nul
         node.* = try arrowFormatToSchemaNode(fmt);
     }
 
-    if (nullable) {
-        const opt_node = allocator.create(SchemaNode) catch return error.OutOfMemory;
-        opt_node.* = .{ .optional = node };
-        return opt_node;
+    if (opt_node) |o| {
+        o.* = .{ .optional = node };
+        return o;
     }
-
     return node;
 }
 
@@ -520,18 +548,15 @@ const ArrowFormatInfo = struct {
             const scale_str = parts.next() orelse return error.InvalidSchema;
             const precision = std.fmt.parseInt(i32, prec_str, 10) catch return error.InvalidSchema;
             const scale = std.fmt.parseInt(i32, scale_str, 10) catch return error.InvalidSchema;
-
-            if (parts.next()) |bw_str| {
-                const bw = std.fmt.parseInt(i32, bw_str, 10) catch return error.InvalidSchema;
-                return .{ .physical_type = .fixed_len_byte_array, .type_length = bw, .logical_type = .{ .decimal = .{ .precision = precision, .scale = scale } } };
-            } else if (precision <= 9) {
-                return .{ .physical_type = .int32, .logical_type = .{ .decimal = .{ .precision = precision, .scale = scale } } };
-            } else if (precision <= 18) {
-                return .{ .physical_type = .int64, .logical_type = .{ .decimal = .{ .precision = precision, .scale = scale } } };
-            } else {
-                const bw = safe.castTo(i32, decimalByteLength(precision)) catch unreachable; // decimalByteLength max is 16
-                return .{ .physical_type = .fixed_len_byte_array, .type_length = bw, .logical_type = .{ .decimal = .{ .precision = precision, .scale = scale } } };
-            }
+            // The bit width (32, 64, 128, 256) is the Arrow layout; the Parquet storage follows
+            // from the precision.
+            _ = arrowDecimalWidth(fmt) catch return error.InvalidSchema;
+            if (precision < 1 or precision > 76) return error.InvalidSchema;
+            const decimal: format.LogicalType = .{ .decimal = .{ .precision = precision, .scale = scale } };
+            if (precision <= 9) return .{ .physical_type = .int32, .logical_type = decimal };
+            if (precision <= 18) return .{ .physical_type = .int64, .logical_type = decimal };
+            const len = safe.castTo(i32, decimalStorageBytes(precision)) catch unreachable; // at most 32
+            return .{ .physical_type = .fixed_len_byte_array, .type_length = len, .logical_type = decimal };
         }
         return error.UnsupportedType;
     }
@@ -634,16 +659,23 @@ fn arrowStructToColumnDef(allocator: Allocator, schema: *const ArrowSchema, name
     const nc = safe.castTo(usize, schema.n_children) catch return error.InvalidSchema;
     const children: [*]*ArrowSchema = schema.children orelse return error.InvalidSchema;
 
-    var has_nested = false;
+    // Structs with nested or FIXED_LEN_BYTE_ARRAY fields are written from a schema node; the
+    // flat struct field writer handles neither.
+    var needs_node = false;
     for (0..nc) |i| {
         const child_fmt = std.mem.sliceTo(children[i].format, 0);
         if (hasNestedFormat(child_fmt)) {
-            has_nested = true;
+            needs_node = true;
+            break;
+        }
+        const info = ArrowFormatInfo.parse(child_fmt) catch continue;
+        if (info.physical_type == .fixed_len_byte_array) {
+            needs_node = true;
             break;
         }
     }
 
-    if (has_nested) {
+    if (needs_node) {
         const node = try arrowSchemaToSchemaNode(allocator, schema, nullable);
         return ColumnDef.fromNode(name, node);
     }
@@ -982,8 +1014,8 @@ pub const ArrowBatchReader = struct {
             l.max_rep = levels.max_rep;
             joined = k + 1;
         }
-        if (node.kind == .leaf) return buffersToArrow(allocator, leaves[0].leaf.buffers.takeAll());
-        return assembleNode(allocator, node, leaves, node.physical_start);
+        if (node.kind == .leaf) return leafToArrow(allocator, leaves[0].leaf.buffers.takeAll(), self.metadata.schema[node.schema_idx]);
+        return assembleNode(allocator, self.metadata.schema, node, leaves, node.physical_start);
     }
 
     fn openRowGroup(self: *ArrowBatchReader, rg_index: usize) !void {
@@ -1083,12 +1115,12 @@ fn readNestedColumn(
         l.max_rep = info.max_rep_level;
         decoded = k + 1;
     }
-    return assembleNode(allocator, node, leaves, node.physical_start);
+    return assembleNode(allocator, metadata.schema, node, leaves, node.physical_start);
 }
 
 /// Assembles `node` from its decoded leaves; `leaves[k]` is leaf column `base + k`.
 /// Shapes are computed from the node's first leaf before the children take their buffers.
-fn assembleNode(allocator: Allocator, node: *const Node, leaves: []NestedLeaf, base: usize) ReaderError!ArrowArray {
+fn assembleNode(allocator: Allocator, schema: []const format.SchemaElement, node: *const Node, leaves: []NestedLeaf, base: usize) ReaderError!ArrowArray {
     const first = &leaves[node.physical_start - base];
     switch (node.kind) {
         .leaf => {
@@ -1099,7 +1131,7 @@ fn assembleNode(allocator: Allocator, node: *const Node, leaves: []NestedLeaf, b
                     return asErrorOf(ReaderError, e)
             else
                 first.leaf.buffers.takeAll();
-            return buffersToArrow(allocator, bufs);
+            return leafToArrow(allocator, bufs, schema[node.schema_idx]);
         },
         .struct_ => {
             const shape = try levelShape(allocator, first.leaf.def_levels, first.leaf.rep_levels, first.entries, node.levels, false);
@@ -1114,7 +1146,7 @@ fn assembleNode(allocator: Allocator, node: *const Node, leaves: []NestedLeaf, b
                 allocator.free(children);
             };
             for (node.children, 0..) |*child, i| {
-                children[i] = try assembleNode(allocator, child, leaves, base);
+                children[i] = try assembleNode(allocator, schema, child, leaves, base);
                 init_count = i + 1;
                 if (children[i].length != shape.length) return error.InvalidPageData;
             }
@@ -1130,7 +1162,7 @@ fn assembleNode(allocator: Allocator, node: *const Node, leaves: []NestedLeaf, b
                 allocator.free(shape.validity);
                 allocator.free(shape.offsets.?);
             };
-            var child = try assembleNode(allocator, &node.children[0], leaves, base);
+            var child = try assembleNode(allocator, schema, &node.children[0], leaves, base);
             errdefer if (child.release != null) child.doRelease();
             if (child.length != shape.elements) return error.InvalidPageData;
             const array = try buildListArray(allocator, shape.length, shape.null_count, shape.validity, shape.offsets.?, &child);
@@ -1138,6 +1170,85 @@ fn assembleNode(allocator: Allocator, node: *const Node, leaves: []NestedLeaf, b
             return array;
         },
     }
+}
+
+/// Wraps a leaf's decoded buffers in an ArrowArray, converting decimals to Arrow's layout.
+/// Takes ownership of `bufs` (they are freed on error).
+fn leafToArrow(allocator: Allocator, bufs: leaf_decoder.Buffers, elem: format.SchemaElement) ReaderError!ArrowArray {
+    const d = decimalOf(elem) orelse return buffersToArrow(allocator, bufs);
+    return buffersToArrow(allocator, try decimalToArrow(allocator, bufs, elem.type_ orelse return error.InvalidSchema, d.precision));
+}
+
+const DecimalParams = struct { precision: i32, scale: i32 };
+
+/// Precision and scale of a decimal leaf, from its logical type or DECIMAL converted type.
+fn decimalOf(elem: format.SchemaElement) ?DecimalParams {
+    if (elem.logical_type) |lt| return switch (lt) {
+        .decimal => |d| .{ .precision = d.precision, .scale = d.scale },
+        else => null,
+    };
+    const ct = elem.converted_type orelse return null;
+    if (ct != format.ConvertedType.DECIMAL) return null;
+    return .{ .precision = elem.precision orelse 0, .scale = elem.scale orelse 0 };
+}
+
+/// Rewrites a decimal leaf's values as Arrow decimal128 (precision up to 38) or decimal256 (up
+/// to 76): 16 or 32 bytes per entry, little-endian two's complement. Parquet stores them as
+/// native INT32 or INT64, or as big-endian two's complement bytes (FIXED_LEN_BYTE_ARRAY,
+/// BYTE_ARRAY). Takes ownership of `bufs`; the validity bitmap is kept.
+fn decimalToArrow(allocator: Allocator, bufs: leaf_decoder.Buffers, physical: format.PhysicalType, precision: i32) ReaderError!leaf_decoder.Buffers {
+    var src = bufs;
+    errdefer src.deinit(allocator);
+    if (precision < 1 or precision > 76) return error.UnsupportedType;
+    const width: usize = if (precision <= 38) 16 else 32;
+    const n = src.length;
+    const values = try allocBuffer(allocator, std.math.mul(usize, n, width) catch return error.IntegerOverflow);
+    errdefer allocator.free(values);
+    for (0..n) |i| {
+        const v: i256 = switch (physical) {
+            .int32 => std.mem.bytesToValue(i32, src.values[i * 4 ..][0..4]),
+            .int64 => std.mem.bytesToValue(i64, src.values[i * 8 ..][0..8]),
+            .fixed_len_byte_array => blk: {
+                const w = src.layout.fixed;
+                break :blk bigEndianToInt(src.values[i * w ..][0..w]) orelse return error.InvalidPageData;
+            },
+            .byte_array => bigEndianToInt(src.bytesAt(i)) orelse return error.InvalidPageData,
+            else => return error.InvalidSchema,
+        };
+        const out = values[i * width ..][0..width];
+        if (width == 16) {
+            std.mem.writeInt(i128, out[0..16], std.math.cast(i128, v) orelse return error.InvalidPageData, .little);
+        } else {
+            std.mem.writeInt(i256, out[0..32], v, .little);
+        }
+    }
+    allocator.free(src.values);
+    if (src.offsets) |o| allocator.free(o);
+    return .{
+        .length = n,
+        .null_count = src.null_count,
+        .validity = src.validity,
+        .values = values,
+        .offsets = null,
+        .layout = .{ .fixed = width },
+    };
+}
+
+/// A big-endian two's complement integer of any length, or null when it does not fit in i256.
+fn bigEndianToInt(b: []const u8) ?i256 {
+    if (b.len == 0) return 0;
+    const negative = b[0] & 0x80 != 0;
+    var start: usize = 0;
+    if (b.len > 32) {
+        // Bytes before the last 32 must only extend the sign.
+        start = b.len - 32;
+        const pad: u8 = if (negative) 0xFF else 0;
+        for (b[0..start]) |x| if (x != pad) return null;
+        if ((b[start] & 0x80 != 0) != negative) return null;
+    }
+    var u: u256 = if (negative) std.math.maxInt(u256) else 0;
+    for (b[start..]) |x| u = (u << 8) | x;
+    return @bitCast(u);
 }
 
 /// Wraps decoded buffers in an ArrowArray, taking ownership of them (they are freed on error).
@@ -1277,7 +1388,7 @@ fn readColumnAsArrow(
 
     const leaf = leaf_decoder.decodeLeaf(allocator, page_data, meta, column_info, .{}) catch |e|
         return asErrorOf(ReaderError, e);
-    return buffersToArrow(allocator, leaf.buffers);
+    return leafToArrow(allocator, leaf.buffers, column_info.element);
 }
 
 /// Decodes a flat column chunk (see `leaf_decoder.isFlat`) directly into an ArrowArray.
@@ -1288,7 +1399,7 @@ pub fn decodeFlatChunk(
     column_info: format.ColumnInfo,
 ) ReaderError!ArrowArray {
     const bufs = try leaf_decoder.decodeChunk(allocator, page_data, meta, column_info);
-    return buffersToArrow(allocator, bufs);
+    return leafToArrow(allocator, bufs, column_info.element);
 }
 
 // ============================================================================
@@ -1476,29 +1587,20 @@ fn writeArrowColumnToParquet(
         return;
     }
 
-    // Decimal
+    // Decimal: converted to the column's Parquet storage first.
     if (fmt.len >= 4 and fmt[0] == 'd' and fmt[1] == ':') {
-        // Determine backing type from the Writer's column def
-        if (col_idx < writer.columns.len) {
-            const col_def = &writer.columns[col_idx];
-            switch (col_def.type_) {
-                .int32 => {
-                    try writeTypedColumn(i32, writer, allocator, col_idx, arr, n);
-                    return;
-                },
-                .int64 => {
-                    try writeTypedColumn(i64, writer, allocator, col_idx, arr, n);
-                    return;
-                },
-                .fixed_len_byte_array => {
-                    const tl = safe.castTo(usize, col_def.type_length orelse return error.InvalidFixedLength) catch return error.IntegerOverflow;
-                    try writeFixedByteArrayColumn(writer, allocator, col_idx, arr, n, tl);
-                    return;
-                },
-                else => {},
-            }
+        if (col_idx >= writer.columns.len) return error.TypeMismatch;
+        const col_def = &writer.columns[col_idx];
+        var buffers: [2]?*anyopaque = undefined;
+        const conv = try decimalToParquet(allocator, arr, fmt, col_def, &buffers);
+        defer allocator.free(conv.data);
+        switch (col_def.type_) {
+            .int32 => try writeTypedColumn(i32, writer, allocator, col_idx, conv.array, n),
+            .int64 => try writeTypedColumn(i64, writer, allocator, col_idx, conv.array, n),
+            .fixed_len_byte_array => try writeFixedByteArrayColumn(writer, allocator, col_idx, conv.array, n, conv.width),
+            else => return error.TypeMismatch,
         }
-        return error.TypeMismatch;
+        return;
     }
 
     // LIST
@@ -1568,10 +1670,11 @@ fn arrowToValue(allocator: Allocator, arr: ArrowArray, sch: ArrowSchema, idx: us
         return arrowMapToValue(allocator, arr, sch, idx);
     }
 
-    return arrowLeafToValue(arr, fmt, idx);
+    return arrowLeafToValue(allocator, arr, fmt, idx);
 }
 
-fn arrowLeafToValue(arr: ArrowArray, fmt: []const u8, idx: usize) ArrowValueError!Value {
+/// `allocator` holds the bytes of FIXED_LEN_BYTE_ARRAY decimal values.
+fn arrowLeafToValue(allocator: Allocator, arr: ArrowArray, fmt: []const u8, idx: usize) ArrowValueError!Value {
     if (fmt.len == 1) {
         switch (fmt[0]) {
             'b' => {
@@ -1675,29 +1778,19 @@ fn arrowLeafToValue(arr: ArrowArray, fmt: []const u8, idx: usize) ArrowValueErro
         return .{ .fixed_bytes_val = data[idx * type_len ..][0..type_len] };
     }
     if (fmt.len >= 4 and fmt[0] == 'd' and fmt[1] == ':') {
-        // Decimal: stored as int32, int64, or fixed bytes depending on precision
-        // We infer from Arrow's buffer layout (int128 for decimal128, etc.)
-        const params = fmt[2..];
-        var parts = std.mem.splitScalar(u8, params, ',');
-        const prec_str = parts.next() orelse return error.InvalidSchema;
-        _ = parts.next() orelse return error.InvalidSchema;
-        const precision = std.fmt.parseInt(i32, prec_str, 10) catch return error.InvalidSchema;
-
-        if (parts.next()) |bw_str| {
-            const bw = std.fmt.parseInt(usize, bw_str, 10) catch return error.InvalidSchema;
-            const data: [*]const u8 = @ptrCast(@alignCast(arr.buffers[1].?));
-            return .{ .fixed_bytes_val = data[idx * bw ..][0..bw] };
-        } else if (precision <= 9) {
-            const data: [*]const i32 = @ptrCast(@alignCast(arr.buffers[1].?));
-            return .{ .int32_val = data[idx] };
-        } else if (precision <= 18) {
-            const data: [*]const i64 = @ptrCast(@alignCast(arr.buffers[1].?));
-            return .{ .int64_val = data[idx] };
-        } else {
-            const bw = decimalByteLength(precision);
-            const data: [*]const u8 = @ptrCast(@alignCast(arr.buffers[1].?));
-            return .{ .fixed_bytes_val = data[idx * bw ..][0..bw] };
-        }
+        // Decimal: the Arrow value, as the Parquet storage its precision maps to (see
+        // ArrowFormatInfo): i32 up to 9 digits, i64 up to 18, big-endian bytes above.
+        var parts = std.mem.splitScalar(u8, fmt[2..], ',');
+        const precision = std.fmt.parseInt(i32, parts.next() orelse return error.InvalidSchema, 10) catch return error.InvalidSchema;
+        const width = arrowDecimalWidth(fmt) catch return error.InvalidSchema;
+        const data: [*]const u8 = @ptrCast(arr.buffers[1] orelse return error.InvalidSchema);
+        const value = arrowDecimalAt(data, width, idx);
+        if (precision <= 9) return .{ .int32_val = std.math.cast(i32, value) orelse return error.IntegerOverflow };
+        if (precision <= 18) return .{ .int64_val = std.math.cast(i64, value) orelse return error.IntegerOverflow };
+        if (precision > 76) return error.InvalidSchema;
+        const bytes = allocator.alloc(u8, decimalStorageBytes(precision)) catch return error.OutOfMemory;
+        if (!intToBigEndian(value, bytes)) return error.IntegerOverflow;
+        return .{ .fixed_bytes_val = bytes };
     }
 
     return error.UnsupportedType;
@@ -1841,7 +1934,7 @@ fn writeListFromArrow(
         return;
     }
     if (child_fmt.len >= 4 and child_fmt[0] == 'd' and child_fmt[1] == ':') {
-        try writeListColumnDecimal(writer, allocator, col_idx, arr, child_arr.*, n);
+        try writeListColumnDecimal(writer, allocator, col_idx, arr, child_arr.*, child_fmt, n);
         return;
     }
 
@@ -2256,17 +2349,18 @@ fn writeListColumnDecimal(
     col_idx: usize,
     parent_arr: ArrowArray,
     child_arr: ArrowArray,
+    child_fmt: []const u8,
     n: usize,
 ) WriterError!void {
     if (col_idx >= writer.columns.len) return error.TypeMismatch;
     const col_def = &writer.columns[col_idx];
+    var buffers: [2]?*anyopaque = undefined;
+    const conv = try decimalToParquet(allocator, child_arr, child_fmt, col_def, &buffers);
+    defer allocator.free(conv.data);
     switch (col_def.type_) {
-        .int32 => try writeListColumnTyped(i32, writer, allocator, col_idx, parent_arr, child_arr, n),
-        .int64 => try writeListColumnTyped(i64, writer, allocator, col_idx, parent_arr, child_arr, n),
-        .fixed_len_byte_array => {
-            const tl = safe.castTo(usize, col_def.type_length orelse return error.InvalidFixedLength) catch return error.IntegerOverflow;
-            try writeListColumnFixedByteArray(writer, allocator, col_idx, parent_arr, child_arr, n, tl);
-        },
+        .int32 => try writeListColumnTyped(i32, writer, allocator, col_idx, parent_arr, conv.array, n),
+        .int64 => try writeListColumnTyped(i64, writer, allocator, col_idx, parent_arr, conv.array, n),
+        .fixed_len_byte_array => try writeListColumnFixedByteArray(writer, allocator, col_idx, parent_arr, conv.array, n, conv.width),
         else => return error.TypeMismatch,
     }
 }
@@ -2366,7 +2460,7 @@ fn writeStructFieldFromArrow(
         return;
     }
     if (child_fmt.len >= 4 and child_fmt[0] == 'd' and child_fmt[1] == ':') {
-        try writeStructFieldDecimal(writer, allocator, struct_col_idx, field_idx, child_arr, n, parent_nulls);
+        try writeStructFieldDecimal(writer, allocator, struct_col_idx, field_idx, child_arr, child_fmt, n, parent_nulls);
         return;
     }
 
@@ -2610,21 +2704,119 @@ fn writeStructFieldDecimal(
     struct_col_idx: usize,
     field_idx: usize,
     child_arr: ArrowArray,
+    child_fmt: []const u8,
     n: usize,
     parent_nulls: []const bool,
 ) WriterError!void {
-    const phys_col_idx = struct_col_idx + 1 + field_idx;
-    if (phys_col_idx >= writer.columns.len) return error.TypeMismatch;
-    const col_def = &writer.columns[phys_col_idx];
+    if (struct_col_idx >= writer.columns.len) return error.TypeMismatch;
+    const fields = writer.columns[struct_col_idx].struct_fields orelse return error.TypeMismatch;
+    if (field_idx >= fields.len) return error.TypeMismatch;
+    // Flat struct decimal fields are INT32 or INT64; wider ones take the schema node path.
+    const field_def: ColumnDef = .{ .name = fields[field_idx].name, .type_ = fields[field_idx].type_ };
+    const col_def = &field_def;
+    var buffers: [2]?*anyopaque = undefined;
+    const conv = try decimalToParquet(allocator, child_arr, child_fmt, col_def, &buffers);
+    defer allocator.free(conv.data);
     switch (col_def.type_) {
-        .int32 => try writeStructFieldTyped(i32, writer, allocator, struct_col_idx, field_idx, child_arr, n, parent_nulls),
-        .int64 => try writeStructFieldTyped(i64, writer, allocator, struct_col_idx, field_idx, child_arr, n, parent_nulls),
-        .fixed_len_byte_array => {
-            const tl = safe.castTo(usize, col_def.type_length orelse return error.InvalidFixedLength) catch return error.IntegerOverflow;
-            try writeStructFieldFixedByteArray(writer, allocator, struct_col_idx, field_idx, child_arr, n, parent_nulls, tl);
-        },
+        .int32 => try writeStructFieldTyped(i32, writer, allocator, struct_col_idx, field_idx, conv.array, n, parent_nulls),
+        .int64 => try writeStructFieldTyped(i64, writer, allocator, struct_col_idx, field_idx, conv.array, n, parent_nulls),
         else => return error.TypeMismatch,
     }
+}
+
+/// Bytes per entry of an Arrow decimal format "d:p,s[,bit width]": 16 (decimal128) without a
+/// bit width; 4, 8, 16 or 32 for a bit width of 32, 64, 128 or 256.
+fn arrowDecimalWidth(fmt: []const u8) error{InvalidSchema}!usize {
+    var parts = std.mem.splitScalar(u8, fmt[2..], ',');
+    _ = parts.next();
+    _ = parts.next();
+    const bits = parts.next() orelse return 16;
+    return switch (std.fmt.parseInt(u16, bits, 10) catch return error.InvalidSchema) {
+        32 => 4,
+        64 => 8,
+        128 => 16,
+        256 => 32,
+        else => error.InvalidSchema,
+    };
+}
+
+/// Bytes of the FIXED_LEN_BYTE_ARRAY storage of a decimal of `precision` (1 to 76): the
+/// fewest that hold every value of that many digits.
+fn decimalStorageBytes(precision: i32) usize {
+    if (precision <= 38) return decimalByteLength(precision);
+    // ceil((precision * log2(10) + 1) / 8)
+    const bits = @as(f64, @floatFromInt(precision)) * std.math.log2(10.0) + 1.0;
+    return @intFromFloat(@ceil(bits / 8.0));
+}
+
+/// Arrow decimal entry `i`: little-endian two's complement of `width` bytes.
+fn arrowDecimalAt(data: [*]const u8, width: usize, i: usize) i256 {
+    return switch (width) {
+        4 => std.mem.readInt(i32, data[i * 4 ..][0..4], .little),
+        8 => std.mem.readInt(i64, data[i * 8 ..][0..8], .little),
+        16 => std.mem.readInt(i128, data[i * 16 ..][0..16], .little),
+        else => std.mem.readInt(i256, data[i * 32 ..][0..32], .little),
+    };
+}
+
+/// Writes `v` as big-endian two's complement into `out`, or returns false when it does not fit.
+fn intToBigEndian(v: i256, out: []u8) bool {
+    var u: u256 = @bitCast(v);
+    var k = out.len;
+    while (k > 0) {
+        k -= 1;
+        out[k] = @truncate(u);
+        u = @bitCast(@as(i256, @bitCast(u)) >> 8);
+    }
+    // What is left must be the sign extension of the bytes written.
+    const sign_ok = if (out.len > 0) (out[0] & 0x80 != 0) == (v < 0) else v == 0;
+    const rest: i256 = @bitCast(u);
+    return sign_ok and rest == (if (v < 0) @as(i256, -1) else 0);
+}
+
+const DecimalConversion = struct {
+    /// `arr` with its values buffer replaced by `data`.
+    array: ArrowArray,
+    /// Converted values; the caller frees them.
+    data: []align(16) u8,
+    /// Bytes per converted value.
+    width: usize,
+};
+
+/// Converts the values of Arrow decimal array `arr` (format `fmt`) to the Parquet storage of
+/// `col_def`: native i32 or i64, or big-endian bytes of the column's type length. Null
+/// entries become 0. A value that does not fit the storage returns `error.IntegerOverflow`.
+/// `buffers` holds the returned array's buffer pointers and must outlive it.
+fn decimalToParquet(allocator: Allocator, arr: ArrowArray, fmt: []const u8, col_def: *const ColumnDef, buffers: *[2]?*anyopaque) WriterError!DecimalConversion {
+    const src_width = arrowDecimalWidth(fmt) catch return error.TypeMismatch;
+    const n = safe.castTo(usize, arr.length) catch return error.IntegerOverflow;
+    const width: usize = switch (col_def.type_) {
+        .int32 => 4,
+        .int64 => 8,
+        .fixed_len_byte_array => safe.castTo(usize, col_def.type_length orelse return error.InvalidFixedLength) catch return error.IntegerOverflow,
+        else => return error.TypeMismatch,
+    };
+    const data = allocator.alignedAlloc(u8, .@"16", std.math.mul(usize, n, width) catch return error.IntegerOverflow) catch return error.OutOfMemory;
+    errdefer allocator.free(data);
+    @memset(data, 0);
+    const validity: ?[*]const u8 = if (arr.buffers[0]) |b| @ptrCast(b) else null;
+    if (n > 0) {
+        const src: [*]const u8 = @ptrCast(arr.buffers[1] orelse return error.TypeMismatch);
+        for (0..n) |i| {
+            if (validity) |v| if ((v[i / 8] >> @intCast(i % 8)) & 1 == 0) continue;
+            const value = arrowDecimalAt(src, src_width, i);
+            const out = data[i * width ..][0..width];
+            switch (col_def.type_) {
+                .int32 => std.mem.bytesAsValue(i32, out[0..4]).* = std.math.cast(i32, value) orelse return error.IntegerOverflow,
+                .int64 => std.mem.bytesAsValue(i64, out[0..8]).* = std.math.cast(i64, value) orelse return error.IntegerOverflow,
+                else => if (!intToBigEndian(value, out)) return error.IntegerOverflow,
+            }
+        }
+    }
+    buffers.* = .{ arr.buffers[0], @ptrCast(data.ptr) };
+    var array = arr;
+    array.buffers = buffers;
+    return .{ .array = array, .data = data, .width = width };
 }
 
 fn writeMapFromArrow(
@@ -4393,68 +4585,103 @@ test "round-trip: arrow write then read - large utf8" {
 // Arrow write round-trip tests: decimal
 // ============================================================================
 
-test "round-trip: arrow write then read - decimal int32 and int64 backed" {
+/// A flat Arrow decimal array of `width` bytes per entry (4, 8, 16 or 32); null values are
+/// nulls. Buffers are allocated with `arena`.
+fn testDecimalArray(arena: Allocator, width: usize, values: []const ?i256) !ArrowArray {
+    const n = values.len;
+    const validity = try arena.alloc(u8, (n + 7) / 8 + 1);
+    @memset(validity, 0xFF);
+    const data = try arena.alignedAlloc(u8, .@"16", n * width + 1);
+    @memset(data, 0);
+    var nulls: i64 = 0;
+    for (values, 0..) |v, i| {
+        const value = v orelse {
+            arrow.clearBit(validity, i);
+            nulls += 1;
+            continue;
+        };
+        const out = data[i * width ..];
+        switch (width) {
+            4 => std.mem.writeInt(i32, out[0..4], @intCast(value), .little),
+            8 => std.mem.writeInt(i64, out[0..8], @intCast(value), .little),
+            16 => std.mem.writeInt(i128, out[0..16], @intCast(value), .little),
+            else => std.mem.writeInt(i256, out[0..32], value, .little),
+        }
+    }
+    const buffers = try arena.alloc(?*anyopaque, 2);
+    buffers[0] = @ptrCast(validity.ptr);
+    buffers[1] = @ptrCast(data.ptr);
+    return .{
+        .length = @intCast(n), .null_count = nulls, .offset = 0, .n_buffers = 2,
+        .n_children = 0, .buffers = buffers.ptr, .children = null,
+        .dictionary = null, .release = null, .private_data = null,
+    };
+}
+
+fn testLeafSchema(format_str: [*:0]const u8, name: [*:0]const u8) ArrowSchema {
+    return .{
+        .format = format_str, .name = name, .metadata = null,
+        .flags = arrow.ARROW_FLAG_NULLABLE, .n_children = 0, .children = null,
+        .dictionary = null, .release = null, .private_data = null,
+    };
+}
+
+/// Checks a decimal array read back: `width` bytes per entry, null where `expected` is null.
+fn expectDecimalArray(arr: *const ArrowArray, width: usize, expected: []const ?i256) !void {
+    try std.testing.expectEqual(@as(i64, @intCast(expected.len)), arr.length);
+    const data: [*]const u8 = @ptrCast(arr.buffers[1].?);
+    const validity: ?[*]const u8 = if (arr.buffers[0]) |v| @ptrCast(v) else null;
+    for (expected, 0..) |e, i| {
+        const valid = if (validity) |v| (v[i / 8] >> @intCast(i % 8)) & 1 == 1 else true;
+        try std.testing.expectEqual(e != null, valid);
+        if (e) |value| try std.testing.expectEqual(value, arrowDecimalAt(data, width, i));
+    }
+}
+
+test "round-trip: arrow write then read - decimals in Arrow layout" {
     const allocator = std.testing.allocator;
-    const n: usize = 3;
-    const bitmap_len: usize = 1;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
 
-    // Decimal(9,2) backed by int32
-    const d9_validity = try allocator.alloc(u8, bitmap_len);
-    defer allocator.free(d9_validity);
-    @memset(d9_validity, 0xFF);
-    arrow.clearBit(d9_validity, 2);
+    const max30: i256 = std.math.pow(i256, 10, 30) - 1;
+    const max50: i256 = std.math.pow(i256, 10, 50) - 1;
+    const d9 = [_]?i256{ 12345, -99999, null };
+    const d18 = [_]?i256{ 123456789012345678, -1, 0 };
+    const d30 = [_]?i256{ -max30, null, max30 };
+    const d50 = [_]?i256{ max50, -max50, null };
+    const d9_32 = [_]?i256{ 1, null, -2 };
 
-    const d9_data = try allocator.alloc(u8, n * 4);
-    defer allocator.free(d9_data);
-    const d9_typed: [*]i32 = @ptrCast(@alignCast(d9_data.ptr));
-    d9_typed[0] = 12345; // 123.45
-    d9_typed[1] = -99999; // -999.99
-    d9_typed[2] = 0; // null
-
-    var d9_buffers = [_]?*anyopaque{ @ptrCast(d9_validity.ptr), @ptrCast(d9_data.ptr) };
-    const d9_arr = ArrowArray{
-        .length = 3, .null_count = 1, .offset = 0, .n_buffers = 2,
-        .n_children = 0, .buffers = &d9_buffers, .children = null,
-        .dictionary = null, .release = null, .private_data = null,
-    };
-    const d9_sch = ArrowSchema{
-        .format = "d:9,2", .name = "price", .metadata = null,
-        .flags = arrow.ARROW_FLAG_NULLABLE, .n_children = 0, .children = null,
-        .dictionary = null, .release = null, .private_data = null,
+    // Format, bytes per Arrow entry, values; the Parquet storage follows from the precision.
+    const Case = struct { format: [*:0]const u8, name: [*:0]const u8, width: usize, values: []const ?i256, physical: format.PhysicalType, type_length: ?i32, read_format: []const u8, read_width: usize };
+    const cases = [_]Case{
+        .{ .format = "d:9,2", .name = "d9", .width = 16, .values = &d9, .physical = .int32, .type_length = null, .read_format = "d:9,2", .read_width = 16 },
+        .{ .format = "d:18,4,128", .name = "d18", .width = 16, .values = &d18, .physical = .int64, .type_length = null, .read_format = "d:18,4", .read_width = 16 },
+        .{ .format = "d:30,2", .name = "d30", .width = 16, .values = &d30, .physical = .fixed_len_byte_array, .type_length = 13, .read_format = "d:30,2", .read_width = 16 },
+        .{ .format = "d:50,2,256", .name = "d50", .width = 32, .values = &d50, .physical = .fixed_len_byte_array, .type_length = 21, .read_format = "d:50,2,256", .read_width = 32 },
+        .{ .format = "d:9,2,32", .name = "d9_32", .width = 4, .values = &d9_32, .physical = .int32, .type_length = null, .read_format = "d:9,2", .read_width = 16 },
     };
 
-    // Decimal(18,4) backed by int64
-    const d18_validity = try allocator.alloc(u8, bitmap_len);
-    defer allocator.free(d18_validity);
-    @memset(d18_validity, 0xFF);
-
-    const d18_data = try allocator.alloc(u8, n * 8);
-    defer allocator.free(d18_data);
-    const d18_typed: [*]i64 = @ptrCast(@alignCast(d18_data.ptr));
-    d18_typed[0] = 123456789012345678;
-    d18_typed[1] = -1;
-    d18_typed[2] = 0;
-
-    var d18_buffers = [_]?*anyopaque{ @ptrCast(d18_validity.ptr), @ptrCast(d18_data.ptr) };
-    const d18_arr = ArrowArray{
-        .length = 3, .null_count = 0, .offset = 0, .n_buffers = 2,
-        .n_children = 0, .buffers = &d18_buffers, .children = null,
-        .dictionary = null, .release = null, .private_data = null,
+    var arrays: [cases.len]ArrowArray = undefined;
+    var schemas: [cases.len]ArrowSchema = undefined;
+    var schema_ptrs: [cases.len]*ArrowSchema = undefined;
+    for (cases, 0..) |c, i| {
+        arrays[i] = try testDecimalArray(arena, c.width, c.values);
+        schemas[i] = testLeafSchema(c.format, c.name);
+        schema_ptrs[i] = &schemas[i];
+    }
+    const root = ArrowSchema{
+        .format = "+s", .name = "", .metadata = null, .flags = 0, .n_children = cases.len,
+        .children = @ptrCast(&schema_ptrs), .dictionary = null, .release = null, .private_data = null,
     };
-    const d18_sch = ArrowSchema{
-        .format = "d:18,4", .name = "amount", .metadata = null,
-        .flags = arrow.ARROW_FLAG_NULLABLE, .n_children = 0, .children = null,
-        .dictionary = null, .release = null, .private_data = null,
-    };
+    const col_defs = try importSchemaFromArrow(allocator, &root);
+    defer freeImportedColumnDefs(allocator, col_defs);
+    for (cases, col_defs) |c, def| {
+        try std.testing.expectEqual(c.physical, def.type_);
+        try std.testing.expectEqual(c.type_length, def.type_length);
+    }
 
-    const col_defs = [_]ColumnDef{
-        .{ .name = "price", .type_ = .int32, .optional = true, .logical_type = .{ .decimal = .{ .precision = 9, .scale = 2 } } },
-        .{ .name = "amount", .type_ = .int64, .optional = true, .logical_type = .{ .decimal = .{ .precision = 18, .scale = 4 } } },
-    };
-
-    var writer = try api_writer_mod.writeToBuffer(allocator, &col_defs);
-    const arrays = [_]ArrowArray{ d9_arr, d18_arr };
-    const schemas = [_]ArrowSchema{ d9_sch, d18_sch };
+    var writer = try api_writer_mod.writeToBuffer(allocator, col_defs);
     try writeRowGroupFromArrow(&writer, allocator, &arrays, &schemas);
     try writer.close();
     const buf = try writer.toOwnedSlice();
@@ -4465,20 +4692,116 @@ test "round-trip: arrow write then read - decimal int32 and int64 backed" {
     defer dr.deinit();
     var result = try readRowGroupAsArrow(allocator, dr.getSource(), dr.metadata, 0, null);
     defer result.deinit();
+    for (cases, 0..) |c, i| {
+        try std.testing.expectEqualStrings(c.read_format, std.mem.span(result.schema.children.?[i].format));
+        try expectDecimalArray(&result.arrays[i], c.read_width, c.values);
+    }
+}
 
-    try std.testing.expectEqual(@as(usize, 2), result.arrays.len);
+test "round-trip: arrow write then read - decimals in a list and a struct" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
 
-    // Decimal(9,2) -> int32
-    const read_d9: [*]const i32 = @ptrCast(@alignCast(result.arrays[0].buffers[1].?));
-    try std.testing.expectEqual(@as(i32, 12345), read_d9[0]);
-    try std.testing.expectEqual(@as(i32, -99999), read_d9[1]);
-    try std.testing.expectEqual(@as(i64, 1), result.arrays[0].null_count);
+    // list<decimal(18,2)>: [[1.50, null], null, [], [-3.25]]
+    const elements = [_]?i256{ 150, null, -325 };
+    var element_arr = try testDecimalArray(arena, 16, &elements);
+    var element_sch = testLeafSchema("d:18,2", "element");
+    var list_offsets = [_]i32{ 0, 2, 2, 2, 3 };
+    var list_validity = [_]u8{0b1101};
+    var list_buffers = [_]?*anyopaque{ @ptrCast(&list_validity), @ptrCast(&list_offsets) };
+    var list_children = [_]*ArrowArray{&element_arr};
+    var list_child_schemas = [_]*ArrowSchema{&element_sch};
+    const list_arr = ArrowArray{
+        .length = 4, .null_count = 1, .offset = 0, .n_buffers = 2, .n_children = 1,
+        .buffers = &list_buffers, .children = &list_children, .dictionary = null, .release = null, .private_data = null,
+    };
+    const list_sch = ArrowSchema{
+        .format = "+l", .name = "prices", .metadata = null, .flags = arrow.ARROW_FLAG_NULLABLE, .n_children = 1,
+        .children = &list_child_schemas, .dictionary = null, .release = null, .private_data = null,
+    };
 
-    // Decimal(18,4) -> int64
-    const read_d18: [*]const i64 = @ptrCast(@alignCast(result.arrays[1].buffers[1].?));
-    try std.testing.expectEqual(@as(i64, 123456789012345678), read_d18[0]);
-    try std.testing.expectEqual(@as(i64, -1), read_d18[1]);
-    try std.testing.expectEqual(@as(i64, 0), read_d18[2]);
+    // struct<a: decimal(30,2)>: [{a: 1.00}, {a: null}, null, {a: -10^29}]
+    const big: i256 = -std.math.pow(i256, 10, 29);
+    const fields = [_]?i256{ 100, null, 0, big };
+    var field_arr = try testDecimalArray(arena, 16, &fields);
+    var field_sch = testLeafSchema("d:30,2", "a");
+    var struct_validity = [_]u8{0b1011};
+    var struct_buffers = [_]?*anyopaque{@ptrCast(&struct_validity)};
+    var struct_children = [_]*ArrowArray{&field_arr};
+    var struct_child_schemas = [_]*ArrowSchema{&field_sch};
+    const struct_arr = ArrowArray{
+        .length = 4, .null_count = 1, .offset = 0, .n_buffers = 1, .n_children = 1,
+        .buffers = &struct_buffers, .children = &struct_children, .dictionary = null, .release = null, .private_data = null,
+    };
+    const struct_sch = ArrowSchema{
+        .format = "+s", .name = "point", .metadata = null, .flags = arrow.ARROW_FLAG_NULLABLE, .n_children = 1,
+        .children = &struct_child_schemas, .dictionary = null, .release = null, .private_data = null,
+    };
+
+    var schemas = [_]ArrowSchema{ list_sch, struct_sch };
+    var schema_ptrs = [_]*ArrowSchema{ &schemas[0], &schemas[1] };
+    const root = ArrowSchema{
+        .format = "+s", .name = "", .metadata = null, .flags = 0, .n_children = 2,
+        .children = &schema_ptrs, .dictionary = null, .release = null, .private_data = null,
+    };
+    const col_defs = try importSchemaFromArrow(allocator, &root);
+    defer freeImportedColumnDefs(allocator, col_defs);
+
+    var writer = try api_writer_mod.writeToBuffer(allocator, col_defs);
+    try writeRowGroupFromArrow(&writer, allocator, &.{ list_arr, struct_arr }, &schemas);
+    try writer.close();
+    const buf = try writer.toOwnedSlice();
+    defer allocator.free(buf);
+    writer.deinit();
+
+    var dr = try api_reader_mod.openBufferDynamic(allocator, buf, .{});
+    defer dr.deinit();
+    var result = try readRowGroupAsArrow(allocator, dr.getSource(), dr.metadata, 0, null);
+    defer result.deinit();
+
+    const list = &result.arrays[0];
+    try std.testing.expectEqual(@as(i64, 1), list.null_count);
+    const read_offsets: [*]const i32 = @ptrCast(@alignCast(list.buffers[1].?));
+    try std.testing.expectEqualSlices(i32, &list_offsets, read_offsets[0..5]);
+    try std.testing.expectEqualStrings("d:18,2", std.mem.span(result.schema.children.?[0].children.?[0].format));
+    try expectDecimalArray(list.children.?[0], 16, &elements);
+
+    const st = &result.arrays[1];
+    try std.testing.expectEqual(@as(i64, 1), st.null_count);
+    try std.testing.expectEqualStrings("d:30,2", std.mem.span(result.schema.children.?[1].children.?[0].format));
+    // Struct slot 2 is null; its field reads back as null.
+    try expectDecimalArray(st.children.?[0], 16, &.{ 100, null, null, big });
+}
+
+test "decimal files read as Arrow decimal128" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    // parquet-testing files holding 1.00, 2.00, ... in INT32, INT64, FIXED_LEN_BYTE_ARRAY
+    // and BYTE_ARRAY decimals.
+    const files = [_][]const u8{ "int32_decimal.parquet", "int64_decimal.parquet", "fixed_length_decimal.parquet", "fixed_length_decimal_legacy.parquet", "byte_array_decimal.parquet" };
+    var dir = std.Io.Dir.cwd().openDir(io, "../test-files-wild/parquet-testing/data", .{}) catch return error.SkipZigTest;
+    defer dir.close(io);
+    for (files) |name| {
+        const file = try dir.openFile(io, name, .{});
+        defer file.close(io);
+        var reader = try @import("../lib.zig").openFileDynamic(allocator, file, io, .{});
+        defer reader.deinit();
+        var result = try readRowGroupAsArrow(allocator, reader.getSource(), reader.metadata, 0, null);
+        defer result.deinit();
+        const fmt = std.mem.span(result.schema.children.?[0].format);
+        try std.testing.expect(std.mem.startsWith(u8, fmt, "d:") and std.mem.count(u8, fmt, ",") == 1);
+        const arr = &result.arrays[0];
+        try std.testing.expect(arr.length >= 4);
+        const data: [*]const u8 = @ptrCast(arr.buffers[1].?);
+        for (0..@intCast(arr.length)) |i| {
+            std.testing.expectEqual(@as(i256, @intCast((i + 1) * 100)), arrowDecimalAt(data, 16, i)) catch |err| {
+                std.debug.print("{s} entry {d}\n", .{ name, i });
+                return err;
+            };
+        }
+    }
 }
 
 // ============================================================================
@@ -5018,9 +5341,10 @@ fn canonEntry(w: *std.Io.Writer, schema: []const format.SchemaElement, node: *co
 }
 
 /// How nested_reference.py writes a leaf of this schema element (from PyArrow's type for it).
-const LeafCategory = enum { boolean, int, float, double, bytes, other };
+const LeafCategory = enum { boolean, int, float, double, bytes, decimal, other };
 
 fn leafCategory(elem: format.SchemaElement) LeafCategory {
+    if (decimalOf(elem) != null) return .decimal;
     const physical = elem.type_ orelse return .other;
     return switch (physical) {
         .boolean => .boolean,
@@ -5055,6 +5379,7 @@ fn canonLeaf(w: *std.Io.Writer, elem: format.SchemaElement, arr: *const ArrowArr
             try w.print("i{d}", .{std.mem.bytesToValue(i64, data[i * 8 ..][0..8])}),
         .float => try writeDouble(w, std.mem.bytesToValue(f32, data[i * 4 ..][0..4])),
         .double => try writeDouble(w, std.mem.bytesToValue(f64, data[i * 8 ..][0..8])),
+        .decimal => try w.print("e{d}", .{arrowDecimalAt(data, if (decimalOf(elem).?.precision <= 38) 16 else 32, i)}),
         .bytes => {
             try w.writeByte('x');
             const bytes = if (elem.type_.? == .byte_array) blk: {

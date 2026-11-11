@@ -6,7 +6,7 @@ its own (from test-files-arrow, with uv):
     uv run python -I nested_reference.py nested_reference.json
 
 For every .parquet file under ../test-files-arrow and ../test-files-wild with at least one
-list, map or struct top-level column and at most MAX_ROWS rows, writes the first
+list, map, struct or decimal top-level column and at most MAX_ROWS rows, writes the first
 ROWS_PER_GROUP rows of each row group as
     {"<root>/<path>": {"<row group>:<top-level column index>": "<canonical text>", ...}, ...}
 Files PyArrow cannot read are recorded as {"error": "<message>"}.
@@ -20,8 +20,10 @@ Canonical text, one line per row:
     boolean         t / f
     float, double   d<hex of the little-endian IEEE double>
     string, binary  x<hex of the bytes>
+    decimal         e<unscaled integer>   (the value times 10^scale)
     other leaves    v                     (only presence is compared)
 """
+import decimal
 import json
 import os
 import struct
@@ -32,6 +34,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 ROOTS = ["../test-files-arrow", "../test-files-wild"]
+# Exact unscaled values for decimal256 (up to 76 digits).
+decimal.getcontext().prec = 100
 MAX_ROWS = 200_000
 # Rows compared per row group and column (the first ones).
 ROWS_PER_GROUP = 2_000
@@ -39,6 +43,10 @@ ROWS_PER_GROUP = 2_000
 
 def storage(t):
     return t.storage_type if isinstance(t, pa.BaseExtensionType) else t
+
+
+def is_decimal(t):
+    return pa.types.is_decimal(storage(t))
 
 
 def is_nested(t):
@@ -67,6 +75,8 @@ def leaf(v, t):
         if pa.types.is_unsigned_integer(t) and t.bit_width >= 32 and v >= 1 << (t.bit_width - 1):
             v -= 1 << t.bit_width
         return f"i{v}"
+    if pa.types.is_decimal(t):
+        return f"e{int(v.scaleb(t.scale))}"
     if pa.types.is_float32(t) or pa.types.is_float64(t):
         return "d" + struct.pack("<d", float(v)).hex()
     if pa.types.is_string(t) or pa.types.is_large_string(t):
@@ -81,7 +91,7 @@ def file_reference(path):
     if pf.metadata.num_rows > MAX_ROWS:
         return None
     fields = list(pf.schema_arrow)
-    if not any(is_nested(f.type) for f in fields):
+    if not any(is_nested(f.type) or is_decimal(f.type) for f in fields):
         return None
     out = {}
     for rg in range(pf.num_row_groups):
@@ -110,7 +120,7 @@ def write(out_path):
     with open(out_path, "w") as f:
         json.dump(result, f, indent=0, sort_keys=True)
     readable = sum(1 for v in result.values() if "error" not in v)
-    print(f"{len(result)} files with nested columns ({readable} read by PyArrow {pa.__version__})")
+    print(f"{len(result)} files with nested or decimal columns ({readable} read by PyArrow {pa.__version__})")
 
 
 if __name__ == "__main__":
