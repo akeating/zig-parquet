@@ -845,6 +845,9 @@ pub const NestedEncodingOpts = struct {
     dictionary_size_limit: ?usize = 1_048_576,
     dictionary_cardinality_threshold: ?f32 = null,
     write_page_checksum: bool = true,
+    /// The column's physical type, used when no value is non-null (otherwise the type is
+    /// taken from the values).
+    physical_type: ?format.PhysicalType = null,
 };
 
 /// Write a column chunk from Value data with definition and repetition levels.
@@ -862,7 +865,19 @@ pub fn writeColumnChunkFromValues(
     codec: format.CompressionCodec,
     opts: NestedEncodingOpts,
 ) ColumnWriteError!ColumnChunkResult {
-    const value_type = detectValueType(values);
+    var value_type = detectValueType(values);
+    if (value_type == .unknown) if (opts.physical_type) |t| {
+        value_type = switch (t) {
+            .int32 => .int32,
+            .int64 => .int64,
+            .float => .float,
+            .double => .double,
+            .byte_array => .byte_array,
+            .fixed_len_byte_array => .fixed_byte_array,
+            .boolean => .boolean,
+            .int96 => .unknown,
+        };
+    };
 
     return switch (value_type) {
         .int32 => writeColumnChunkFromValuesTyped(i32, allocator, output, path_in_schema, values, def_levels, rep_levels, max_def_level, max_rep_level, start_offset, codec, opts),

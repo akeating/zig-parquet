@@ -645,34 +645,14 @@ fn arrowListToColumnDef(allocator: Allocator, schema: *const ArrowSchema, name: 
     return def;
 }
 
+/// Maps are written from a schema node, which keeps the key's and value's logical types and
+/// supports every key and value format.
 fn arrowMapToColumnDef(allocator: Allocator, schema: *const ArrowSchema, name: []const u8, nullable: bool) !ColumnDef {
     if (schema.n_children != 1) return error.InvalidSchema;
     const entries: [*]*ArrowSchema = schema.children orelse return error.InvalidSchema;
-    const entries_schema = entries[0];
-    if (entries_schema.n_children != 2) return error.InvalidSchema;
-    const kv_children: [*]*ArrowSchema = entries_schema.children orelse return error.InvalidSchema;
-
-    const key_fmt = std.mem.sliceTo(kv_children[0].format, 0);
-    const val_fmt = std.mem.sliceTo(kv_children[1].format, 0);
-    const val_nullable = (kv_children[1].flags & arrow.ARROW_FLAG_NULLABLE) != 0;
-
-    if (hasNestedFormat(key_fmt) or hasNestedFormat(val_fmt)) {
-        const node = try arrowSchemaToSchemaNode(allocator, schema, nullable);
-        return ColumnDef.fromNode(name, node);
-    }
-
-    const key_def = try arrowLeafToColumnDef(key_fmt, name, nullable);
-    const val_def = try arrowLeafToColumnDef(val_fmt, "", false);
-
-    return .{
-        .name = name,
-        .type_ = key_def.type_,
-        .optional = nullable,
-        .is_map = true,
-        .map_value_type = val_def.type_,
-        .map_value_optional = val_nullable,
-        .logical_type = key_def.logical_type,
-    };
+    if (entries[0].n_children != 2) return error.InvalidSchema;
+    const node = try arrowSchemaToSchemaNode(allocator, schema, nullable);
+    return ColumnDef.fromNode(name, node);
 }
 
 fn arrowStructToColumnDef(allocator: Allocator, schema: *const ArrowSchema, name: []const u8, nullable: bool) !ColumnDef {
@@ -4944,6 +4924,93 @@ test "arrow write honours array offsets" {
             "i60 t x7336 [] {i70} \n" ++
             "i70 f x7337 [i56] {i80} \n" ++
             "i80 t x7338 [i63,i70] {i90} \n",
+        got.written(),
+    );
+}
+
+test "arrow write of maps keeps key and value types, also when every value is null" {
+    const allocator = std.testing.allocator;
+
+    // Two map columns over the same keys: {a: null}, null, {}, {b: null, c: null} with int64
+    // values (all null), and {a: 1.50}, null, {}, {b: null, c: -2.25} with decimal(9,2).
+    var key_data = "abc".*;
+    var key_offsets = [_]i32{ 0, 1, 2, 3 };
+    var key_buffers = [_]?*anyopaque{ null, @ptrCast(&key_offsets), @ptrCast(&key_data) };
+    var keys = ArrowArray{ .length = 3, .null_count = 0, .offset = 0, .n_buffers = 3, .n_children = 0, .buffers = &key_buffers, .children = null, .dictionary = null, .release = null, .private_data = null };
+    var no_values = [_]u8{0b000};
+    var int_values = [_]i64{ 0, 0, 0 };
+    var int_buffers = [_]?*anyopaque{ @ptrCast(&no_values), @ptrCast(&int_values) };
+    var ints = ArrowArray{ .length = 3, .null_count = 3, .offset = 0, .n_buffers = 2, .n_children = 0, .buffers = &int_buffers, .children = null, .dictionary = null, .release = null, .private_data = null };
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    var decimals = try testDecimalArray(arena_state.allocator(), 16, &.{ 150, null, -225 });
+
+    var map_offsets = [_]i32{ 0, 1, 1, 1, 3 };
+    var map_validity = [_]u8{0b1101};
+    var struct_buffers = [_]?*anyopaque{null};
+    var int_entry_children = [_]*ArrowArray{ &keys, &ints };
+    var int_entries = ArrowArray{ .length = 3, .null_count = 0, .offset = 0, .n_buffers = 1, .n_children = 2, .buffers = &struct_buffers, .children = &int_entry_children, .dictionary = null, .release = null, .private_data = null };
+    var dec_entry_children = [_]*ArrowArray{ &keys, &decimals };
+    var dec_entries = ArrowArray{ .length = 3, .null_count = 0, .offset = 0, .n_buffers = 1, .n_children = 2, .buffers = &struct_buffers, .children = &dec_entry_children, .dictionary = null, .release = null, .private_data = null };
+    var map_buffers = [_]?*anyopaque{ @ptrCast(&map_validity), @ptrCast(&map_offsets) };
+    var int_map_children = [_]*ArrowArray{&int_entries};
+    const int_map = ArrowArray{ .length = 4, .null_count = 1, .offset = 0, .n_buffers = 2, .n_children = 1, .buffers = &map_buffers, .children = &int_map_children, .dictionary = null, .release = null, .private_data = null };
+    var dec_map_children = [_]*ArrowArray{&dec_entries};
+    const dec_map = ArrowArray{ .length = 4, .null_count = 1, .offset = 0, .n_buffers = 2, .n_children = 1, .buffers = &map_buffers, .children = &dec_map_children, .dictionary = null, .release = null, .private_data = null };
+
+    var key_sch = ArrowSchema{ .format = "u", .name = "key", .metadata = null, .flags = 0, .n_children = 0, .children = null, .dictionary = null, .release = null, .private_data = null };
+    var int_sch = testLeafSchema("l", "value");
+    var dec_sch = testLeafSchema("d:9,2", "value");
+    var int_entry_sch_children = [_]*ArrowSchema{ &key_sch, &int_sch };
+    var int_entry_sch = ArrowSchema{ .format = "+s", .name = "entries", .metadata = null, .flags = 0, .n_children = 2, .children = &int_entry_sch_children, .dictionary = null, .release = null, .private_data = null };
+    var dec_entry_sch_children = [_]*ArrowSchema{ &key_sch, &dec_sch };
+    var dec_entry_sch = ArrowSchema{ .format = "+s", .name = "entries", .metadata = null, .flags = 0, .n_children = 2, .children = &dec_entry_sch_children, .dictionary = null, .release = null, .private_data = null };
+    var int_map_sch_children = [_]*ArrowSchema{&int_entry_sch};
+    var dec_map_sch_children = [_]*ArrowSchema{&dec_entry_sch};
+    var schemas = [_]ArrowSchema{
+        .{ .format = "+m", .name = "ints", .metadata = null, .flags = arrow.ARROW_FLAG_NULLABLE, .n_children = 1, .children = &int_map_sch_children, .dictionary = null, .release = null, .private_data = null },
+        .{ .format = "+m", .name = "decs", .metadata = null, .flags = arrow.ARROW_FLAG_NULLABLE, .n_children = 1, .children = &dec_map_sch_children, .dictionary = null, .release = null, .private_data = null },
+    };
+    var schema_ptrs = [_]*ArrowSchema{ &schemas[0], &schemas[1] };
+    const root = ArrowSchema{ .format = "+s", .name = "", .metadata = null, .flags = 0, .n_children = 2, .children = &schema_ptrs, .dictionary = null, .release = null, .private_data = null };
+    const col_defs = try importSchemaFromArrow(allocator, &root);
+    defer freeImportedColumnDefs(allocator, col_defs);
+
+    var writer = try api_writer_mod.writeToBuffer(allocator, col_defs);
+    try writeRowGroupFromArrow(&writer, allocator, &.{ int_map, dec_map }, &schemas);
+    try writer.close();
+    const buf = try writer.toOwnedSlice();
+    defer allocator.free(buf);
+    writer.deinit();
+
+    var dr = try api_reader_mod.openBufferDynamic(allocator, buf, .{});
+    defer dr.deinit();
+    // Leaf columns: ints.key, ints.value, decs.key, decs.value.
+    const chunks = dr.metadata.row_groups[0].columns;
+    try std.testing.expectEqual(format.PhysicalType.byte_array, chunks[0].meta_data.?.type_);
+    try std.testing.expectEqual(format.PhysicalType.int64, chunks[1].meta_data.?.type_);
+    try std.testing.expectEqual(format.PhysicalType.int32, chunks[3].meta_data.?.type_);
+    for (dr.metadata.schema) |elem| {
+        if (std.mem.eql(u8, elem.name, "key")) try std.testing.expect(elem.logical_type != null and elem.logical_type.? == .string);
+    }
+
+    const tree = try buildSchemaTree(arena_state.allocator(), dr.metadata.schema);
+    var result = try readRowGroupAsArrow(allocator, dr.getSource(), dr.metadata, 0, null);
+    defer result.deinit();
+    var got: std.Io.Writer.Allocating = .init(allocator);
+    defer got.deinit();
+    for (0..4) |row| {
+        for (tree, 0..) |*node, c| {
+            try canonEntry(&got.writer, dr.metadata.schema, node, &result.arrays[c], row, false);
+            try got.writer.writeByte(' ');
+        }
+        try got.writer.writeByte('\n');
+    }
+    try std.testing.expectEqualStrings(
+        "[(x61:n)] [(x61:e150)] \n" ++
+            "n n \n" ++
+            "[] [] \n" ++
+            "[(x62:n),(x63:n)] [(x62:n),(x63:e-225)] \n",
         got.written(),
     );
 }

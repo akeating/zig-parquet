@@ -1065,6 +1065,9 @@ pub const DynamicWriter = struct {
 
         const leaf_levels = node.computeLeafLevels(allocator) catch return error.OutOfMemory;
         defer allocator.free(leaf_levels);
+        // The column types come from the schema; values alone do not give them when all are null.
+        const leaf_types = node.leafPhysicalTypes(allocator) catch return error.OutOfMemory;
+        defer allocator.free(leaf_types);
 
         for (all_columns.items, 0..) |*flat_col, leaf_idx| {
             const path = if (leaf_idx < leaf_paths.items.len) leaf_paths.items[leaf_idx] else &[_][]const u8{col_name};
@@ -1094,6 +1097,7 @@ pub const DynamicWriter = struct {
                     .dictionary_size_limit = opts.dictionary_size_limit,
                     .dictionary_cardinality_threshold = opts.dictionary_cardinality_threshold,
                     .write_page_checksum = opts.write_page_checksum,
+                    .physical_type = if (leaf_idx < leaf_types.len) leaf_types[leaf_idx] else null,
                 },
             ) catch return error.WriteError;
 

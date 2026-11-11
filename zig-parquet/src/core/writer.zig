@@ -815,6 +815,9 @@ pub const Writer = struct {
         // Compute levels for each leaf column (each leaf has its own max levels based on path)
         const leaf_levels = node.computeLeafLevels(self.allocator) catch return error.OutOfMemory;
         defer self.allocator.free(leaf_levels);
+        // The column types come from the schema; values alone do not give them when all are null.
+        const leaf_types = node.leafPhysicalTypes(self.allocator) catch return error.OutOfMemory;
+        defer self.allocator.free(leaf_types);
 
         // Write each physical column
         const base_physical_idx = self.getPhysicalColumnIndex(column_index, 0) catch return error.InvalidColumnIndex;
@@ -845,7 +848,7 @@ pub const Writer = struct {
                     .file_path = null,
                     .file_offset = self.current_offset,
                     .meta_data = .{
-                        .type_ = .int32, // Default type for empty column
+                        .type_ = if (leaf_idx < leaf_types.len) leaf_types[leaf_idx] else .int32,
                         .encodings = encodings,
                         .path_in_schema = path_copy,
                         .codec = col_def.codec,
@@ -878,7 +881,7 @@ pub const Writer = struct {
                 levels.max_rep,
                 self.current_offset,
                 col_def.codec,
-                .{},
+                .{ .physical_type = if (leaf_idx < leaf_types.len) leaf_types[leaf_idx] else null },
             ) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.WriteError => return error.WriteError,
@@ -1610,7 +1613,8 @@ pub const Writer = struct {
                     .scale = null,
                     .precision = null,
                     .field_id = null,
-                    .logical_type = null,
+                    // A map ColumnDef's logical type is its key's.
+                    .logical_type = col.logical_type,
                 };
                 idx += 1;
 

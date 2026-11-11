@@ -810,3 +810,50 @@ test "round-trip map string-to-f32" {
         try std.testing.expect(rows[1].getColumn(0).?.isNull());
     }
 }
+
+test "ColumnDef.mapStringInt32 writes STRING keys" {
+    const allocator = std.testing.allocator;
+
+    var writer = try parquet.writeToBuffer(allocator, &.{ColumnDef.mapStringInt32("attrs", true)});
+    defer writer.deinit();
+    const entries = [_]WriterMapEntry([]const u8, i32){.{ .key = "a", .value = .{ .value = 1 } }};
+    try writer.writeMapColumnStringInt32(0, &.{.{ .value = &entries }});
+    try writer.close();
+    const buf = try writer.toOwnedSlice();
+    defer allocator.free(buf);
+
+    var reader = try parquet.openBufferDynamic(allocator, buf, .{});
+    defer reader.deinit();
+    var found = false;
+    for (reader.metadata.schema) |elem| {
+        if (!std.mem.eql(u8, elem.name, "key")) continue;
+        found = true;
+        try std.testing.expect(elem.logical_type != null and elem.logical_type.? == .string);
+    }
+    try std.testing.expect(found);
+}
+
+test "dynamic writer keeps the physical type of a nested column whose values are all null" {
+    const allocator = std.testing.allocator;
+
+    var writer = try parquet.createBufferDynamic(allocator);
+    defer writer.deinit();
+    const element = try writer.allocSchemaNode(.{ .int64 = .{} });
+    const optional_element = try writer.allocSchemaNode(.{ .optional = element });
+    const list = try writer.allocSchemaNode(.{ .list = optional_element });
+    try writer.addColumnNested("values", list, .{});
+    try writer.begin();
+    for (0..3) |_| {
+        try writer.beginList(0);
+        try writer.appendNestedValue(0, .{ .null_val = {} });
+        try writer.endList(0);
+        try writer.addRow();
+    }
+    try writer.close();
+    const buf = try writer.toOwnedSlice();
+    defer allocator.free(buf);
+
+    var reader = try parquet.openBufferDynamic(allocator, buf, .{});
+    defer reader.deinit();
+    try std.testing.expectEqual(parquet.format.PhysicalType.int64, reader.metadata.row_groups[0].columns[0].meta_data.?.type_);
+}

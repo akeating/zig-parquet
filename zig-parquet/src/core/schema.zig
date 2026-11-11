@@ -211,6 +211,30 @@ pub const SchemaNode = union(enum) {
         }
     }
 
+    /// Physical type of each leaf column, in the order of `computeLeafLevels`.
+    pub fn leafPhysicalTypes(self: *const SchemaNode, allocator: std.mem.Allocator) ![]format.PhysicalType {
+        const result = try allocator.alloc(format.PhysicalType, self.countLeafColumns());
+        var index: usize = 0;
+        leafPhysicalTypesRecursive(self, result, &index);
+        return result;
+    }
+
+    fn leafPhysicalTypesRecursive(node: *const SchemaNode, result: []format.PhysicalType, index: *usize) void {
+        switch (node.*) {
+            .optional => |child| leafPhysicalTypesRecursive(child, result, index),
+            .list => |element| leafPhysicalTypesRecursive(element, result, index),
+            .map => |m| {
+                leafPhysicalTypesRecursive(m.key, result, index);
+                leafPhysicalTypesRecursive(m.value, result, index);
+            },
+            .struct_ => |st| for (st.fields) |f| leafPhysicalTypesRecursive(f.node, result, index),
+            inline .boolean, .int32, .int64, .float, .double, .byte_array, .fixed_len_byte_array => |_, tag| {
+                result[index.*] = @field(format.PhysicalType, @tagName(tag));
+                index.* += 1;
+            },
+        }
+    }
+
     /// Count the number of physical (leaf) columns this schema produces.
     ///
     /// Lists and maps each produce one or two leaf columns, structs produce

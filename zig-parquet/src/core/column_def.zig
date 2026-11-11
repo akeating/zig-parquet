@@ -134,32 +134,44 @@ pub const ColumnDef = struct {
 
     /// Create a MAP of STRING to INT32
     pub fn mapStringInt32(name: []const u8, value_optional: bool) ColumnDef {
-        return map(name, .byte_array, .int32, value_optional);
+        var def = map(name, .byte_array, .int32, value_optional);
+        def.logical_type = .string; // key
+        return def;
     }
 
     /// Create a MAP of STRING to INT64
     pub fn mapStringInt64(name: []const u8, value_optional: bool) ColumnDef {
-        return map(name, .byte_array, .int64, value_optional);
+        var def = map(name, .byte_array, .int64, value_optional);
+        def.logical_type = .string; // key
+        return def;
     }
 
     /// Create a MAP of STRING to STRING
     pub fn mapStringString(name: []const u8, value_optional: bool) ColumnDef {
-        return map(name, .byte_array, .byte_array, value_optional);
+        var def = map(name, .byte_array, .byte_array, value_optional);
+        def.logical_type = .string; // key
+        return def;
     }
 
     /// Create a MAP of STRING to FLOAT
     pub fn mapStringFloat32(name: []const u8, value_optional: bool) ColumnDef {
-        return map(name, .byte_array, .float, value_optional);
+        var def = map(name, .byte_array, .float, value_optional);
+        def.logical_type = .string; // key
+        return def;
     }
 
     /// Create a MAP of STRING to DOUBLE
     pub fn mapStringFloat64(name: []const u8, value_optional: bool) ColumnDef {
-        return map(name, .byte_array, .double, value_optional);
+        var def = map(name, .byte_array, .double, value_optional);
+        def.logical_type = .string; // key
+        return def;
     }
 
     /// Create a MAP of STRING to BOOLEAN
     pub fn mapStringBool(name: []const u8, value_optional: bool) ColumnDef {
-        return map(name, .byte_array, .boolean, value_optional);
+        var def = map(name, .byte_array, .boolean, value_optional);
+        def.logical_type = .string; // key
+        return def;
     }
 
     /// Create a MAP of INT32 to STRING
