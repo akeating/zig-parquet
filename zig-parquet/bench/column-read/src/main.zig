@@ -1,7 +1,8 @@
 //! Column read benchmark (Phase 0 baseline).
 //!
 //! Reads every row group of FILE through each read path, one column at a time and all columns
-//! together, and reports wall time plus allocator activity.
+//! together, and reports wall time plus allocator activity. Paths: `arrow` reads each row
+//! group whole, `batches` reads 65,536-row batches, `rows` reads through the row API.
 //!
 //! Usage: zig build run -- FILE.parquet [RUNS]
 //!   RUNS: measured runs per case after one warm-up run (default 5).
@@ -83,7 +84,10 @@ const CountingAllocator = struct {
     }
 };
 
-const Path = enum { arrow, rows };
+const Path = enum { arrow, batches, rows };
+
+/// Rows per batch of the `batches` path, the default of PyArrow's `iter_batches`.
+const batch_rows = 65536;
 
 const Case = struct {
     path: Path,
@@ -119,9 +123,9 @@ pub fn main(init: std.process.Init) !void {
 
     var cases: std.ArrayList(Case) = .empty;
     defer cases.deinit(init.gpa);
-    // Optional CASE argument "path:column" (e.g. "arrow:id", "rows:all") runs only that case.
+    // Optional CASE argument "path:column" (e.g. "arrow:id", "batches:all") runs only that case.
     const filter: ?[]const u8 = if (args.len > 3) args[3] else null;
-    for ([_]Path{ .arrow, .rows }) |p| {
+    for ([_]Path{ .arrow, .batches, .rows }) |p| {
         for (0..num_cols + 1) |c| {
             const column: ?usize = if (c < num_cols) c else null;
             if (filter) |f| {
@@ -153,6 +157,7 @@ pub fn main(init: std.process.Init) !void {
             const start = std.Io.Clock.awake.now(io);
             check = switch (case.path) {
                 .arrow => try readArrow(allocator, &reader, num_rgs, case.column),
+                .batches => try readBatches(allocator, &reader, case.column),
                 .rows => try readRows(allocator, &reader, num_rgs, case.column),
             };
             const elapsed = start.durationTo(std.Io.Clock.awake.now(io));
@@ -215,6 +220,24 @@ fn readArrow(allocator: std.mem.Allocator, reader: *parquet.DynamicReader, num_r
     for (0..num_rgs) |rg| {
         const cols: ?[]const usize = if (column) |c| &.{c} else null;
         var result = try parquet.readRowGroupAsArrow(allocator, reader.getSource(), reader.metadata, rg, cols);
+        defer result.deinit();
+        for (result.arrays) |arr| {
+            check +%= @as(u64, @intCast(arr.length)) *% 31 +% @as(u64, @intCast(arr.null_count));
+        }
+    }
+    return check;
+}
+
+/// Reads the file through ArrowBatchReader, `batch_rows` rows per batch. Returns the same
+/// checksum as readArrow when every row group's rows fit in one batch; otherwise a checksum
+/// of the batches.
+fn readBatches(allocator: std.mem.Allocator, reader: *parquet.DynamicReader, column: ?usize) !u64 {
+    var check: u64 = 0;
+    const cols: ?[]const usize = if (column) |c| &.{c} else null;
+    var batches = try parquet.ArrowBatchReader.init(allocator, reader.getSource(), reader.metadata, .{ .columns = cols, .batch_rows = batch_rows });
+    defer batches.deinit();
+    while (try batches.next()) |result_const| {
+        var result = result_const;
         defer result.deinit();
         for (result.arrays) |arr| {
             check +%= @as(u64, @intCast(arr.length)) *% 31 +% @as(u64, @intCast(arr.null_count));

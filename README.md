@@ -325,7 +325,24 @@ Buffer layout:
 
 `result.schema` is a struct `ArrowSchema` whose children give each column's Arrow type (format string), name and nullability, for the columns read and in the order of `col_indices`. `parquet.exportSchemaAsArrow` returns the schema of all columns without reading data. `result.deinit()` releases all arrays and the schema.
 
-C callers have the same function as `zp_reader_read_row_group`. `zp_reader_get_stream` returns an `ArrowArrayStream` whose batches are the file's row groups, one per `get_next` call; `zp_reader_get_stream_columns` does the same for a subset of columns. A batch has as many rows as its row group.
+To read in batches of a fixed number of rows instead of whole row groups, use `ArrowBatchReader`:
+
+```zig
+var batches = try parquet.ArrowBatchReader.init(allocator, reader.getSource(), reader.metadata, .{
+    .columns = &.{0}, // null: all columns
+    .batch_rows = 65536,
+});
+defer batches.deinit();
+while (try batches.next()) |batch| {
+    var result = batch;
+    defer result.deinit();
+    // result.arrays, result.schema as above
+}
+```
+
+A batch does not span row groups, so the last batch of a row group can have fewer rows. For each row group, the reader holds the selected columns' compressed column chunks and decodes their pages as batches need them.
+
+C callers have the same functions as `zp_reader_read_row_group` and `zp_reader_get_stream_columns`. The second returns an `ArrowArrayStream` over the selected columns with `batch_rows` rows per batch, or one batch per row group when `batch_rows` is 0; `zp_reader_get_stream` is the same with all columns and one batch per row group.
 
 The reader loads a column chunk's compressed bytes whole, then decompresses and decodes one page at a time directly into the Arrow buffers.
 

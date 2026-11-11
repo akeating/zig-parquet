@@ -284,20 +284,29 @@ int zp_reader_get_stream(zp_reader_t handle,
 
 /**
  * Like zp_reader_get_stream(), reading only the top-level columns in
- * col_indices, in that order. get_schema() describes those columns.
+ * col_indices, in that order, and optionally in batches of a fixed number
+ * of rows. get_schema() describes the selected columns.
  *
- * Each batch is one row group of the selected columns; columns not
- * selected are not read or decoded. The stream keeps its own copy of
- * col_indices.
+ * With batch_rows 0, each batch is one row group. With batch_rows > 0,
+ * each batch has at most batch_rows rows; a batch does not span row
+ * groups, so the last batch of a row group can be shorter. Pages are
+ * decoded as batches need them; the selected columns' compressed column
+ * chunks of the current row group are held in memory.
+ *
+ * Columns not selected are not read or decoded. The stream keeps its own
+ * copy of col_indices.
  *
  * @param handle       Reader handle (must stay open while stream is active).
  * @param col_indices  Top-level column indices, or NULL for all columns.
  * @param num_cols     Number of entries in col_indices (ignored if NULL).
+ * @param batch_rows   Rows per batch, or 0 for one batch per row group.
  * @param stream_out   Output: initialized ArrowArrayStream.
- * @return ZP_OK, or ZP_ERROR_INVALID_ARGUMENT if an index is out of range.
+ * @return ZP_OK, or ZP_ERROR_INVALID_ARGUMENT if an index is out of range
+ *         or batch_rows is negative.
  */
 int zp_reader_get_stream_columns(zp_reader_t handle,
                                  const int* col_indices, int num_cols,
+                                 int64_t batch_rows,
                                  struct ArrowArrayStream* stream_out);
 
 /** Close the reader and release all resources. */

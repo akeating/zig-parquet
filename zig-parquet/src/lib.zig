@@ -90,6 +90,8 @@ pub const exportProjectedSchemaAsArrow = arrow_batch.exportProjectedSchemaAsArro
 pub const importSchemaFromArrow = arrow_batch.importSchemaFromArrow;
 pub const freeImportedColumnDefs = arrow_batch.freeImportedColumnDefs;
 pub const readRowGroupAsArrow = arrow_batch.readRowGroupAsArrow;
+pub const ArrowBatchReader = arrow_batch.ArrowBatchReader;
+pub const BatchOptions = arrow_batch.BatchOptions;
 pub const writeRowGroupFromArrow = arrow_batch.writeRowGroupFromArrow;
 
 // Writer (core type)

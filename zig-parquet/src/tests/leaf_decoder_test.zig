@@ -92,8 +92,19 @@ fn decodeFile(allocator: std.mem.Allocator, dir: std.Io.Dir, basename: []const u
                 totals.errors += 1;
                 continue;
             };
-            leaf.deinit(allocator);
+            defer leaf.deinit(allocator);
             totals.decoded += 1;
+
+            // Batches from a cursor, joined, equal the whole chunk. Small batch sizes only on
+            // small chunks, to bound the test's run time.
+            const entries = leaf.buffers.length;
+            for ([_]usize{ 1, 7, 1000 }) |rows| {
+                if (entries > rows * 1000) continue;
+                expectCursorMatches(allocator, page_data, meta, info, &leaf, rows) catch |err| {
+                    std.debug.print("cursor mismatch, {d} rows per batch: {s} column {d}: {s}\n", .{ rows, basename, col, @errorName(err) });
+                    return err;
+                };
+            }
 
             if (leaf_decoder.isFlat(info)) {
                 var arr = arrow_batch.decodeFlatChunk(allocator, page_data, meta, info) catch continue;
@@ -101,6 +112,67 @@ fn decodeFile(allocator: std.mem.Allocator, dir: std.Io.Dir, basename: []const u
             }
         }
     }
+}
+
+/// Reads the chunk through a `ColumnCursor`, `rows` rows per call, and checks that the
+/// batches hold `rows` rows each (except the last), start at a row boundary, and joined
+/// equal `full`.
+fn expectCursorMatches(
+    allocator: std.mem.Allocator,
+    page_data: []const u8,
+    meta: format.ColumnMetaData,
+    info: format.ColumnInfo,
+    full: *const leaf_decoder.Leaf,
+    rows: usize,
+) !void {
+    var cursor = try leaf_decoder.ColumnCursor.init(allocator, page_data, meta, info, .{ .keep_levels = true, .large_offsets = true }, 0);
+    defer cursor.deinit();
+    var at: usize = 0;
+    var short = false;
+    while (true) {
+        var batch = try cursor.next(rows);
+        defer batch.deinit(allocator);
+        const b = &batch.buffers;
+        if (b.length == 0) break;
+        // Only the last batch may hold fewer rows.
+        try std.testing.expect(!short);
+        const batch_rows = if (batch.rep_levels) |r| countZeros(r) else b.length;
+        if (batch_rows < rows) short = true;
+        try std.testing.expect(batch_rows <= rows);
+        // A batch starts at a row boundary (except in files whose levels do not start at 0).
+        if (batch.rep_levels) |r| {
+            if (at > 0 or full.rep_levels.?[0] == 0) try std.testing.expectEqual(@as(u32, 0), r[0]);
+        }
+
+        try std.testing.expect(at + b.length <= full.buffers.length);
+        var nulls: usize = 0;
+        for (0..b.length) |i| {
+            const j = at + i;
+            try std.testing.expectEqual(full.buffers.isValid(j), b.isValid(i));
+            nulls += @intFromBool(!b.isValid(i));
+            switch (b.layout) {
+                .bits => try std.testing.expectEqual(getBit(full.buffers.values.ptr, j), getBit(b.values.ptr, i)),
+                .fixed => |w| try std.testing.expectEqualSlices(u8, full.buffers.values[j * w ..][0..w], b.values[i * w ..][0..w]),
+                .bytes => try std.testing.expectEqualSlices(u8, full.buffers.bytesAt(j), b.bytesAt(i)),
+            }
+        }
+        try std.testing.expectEqual(nulls, b.null_count);
+        // Bits past the last entry of the validity bitmap are set.
+        if (b.length % 8 != 0) {
+            const pad: u8 = ~((@as(u8, 1) << @intCast(b.length % 8)) - 1);
+            try std.testing.expectEqual(pad, b.validity[b.length / 8] & pad);
+        }
+        if (full.def_levels) |d| try std.testing.expectEqualSlices(u32, d[at..][0..b.length], batch.def_levels.?);
+        if (full.rep_levels) |r| try std.testing.expectEqualSlices(u32, r[at..][0..b.length], batch.rep_levels.?);
+        at += b.length;
+    }
+    try std.testing.expectEqual(full.buffers.length, at);
+}
+
+fn countZeros(levels: []const u32) usize {
+    var n: usize = 0;
+    for (levels) |lv| n += @intFromBool(lv == 0);
+    return n;
 }
 
 // =============================================================================

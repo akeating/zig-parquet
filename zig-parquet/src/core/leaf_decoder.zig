@@ -248,85 +248,216 @@ pub fn decodeLeaf(
     info: format.ColumnInfo,
     options: Options,
 ) !Leaf {
-    const physical = info.element.type_ orelse return error.InvalidSchema;
+    var cursor = try ColumnCursor.init(allocator, page_data, meta, info, options, reservedEntries(meta.num_values));
+    defer cursor.deinit();
+    return cursor.next(std.math.maxInt(usize));
+}
 
-    var builder = Builder{
-        .allocator = allocator,
-        .large_offsets = options.large_offsets,
-        .kind = switch (physical) {
-            .boolean => .bits,
-            .int32, .float => .{ .fixed = 4 },
-            .int64, .double, .int96 => .{ .fixed = 8 },
-            .fixed_len_byte_array => .{ .fixed = try fixedLength(info.element) },
-            .byte_array => .bytes,
-        },
-    };
-    errdefer builder.deinit();
-    try builder.init(reservedEntries(meta.num_values));
+/// Decodes a leaf column chunk a number of rows at a time. Pages are decoded whole; entries
+/// of a page past the rows returned are kept for the next call, along with the dictionary.
+///
+/// A row of a column with repetition starts at each entry with repetition level 0, so a cut
+/// before row `n` needs the start of row `n` to have been decoded. Such a column needs
+/// `Options.keep_levels`.
+pub const ColumnCursor = struct {
+    /// Chunk bytes as stored in the file; borrowed, must outlive the cursor.
+    page_data: []const u8,
+    /// Position of the next page header in `page_data`.
+    pos: usize,
+    checksum: parquet_reader.ChecksumOptions,
+    dec: ChunkDecoder,
+    /// Entries decoded; those from `start` on are not yet returned.
+    builder: Builder,
+    start: usize = 0,
 
-    var dec = ChunkDecoder{
-        .allocator = allocator,
-        .physical = physical,
-        .info = info,
-        .codec = meta.codec,
-        .dict_set = parquet_reader.DictionarySet.init(allocator),
-        .def_bits = format.computeBitWidth(info.max_def_level),
-        .rep_bits = format.computeBitWidth(info.max_rep_level),
-        .keep_levels = options.keep_levels,
-    };
-    defer dec.deinit();
+    /// Reads the dictionary page, if any. `reserve` is the number of entries to allocate room
+    /// for before the first page.
+    pub fn init(
+        allocator: Allocator,
+        page_data: []const u8,
+        meta: format.ColumnMetaData,
+        info: format.ColumnInfo,
+        options: Options,
+        reserve: usize,
+    ) !ColumnCursor {
+        const physical = info.element.type_ orelse return error.InvalidSchema;
+        var builder = Builder{
+            .allocator = allocator,
+            .large_offsets = options.large_offsets,
+            .kind = switch (physical) {
+                .boolean => .bits,
+                .int32, .float => .{ .fixed = 4 },
+                .int64, .double, .int96 => .{ .fixed = 8 },
+                .fixed_len_byte_array => .{ .fixed = try fixedLength(info.element) },
+                .byte_array => .bytes,
+            },
+        };
+        errdefer builder.deinit();
+        try builder.init(reserve);
 
-    var pos: usize = 0;
+        var dec = ChunkDecoder{
+            .allocator = allocator,
+            .physical = physical,
+            .info = info,
+            .codec = meta.codec,
+            .dict_set = parquet_reader.DictionarySet.init(allocator),
+            .def_bits = format.computeBitWidth(info.max_def_level),
+            .rep_bits = format.computeBitWidth(info.max_rep_level),
+            .keep_levels = options.keep_levels,
+        };
+        errdefer dec.deinit();
 
-    // A dictionary page can only be the first page of the chunk.
-    if (pos < page_data.len) {
-        var peek = thrift.CompactReader.init(page_data[pos..]);
-        const first = try format.PageHeader.parse(allocator, &peek);
-        defer parquet_reader.freePageHeaderContents(allocator, &first);
+        var pos: usize = 0;
+        // A dictionary page can only be the first page of the chunk.
+        if (pos < page_data.len) {
+            var peek = thrift.CompactReader.init(page_data[pos..]);
+            const first = try format.PageHeader.parse(allocator, &peek);
+            defer parquet_reader.freePageHeaderContents(allocator, &first);
 
-        if (first.dictionary_page_header) |dph| {
-            pos += peek.pos;
-            const size = safe.cast(first.compressed_page_size) catch return error.InvalidPageSize;
-            const body = try safe.slice(page_data, pos, size);
-            pos += size;
-            try checkCrc(options.checksum, first, body);
-            const uncompressed = safe.cast(first.uncompressed_page_size) catch return error.InvalidPageSize;
-            const count = safe.cast(dph.num_values) catch return error.InvalidPageSize;
-            try dec.dict_set.initFromPage(body, count, physical, info.element.type_length, meta.codec, uncompressed);
-            try dec.buildDictView();
+            if (first.dictionary_page_header) |dph| {
+                pos += peek.pos;
+                const size = safe.cast(first.compressed_page_size) catch return error.InvalidPageSize;
+                const body = try safe.slice(page_data, pos, size);
+                pos += size;
+                try checkCrc(options.checksum, first, body);
+                const uncompressed = safe.cast(first.uncompressed_page_size) catch return error.InvalidPageSize;
+                const count = safe.cast(dph.num_values) catch return error.InvalidPageSize;
+                try dec.dict_set.initFromPage(body, count, physical, info.element.type_length, meta.codec, uncompressed);
+                try dec.buildDictView();
+            }
         }
+        return .{ .page_data = page_data, .pos = pos, .checksum = options.checksum, .dec = dec, .builder = builder };
     }
 
-    while (pos < page_data.len) {
-        var reader = thrift.CompactReader.init(page_data[pos..]);
+    pub fn deinit(self: *ColumnCursor) void {
+        self.builder.deinit();
+        self.dec.deinit();
+    }
+
+    /// Returns the next `rows` rows, or the remaining rows when fewer are left. An empty leaf
+    /// means the chunk is finished.
+    pub fn next(self: *ColumnCursor, rows: usize) !Leaf {
+        const repeated = self.dec.info.max_rep_level > 0;
+        // A row of a repeated column is complete once the next row has started.
+        const need = if (repeated) rows +| 1 else rows;
+        while (self.dec.row_starts < need and self.pos < self.page_data.len) try self.decodeNextPage();
+        if (self.dec.row_starts < need) return self.take(self.builder.length - self.start, self.dec.row_starts);
+        if (!repeated) return self.take(rows, rows);
+        if (!self.dec.keep_levels) return error.InvalidArgument;
+        // Entry index of the start of row `rows`.
+        var seen: usize = 0;
+        for (self.dec.out_rep.items[self.start..], 0..) |lv, i| {
+            if (lv != 0) continue;
+            if (seen == rows) return self.take(i, rows);
+            seen += 1;
+        }
+        unreachable; // row_starts counts the zeros in out_rep from `start`
+    }
+
+    /// Returns the next `n` pending entries, which hold `rows` rows.
+    ///
+    /// When they are at least half of the pending entries, the builder's buffers are moved
+    /// out and the rest is copied into a new builder. Otherwise the entries are copied out
+    /// and `start` advances; the returned entries are dropped once they are more than half of
+    /// the builder. Either way an entry is copied a bounded number of times, also when `rows`
+    /// is much smaller than a page.
+    fn take(self: *ColumnCursor, n: usize, rows: usize) !Leaf {
+        const allocator = self.dec.allocator;
+        const dec = &self.dec;
+        const keep_def = dec.keep_levels and dec.info.max_def_level > 0;
+        const keep_rep = dec.keep_levels and dec.info.max_rep_level > 0;
+        const end = self.start + n;
+        const rest = self.builder.length - end;
+
+        if (self.start == 0 and n >= rest) {
+            var tail = try self.builder.splitOff(n);
+            errdefer tail.deinit();
+            var tail_def = try levelsFrom(allocator, &dec.out_def, n, keep_def);
+            errdefer tail_def.deinit(allocator);
+            var tail_rep = try levelsFrom(allocator, &dec.out_rep, n, keep_rep);
+            errdefer tail_rep.deinit(allocator);
+            dec.out_def.shrinkRetainingCapacity(@min(n, dec.out_def.items.len));
+            dec.out_rep.shrinkRetainingCapacity(@min(n, dec.out_rep.items.len));
+
+            var buffers = try self.builder.finish();
+            errdefer buffers.deinit(allocator);
+            const def_levels = if (keep_def) try dec.out_def.toOwnedSlice(allocator) else null;
+            errdefer if (def_levels) |l| allocator.free(l);
+            const rep_levels = if (keep_rep) try dec.out_rep.toOwnedSlice(allocator) else null;
+
+            self.builder.deinit();
+            self.builder = tail;
+            dec.out_def.deinit(allocator);
+            dec.out_def = tail_def;
+            dec.out_rep.deinit(allocator);
+            dec.out_rep = tail_rep;
+            dec.row_starts -= rows;
+            return .{ .buffers = buffers, .def_levels = def_levels, .rep_levels = rep_levels };
+        }
+
+        var head = try self.builder.copyRange(self.start, n);
+        var buffers = head.finish() catch |e| {
+            head.deinit();
+            return e;
+        };
+        errdefer buffers.deinit(allocator);
+        const def_levels = if (keep_def) try allocator.dupe(u32, dec.out_def.items[self.start..end]) else null;
+        errdefer if (def_levels) |l| allocator.free(l);
+        const rep_levels = if (keep_rep) try allocator.dupe(u32, dec.out_rep.items[self.start..end]) else null;
+        errdefer if (rep_levels) |l| allocator.free(l);
+
+        if (end * 2 > self.builder.length) {
+            const tail = try self.builder.copyRange(end, rest);
+            self.builder.deinit();
+            self.builder = tail;
+            if (keep_def) dropFront(&dec.out_def, end);
+            if (keep_rep) dropFront(&dec.out_rep, end);
+            self.start = 0;
+        } else {
+            self.start = end;
+        }
+        dec.row_starts -= rows;
+        return .{ .buffers = buffers, .def_levels = def_levels, .rep_levels = rep_levels };
+    }
+
+    /// A list with `list.items[from..]`, or an empty list when `keep` is false.
+    fn levelsFrom(allocator: Allocator, list: *const std.ArrayList(u32), from: usize, keep: bool) !std.ArrayList(u32) {
+        var out: std.ArrayList(u32) = .empty;
+        if (keep) try out.appendSlice(allocator, list.items[from..]);
+        return out;
+    }
+
+    fn dropFront(list: *std.ArrayList(u32), n: usize) void {
+        const rest = list.items.len - n;
+        std.mem.copyForwards(u32, list.items[0..rest], list.items[n..]);
+        list.shrinkRetainingCapacity(rest);
+    }
+
+    /// Decodes the next data page into `builder`. Other page types are skipped.
+    fn decodeNextPage(self: *ColumnCursor) !void {
+        const allocator = self.dec.allocator;
+        var reader = thrift.CompactReader.init(self.page_data[self.pos..]);
         const header = try format.PageHeader.parse(allocator, &reader);
         defer parquet_reader.freePageHeaderContents(allocator, &header);
-        pos += reader.pos;
+        self.pos += reader.pos;
 
         const size = safe.cast(header.compressed_page_size) catch return error.InvalidPageSize;
         if (header.data_page_header == null and header.data_page_header_v2 == null) {
-            // Other page types (index pages, a second dictionary page) are skipped.
-            pos = std.math.add(usize, pos, size) catch page_data.len;
-            continue;
+            // Index pages and a second dictionary page are skipped.
+            self.pos = std.math.add(usize, self.pos, size) catch self.page_data.len;
+            return;
         }
-        const body = try safe.slice(page_data, pos, size);
-        pos += size;
-        try checkCrc(options.checksum, header, body);
+        const body = try safe.slice(self.page_data, self.pos, size);
+        self.pos += size;
+        try checkCrc(self.checksum, header, body);
 
         if (header.data_page_header) |dph| {
-            try dec.decodeV1Page(&builder, body, dph, header);
+            try self.dec.decodeV1Page(&self.builder, body, dph, header);
         } else if (header.data_page_header_v2) |v2| {
-            try dec.decodeV2Page(&builder, body, v2, header);
+            try self.dec.decodeV2Page(&self.builder, body, v2, header);
         }
     }
-
-    var buffers = try builder.finish();
-    errdefer buffers.deinit(allocator);
-    const def_levels = if (dec.keep_levels and info.max_def_level > 0) try dec.out_def.toOwnedSlice(allocator) else null;
-    errdefer if (def_levels) |l| allocator.free(l);
-    const rep_levels = if (dec.keep_levels and info.max_rep_level > 0) try dec.out_rep.toOwnedSlice(allocator) else null;
-    return .{ .buffers = buffers, .def_levels = def_levels, .rep_levels = rep_levels };
-}
+};
 
 fn checkCrc(options: parquet_reader.ChecksumOptions, header: format.PageHeader, body: []const u8) !void {
     if (!options.validate_page_checksum) return;
@@ -433,6 +564,61 @@ const Builder = struct {
         return if (self.large_offsets) 8 else 4;
     }
 
+    /// A new builder with copies of entries `start..start + n`.
+    fn copyRange(self: *const Builder, start: usize, n: usize) !Builder {
+        var out = Builder{ .allocator = self.allocator, .kind = self.kind, .large_offsets = self.large_offsets };
+        errdefer out.deinit();
+        try out.init(n);
+        if (n == 0) return out;
+        appendBitRange(&out.validity, self.validity.items, start, n, true);
+        var ones: usize = 0;
+        for (out.validity.items) |byte| ones += @popCount(byte);
+        // Padding bits past `n` are set, so they count as valid.
+        out.null_count = out.validity.items.len * 8 - ones;
+        out.length = n;
+        switch (self.kind) {
+            .bits => appendBitRange(&out.values, self.values.items, start, n, false),
+            .fixed => |w| out.values.appendSliceAssumeCapacity(self.values.items[start * w .. (start + n) * w]),
+            .bytes => {
+                const first = self.offsetAt(start);
+                try out.values.appendSlice(self.allocator, self.values.items[first..self.offsetAt(start + n)]);
+                for (start + 1..start + n + 1) |i| try pushOffsetAt(&out, self.offsetAt(i) - first);
+            },
+        }
+        return out;
+    }
+
+    /// Moves the entries from `cut` on into a new builder and truncates this one to `cut`
+    /// entries.
+    fn splitOff(self: *Builder, cut: usize) !Builder {
+        const tail = try self.copyRange(cut, self.length - cut);
+        self.validity.shrinkRetainingCapacity(bitBytes(cut));
+        if (cut % 8 != 0) self.validity.items[cut / 8] |= ~((@as(u8, 1) << @intCast(cut % 8)) - 1);
+        switch (self.kind) {
+            .bits => {
+                self.values.shrinkRetainingCapacity(bitBytes(cut));
+                if (cut % 8 != 0) self.values.items[cut / 8] &= (@as(u8, 1) << @intCast(cut % 8)) - 1;
+            },
+            .fixed => |w| self.values.shrinkRetainingCapacity(cut * w),
+            .bytes => {
+                self.values.shrinkRetainingCapacity(self.offsetAt(cut));
+                self.offsets.shrinkRetainingCapacity((cut + 1) * self.offsetWidth());
+            },
+        }
+        self.null_count -= tail.null_count;
+        self.length = cut;
+        return tail;
+    }
+
+    /// Byte-array offset `i`.
+    fn offsetAt(self: *const Builder, i: usize) usize {
+        const o = self.offsets.items;
+        return if (self.large_offsets)
+            @intCast(std.mem.bytesToValue(i64, o[i * 8 ..][0..8]))
+        else
+            @intCast(std.mem.bytesToValue(i32, o[i * 4 ..][0..4]));
+    }
+
     fn finish(self: *Builder) !Buffers {
         if (self.kind == .bytes and self.values.items.len == 0) {
             // Arrow consumers expect a non-null data buffer.
@@ -443,7 +629,7 @@ const Builder = struct {
         const values = try self.values.toOwnedSlice(self.allocator);
         errdefer self.allocator.free(values);
         const offsets: ?Buffer = if (self.kind == .bytes) try self.offsets.toOwnedSlice(self.allocator) else null;
-        self.offsets.deinit(self.allocator);
+        // The lists are left empty, so `deinit` can still be called.
         return .{
             .length = self.length,
             .null_count = self.null_count,
@@ -455,6 +641,24 @@ const Builder = struct {
         };
     }
 };
+
+/// Appends bits `start..start + n` of `src` to an empty bit list, starting at bit 0. Bits
+/// past `n` in the last byte are set to `pad`. Requires capacity for `bitBytes(n)` bytes.
+fn appendBitRange(list: *BufferList, src: []const u8, start: usize, n: usize, pad: bool) void {
+    const shift: u3 = @intCast(start % 8);
+    const first = start / 8;
+    for (0..bitBytes(n)) |j| {
+        const k = first + j;
+        var byte = src[k] >> shift;
+        if (shift != 0 and k + 1 < src.len) byte |= src[k + 1] << @intCast(@as(u4, 8) - shift);
+        list.appendAssumeCapacity(byte);
+    }
+    if (n % 8 != 0) {
+        const mask = (@as(u8, 1) << @intCast(n % 8)) - 1;
+        const last = &list.items[list.items.len - 1];
+        last.* = if (pad) last.* | ~mask else last.* & mask;
+    }
+}
 
 fn mulSize(a: usize, b: usize) error{OutOfMemory}!usize {
     return std.math.mul(usize, a, b) catch error.OutOfMemory;
@@ -521,6 +725,9 @@ const ChunkDecoder = struct {
     mask: std.ArrayList(u32) = .empty,
     out_def: std.ArrayList(u32) = .empty,
     out_rep: std.ArrayList(u32) = .empty,
+    /// Rows started in the entries decoded and not yet returned by `ColumnCursor`: entries
+    /// with repetition level 0, or all entries when the column has no repetition.
+    row_starts: usize = 0,
     /// Dictionary indices or RLE booleans of the current page.
     indices: std.ArrayList(u32) = .empty,
     /// Dense values of the current page when they must be converted before copying.
@@ -683,6 +890,9 @@ const ChunkDecoder = struct {
             if (def) |d| try self.out_def.appendSlice(self.allocator, d);
             if (rep) |r| try self.out_rep.appendSlice(self.allocator, r);
         }
+        if (rep) |r| {
+            for (r) |lv| self.row_starts += @intFromBool(lv == 0);
+        } else self.row_starts += n;
         var present: ?[]const u32 = null;
         var non_null = n;
         if (def) |d| {

@@ -267,16 +267,20 @@ pub export fn zp_reader_get_stream(
     handle_ptr: ?*anyopaque,
     stream_out: ?*ArrowArrayStream,
 ) callconv(.c) c_int {
-    return zp_reader_get_stream_columns(handle_ptr, null, 0, stream_out);
+    return zp_reader_get_stream_columns(handle_ptr, null, 0, 0, stream_out);
 }
 
-/// Get an Arrow C Stream Interface that iterates over row groups and reads only the
-/// top-level columns `col_indices`, in that order. If `col_indices` is null, all columns
-/// are read and `num_cols` is ignored. The stream keeps its own copy of the indices.
+/// Get an Arrow C Stream Interface that reads the top-level columns `col_indices`, in that
+/// order. If `col_indices` is null, all columns are read and `num_cols` is ignored. The
+/// stream keeps its own copy of the indices.
+///
+/// With `batch_rows` 0, each batch is one row group. With `batch_rows` > 0, each batch has
+/// at most `batch_rows` rows; a batch does not span row groups.
 pub export fn zp_reader_get_stream_columns(
     handle_ptr: ?*anyopaque,
     col_indices: ?[*]const c_int,
     num_cols: c_int,
+    batch_rows: i64,
     stream_out: ?*ArrowArrayStream,
 ) callconv(.c) c_int {
     const handle = castHandle(ReaderHandle, handle_ptr) orelse return err.ZP_ERROR_INVALID_ARGUMENT;
@@ -297,7 +301,25 @@ pub export fn zp_reader_get_stream_columns(
         indices = copy;
     }
 
+    if (batch_rows < 0) {
+        if (indices) |ci| handle.allocator.free(ci);
+        handle.err_ctx.setError(err.ZP_ERROR_INVALID_ARGUMENT, "batch_rows must not be negative");
+        return handle.err_ctx.code;
+    }
+    var batches: ?arrow_batch.ArrowBatchReader = null;
+    if (batch_rows > 0) {
+        batches = arrow_batch.ArrowBatchReader.init(handle.allocator, handle.source, handle.metadata, .{
+            .columns = indices,
+            .batch_rows = safe.castTo(usize, batch_rows) catch std.math.maxInt(usize),
+        }) catch |e| {
+            if (indices) |ci| handle.allocator.free(ci);
+            handle.err_ctx.setError(err.mapError(e), err.errorMessage(e));
+            return handle.err_ctx.code;
+        };
+    }
+
     const pd = handle.allocator.create(StreamPrivateData) catch {
+        if (batches) |*b| b.deinit();
         if (indices) |ci| handle.allocator.free(ci);
         handle.err_ctx.setError(err.ZP_ERROR_OUT_OF_MEMORY, "OutOfMemory");
         return handle.err_ctx.code;
@@ -306,6 +328,7 @@ pub export fn zp_reader_get_stream_columns(
         .handle = handle,
         .rg_index = 0,
         .col_indices = indices,
+        .batches = batches,
     };
 
     out.* = .{
@@ -547,6 +570,8 @@ const StreamPrivateData = struct {
     rg_index: usize,
     /// Top-level columns to read; null reads all. Owned by the stream.
     col_indices: ?[]usize,
+    /// Set when the stream returns batches of a fixed number of rows instead of row groups.
+    batches: ?arrow_batch.ArrowBatchReader,
 };
 
 fn streamGetSchema(stream: *ArrowArrayStream, schema_out: *ArrowSchema) callconv(.c) c_int {
@@ -565,23 +590,23 @@ fn streamGetNext(stream: *ArrowArrayStream, array_out: *ArrowArray) callconv(.c)
     const pd: *StreamPrivateData = @ptrCast(@alignCast(stream.private_data));
     const handle = pd.handle;
 
-    if (pd.rg_index >= handle.metadata.row_groups.len) {
-        // Signal end of stream with a released array
-        array_out.* = .{
-            .length = 0,
-            .null_count = 0,
-            .offset = 0,
-            .n_buffers = 0,
-            .n_children = 0,
-            .buffers = undefined,
-            .children = null,
-            .dictionary = null,
-            .release = null,
-            .private_data = null,
+    if (pd.batches) |*batches| {
+        const batch = batches.next() catch |e| {
+            handle.err_ctx.setErrorFmt(err.mapError(e), "reading the next batch failed: {s}", .{err.errorMessage(e)});
+            return handle.err_ctx.code;
         };
+        if (batch) |result_const| {
+            var result = result_const;
+            return wrapStreamBatch(handle, &result, array_out);
+        }
+        array_out.* = end_of_stream;
         return ZP_OK;
     }
 
+    if (pd.rg_index >= handle.metadata.row_groups.len) {
+        array_out.* = end_of_stream;
+        return ZP_OK;
+    }
     var result = arrow_batch.readRowGroupAsArrow(
         handle.allocator,
         handle.source,
@@ -592,19 +617,37 @@ fn streamGetNext(stream: *ArrowArrayStream, array_out: *ArrowArray) callconv(.c)
         handle.err_ctx.setErrorFmt(err.mapError(e), "readRowGroupAsArrow failed: {s}", .{err.errorMessage(e)});
         return handle.err_ctx.code;
     };
+    const rc = wrapStreamBatch(handle, &result, array_out);
+    if (rc == ZP_OK) pd.rg_index += 1;
+    return rc;
+}
 
+/// A released array, which `get_next` returns at the end of the stream.
+const end_of_stream: ArrowArray = .{
+    .length = 0,
+    .null_count = 0,
+    .offset = 0,
+    .n_buffers = 0,
+    .n_children = 0,
+    .buffers = undefined,
+    .children = null,
+    .dictionary = null,
+    .release = null,
+    .private_data = null,
+};
+
+/// Wraps a read's column arrays in one struct array for `get_next`. The caller gets the
+/// schema from `get_schema`, so the read's schema is released. On error, frees `result`.
+fn wrapStreamBatch(handle: *ReaderHandle, result: *arrow_batch.ReadResult, array_out: *ArrowArray) c_int {
     const wrapper = wrapColumnsAsStruct(handle.allocator, result.arrays, &result.schema) catch |e| {
         result.deinit();
         handle.err_ctx.setError(err.mapError(e), err.errorMessage(e));
         return handle.err_ctx.code;
     };
-
     array_out.* = wrapper.array;
-    // Schema from each row group read is the same; release it since the caller
-    // gets the schema via get_schema(). The wrapper owns the column arrays.
+    // The wrapper owns the column arrays; only the slice is freed.
     result.schema.doRelease();
     handle.allocator.free(result.arrays);
-    pd.rg_index += 1;
     return ZP_OK;
 }
 
@@ -617,6 +660,7 @@ fn streamGetLastError(stream: *ArrowArrayStream) callconv(.c) ?[*:0]const u8 {
 
 fn streamRelease(stream: *ArrowArrayStream) callconv(.c) void {
     const pd: *StreamPrivateData = @ptrCast(@alignCast(stream.private_data));
+    if (pd.batches) |*b| b.deinit();
     if (pd.col_indices) |ci| pd.handle.allocator.free(ci);
     pd.handle.allocator.destroy(pd);
     stream.release = null;
