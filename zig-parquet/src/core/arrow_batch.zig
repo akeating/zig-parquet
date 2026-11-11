@@ -355,14 +355,16 @@ fn physicalTypeToArrowFormat(allocator: Allocator, elem: format.SchemaElement) S
 
 /// Convert an ArrowSchema (root struct) to Parquet ColumnDef[].
 /// The caller owns the returned slice and must call `freeImportedColumnDefs` to free it.
+/// Names are copied, so `schema` can be released once this returns.
 pub fn importSchemaFromArrow(allocator: Allocator, schema: *const ArrowSchema) ![]ColumnDef {
     const fmt = std.mem.sliceTo(schema.format, 0);
     if (!std.mem.eql(u8, fmt, "+s")) return error.InvalidSchema;
 
     const nc = safe.castTo(usize, schema.n_children) catch return error.InvalidSchema;
-    var col_defs = try allocator.alloc(ColumnDef, nc);
+    const col_defs = try allocator.alloc(ColumnDef, nc);
+    var built: usize = 0;
     errdefer {
-        for (col_defs) |*cd| cd.freeStructFields(allocator);
+        for (col_defs[0..built]) |*cd| freeImportedColumnDef(allocator, cd);
         allocator.free(col_defs);
     }
 
@@ -370,6 +372,7 @@ pub fn importSchemaFromArrow(allocator: Allocator, schema: *const ArrowSchema) !
     for (0..nc) |i| {
         const child = children[i];
         col_defs[i] = try arrowSchemaToColumnDef(allocator, child);
+        built = i + 1;
     }
 
     return col_defs;
@@ -378,12 +381,20 @@ pub fn importSchemaFromArrow(allocator: Allocator, schema: *const ArrowSchema) !
 /// Free ColumnDef[] returned by importSchemaFromArrow, including any
 /// heap-allocated struct_fields within individual column definitions.
 pub fn freeImportedColumnDefs(allocator: Allocator, col_defs: []ColumnDef) void {
-    for (col_defs) |*cd| {
-        cd.freeStructFields(allocator);
-        if (cd.schema_node) |node| freeSchemaNode(allocator, node);
-        cd.schema_node = null;
-    }
+    for (col_defs) |*cd| freeImportedColumnDef(allocator, cd);
     allocator.free(col_defs);
+}
+
+/// Frees the names, struct fields and schema nodes of a ColumnDef made by
+/// `arrowSchemaToColumnDef`.
+fn freeImportedColumnDef(allocator: Allocator, cd: *ColumnDef) void {
+    if (cd.struct_fields_owned) {
+        if (cd.struct_fields) |fields| for (fields) |f| allocator.free(f.name);
+    }
+    cd.freeStructFields(allocator);
+    if (cd.schema_node) |node| freeSchemaNode(allocator, node);
+    cd.schema_node = null;
+    allocator.free(cd.name);
 }
 
 /// Frees a schema node tree allocated by `arrowSchemaToSchemaNode`.
@@ -396,7 +407,10 @@ fn freeSchemaNode(allocator: Allocator, node: *const SchemaNode) void {
             freeSchemaNode(allocator, m.value);
         },
         .struct_ => |st| {
-            for (st.fields) |field| freeSchemaNode(allocator, field.node);
+            for (st.fields) |field| {
+                freeSchemaNode(allocator, field.node);
+                allocator.free(field.name);
+            }
             allocator.free(st.fields);
         },
         else => {},
@@ -404,9 +418,11 @@ fn freeSchemaNode(allocator: Allocator, node: *const SchemaNode) void {
     allocator.destroy(node);
 }
 
+/// A ColumnDef of a top-level Arrow column; it owns a copy of every name it holds.
 fn arrowSchemaToColumnDef(allocator: Allocator, schema: *const ArrowSchema) !ColumnDef {
     const fmt = std.mem.sliceTo(schema.format, 0);
-    const name = if (schema.name) |n| std.mem.sliceTo(n, 0) else "";
+    const name = try allocator.dupe(u8, if (schema.name) |n| std.mem.sliceTo(n, 0) else "");
+    errdefer allocator.free(name);
     const nullable = (schema.flags & arrow.ARROW_FLAG_NULLABLE) != 0;
 
     if (std.mem.eql(u8, fmt, "+l")) {
@@ -449,12 +465,16 @@ fn arrowSchemaToSchemaNode(allocator: Allocator, schema: *const ArrowSchema, nul
         const fields = allocator.alloc(SchemaNode.Field, nc) catch return error.OutOfMemory;
         var built: usize = 0;
         errdefer {
-            for (fields[0..built]) |f| freeSchemaNode(allocator, f.node);
+            for (fields[0..built]) |f| {
+                freeSchemaNode(allocator, f.node);
+                allocator.free(f.name);
+            }
             allocator.free(fields);
         }
         for (0..nc) |i| {
             const child = children[i];
-            const child_name = if (child.name) |n| std.mem.sliceTo(n, 0) else "";
+            const child_name = try allocator.dupe(u8, if (child.name) |n| std.mem.sliceTo(n, 0) else "");
+            errdefer allocator.free(child_name);
             const child_nullable = (child.flags & arrow.ARROW_FLAG_NULLABLE) != 0;
             fields[i] = .{
                 .name = child_name,
@@ -681,15 +701,20 @@ fn arrowStructToColumnDef(allocator: Allocator, schema: *const ArrowSchema, name
     }
 
     const struct_fields = try allocator.alloc(StructField, nc);
-    errdefer allocator.free(struct_fields);
+    var built: usize = 0;
+    errdefer {
+        for (struct_fields[0..built]) |f| allocator.free(f.name);
+        allocator.free(struct_fields);
+    }
 
     for (0..nc) |i| {
         const child = children[i];
         const child_fmt = std.mem.sliceTo(child.format, 0);
-        const child_name = if (child.name) |n| std.mem.sliceTo(n, 0) else "";
         const child_nullable = (child.flags & arrow.ARROW_FLAG_NULLABLE) != 0;
 
-        const child_def = try arrowLeafToColumnDef(child_fmt, child_name, child_nullable);
+        const child_def = try arrowLeafToColumnDef(child_fmt, "", child_nullable);
+        const child_name = try allocator.dupe(u8, if (child.name) |n| std.mem.sliceTo(n, 0) else "");
+        built = i + 1;
         struct_fields[i] = .{
             .name = child_name,
             .type_ = child_def.type_,
@@ -4636,6 +4661,73 @@ fn expectDecimalArray(arr: *const ArrowArray, width: usize, expected: []const ?i
         try std.testing.expectEqual(e != null, valid);
         if (e) |value| try std.testing.expectEqual(value, arrowDecimalAt(data, width, i));
     }
+}
+
+test "imported schema keeps no references to the Arrow schema's names" {
+    const allocator = std.testing.allocator;
+
+    // Names in heap memory, as a C caller's schema would have them. Schema:
+    // top: int32, point: struct<x: int32>, items: list<struct<y: int64>>.
+    const name_list = [_][]const u8{ "top", "point", "x", "items", "element", "y" };
+    var names: [name_list.len][:0]u8 = undefined;
+    for (name_list, 0..) |n, i| names[i] = try allocator.dupeSentinel(u8, n, 0);
+    var freed = false;
+    defer if (!freed) for (names) |n| allocator.free(n);
+
+    var top = testLeafSchema("i", names[0].ptr);
+    var x = testLeafSchema("i", names[2].ptr);
+    var point_children = [_]*ArrowSchema{&x};
+    var point = ArrowSchema{ .format = "+s", .name = names[1].ptr, .metadata = null, .flags = arrow.ARROW_FLAG_NULLABLE, .n_children = 1, .children = &point_children, .dictionary = null, .release = null, .private_data = null };
+    var y = testLeafSchema("l", names[5].ptr);
+    var element_children = [_]*ArrowSchema{&y};
+    var element = ArrowSchema{ .format = "+s", .name = names[4].ptr, .metadata = null, .flags = arrow.ARROW_FLAG_NULLABLE, .n_children = 1, .children = &element_children, .dictionary = null, .release = null, .private_data = null };
+    var items_children = [_]*ArrowSchema{&element};
+    var items = ArrowSchema{ .format = "+l", .name = names[3].ptr, .metadata = null, .flags = arrow.ARROW_FLAG_NULLABLE, .n_children = 1, .children = &items_children, .dictionary = null, .release = null, .private_data = null };
+    var root_children = [_]*ArrowSchema{ &top, &point, &items };
+    const root = ArrowSchema{ .format = "+s", .name = "", .metadata = null, .flags = 0, .n_children = 3, .children = &root_children, .dictionary = null, .release = null, .private_data = null };
+
+    const col_defs = try importSchemaFromArrow(allocator, &root);
+    defer freeImportedColumnDefs(allocator, col_defs);
+
+    // The caller releases its schema.
+    for (names) |n| {
+        @memset(n, 'Z');
+        allocator.free(n);
+    }
+    freed = true;
+
+    // One row group of 0 rows.
+    var zero_offsets = [_]i32{0};
+    var no_data: [8]u8 = @splat(0);
+    var leaf_buffers = [_]?*anyopaque{ null, @ptrCast(&no_data) };
+    var y_arr = ArrowArray{ .length = 0, .null_count = 0, .offset = 0, .n_buffers = 2, .n_children = 0, .buffers = &leaf_buffers, .children = null, .dictionary = null, .release = null, .private_data = null };
+    var struct_buffers = [_]?*anyopaque{null};
+    var element_arr_children = [_]*ArrowArray{&y_arr};
+    var element_arr = ArrowArray{ .length = 0, .null_count = 0, .offset = 0, .n_buffers = 1, .n_children = 1, .buffers = &struct_buffers, .children = &element_arr_children, .dictionary = null, .release = null, .private_data = null };
+    var list_buffers = [_]?*anyopaque{ null, @ptrCast(&zero_offsets) };
+    var items_arr_children = [_]*ArrowArray{&element_arr};
+    const items_arr = ArrowArray{ .length = 0, .null_count = 0, .offset = 0, .n_buffers = 2, .n_children = 1, .buffers = &list_buffers, .children = &items_arr_children, .dictionary = null, .release = null, .private_data = null };
+    var x_arr = y_arr;
+    var point_arr_children = [_]*ArrowArray{&x_arr};
+    const point_arr = ArrowArray{ .length = 0, .null_count = 0, .offset = 0, .n_buffers = 1, .n_children = 1, .buffers = &struct_buffers, .children = &point_arr_children, .dictionary = null, .release = null, .private_data = null };
+    const top_arr = y_arr;
+
+    var writer = try api_writer_mod.writeToBuffer(allocator, col_defs);
+    try writeRowGroupFromArrow(&writer, allocator, &.{ top_arr, point_arr, items_arr }, &.{ top, point, items });
+    try writer.close();
+    const buf = try writer.toOwnedSlice();
+    defer allocator.free(buf);
+    writer.deinit();
+
+    var dr = try api_reader_mod.openBufferDynamic(allocator, buf, .{});
+    defer dr.deinit();
+    var written: std.ArrayList(u8) = .empty;
+    defer written.deinit(allocator);
+    for (dr.metadata.schema[1..]) |elem| {
+        try written.appendSlice(allocator, elem.name);
+        try written.append(allocator, ' ');
+    }
+    try std.testing.expectEqualStrings("top point x items list element y ", written.items);
 }
 
 test "round-trip: arrow write then read - decimals in Arrow layout" {

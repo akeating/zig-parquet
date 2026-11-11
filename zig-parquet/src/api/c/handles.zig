@@ -277,7 +277,6 @@ pub const WriterHandle = struct {
     writer: ?*Writer = null,
     backend: WriterBackend,
     column_defs: ?[]ColumnDef = null,
-    column_names: ?[][:0]u8 = null,
     err_ctx: ErrorContext = .{},
     transport_failed: bool = false,
     row_group_size: ?usize = null,
@@ -350,17 +349,7 @@ pub const WriterHandle = struct {
         const allocator = self.allocator;
         const col_defs = try arrow_batch.importSchemaFromArrow(allocator, schema);
         errdefer arrow_batch.freeImportedColumnDefs(allocator, col_defs);
-
-        // Dupe column names so they outlive the ArrowSchema
-        var names = try allocator.alloc([:0]u8, col_defs.len);
-        errdefer {
-            for (names[0..col_defs.len]) |n| allocator.free(n);
-            allocator.free(names);
-        }
-        for (col_defs, 0..) |*cd, i| {
-            names[i] = try allocator.dupeSentinel(u8, cd.name, 0);
-            cd.name = names[i];
-        }
+        // importSchemaFromArrow copies the names, so `schema` can be released after this.
 
         const w = try allocator.create(Writer);
         errdefer allocator.destroy(w);
@@ -368,7 +357,6 @@ pub const WriterHandle = struct {
 
         self.writer = w;
         self.column_defs = col_defs;
-        self.column_names = names;
     }
 
     pub fn close(self: *WriterHandle) !void {
@@ -385,10 +373,6 @@ pub const WriterHandle = struct {
             allocator.destroy(w);
         }
 
-        if (self.column_names) |names| {
-            for (names) |n| allocator.free(n);
-            allocator.free(names);
-        }
         if (self.column_defs) |defs| arrow_batch.freeImportedColumnDefs(allocator, defs);
 
         switch (self.backend) {
