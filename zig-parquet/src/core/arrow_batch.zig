@@ -165,11 +165,12 @@ pub fn exportProjectedSchemaAsArrow(allocator: Allocator, metadata: format.FileM
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const columns = try buildSchemaTree(arena.allocator(), schema);
-    return treeSchema(allocator, schema, columns, col_indices);
+    return treeSchema(allocator, schema, columns, col_indices, false);
 }
 
 /// The ArrowSchema of the top-level columns `col_indices` of a schema tree, or of all of them.
-fn treeSchema(allocator: Allocator, schema: []const format.SchemaElement, columns: []const Node, col_indices: ?[]const usize) !ArrowSchema {
+/// With `large_offsets`, BYTE_ARRAY leaves are large_string ("U") or large_binary ("Z").
+fn treeSchema(allocator: Allocator, schema: []const format.SchemaElement, columns: []const Node, col_indices: ?[]const usize, large_offsets: bool) !ArrowSchema {
     const n = if (col_indices) |ci| ci.len else columns.len;
     var children = try allocator.alloc(ArrowSchema, n);
     var init_count: usize = 0;
@@ -184,7 +185,7 @@ fn treeSchema(allocator: Allocator, schema: []const format.SchemaElement, column
     for (0..n) |i| {
         const col_idx = if (col_indices) |ci| ci[i] else i;
         if (col_idx >= columns.len) return error.InvalidArgument;
-        children[i] = try nodeSchema(allocator, schema, &columns[col_idx], null);
+        children[i] = try nodeSchema(allocator, schema, &columns[col_idx], null, large_offsets);
         children_ptrs[i] = &children[i];
         init_count = i + 1;
     }
@@ -199,12 +200,14 @@ const SchemaConvError = error{
 };
 
 /// ArrowSchema of a schema tree node. `name_override` replaces the schema element's name.
-fn nodeSchema(allocator: Allocator, schema: []const format.SchemaElement, node: *const Node, name_override: ?[]const u8) SchemaConvError!ArrowSchema {
+fn nodeSchema(allocator: Allocator, schema: []const format.SchemaElement, node: *const Node, name_override: ?[]const u8, large_offsets: bool) SchemaConvError!ArrowSchema {
     const elem = schema[node.schema_idx];
     const name = name_override orelse elem.name;
     if (node.kind == .leaf) {
         const fmt = try parquetTypeToArrowFormat(allocator, elem);
         defer allocator.free(fmt);
+        // BYTE_ARRAY leaves read with i64 offsets: "u" -> "U", "z" -> "Z".
+        if (large_offsets and elem.type_ == .byte_array and fmt.len == 1 and (fmt[0] == 'u' or fmt[0] == 'z')) fmt[0] = std.ascii.toUpper(fmt[0]);
         return createSchemaNode(allocator, fmt, name, node.nullable, null, null);
     }
 
@@ -220,7 +223,7 @@ fn nodeSchema(allocator: Allocator, schema: []const format.SchemaElement, node: 
 
     for (node.children, 0..) |*child, i| {
         // An Arrow map's child is the struct "entries" (key, value).
-        children[i] = try nodeSchema(allocator, schema, child, if (node.kind == .map) "entries" else null);
+        children[i] = try nodeSchema(allocator, schema, child, if (node.kind == .map) "entries" else null, large_offsets);
         ptrs[i] = &children[i];
         init_count = i + 1;
     }
@@ -767,7 +770,7 @@ pub fn readRowGroupAsArrow(
         init_count = i + 1;
     }
 
-    var schema = try treeSchema(allocator, metadata.schema, columns, col_indices);
+    var schema = try treeSchema(allocator, metadata.schema, columns, col_indices, false);
     errdefer schema.doRelease();
 
     return .{
@@ -783,8 +786,12 @@ pub const BatchOptions = struct {
     /// Row groups to read, in this order; null reads all.
     row_groups: ?[]const usize = null,
     /// Rows per batch. A batch does not span row groups, so the last batch of a row group
-    /// can have fewer rows.
+    /// can have fewer rows. `std.math.maxInt(usize)` returns one batch per row group.
     batch_rows: usize = 65536,
+    /// Read BYTE_ARRAY columns as Arrow large_string / large_binary (formats "U" and "Z",
+    /// i64 offsets). With i32 offsets, a batch whose column holds more than 2^31 - 1 bytes
+    /// of byte-array data returns `error.IntegerOverflow`.
+    large_offsets: bool = false,
 };
 
 /// Reads a file's columns as Arrow arrays, `batch_rows` rows at a time.
@@ -805,6 +812,7 @@ pub const ArrowBatchReader = struct {
     columns: []const usize,
     row_groups: []const usize,
     batch_rows: usize,
+    large_offsets: bool,
     /// Position in `row_groups` of the next row group to open.
     next_rg: usize = 0,
     /// Rows of the open row group not yet returned.
@@ -853,6 +861,7 @@ pub const ArrowBatchReader = struct {
             .columns = columns,
             .row_groups = row_groups,
             .batch_rows = options.batch_rows,
+            .large_offsets = options.large_offsets,
         };
     }
 
@@ -863,7 +872,7 @@ pub const ArrowBatchReader = struct {
 
     /// The schema of the batches: a struct whose children are the selected columns.
     pub fn schema(self: *const ArrowBatchReader) !ArrowSchema {
-        return treeSchema(self.allocator, self.metadata.schema, self.tree, self.columns);
+        return treeSchema(self.allocator, self.metadata.schema, self.tree, self.columns, self.large_offsets);
     }
 
     /// The next batch, or null after the last row group.
@@ -944,7 +953,7 @@ pub const ArrowBatchReader = struct {
                 const range = try parquet_reader.columnChunkRange(chunk);
                 const pages = leaf_decoder.PageReader.fromSource(allocator, self.source, range.start, range.size);
                 const reserve = @min(self.batch_rows, safe.castTo(usize, meta.num_values) catch 0);
-                const cursor = try leaf_decoder.ColumnCursor.init(allocator, pages, meta, info, .{ .keep_levels = node.kind != .leaf }, reserve);
+                const cursor = try leaf_decoder.ColumnCursor.init(allocator, pages, meta, info, .{ .keep_levels = node.kind != .leaf, .large_offsets = self.large_offsets }, reserve);
                 l.* = .{ .cursor = cursor, .max_def = info.max_def_level, .max_rep = info.max_rep_level };
                 leaf_count = k + 1;
             }
@@ -3140,6 +3149,58 @@ test "projected read returns a schema of the selected columns" {
     try std.testing.expectError(error.InvalidArgument, exportProjectedSchemaAsArrow(allocator, dr.metadata, &.{3}));
 }
 
+test "batch reader with large_offsets returns large_string with i64 offsets" {
+    const allocator = std.testing.allocator;
+
+    const col_defs = [_]ColumnDef{
+        .{ .name = "name", .type_ = .byte_array, .optional = true, .logical_type = .string },
+        .{ .name = "tags", .type_ = .byte_array, .optional = true, .is_list = true, .element_optional = true, .logical_type = .string },
+    };
+    var writer = try api_writer_mod.writeToBuffer(allocator, &col_defs);
+    try writer.writeColumnOptional([]const u8, 0, &.{ .{ .value = "alice" }, .null_value, .{ .value = "charlie" } });
+    try writer.writeListColumn([]const u8, 1, &.{
+        .{ .value = &.{ .{ .value = "a" }, .{ .value = "bc" } } },
+        .null_value,
+        .{ .value = &.{.{ .value = "def" }} },
+    });
+    try writer.close();
+    const buf = try writer.toOwnedSlice();
+    defer allocator.free(buf);
+    writer.deinit();
+
+    var dr = try api_reader_mod.openBufferDynamic(allocator, buf, .{});
+    defer dr.deinit();
+
+    // Batches of 2 rows: [0, 1], [2].
+    var batches = try ArrowBatchReader.init(allocator, dr.getSource(), dr.metadata, .{ .batch_rows = 2, .large_offsets = true });
+    defer batches.deinit();
+
+    var first = (try batches.next()).?;
+    defer first.deinit();
+    const children = first.schema.children.?;
+    try std.testing.expectEqualStrings("U", std.mem.span(children[0].format));
+    try std.testing.expectEqualStrings("+l", std.mem.span(children[1].format));
+    try std.testing.expectEqualStrings("U", std.mem.span(children[1].children.?[0].format));
+
+    const names = &first.arrays[0];
+    try std.testing.expectEqual(@as(i64, 2), names.length);
+    try std.testing.expectEqual(@as(i64, 1), names.null_count);
+    const name_offsets: [*]const i64 = @ptrCast(@alignCast(names.buffers[1].?));
+    const name_data: [*]const u8 = @ptrCast(names.buffers[2].?);
+    try std.testing.expectEqualStrings("alice", name_data[@intCast(name_offsets[0])..@intCast(name_offsets[1])]);
+    try std.testing.expectEqual(name_offsets[1], name_offsets[2]);
+
+    var second = (try batches.next()).?;
+    defer second.deinit();
+    const tags = second.arrays[1].children.?[0];
+    try std.testing.expectEqual(@as(i64, 1), tags.length);
+    const tag_offsets: [*]const i64 = @ptrCast(@alignCast(tags.buffers[1].?));
+    const tag_data: [*]const u8 = @ptrCast(tags.buffers[2].?);
+    try std.testing.expectEqualStrings("def", tag_data[@intCast(tag_offsets[0])..@intCast(tag_offsets[1])]);
+
+    try std.testing.expect((try batches.next()) == null);
+}
+
 test "round-trip: arrow write then arrow read - int64 + float64" {
     const allocator = std.testing.allocator;
 
@@ -4489,7 +4550,7 @@ test "Arrow arrays match PyArrow on the test files with nested columns" {
             continue;
         }
         totals.files += 1;
-        try compareFileWithReference(entry.key_ptr.*, columns, &totals, null);
+        try compareFileWithReference(entry.key_ptr.*, columns, &totals, null, false);
     }
     std.debug.print("\nPyArrow comparison: {d} files ({d} more unreadable by PyArrow), {d} columns: {d} equal, {d} differ, {d} read errors\n", .{
         totals.files, totals.pyarrow_errors, totals.columns, totals.equal, totals.differ, totals.read_errors,
@@ -4507,18 +4568,19 @@ test "Arrow batches match PyArrow on the test files with nested columns" {
     const json_text = try std.Io.Dir.cwd().readFileAlloc(io, "../test-files-arrow/nested_reference.json", arena, .limited(1 << 30));
     const reference = try std.json.parseFromSliceLeaky(std.json.Value, arena, json_text, .{});
 
-    // 7 rows per batch cuts inside pages; 1000 cuts mostly at or near page ends.
-    for ([_]usize{ 7, 1000 }) |batch_rows| {
+    // 7 rows per batch cuts inside pages; 1000 cuts mostly at or near page ends. The second
+    // pass reads byte arrays with i64 offsets.
+    for ([_]usize{ 7, 1000 }, [_]bool{ false, true }) |batch_rows, large| {
         var totals: NestedTotals = .{};
         var it = reference.object.iterator();
         while (it.next()) |entry| {
             const columns = entry.value_ptr.*.object;
             if (columns.get("error") != null) continue;
             totals.files += 1;
-            try compareFileWithReference(entry.key_ptr.*, columns, &totals, batch_rows);
+            try compareFileWithReference(entry.key_ptr.*, columns, &totals, batch_rows, large);
         }
-        std.debug.print("\nPyArrow comparison, {d} rows per batch: {d} files, {d} columns: {d} equal, {d} differ, {d} read errors\n", .{
-            batch_rows, totals.files, totals.columns, totals.equal, totals.differ, totals.read_errors,
+        std.debug.print("\nPyArrow comparison, {d} rows per batch{s}: {d} files, {d} columns: {d} equal, {d} differ, {d} read errors\n", .{
+            batch_rows, if (large) ", i64 offsets" else "", totals.files, totals.columns, totals.equal, totals.differ, totals.read_errors,
         });
         try std.testing.expectEqual(@as(usize, 0), totals.differ);
         try std.testing.expectEqual(@as(usize, 0), totals.read_errors);
@@ -4536,6 +4598,7 @@ fn canonColumn(
     rg: usize,
     c: usize,
     batch_rows: ?usize,
+    large: bool,
     max_rows: usize,
 ) !void {
     if (batch_rows == null) {
@@ -4545,11 +4608,11 @@ fn canonColumn(
         const rows = @min(@as(usize, @intCast(arr.length)), max_rows);
         for (0..rows) |i| {
             if (i > 0) try w.writeByte('\n');
-            try canonEntry(w, md.schema, node, arr, i);
+            try canonEntry(w, md.schema, node, arr, i, false);
         }
         return;
     }
-    var batches = try ArrowBatchReader.init(allocator, source, md, .{ .columns = &.{c}, .row_groups = &.{rg}, .batch_rows = batch_rows.? });
+    var batches = try ArrowBatchReader.init(allocator, source, md, .{ .columns = &.{c}, .row_groups = &.{rg}, .batch_rows = batch_rows.?, .large_offsets = large });
     defer batches.deinit();
     var written: usize = 0;
     while (written < max_rows) {
@@ -4560,13 +4623,13 @@ fn canonColumn(
         const rows = @min(@as(usize, @intCast(arr.length)), max_rows - written);
         for (0..rows) |i| {
             if (written > 0) try w.writeByte('\n');
-            try canonEntry(w, md.schema, node, arr, i);
+            try canonEntry(w, md.schema, node, arr, i, large);
             written += 1;
         }
     }
 }
 
-fn compareFileWithReference(path: []const u8, reference: std.json.ObjectMap, totals: *NestedTotals, batch_rows: ?usize) !void {
+fn compareFileWithReference(path: []const u8, reference: std.json.ObjectMap, totals: *NestedTotals, batch_rows: ?usize, large: bool) !void {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     // The reader uses an arena (footer parsing leaks on some malformed files); the Arrow read
@@ -4599,7 +4662,7 @@ fn compareFileWithReference(path: []const u8, reference: std.json.ObjectMap, tot
 
             var out: std.Io.Writer.Allocating = .init(allocator);
             defer out.deinit();
-            canonColumn(allocator, &out.writer, reader.getSource(), md, node, rg, c, batch_rows, 2000) catch |err| {
+            canonColumn(allocator, &out.writer, reader.getSource(), md, node, rg, c, batch_rows, large, 2000) catch |err| {
                 totals.read_errors += 1;
                 std.debug.print("READ ERROR {s} {s} ({s}): {s}\n", .{ path, key, md.schema[node.schema_idx].name, @errorName(err) });
                 continue;
@@ -4639,18 +4702,19 @@ fn window(s: []const u8, at: usize) []const u8 {
 
 /// Writes entry `i` of `arr` (the Arrow array of `node`) in the canonical text of
 /// test-files-arrow/nested_reference.py.
-fn canonEntry(w: *std.Io.Writer, schema: []const format.SchemaElement, node: *const Node, arr: *const ArrowArray, i: usize) !void {
+/// `large`: BYTE_ARRAY leaves have i64 offsets.
+fn canonEntry(w: *std.Io.Writer, schema: []const format.SchemaElement, node: *const Node, arr: *const ArrowArray, i: usize, large: bool) !void {
     if (arr.buffers[0]) |v| {
         const bits: [*]const u8 = @ptrCast(v);
         if ((bits[i / 8] >> @intCast(i % 8)) & 1 == 0) return w.writeAll("n");
     }
     switch (node.kind) {
-        .leaf => try canonLeaf(w, schema[node.schema_idx], arr, i),
+        .leaf => try canonLeaf(w, schema[node.schema_idx], arr, i, large),
         .struct_ => {
             try w.writeByte('{');
             for (node.children, 0..) |*child, k| {
                 if (k > 0) try w.writeByte(',');
-                try canonEntry(w, schema, child, arr.children.?[k], i);
+                try canonEntry(w, schema, child, arr.children.?[k], i, large);
             }
             try w.writeByte('}');
         },
@@ -4663,13 +4727,13 @@ fn canonEntry(w: *std.Io.Writer, schema: []const format.SchemaElement, node: *co
             for (start..end) |j| {
                 if (j > start) try w.writeByte(',');
                 if (node.kind == .list) {
-                    try canonEntry(w, schema, &node.children[0], child, j);
+                    try canonEntry(w, schema, &node.children[0], child, j, large);
                 } else {
                     const entries = &node.children[0];
                     try w.writeByte('(');
-                    try canonEntry(w, schema, &entries.children[0], child.children.?[0], j);
+                    try canonEntry(w, schema, &entries.children[0], child.children.?[0], j, large);
                     try w.writeByte(':');
-                    try canonEntry(w, schema, &entries.children[1], child.children.?[1], j);
+                    try canonEntry(w, schema, &entries.children[1], child.children.?[1], j, large);
                     try w.writeByte(')');
                 }
             }
@@ -4706,7 +4770,7 @@ fn leafCategory(elem: format.SchemaElement) LeafCategory {
     };
 }
 
-fn canonLeaf(w: *std.Io.Writer, elem: format.SchemaElement, arr: *const ArrowArray, i: usize) !void {
+fn canonLeaf(w: *std.Io.Writer, elem: format.SchemaElement, arr: *const ArrowArray, i: usize, large: bool) !void {
     const data: [*]const u8 = @ptrCast(arr.buffers[1].?);
     switch (leafCategory(elem)) {
         .boolean => try w.writeAll(if ((data[i / 8] >> @intCast(i % 8)) & 1 == 1) "t" else "f"),
@@ -4719,8 +4783,12 @@ fn canonLeaf(w: *std.Io.Writer, elem: format.SchemaElement, arr: *const ArrowArr
         .bytes => {
             try w.writeByte('x');
             const bytes = if (elem.type_.? == .byte_array) blk: {
-                const offsets: [*]const i32 = @ptrCast(@alignCast(data));
                 const values: [*]const u8 = @ptrCast(arr.buffers[2].?);
+                if (large) {
+                    const offsets: [*]const i64 = @ptrCast(@alignCast(data));
+                    break :blk values[@intCast(offsets[i])..@intCast(offsets[i + 1])];
+                }
+                const offsets: [*]const i32 = @ptrCast(@alignCast(data));
                 break :blk values[@intCast(offsets[i])..@intCast(offsets[i + 1])];
             } else blk: {
                 const width: usize = @intCast(elem.type_length.?);

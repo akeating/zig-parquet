@@ -100,7 +100,7 @@ pub const Buffers = struct {
     }
 
     /// Copies the entries `i` with `levels[i] >= min_level`, in order and at most `limit` of
-    /// them, into new buffers with i32 offsets.
+    /// them, into new buffers with offsets of the same width.
     pub fn select(self: *const Buffers, allocator: Allocator, levels: []const u32, min_level: u32, limit: usize) !Buffers {
         var count: usize = 0;
         var bytes: usize = 0;
@@ -110,7 +110,7 @@ pub const Buffers = struct {
             count += 1;
             if (self.layout == .bytes) bytes += self.bytesAt(i).len;
         }
-        var b = Builder{ .allocator = allocator, .kind = self.layout };
+        var b = Builder{ .allocator = allocator, .kind = self.layout, .large_offsets = self.large_offsets };
         errdefer b.deinit();
         try b.init(count);
         try b.reserve(count);
@@ -157,10 +157,10 @@ pub const Buffers = struct {
         }
     }
 
-    /// Like `select`, but when every entry is selected and offsets are i32, moves the buffers
-    /// out of `self` (leaving it empty) instead of copying them.
+    /// Like `select`, but when every entry is selected, moves the buffers out of `self`
+    /// (leaving it empty) instead of copying them.
     pub fn take(self: *Buffers, allocator: Allocator, levels: []const u32, min_level: u32, limit: usize) !Buffers {
-        var all = levels.len == self.length and self.length <= limit and !self.large_offsets;
+        var all = levels.len == self.length and self.length <= limit;
         if (all) {
             for (levels) |lv| {
                 if (lv < min_level) {

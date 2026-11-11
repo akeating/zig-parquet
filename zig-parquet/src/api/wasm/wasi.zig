@@ -439,67 +439,58 @@ export fn zp_reader_get_stream(
     handle_ptr: ?*anyopaque,
     stream_out: ?*ArrowArrayStream,
 ) i32 {
-    return zp_reader_get_stream_columns(handle_ptr, null, 0, 0, stream_out);
+    return zp_reader_get_stream_columns(handle_ptr, null, 0, 0, 0, stream_out);
 }
 
 /// Like `zp_reader_get_stream`, reading only the top-level columns `col_indices`, in that
 /// order. If `col_indices` is null, all columns are read and `num_cols` is ignored. With
 /// `batch_rows` 0, each batch is one row group; with `batch_rows` > 0, each batch has at
-/// most `batch_rows` rows and does not span row groups.
+/// most `batch_rows` rows and does not span row groups. `flags`: 0, or
+/// `ZP_STREAM_LARGE_OFFSETS` to read BYTE_ARRAY columns as large_string / large_binary.
 export fn zp_reader_get_stream_columns(
     handle_ptr: ?*anyopaque,
     col_indices: ?[*]const i32,
     num_cols: i32,
     batch_rows: i64,
+    flags: u32,
     stream_out: ?*ArrowArrayStream,
 ) i32 {
     const handle = castHandle(ReaderHandle, handle_ptr) orelse return err.ZP_ERROR_INVALID_ARGUMENT;
     const out = stream_out orelse return err.ZP_ERROR_INVALID_ARGUMENT;
     handle.err_ctx.setOk();
 
-    var indices: ?[]usize = null;
-    if (col_indices) |ci| {
-        const copy = columnIndices(handle, ci, num_cols) orelse return handle.err_ctx.code;
-        // The root's children are the top-level columns.
-        const root_children = if (handle.metadata.schema.len > 0) handle.metadata.schema[0].num_children orelse 0 else 0;
-        const num_top = safe.castTo(usize, root_children) catch 0;
-        for (copy, 0..) |c, i| if (c >= num_top) {
-            handle.allocator.free(copy);
-            handle.err_ctx.setErrorFmt(err.ZP_ERROR_INVALID_ARGUMENT, "column index at position {d} out of range", .{i});
-            return handle.err_ctx.code;
-        };
-        indices = copy;
-    }
-
     if (batch_rows < 0) {
-        if (indices) |ci| handle.allocator.free(ci);
         handle.err_ctx.setError(err.ZP_ERROR_INVALID_ARGUMENT, "batch_rows must not be negative");
         return handle.err_ctx.code;
     }
-    var batches: ?arrow_batch.ArrowBatchReader = null;
-    if (batch_rows > 0) {
-        batches = arrow_batch.ArrowBatchReader.init(handle.allocator, handle.source, handle.metadata, .{
-            .columns = indices,
-            .batch_rows = safe.castTo(usize, batch_rows) catch std.math.maxInt(usize),
-        }) catch |e| {
-            if (indices) |ci| handle.allocator.free(ci);
-            handle.err_ctx.setError(err.mapError(e), err.errorMessage(e));
-            return handle.err_ctx.code;
-        };
+    if (flags & ~stream_known_flags != 0) {
+        handle.err_ctx.setError(err.ZP_ERROR_INVALID_ARGUMENT, "unknown flags");
+        return handle.err_ctx.code;
     }
+    var indices: ?[]usize = null;
+    if (col_indices) |ci| indices = columnIndices(handle, ci, num_cols) orelse return handle.err_ctx.code;
+    // The batch reader keeps its own copy.
+    defer if (indices) |ci| handle.allocator.free(ci);
+
+    var batches = arrow_batch.ArrowBatchReader.init(handle.allocator, handle.source, handle.metadata, .{
+        .columns = indices,
+        .batch_rows = if (batch_rows == 0) std.math.maxInt(usize) else safe.castTo(usize, batch_rows) catch std.math.maxInt(usize),
+        .large_offsets = flags & ZP_STREAM_LARGE_OFFSETS != 0,
+    }) catch |e| {
+        if (e == error.InvalidArgument) {
+            handle.err_ctx.setError(err.ZP_ERROR_INVALID_ARGUMENT, "column index out of range");
+        } else {
+            handle.err_ctx.setError(err.mapError(e), err.errorMessage(e));
+        }
+        return handle.err_ctx.code;
+    };
 
     const pd = handle.allocator.create(StreamPrivateData) catch {
-        if (batches) |*b| b.deinit();
-        if (indices) |ci| handle.allocator.free(ci);
+        batches.deinit();
         handle.err_ctx.setError(err.ZP_ERROR_OUT_OF_MEMORY, "OutOfMemory");
         return handle.err_ctx.code;
     };
-    pd.* = .{
-        .handle = handle,
-        .rg_index = 0,
-        .col_indices = indices,
-        .batches = batches,
-    };
+    pd.* = .{ .handle = handle, .batches = batches };
 
     out.* = .{
         .get_schema = &streamGetSchema,
@@ -2073,61 +2064,38 @@ fn schemaNodeFromTypeInfo(handle: *RowWriterHandle, info: TypeInfo) !*const Sche
 
 const ArrowArrayStream = @import("../../core/arrow.zig").ArrowArrayStream;
 
+/// `zp_reader_get_stream_columns` flag: read BYTE_ARRAY columns as Arrow large_string /
+/// large_binary (i64 offsets).
+pub const ZP_STREAM_LARGE_OFFSETS: u32 = 1;
+const stream_known_flags: u32 = ZP_STREAM_LARGE_OFFSETS;
+
 const StreamPrivateData = struct {
     handle: *ReaderHandle,
-    rg_index: usize,
-    /// Top-level columns to read; null reads all. Owned by the stream.
-    col_indices: ?[]usize,
-    /// Set when the stream returns batches of a fixed number of rows instead of row groups.
-    batches: ?arrow_batch.ArrowBatchReader,
+    batches: arrow_batch.ArrowBatchReader,
 };
 
-fn streamGetSchema(stream: *ArrowArrayStream, schema_out: *ArrowSchema) callconv(.c) c_int {
+fn streamGetSchema(stream: *ArrowArrayStream, schema_out: *ArrowSchema) callconv(.c) i32 {
     const pd: *StreamPrivateData = @ptrCast(@alignCast(stream.private_data));
     const handle = pd.handle;
-
-    const schema = arrow_batch.exportProjectedSchemaAsArrow(handle.allocator, handle.metadata, pd.col_indices) catch |e| {
+    schema_out.* = pd.batches.schema() catch |e| {
         handle.err_ctx.setError(err.mapError(e), err.errorMessage(e));
         return handle.err_ctx.code;
     };
-    schema_out.* = schema;
     return ZP_OK;
 }
 
-fn streamGetNext(stream: *ArrowArrayStream, array_out: *ArrowArray) callconv(.c) c_int {
+fn streamGetNext(stream: *ArrowArrayStream, array_out: *ArrowArray) callconv(.c) i32 {
     const pd: *StreamPrivateData = @ptrCast(@alignCast(stream.private_data));
     const handle = pd.handle;
-
-    if (pd.batches) |*batches| {
-        const batch = batches.next() catch |e| {
-            handle.err_ctx.setErrorFmt(err.mapError(e), "reading the next batch failed: {s}", .{err.errorMessage(e)});
-            return handle.err_ctx.code;
-        };
-        if (batch) |result_const| {
-            var result = result_const;
-            return wrapStreamBatch(handle, &result, array_out);
-        }
-        array_out.* = end_of_stream;
-        return ZP_OK;
-    }
-
-    if (pd.rg_index >= handle.metadata.row_groups.len) {
-        array_out.* = end_of_stream;
-        return ZP_OK;
-    }
-    var result = arrow_batch.readRowGroupAsArrow(
-        handle.allocator,
-        handle.source,
-        handle.metadata,
-        pd.rg_index,
-        pd.col_indices,
-    ) catch |e| {
-        handle.err_ctx.setErrorFmt(err.mapError(e), "readRowGroupAsArrow failed: {s}", .{err.errorMessage(e)});
+    const batch = pd.batches.next() catch |e| {
+        handle.err_ctx.setErrorFmt(err.mapError(e), "reading the next batch failed: {s}", .{err.errorMessage(e)});
         return handle.err_ctx.code;
     };
-    const rc = wrapStreamBatch(handle, &result, array_out);
-    if (rc == ZP_OK) pd.rg_index += 1;
-    return rc;
+    var result = batch orelse {
+        array_out.* = end_of_stream;
+        return ZP_OK;
+    };
+    return wrapStreamBatch(handle, &result, array_out);
 }
 
 /// A released array, which `get_next` returns at the end of the stream.
@@ -2168,8 +2136,7 @@ fn streamGetLastError(stream: *ArrowArrayStream) callconv(.c) ?[*:0]const u8 {
 
 fn streamRelease(stream: *ArrowArrayStream) callconv(.c) void {
     const pd: *StreamPrivateData = @ptrCast(@alignCast(stream.private_data));
-    if (pd.batches) |*b| b.deinit();
-    if (pd.col_indices) |ci| pd.handle.allocator.free(ci);
+    pd.batches.deinit();
     pd.handle.allocator.destroy(pd);
     stream.release = null;
 }

@@ -245,6 +245,7 @@ export interface ParquetWasiExports {
     col_indices_ptr: number,
     num_cols: number,
     batch_rows: bigint,
+    flags: number,
     stream_out_ptr: number,
   ): StatusCode;
   zp_reader_error_code(handle: HandlePtr): StatusCode;

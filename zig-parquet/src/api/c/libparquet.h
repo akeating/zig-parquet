@@ -297,17 +297,25 @@ int zp_reader_get_stream(zp_reader_t handle,
  * Columns not selected are not read or decoded. The stream keeps its own
  * copy of col_indices.
  *
+ * Byte-array columns are string ("u") or binary ("z") with int32 offsets;
+ * a batch whose column holds more than 2^31 - 1 bytes then fails with
+ * ZP_ERROR_INVALID_DATA. With ZP_STREAM_LARGE_OFFSETS in flags they are
+ * large_string ("U") or large_binary ("Z") with int64 offsets.
+ *
  * @param handle       Reader handle (must stay open while stream is active).
  * @param col_indices  Top-level column indices, or NULL for all columns.
  * @param num_cols     Number of entries in col_indices (ignored if NULL).
  * @param batch_rows   Rows per batch, or 0 for one batch per row group.
+ * @param flags        0, or ZP_STREAM_LARGE_OFFSETS.
  * @param stream_out   Output: initialized ArrowArrayStream.
- * @return ZP_OK, or ZP_ERROR_INVALID_ARGUMENT if an index is out of range
- *         or batch_rows is negative.
+ * @return ZP_OK, or ZP_ERROR_INVALID_ARGUMENT if an index is out of range,
+ *         batch_rows is negative or flags has unknown bits.
  */
+#define ZP_STREAM_LARGE_OFFSETS 1u
+
 int zp_reader_get_stream_columns(zp_reader_t handle,
                                  const int* col_indices, int num_cols,
-                                 int64_t batch_rows,
+                                 int64_t batch_rows, uint32_t flags,
                                  struct ArrowArrayStream* stream_out);
 
 /** Close the reader and release all resources. */
