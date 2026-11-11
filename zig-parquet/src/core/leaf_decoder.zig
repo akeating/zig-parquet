@@ -88,15 +88,16 @@ pub const Buffers = struct {
 
     /// Bytes of BYTE_ARRAY entry `i`.
     pub fn bytesAt(self: *const Buffers, i: usize) []const u8 {
+        return self.values[self.offsetAt(i)..self.offsetAt(i + 1)];
+    }
+
+    /// BYTE_ARRAY offset `i` (0 to `length`).
+    pub fn offsetAt(self: *const Buffers, i: usize) usize {
         const o = self.offsets.?;
-        const start: usize, const end: usize = if (self.large_offsets) .{
-            @intCast(std.mem.bytesToValue(i64, o[i * 8 ..][0..8])),
-            @intCast(std.mem.bytesToValue(i64, o[(i + 1) * 8 ..][0..8])),
-        } else .{
-            @intCast(std.mem.bytesToValue(i32, o[i * 4 ..][0..4])),
-            @intCast(std.mem.bytesToValue(i32, o[(i + 1) * 4 ..][0..4])),
-        };
-        return self.values[start..end];
+        return if (self.large_offsets)
+            @intCast(std.mem.bytesToValue(i64, o[i * 8 ..][0..8]))
+        else
+            @intCast(std.mem.bytesToValue(i32, o[i * 4 ..][0..4]));
     }
 
     /// Copies the entries `i` with `levels[i] >= min_level`, in order and at most `limit` of
@@ -226,6 +227,44 @@ pub const Leaf = struct {
         if (self.rep_levels) |l| allocator.free(l);
     }
 };
+
+/// Joins leaves of one column, each starting at a row (from consecutive row groups, say),
+/// into one leaf. `pieces` must not be empty and have the same layout, offset width and
+/// levels kept; they are left unchanged.
+pub fn concatLeaves(allocator: Allocator, pieces: []const Leaf) !Leaf {
+    const first = &pieces[0].buffers;
+    var total: usize = 0;
+    for (pieces) |*p| {
+        if (!std.meta.eql(p.buffers.layout, first.layout) or p.buffers.large_offsets != first.large_offsets) return error.InvalidArgument;
+        if ((p.def_levels == null) != (pieces[0].def_levels == null) or (p.rep_levels == null) != (pieces[0].rep_levels == null)) return error.InvalidArgument;
+        total += p.buffers.length;
+    }
+    var b = Builder{ .allocator = allocator, .kind = first.layout, .large_offsets = first.large_offsets };
+    errdefer b.deinit();
+    try b.init(total);
+    for (pieces) |*p| try b.appendBuffers(&p.buffers);
+    var buffers = try b.finish();
+    errdefer buffers.deinit(allocator);
+    const def_levels = if (pieces[0].def_levels != null) try concatLevels(allocator, pieces, .def, total) else null;
+    errdefer if (def_levels) |l| allocator.free(l);
+    const rep_levels = if (pieces[0].rep_levels != null) try concatLevels(allocator, pieces, .rep, total) else null;
+    return .{ .buffers = buffers, .def_levels = def_levels, .rep_levels = rep_levels };
+}
+
+fn concatLevels(allocator: Allocator, pieces: []const Leaf, comptime which: enum { def, rep }, total: usize) ![]u32 {
+    const out = try allocator.alloc(u32, total);
+    var at: usize = 0;
+    for (pieces) |*p| {
+        const levels = (if (which == .def) p.def_levels else p.rep_levels).?;
+        if (levels.len != p.buffers.length) {
+            allocator.free(out);
+            return error.InvalidPageData;
+        }
+        @memcpy(out[at..][0..levels.len], levels);
+        at += levels.len;
+    }
+    return out;
+}
 
 /// Decodes all data pages of a flat column chunk (see `isFlat`). `page_data` is the column
 /// chunk's bytes as stored in the file (page headers and page bodies, starting with the
@@ -712,6 +751,34 @@ const Builder = struct {
         self.null_count -= tail.null_count;
         self.length = cut;
         return tail;
+    }
+
+    /// Appends the entries of `src`, which has this builder's layout and offset width.
+    fn appendBuffers(self: *Builder, src: *const Buffers) !void {
+        const n = src.length;
+        try self.reserve(n);
+        switch (self.kind) {
+            .bits => {
+                // `pushBit` and `pushValidity` of an entry go together.
+                for (0..n) |i| {
+                    self.pushBit((src.values[i / 8] >> @intCast(i % 8)) & 1 == 1);
+                    self.pushValidity(src.isValid(i));
+                }
+                return;
+            },
+            .fixed => |w| self.values.appendSliceAssumeCapacity(src.values[0 .. n * w]),
+            .bytes => {
+                const base = self.values.items.len;
+                const first = src.offsetAt(0);
+                try self.values.appendSlice(self.allocator, src.values[first..src.offsetAt(n)]);
+                for (1..n + 1) |i| try pushOffsetAt(self, base + (src.offsetAt(i) - first));
+            },
+        }
+        if (src.null_count == 0) {
+            self.validRun(n);
+        } else {
+            for (0..n) |i| self.pushValidity(src.isValid(i));
+        }
     }
 
     /// Byte-array offset `i`.

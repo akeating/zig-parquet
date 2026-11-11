@@ -288,8 +288,8 @@ int zp_reader_get_stream(zp_reader_t handle,
  * of rows. get_schema() describes the selected columns.
  *
  * With batch_rows 0, each batch is one row group. With batch_rows > 0,
- * each batch has at most batch_rows rows; a batch does not span row
- * groups, so the last batch of a row group can be shorter. Pages are
+ * each batch has batch_rows rows, taken from as many row groups as
+ * needed; only the last batch can have fewer. Pages are
  * read and decoded as batches need them; between batches the stream holds,
  * per leaf column, one compressed page, the dictionary, and at most one
  * page of decoded entries.

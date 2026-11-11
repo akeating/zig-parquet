@@ -275,7 +275,8 @@ pub export fn zp_reader_get_stream(
 /// stream keeps its own copy of the indices.
 ///
 /// With `batch_rows` 0, each batch is one row group. With `batch_rows` > 0, each batch has
-/// at most `batch_rows` rows; a batch does not span row groups. `flags`: 0, or
+/// `batch_rows` rows, taken from as many row groups as needed; only the last batch can have
+/// fewer. `flags`: 0, or
 /// `ZP_STREAM_LARGE_OFFSETS` to read BYTE_ARRAY columns as large_string / large_binary.
 pub export fn zp_reader_get_stream_columns(
     handle_ptr: ?*anyopaque,
@@ -304,7 +305,7 @@ pub export fn zp_reader_get_stream_columns(
 
     var batches = arrow_batch.ArrowBatchReader.init(handle.allocator, handle.source, handle.metadata, .{
         .columns = indices,
-        .batch_rows = if (batch_rows == 0) std.math.maxInt(usize) else safe.castTo(usize, batch_rows) catch std.math.maxInt(usize),
+        .batch_rows = if (batch_rows == 0) null else safe.castTo(usize, batch_rows) catch std.math.maxInt(usize),
         .large_offsets = flags & ZP_STREAM_LARGE_OFFSETS != 0,
     }) catch |e| {
         if (e == error.InvalidArgument) {
