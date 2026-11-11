@@ -811,26 +811,36 @@ test "round-trip map string-to-f32" {
     }
 }
 
-test "ColumnDef.mapStringInt32 writes STRING keys" {
+test "ColumnDef.mapStringInt32 and mapStringString write STRING keys and values" {
     const allocator = std.testing.allocator;
 
-    var writer = try parquet.writeToBuffer(allocator, &.{ColumnDef.mapStringInt32("attrs", true)});
+    var writer = try parquet.writeToBuffer(allocator, &.{
+        ColumnDef.mapStringInt32("ints", true),
+        ColumnDef.mapStringString("strs", true),
+    });
     defer writer.deinit();
-    const entries = [_]WriterMapEntry([]const u8, i32){.{ .key = "a", .value = .{ .value = 1 } }};
-    try writer.writeMapColumnStringInt32(0, &.{.{ .value = &entries }});
+    const int_entries = [_]WriterMapEntry([]const u8, i32){.{ .key = "a", .value = .{ .value = 1 } }};
+    try writer.writeMapColumnStringInt32(0, &.{.{ .value = &int_entries }});
+    const str_entries = [_]WriterMapEntry([]const u8, []const u8){.{ .key = "b", .value = .{ .value = "x" } }};
+    try writer.writeMapColumn([]const u8, []const u8, 1, &.{.{ .value = &str_entries }});
     try writer.close();
     const buf = try writer.toOwnedSlice();
     defer allocator.free(buf);
 
     var reader = try parquet.openBufferDynamic(allocator, buf, .{});
     defer reader.deinit();
-    var found = false;
+    // Leaves in schema order: ints key, ints value, strs key, strs value.
+    var strings: [4]bool = undefined;
+    var k: usize = 0;
     for (reader.metadata.schema) |elem| {
-        if (!std.mem.eql(u8, elem.name, "key")) continue;
-        found = true;
-        try std.testing.expect(elem.logical_type != null and elem.logical_type.? == .string);
+        if (elem.num_children != null) continue;
+        const is_string = elem.logical_type != null and elem.logical_type.? == .string;
+        try std.testing.expectEqual(is_string, elem.converted_type == parquet.format.ConvertedType.UTF8);
+        strings[k] = is_string;
+        k += 1;
     }
-    try std.testing.expect(found);
+    try std.testing.expectEqual(@as(usize, 4), k);
+    try std.testing.expectEqualSlices(bool, &.{ true, false, true, true }, &strings);
 }
 
 test "dynamic writer keeps the physical type of a nested column whose values are all null" {

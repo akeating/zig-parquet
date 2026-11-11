@@ -1609,7 +1609,7 @@ pub const Writer = struct {
                     .repetition_type = .required, // keys are always required
                     .name = "key",
                     .num_children = null,
-                    .converted_type = null,
+                    .converted_type = if (col.logical_type) |lt| convertedTypeOf(lt) else null,
                     .scale = null,
                     .precision = null,
                     .field_id = null,
@@ -1625,11 +1625,11 @@ pub const Writer = struct {
                     .repetition_type = if (col.map_value_optional) .optional else .required,
                     .name = "value",
                     .num_children = null,
-                    .converted_type = null,
+                    .converted_type = if (col.map_value_logical_type) |lt| convertedTypeOf(lt) else null,
                     .scale = null,
                     .precision = null,
                     .field_id = null,
-                    .logical_type = null,
+                    .logical_type = col.map_value_logical_type,
                 };
                 idx += 1;
             } else {
@@ -1638,18 +1638,7 @@ pub const Writer = struct {
                 const converted_type: ?i32 = if (col.converted_type) |ct|
                     ct
                 else if (col.logical_type) |lt|
-                    switch (lt) {
-                        .decimal => format.ConvertedType.DECIMAL,
-                        .date => format.ConvertedType.DATE,
-                        .time => |t| if (t.unit == .millis) format.ConvertedType.TIME_MILLIS else format.ConvertedType.TIME_MICROS,
-                        .timestamp => |t| if (t.unit == .millis) format.ConvertedType.TIMESTAMP_MILLIS else format.ConvertedType.TIMESTAMP_MICROS,
-                        .string => format.ConvertedType.UTF8,
-                        .json => format.ConvertedType.JSON,
-                        .bson => format.ConvertedType.BSON,
-                        .enum_ => format.ConvertedType.ENUM,
-                        .uuid => null, // No converted_type for UUID (new logical type only)
-                        else => null,
-                    }
+                    convertedTypeOf(lt)
                 else
                     null;
 
@@ -1698,6 +1687,22 @@ pub const Writer = struct {
 };
 
 // Tests
+/// The legacy converted type written alongside a logical type, or null when there is none
+/// (UUID and the newer types have only the logical type).
+fn convertedTypeOf(lt: format.LogicalType) ?i32 {
+    return switch (lt) {
+        .decimal => format.ConvertedType.DECIMAL,
+        .date => format.ConvertedType.DATE,
+        .time => |t| if (t.unit == .millis) format.ConvertedType.TIME_MILLIS else format.ConvertedType.TIME_MICROS,
+        .timestamp => |t| if (t.unit == .millis) format.ConvertedType.TIMESTAMP_MILLIS else format.ConvertedType.TIMESTAMP_MICROS,
+        .string => format.ConvertedType.UTF8,
+        .json => format.ConvertedType.JSON,
+        .bson => format.ConvertedType.BSON,
+        .enum_ => format.ConvertedType.ENUM,
+        else => null,
+    };
+}
+
 test "Writer basic i64 column" {
     const allocator = std.testing.allocator;
 

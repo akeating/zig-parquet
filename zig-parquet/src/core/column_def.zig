@@ -48,6 +48,8 @@ pub const ColumnDef = struct {
     is_map: bool = false,
     /// For map columns: value type
     map_value_type: ?format.PhysicalType = null,
+    /// For map columns: value logical type (the key's is `logical_type`)
+    map_value_logical_type: ?format.LogicalType = null,
     /// For map columns: whether values can be null
     map_value_optional: bool = true,
     /// For complex nested types: the full schema node
@@ -150,6 +152,7 @@ pub const ColumnDef = struct {
     pub fn mapStringString(name: []const u8, value_optional: bool) ColumnDef {
         var def = map(name, .byte_array, .byte_array, value_optional);
         def.logical_type = .string; // key
+        def.map_value_logical_type = .string;
         return def;
     }
 
