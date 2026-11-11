@@ -1526,9 +1526,117 @@ pub fn writeRowGroupFromArrow(
 ) WriterError!void {
     if (arrays.len != schemas.len) return error.InvalidColumnIndex;
 
+    // The column writers index buffers from 0, so arrays with an offset (slices) are first
+    // rewritten without one.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
     for (arrays, schemas, 0..) |arr, sch, col_idx| {
-        try writeArrowColumnToParquet(writer, allocator, col_idx, arr, sch);
+        const flat = try withoutOffset(arena.allocator(), arr, &sch, 0, arr.length);
+        try writeArrowColumnToParquet(writer, allocator, col_idx, flat, sch);
     }
+}
+
+/// Bytes per entry of an Arrow format with one fixed-width values buffer, or null.
+fn fixedWidthOf(fmt: []const u8) ?usize {
+    if (fmt.len == 1) return switch (fmt[0]) {
+        'c', 'C' => 1,
+        's', 'S', 'e' => 2,
+        'i', 'I', 'f' => 4,
+        'l', 'L', 'g' => 8,
+        else => null,
+    };
+    if (std.mem.eql(u8, fmt, "tdD") or std.mem.eql(u8, fmt, "tts") or std.mem.eql(u8, fmt, "ttm") or std.mem.eql(u8, fmt, "tiM")) return 4;
+    if (std.mem.eql(u8, fmt, "tdm") or std.mem.eql(u8, fmt, "ttu") or std.mem.eql(u8, fmt, "ttn") or std.mem.eql(u8, fmt, "tiD")) return 8;
+    if (std.mem.eql(u8, fmt, "tin")) return 16;
+    if (std.mem.startsWith(u8, fmt, "ts") or std.mem.startsWith(u8, fmt, "tD")) return 8;
+    if (std.mem.startsWith(u8, fmt, "d:")) return arrowDecimalWidth(fmt) catch null;
+    if (std.mem.startsWith(u8, fmt, "w:")) return std.fmt.parseInt(usize, fmt[2..], 10) catch null;
+    return null;
+}
+
+/// The array of entries `extra + arr.offset` to `extra + arr.offset + length` of `arr`, with
+/// offset 0 at every level: fixed-width and offsets buffers start at the first entry, and
+/// bitmaps that do not start on a byte are copied. A struct's offset and length apply to its
+/// children; a list's children are addressed through its offsets. Allocates with `arena`.
+fn withoutOffset(arena: Allocator, arr: ArrowArray, sch: *const ArrowSchema, extra: i64, length: i64) WriterError!ArrowArray {
+    const fmt = std.mem.sliceTo(sch.format, 0);
+    const off = safe.castTo(usize, std.math.add(i64, arr.offset, extra) catch return error.IntegerOverflow) catch return error.IntegerOverflow;
+    const n = safe.castTo(usize, length) catch return error.IntegerOverflow;
+    const nb = safe.castTo(usize, arr.n_buffers) catch return error.IntegerOverflow;
+    const nc = safe.castTo(usize, arr.n_children) catch return error.IntegerOverflow;
+
+    var out = arr;
+    out.offset = 0;
+    out.length = length;
+    if (off != 0) out.null_count = -1;
+
+    if (nb == 0) return out;
+    const src_buffers: [*]?*anyopaque = @ptrCast(arr.buffers);
+    const buffers = arena.alloc(?*anyopaque, nb) catch return error.OutOfMemory;
+    @memcpy(buffers, src_buffers[0..nb]);
+    out.buffers = @ptrCast(buffers.ptr);
+
+    if (off != 0 and !std.mem.eql(u8, fmt, "n")) {
+        // Validity bitmap.
+        if (nb > 0) if (buffers[0]) |v| {
+            buffers[0] = try shiftedBitmap(arena, @ptrCast(v), off, n);
+        };
+        if (std.mem.eql(u8, fmt, "b")) {
+            if (nb < 2) return error.TypeMismatch;
+            buffers[1] = try shiftedBitmap(arena, @ptrCast(buffers[1] orelse return error.TypeMismatch), off, n);
+        } else if (fixedWidthOf(fmt)) |w| {
+            if (nb < 2) return error.TypeMismatch;
+            const values: [*]u8 = @ptrCast(buffers[1] orelse return error.TypeMismatch);
+            buffers[1] = @ptrCast(values + off * w);
+        } else if (std.mem.eql(u8, fmt, "u") or std.mem.eql(u8, fmt, "z") or std.mem.eql(u8, fmt, "+l") or std.mem.eql(u8, fmt, "+m")) {
+            if (nb < 2) return error.TypeMismatch;
+            const offsets: [*]u8 = @ptrCast(buffers[1] orelse return error.TypeMismatch);
+            buffers[1] = @ptrCast(offsets + off * 4);
+        } else if (std.mem.eql(u8, fmt, "U") or std.mem.eql(u8, fmt, "Z") or std.mem.eql(u8, fmt, "+L")) {
+            if (nb < 2) return error.TypeMismatch;
+            const offsets: [*]u8 = @ptrCast(buffers[1] orelse return error.TypeMismatch);
+            buffers[1] = @ptrCast(offsets + off * 8);
+        } else if (!std.mem.eql(u8, fmt, "+s") and !std.mem.startsWith(u8, fmt, "+w:")) {
+            // A layout not handled here; refuse rather than write other entries.
+            return error.TypeMismatch;
+        }
+    }
+
+    if (nc == 0) return out;
+    const src_children: [*]*ArrowArray = arr.children orelse return error.TypeMismatch;
+    const child_schemas: [*]*ArrowSchema = sch.children orelse return error.TypeMismatch;
+    if (sch.n_children != arr.n_children) return error.TypeMismatch;
+    const children = arena.alloc(*ArrowArray, nc) catch return error.OutOfMemory;
+    for (children, 0..) |*c, i| {
+        const child = src_children[i].*;
+        const child_sch = child_schemas[i];
+        c.* = arena.create(ArrowArray) catch return error.OutOfMemory;
+        c.*.* = if (std.mem.eql(u8, fmt, "+s"))
+            // Struct children are indexed like the struct.
+            try withoutOffset(arena, child, child_sch, std.math.add(i64, arr.offset, extra) catch return error.IntegerOverflow, length)
+        else if (std.mem.startsWith(u8, fmt, "+w:")) blk: {
+            const size = std.fmt.parseInt(i64, fmt[3..], 10) catch return error.TypeMismatch;
+            const start = std.math.mul(i64, std.math.add(i64, arr.offset, extra) catch return error.IntegerOverflow, size) catch return error.IntegerOverflow;
+            break :blk try withoutOffset(arena, child, child_sch, start, std.math.mul(i64, length, size) catch return error.IntegerOverflow);
+        } else
+            // List and map children are addressed through the offsets; only their own offset
+            // is removed.
+            try withoutOffset(arena, child, child_sch, 0, child.length);
+    }
+    out.children = @ptrCast(children.ptr);
+    return out;
+}
+
+/// Bits `off` to `off + n` of `bits`, starting at bit 0 of a new bitmap.
+fn shiftedBitmap(arena: Allocator, bits: [*]const u8, off: usize, n: usize) WriterError!?*anyopaque {
+    if (off % 8 == 0) return @ptrCast(@constCast(bits + off / 8));
+    const out = arena.alloc(u8, (n + 7) / 8) catch return error.OutOfMemory;
+    @memset(out, 0);
+    for (0..n) |i| {
+        const j = off + i;
+        if ((bits[j / 8] >> @intCast(j % 8)) & 1 == 1) out[i / 8] |= @as(u8, 1) << @intCast(i % 8);
+    }
+    return @ptrCast(out.ptr);
 }
 
 fn writeArrowColumnToParquet(
@@ -4728,6 +4836,116 @@ test "imported schema keeps no references to the Arrow schema's names" {
         try written.append(allocator, ' ');
     }
     try std.testing.expectEqualStrings("top point x items list element y ", written.items);
+}
+
+test "arrow write honours array offsets" {
+    const allocator = std.testing.allocator;
+
+    // Each column holds 12 entries and is written from entry 3 (offset 3, length 6), so the
+    // validity bits start mid-byte. Entry i is null when i % 4 == 1.
+    const len = 6;
+    const off = 3;
+    var validity = [_]u8{ 0b1101_1101, 0b1101 };
+
+    var ints = [_]i32{ 0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110 };
+    var int_buffers = [_]?*anyopaque{ @ptrCast(&validity), @ptrCast(&ints) };
+    const int_arr = ArrowArray{ .length = len, .null_count = -1, .offset = off, .n_buffers = 2, .n_children = 0, .buffers = &int_buffers, .children = null, .dictionary = null, .release = null, .private_data = null };
+
+    var bools = [_]u8{ 0b0101_0101, 0b0101 };
+    var bool_buffers = [_]?*anyopaque{ @ptrCast(&validity), @ptrCast(&bools) };
+    const bool_arr = ArrowArray{ .length = len, .null_count = -1, .offset = off, .n_buffers = 2, .n_children = 0, .buffers = &bool_buffers, .children = null, .dictionary = null, .release = null, .private_data = null };
+
+    // Strings "s0".."s11" (2 or 3 bytes each).
+    var str_data: [64]u8 = undefined;
+    var str_offsets: [13]i32 = undefined;
+    var pos: usize = 0;
+    for (0..12) |i| {
+        str_offsets[i] = @intCast(pos);
+        pos += (try std.fmt.bufPrint(str_data[pos..], "s{d}", .{i})).len;
+    }
+    str_offsets[12] = @intCast(pos);
+    var str_buffers = [_]?*anyopaque{ @ptrCast(&validity), @ptrCast(&str_offsets), @ptrCast(&str_data) };
+    const str_arr = ArrowArray{ .length = len, .null_count = -1, .offset = off, .n_buffers = 3, .n_children = 0, .buffers = &str_buffers, .children = null, .dictionary = null, .release = null, .private_data = null };
+
+    // list<int32>: entry i holds i % 3 elements from a 30-element child that itself has
+    // offset 2.
+    var child_values: [32]i32 = undefined;
+    for (&child_values, 0..) |*v, i| v.* = @intCast(i * 7);
+    var child_buffers = [_]?*anyopaque{ null, @ptrCast(&child_values) };
+    var child_arr = ArrowArray{ .length = 30, .null_count = 0, .offset = 2, .n_buffers = 2, .n_children = 0, .buffers = &child_buffers, .children = null, .dictionary = null, .release = null, .private_data = null };
+    var list_offsets: [13]i32 = undefined;
+    var total: i32 = 0;
+    for (0..12) |i| {
+        list_offsets[i] = total;
+        total += @intCast(i % 3);
+    }
+    list_offsets[12] = total;
+    var list_buffers = [_]?*anyopaque{ @ptrCast(&validity), @ptrCast(&list_offsets) };
+    var list_children = [_]*ArrowArray{&child_arr};
+    const list_arr = ArrowArray{ .length = len, .null_count = -1, .offset = off, .n_buffers = 2, .n_children = 1, .buffers = &list_buffers, .children = &list_children, .dictionary = null, .release = null, .private_data = null };
+
+    // struct<a: int32>: the field is the ints array with its own offset 1, so struct entry i
+    // holds ints[i + 1].
+    var field_arr = ArrowArray{ .length = 11, .null_count = 0, .offset = 1, .n_buffers = 2, .n_children = 0, .buffers = &int_buffers, .children = null, .dictionary = null, .release = null, .private_data = null };
+    var all_valid = [_]u8{ 0xFF, 0xFF };
+    field_arr.buffers = @ptrCast(@constCast(&[_]?*anyopaque{ @ptrCast(&all_valid), @ptrCast(&ints) }));
+    var struct_buffers = [_]?*anyopaque{@ptrCast(&validity)};
+    var struct_children = [_]*ArrowArray{&field_arr};
+    const struct_arr = ArrowArray{ .length = len, .null_count = -1, .offset = off, .n_buffers = 1, .n_children = 1, .buffers = &struct_buffers, .children = &struct_children, .dictionary = null, .release = null, .private_data = null };
+
+    var element_sch = testLeafSchema("i", "element");
+    var list_sch_children = [_]*ArrowSchema{&element_sch};
+    var a_sch = testLeafSchema("i", "a");
+    var struct_sch_children = [_]*ArrowSchema{&a_sch};
+    var schemas = [_]ArrowSchema{
+        testLeafSchema("i", "ints"),
+        testLeafSchema("b", "bools"),
+        testLeafSchema("u", "strs"),
+        .{ .format = "+l", .name = "list", .metadata = null, .flags = arrow.ARROW_FLAG_NULLABLE, .n_children = 1, .children = &list_sch_children, .dictionary = null, .release = null, .private_data = null },
+        .{ .format = "+s", .name = "st", .metadata = null, .flags = arrow.ARROW_FLAG_NULLABLE, .n_children = 1, .children = &struct_sch_children, .dictionary = null, .release = null, .private_data = null },
+    };
+    var schema_ptrs: [schemas.len]*ArrowSchema = undefined;
+    for (&schema_ptrs, &schemas) |*ptr, *sch| ptr.* = sch;
+    const root = ArrowSchema{ .format = "+s", .name = "", .metadata = null, .flags = 0, .n_children = schemas.len, .children = &schema_ptrs, .dictionary = null, .release = null, .private_data = null };
+    const col_defs = try importSchemaFromArrow(allocator, &root);
+    defer freeImportedColumnDefs(allocator, col_defs);
+
+    var writer = try api_writer_mod.writeToBuffer(allocator, col_defs);
+    try writeRowGroupFromArrow(&writer, allocator, &.{ int_arr, bool_arr, str_arr, list_arr, struct_arr }, &schemas);
+    try writer.close();
+    const buf = try writer.toOwnedSlice();
+    defer allocator.free(buf);
+    writer.deinit();
+
+    var dr = try api_reader_mod.openBufferDynamic(allocator, buf, .{});
+    defer dr.deinit();
+    var tree_arena = std.heap.ArenaAllocator.init(allocator);
+    defer tree_arena.deinit();
+    const tree = try buildSchemaTree(tree_arena.allocator(), dr.metadata.schema);
+    var result = try readRowGroupAsArrow(allocator, dr.getSource(), dr.metadata, 0, null);
+    defer result.deinit();
+
+    var got: std.Io.Writer.Allocating = .init(allocator);
+    defer got.deinit();
+    for (0..len) |row| {
+        for (tree, 0..) |*node, c| {
+            try canonEntry(&got.writer, dr.metadata.schema, node, &result.arrays[c], row, false);
+            try got.writer.writeByte(' ');
+        }
+        try got.writer.writeByte('\n');
+    }
+    // Entries 3 to 8; entry 5 is null. Bools: true for even i. Strings: hex of "s<i>".
+    // Lists: element j of entry i is child entry 2 + list_offsets[i] + j, value 7 times that.
+    // Struct field: ints[i + 1].
+    try std.testing.expectEqualStrings(
+        "i30 f x7333 [] {i40} \n" ++
+            "i40 t x7334 [i35] {i50} \n" ++
+            "n n n n n \n" ++
+            "i60 t x7336 [] {i70} \n" ++
+            "i70 f x7337 [i56] {i80} \n" ++
+            "i80 t x7338 [i63,i70] {i90} \n",
+        got.written(),
+    );
 }
 
 test "round-trip: arrow write then read - decimals in Arrow layout" {

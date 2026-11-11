@@ -231,8 +231,14 @@ pub export fn zp_writer_write_row_group(
     };
     defer handle.allocator.free(schemas);
 
+    // A struct's offset and length apply to its children.
     for (0..nc) |i| {
         arrays[i] = arr_children[i].*;
+        arrays[i].offset = std.math.add(i64, arrays[i].offset, b.offset) catch {
+            handle.err_ctx.setError(err.ZP_ERROR_INVALID_ARGUMENT, "invalid offset");
+            return handle.err_ctx.code;
+        };
+        arrays[i].length = b.length;
         schemas[i] = sch_children[i].*;
     }
 
