@@ -104,3 +104,26 @@ Without read-ahead, a row group's columns finish when its slowest column finishe
 The row path writes a `Value` per entry and a `Row` per row. The values of a read are in one block of storage shared by its rows, and string values reference the decoded byte buffers.
 
 Arrow path reading all columns, first measurement → now: flat file 750 → 177 ms (first measured at commit b64724f, before the column-read changes); nested file 479 → 278 ms (first measured at commit 2eee218, when list, struct and map assembly still built a `Value` per entry). Row path reading all columns: flat file 996 → 332 ms, nested file 1,167 → 333 ms (before at commit 32643e1). The commit messages on the branch record each change's effect. PyArrow peak for nested `point` was 62.7 MB in earlier versions of this file, which carried over the `ints` case's peak in the same process; the script now runs each case in its own process.
+
+## Snappy decompression (2026-11-12, Apple M2 Max)
+
+`bench-snappy` decompresses raw snappy blocks with the pure-Zig decoder and with the C library, and checks the output against the uncompressed input. Each run allocates the output buffer, as the reader does.
+
+```bash
+cd test-files-arrow
+uv run python -I ../zig-parquet/bench/column-read/scripts/snappy_inputs.py /tmp/snappy_inputs   # PyArrow-compressed inputs
+cd ../zig-parquet/bench/column-read
+zig build snappy -- /tmp/snappy_inputs 30
+```
+
+GB/s of output, median of 30 runs:
+
+| Input | Ratio | Zig | C library |
+|---|---|---|---|
+| int64 ids | 2.00 | 2.4 | 1.7 |
+| int64 timestamps | 1.10 | 2.3 | 2.0 |
+| random doubles | 1.00 | 13.0 | 13.1 |
+| strings, 1,000 distinct | 4.85 | 4.6 | 4.6 |
+| JSON-like text | 4.34 | 2.9 | 4.0 |
+
+The decoder handles most of a block in a loop that needs no checks against the ends of the input and output: it runs while 21 input bytes (the longest element header and a 16-byte literal block) and 64 output bytes (the block writes of a copy) remain. It branches on the element type. A version that looked the element up in a table was slower on every input (timestamps 0.9 GB/s): each element's input position then depended on a load, so elements were decoded one after another. JSON-like text has 922,000 elements of 11.7 bytes on average, mostly copies of 16 to 19 bytes; the C library decodes it 1.4 times as fast.

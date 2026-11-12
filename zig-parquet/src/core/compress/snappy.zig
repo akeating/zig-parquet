@@ -235,6 +235,66 @@ fn snappyDecode(src: []const u8, dst: []u8) error{DecompressionError}!usize {
 
     var sp: usize = varint.bytes_read;
     var dp: usize = 0;
+    const out = dst[0..expected_len];
+
+    // Fast loop: while the input has room for the longest element header (5 bytes) and a
+    // 16-byte literal block after it, and the output has room for the block writes of any
+    // short literal or copy (`copy_slack`), elements are decoded without checks on those
+    // ends. The loop below decodes the rest.
+    while (src.len - sp >= 21 and expected_len - dp >= copy_slack) {
+        const tag = src[sp];
+        sp += 1;
+        // A branch per element type: the input position after the element is then known
+        // without waiting for loads, so the CPU can start on the next element.
+        switch (@as(u2, @truncate(tag))) {
+            0 => {
+                const upper6: usize = tag >> 2;
+                var lit_len = upper6 + 1;
+                if (upper6 >= 60) {
+                    const extra = upper6 - 59; // 1..4
+                    const raw = std.mem.readInt(u32, src[sp..][0..4], .little) & trailer_mask[extra];
+                    sp += extra;
+                    lit_len = @as(usize, raw) + 1;
+                }
+                if (lit_len <= 16) {
+                    // 21 input bytes were left before the header of at most 5 bytes, and the
+                    // output has `copy_slack` bytes; the bytes past `lit_len` are overwritten
+                    // by what follows.
+                    out[dp..][0..16].* = src[sp..][0..16].*;
+                } else {
+                    if (src.len - sp < lit_len or expected_len - dp < lit_len) return error.DecompressionError;
+                    @memcpy(out[dp..][0..lit_len], src[sp..][0..lit_len]);
+                }
+                sp += lit_len;
+                dp += lit_len;
+            },
+            1 => {
+                const length = @as(usize, (tag >> 2) & 7) + 4;
+                const offset = (@as(usize, tag >> 5) << 8) | @as(usize, src[sp]);
+                sp += 1;
+                if (offset == 0 or offset > dp) return error.DecompressionError;
+                // length <= 64 = copy_slack, so the copy and its block writes stay in `out`.
+                copyBlocks(out, dp, offset, length);
+                dp += length;
+            },
+            2 => {
+                const length = @as(usize, tag >> 2) + 1;
+                const offset: usize = std.mem.readInt(u16, src[sp..][0..2], .little);
+                sp += 2;
+                if (offset == 0 or offset > dp) return error.DecompressionError;
+                copyBlocks(out, dp, offset, length);
+                dp += length;
+            },
+            3 => {
+                const length = @as(usize, tag >> 2) + 1;
+                const offset: usize = std.mem.readInt(u32, src[sp..][0..4], .little);
+                sp += 4;
+                if (offset == 0 or offset > dp) return error.DecompressionError;
+                copyBlocks(out, dp, offset, length);
+                dp += length;
+            },
+        }
+    }
 
     while (sp < src.len and dp < expected_len) {
         const tag = src[sp];
@@ -306,6 +366,9 @@ fn snappyDecode(src: []const u8, dst: []u8) error{DecompressionError}!usize {
     return dp;
 }
 
+/// The mask of the first `extra` bytes of a little-endian u32.
+const trailer_mask = [5]u32{ 0, 0xff, 0xffff, 0xffffff, 0xffffffff };
+
 /// Bytes that must remain in `dst` after the start of a copy for `copyAtOffset` to use block
 /// copies: blocks cover the copy's at most 64 bytes and write past its end.
 const copy_slack = 64;
@@ -315,12 +378,18 @@ const copy_slack = 64;
 /// The caller checks that `offset <= pos`, `pos + length <= dst.len`, and `length <= 64`
 /// (the largest snappy copy element).
 inline fn copyAtOffset(dst: []u8, pos: usize, offset: usize, length: usize) void {
-    const from = pos - offset;
     if (dst.len - pos < copy_slack) {
         // Near the end of the output: byte by byte, writing nothing past `pos + length`.
+        const from = pos - offset;
         for (0..length) |i| dst[pos + i] = dst[from + i];
         return;
     }
+    copyBlocks(dst, pos, offset, length);
+}
+
+/// `copyAtOffset` when `dst` has at least `copy_slack` bytes from `pos` on.
+inline fn copyBlocks(dst: []u8, pos: usize, offset: usize, length: usize) void {
+    const from = pos - offset;
     // Block copies of a fixed size where possible, so the work does not branch on the exact
     // length. Each block reads bytes before the position it writes (blocks are at most `offset`
     // bytes, or the source repeats with a period that is), so it reads output already written.
