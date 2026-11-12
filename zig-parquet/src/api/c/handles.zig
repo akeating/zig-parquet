@@ -4,6 +4,7 @@
 //! respective Parquet operations and manage cleanup on close.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const ErrorContext = @import("error.zig").ErrorContext;
 
 const format = @import("../../core/format.zig");
@@ -34,9 +35,12 @@ pub const ColumnDef = column_def_mod.ColumnDef;
 
 const Allocator = std.mem.Allocator;
 
-/// Backing allocator for C ABI handles.
-/// page_allocator is always available on all targets.
-const backing_allocator = std.heap.page_allocator;
+/// Backing allocator of the C ABI handles (readers, writers, row readers and row writers)
+/// and of the data they hold and return. `page_allocator` maps memory from the OS for each
+/// allocation: reading all columns of a 10-million-row file makes 17,000 to 25,000
+/// allocations, and with it the C stream took 194-197 ms against 150-159 ms through the
+/// Zig API with `smp_allocator`. `smp_allocator` needs a multi-threaded build.
+const backing_allocator = if (builtin.single_threaded) std.heap.page_allocator else std.heap.smp_allocator;
 
 /// Lazily-initialized blocking I/O backend for file operations.
 var c_io_threaded: ?std.Io.Threaded = null;

@@ -15,7 +15,7 @@ uv run python -I ../zig-parquet/bench/column-read/scripts/gen_bench.py /tmp/benc
 # 2. zig-parquet (builds ReleaseFast by default)
 cd ../zig-parquet/bench/column-read
 zig build run -- /tmp/bench_10m.parquet 5            # all cases, 5 measured runs
-zig build run -- /tmp/bench_10m.parquet 5 arrow:id   # one case: PATH:COLUMN, PATH is arrow, groups, batches or rows, COLUMN a column name or all
+zig build run -- /tmp/bench_10m.parquet 5 arrow:id   # one case: PATH:COLUMN, PATH is arrow, groups, batches, rows, cgroups or cbatches, COLUMN a column name or all
 zig build run -- /tmp/bench_10m.parquet 5 threads=8 ahead=1   # decode on up to 8 threads, 1 row group ahead (groups and batches paths)
 zig build -Dcodecs=c-only run -- /tmp/bench_10m.parquet 5   # with the C codec libraries (rebuilds zig-out)
 
@@ -127,3 +127,16 @@ GB/s of output, median of 30 runs:
 | JSON-like text | 4.34 | 2.9 | 4.0 |
 
 The decoder handles most of a block in a loop that needs no checks against the ends of the input and output: it runs while 21 input bytes (the longest element header and a 16-byte literal block) and 64 output bytes (the block writes of a copy) remain. It branches on the element type. A version that looked the element up in a table was slower on every input (timestamps 0.9 GB/s): each element's input position then depended on a load, so elements were decoded one after another. JSON-like text has 922,000 elements of 11.7 bytes on average, mostly copies of 16 to 19 bytes; the C library decodes it 1.4 times as fast.
+
+## C stream (2026-11-12, Apple M2 Max)
+
+The `cgroups` and `cbatches` paths read through the C API (`zp_reader_open_file`, `zp_reader_get_stream_with_options`), one batch per row group and 65,536-row batches; `threads=` and `ahead=` set the stream's `threads` and `read_ahead`. The C API allocates with its own allocator, so the allocation columns are empty for them. All columns, median of 9 runs, ms:
+
+| File | groups | cgroups | batches | cbatches |
+|---|---|---|---|---|
+| flat, C handles on `page_allocator` | 159 | 197 | 150 | 194 |
+| flat, C handles on `smp_allocator` | 156 | 160 | 153 | 156 |
+| nested, `page_allocator` | 154 | 159 | 156 | 167 |
+| nested, `smp_allocator` | 160 | 158 | 167 | 166 |
+
+`page_allocator` maps memory from the OS for each allocation, and the flat file's reads make 17,000 to 25,000 of them. The C handles now use `smp_allocator` in multi-threaded builds.

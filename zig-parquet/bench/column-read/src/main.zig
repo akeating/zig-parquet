@@ -103,7 +103,7 @@ const CountingAllocator = struct {
     }
 };
 
-const Path = enum { arrow, groups, batches, rows };
+const Path = enum { arrow, groups, batches, rows, cgroups, cbatches };
 
 /// Rows per batch of the `batches` path, the default of PyArrow's `iter_batches`.
 const batch_rows = 65536;
@@ -165,7 +165,7 @@ pub fn main(init: std.process.Init) !void {
     defer cases.deinit(init.gpa);
     // Optional CASE argument "path:column" (e.g. "arrow:id", "batches:all") runs only that case.
     const filter: ?[]const u8 = positional[1];
-    for ([_]Path{ .arrow, .groups, .batches, .rows }) |p| {
+    for ([_]Path{ .arrow, .groups, .batches, .rows, .cgroups, .cbatches }) |p| {
         for (0..num_cols + 1) |c| {
             const column: ?usize = if (c < num_cols) c else null;
             if (filter) |f| {
@@ -199,6 +199,8 @@ pub fn main(init: std.process.Init) !void {
                 .arrow => try readArrow(allocator, &reader, num_rgs, case.column, decode_io),
                 .groups => try readBatches(allocator, &reader, case.column, null, decode_io, ahead),
                 .batches => try readBatches(allocator, &reader, case.column, batch_rows, decode_io, ahead),
+                .cgroups => try readCStream(path, case.column, 0, threads, ahead),
+                .cbatches => try readCStream(path, case.column, batch_rows, threads, ahead),
                 .rows => try readRows(allocator, &reader, num_rgs, case.column),
             };
             const elapsed = start.durationTo(std.Io.Clock.awake.now(io));
@@ -281,6 +283,46 @@ fn readBatches(allocator: std.mem.Allocator, reader: *parquet.DynamicReader, col
         var result = result_const;
         defer result.deinit();
         for (result.arrays) |arr| {
+            check +%= @as(u64, @intCast(arr.length)) *% 31 +% @as(u64, @intCast(arr.null_count));
+        }
+    }
+    return check;
+}
+
+/// Reads the file through the C API's Arrow stream (`zp_reader_open_file`,
+/// `zp_reader_get_stream_with_options`), `rows_per_batch` rows per batch (0: one batch per
+/// row group). The C API allocates with its own allocator, so the allocation columns show
+/// nothing. Returns the same checksum as readBatches.
+fn readCStream(path: []const u8, column: ?usize, rows_per_batch: i64, threads: usize, ahead: usize) !u64 {
+    const c = parquet.c_api.reader;
+    var path_buf: [4096]u8 = undefined;
+    const path_z = try std.fmt.bufPrintSentinel(&path_buf, "{s}", .{path}, 0);
+    var handle: ?*anyopaque = null;
+    if (c.zp_reader_open_file(path_z.ptr, &handle) != 0) return error.OpenFailed;
+    defer c.zp_reader_close(handle);
+    const col: [1]c_int = .{@intCast(column orelse 0)};
+    // zp_stream_options, from the type of the function's parameter.
+    const Options = @typeInfo(@typeInfo(@typeInfo(@TypeOf(c.zp_reader_get_stream_with_options)).@"fn".param_types[1].?).optional.child).pointer.child;
+    var options = std.mem.zeroes(Options);
+    options.size = @sizeOf(@TypeOf(options));
+    if (column != null) {
+        options.col_indices = &col;
+        options.num_cols = 1;
+    }
+    options.batch_rows = rows_per_batch;
+    options.threads = @intCast(threads);
+    options.read_ahead = @intCast(ahead);
+    var stream: parquet.ArrowArrayStream = undefined;
+    if (c.zp_reader_get_stream_with_options(handle, &options, &stream) != 0) return error.StreamFailed;
+    defer stream.release.?(&stream);
+    var check: u64 = 0;
+    while (true) {
+        var batch: parquet.ArrowArray = undefined;
+        if (stream.get_next.?(&stream, &batch) != 0) return error.NextFailed;
+        if (batch.release == null) break;
+        defer batch.doRelease();
+        for (0..@intCast(batch.n_children)) |i| {
+            const arr = batch.children.?[i];
             check +%= @as(u64, @intCast(arr.length)) *% 31 +% @as(u64, @intCast(arr.null_count));
         }
     }
