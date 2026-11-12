@@ -38,6 +38,25 @@ test "leaf decoder decodes every leaf column chunk of the test files without lea
     const allocator = std.testing.allocator;
     var totals: Totals = .{};
 
+    // The files are decoded as tasks of `std.testing.io`, several at a time. Each job has an
+    // allocator of its own that fails the job when memory leaks.
+    const Job = struct {
+        path: []const u8,
+        totals: Totals = .{},
+        err: ?anyerror = null,
+
+        fn run(job: *@This()) void {
+            var gpa: test_util.LeakCheckAllocator = .init;
+            decodeFile(gpa.allocator(), std.Io.Dir.cwd(), job.path, &job.totals) catch |e| {
+                job.err = e;
+            };
+            if (gpa.deinit() == .leak and job.err == null) job.err = error.MemoryLeak;
+        }
+    };
+    var paths: std.heap.ArenaAllocator = .init(allocator);
+    defer paths.deinit();
+    var jobs: std.ArrayList(Job) = .empty;
+    defer jobs.deinit(allocator);
     for (roots) |root| {
         var dir = std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true }) catch |err| {
             std.debug.print("skipping {s}: {s}\n", .{ root, @errorName(err) });
@@ -49,10 +68,21 @@ test "leaf decoder decodes every leaf column chunk of the test files without lea
         while (try walker.next(io)) |entry| {
             if (entry.kind != .file or !std.mem.endsWith(u8, entry.basename, ".parquet")) continue;
             if (std.mem.indexOf(u8, entry.path, ".venv") != null) continue;
-            totals.files += 1;
-            try decodeFile(allocator, entry.dir, entry.basename, &totals);
+            const path = try std.fs.path.join(paths.allocator(), &.{ root, entry.path });
+            try jobs.append(allocator, .{ .path = path });
         }
     }
+    var group: std.Io.Group = .init;
+    for (jobs.items) |*job| group.async(io, Job.run, .{job});
+    try group.await(io);
+    for (jobs.items) |job| {
+        if (job.err) |e| {
+            std.debug.print("leaf decoder sweep: {s}: {s}\n", .{ job.path, @errorName(e) });
+            return e;
+        }
+        inline for (@typeInfo(Totals).@"struct".field_names) |name| @field(totals, name) += @field(job.totals, name);
+    }
+    totals.files = jobs.items.len;
 
     std.debug.print(
         "\nleaf decoder sweep: {d} files ({d} unreadable), {d} leaf chunks: {d} decoded, {d} errors, {d} skipped (over {d} MiB); {d} page headers over 1 KiB\n",
