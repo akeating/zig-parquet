@@ -247,6 +247,8 @@ defer {
 
 The filter is conservative: kept rows come from pages whose stats *could* match, so you may still need a value-level check post-decode. `readRowsFiltered` requires every leaf column in the row group to carry an `OffsetIndex`; use `readAllRows` for unindexed files.
 
+Filters target leaf columns, including the leaves of lists, structs and maps; a filter on a list or map leaf keeps the rows of pages that might hold a matching element. Nested columns are returned as by `readAllRows`. Their data pages must start at row boundaries, as the format requires of files with an offset index; a page that does not returns `error.PageNotAtRowStart`.
+
 Writing files with indexes is opt-in:
 
 ```zig

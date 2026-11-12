@@ -267,7 +267,7 @@ pub const DynamicReader = struct {
 
                 if (self.current_rg >= self.num_rgs) return null;
 
-                const rows = try self.reader.readRowsInternal(self.current_rg, self.col_indices);
+                const rows = try self.reader.readRowsInternal(self.current_rg, self.col_indices, null);
                 self.current_rg += 1;
 
                 if (rows.len > 0) {
@@ -321,14 +321,14 @@ pub const DynamicReader = struct {
 
     /// Read all rows from a row group as dynamic Value types
     pub fn readAllRows(self: *Self, row_group_index: usize) ![]Row {
-        return self.readRowsInternal(row_group_index, null);
+        return self.readRowsInternal(row_group_index, null, null);
     }
 
     /// Read rows from a row group, returning only the specified top-level columns.
     /// Column indices refer to top-level schema columns (not leaf columns).
     /// Returned rows contain values in dense order matching the projection list.
     pub fn readRowsProjected(self: *Self, row_group_index: usize, col_indices: []const usize) ![]Row {
-        return self.readRowsInternal(row_group_index, col_indices);
+        return self.readRowsInternal(row_group_index, col_indices, null);
     }
 
     /// Read rows from a row group, applying page-index-driven filters to skip
@@ -338,12 +338,24 @@ pub const DynamicReader = struct {
     ///   - Every leaf column in the row group must advertise an `OffsetIndex`;
     ///     otherwise `error.PageIndexMissing` is returned (use `readAllRows`
     ///     for unindexed files).
-    ///   - Only flat schemas are supported; `error.NestedNotSupported` is
-    ///     returned for nested / list / map / struct columns.
-    ///   - `filters` target leaf column indices. Columns without a filter are
-    ///     treated as wildcards (`full(rg_num_rows)`).
+    ///   - `filters` target leaf column indices. Each filter keeps the rows of
+    ///     the pages of its column whose statistics might match, and the
+    ///     filters' rows are intersected. Columns without a filter are treated
+    ///     as wildcards (`full(rg_num_rows)`). A filter on a leaf of a list or
+    ///     map keeps a row when the page holding the row might contain a
+    ///     matching element of that row.
     ///   - Pages whose row ranges don't intersect the final (intersected)
-    ///     `RowRanges` are never read or decompressed.
+    ///     `RowRanges` are never read or decompressed. For a column with
+    ///     repetition (inside a list or map), when a run of kept rows ends at
+    ///     the end of a page, the next page is also read and decoded, to check
+    ///     that the run's last row does not continue in it.
+    ///   - Nested columns (lists, structs, maps) are returned as by `readAllRows`.
+    ///     The page index counts rows, so the data pages of a column with
+    ///     repetition must start at a row (repetition level 0), as the Parquet
+    ///     format requires of files with an offset index. A page read that does
+    ///     not start at a row returns `error.PageNotAtRowStart`, and a page whose
+    ///     row count differs from the offset index returns
+    ///     `error.PageRowCountMismatch`.
     ///
     /// The returned rows are in row-group order, restricted to the final
     /// `RowRanges`. A stats-level predicate pushdown may still leave rows that
@@ -357,25 +369,11 @@ pub const DynamicReader = struct {
             return try self.allocator.alloc(Row, 0);
         }
 
-        // Allocate the rows' memory in storage shared by the rows of this read.
-        const storage = try self.beginStorage();
-        defer self.endStorage(storage);
-
         const rg = &self.metadata.row_groups[row_group_index];
         const num_rows = try safeRowCount(rg.num_rows);
         const num_leaf_columns = rg.columns.len;
         if (num_rows == 0 or num_leaf_columns == 0) {
             return try self.allocator.alloc(Row, 0);
-        }
-
-        // Flat-schema-only in this first cut.
-        const schema = self.metadata.schema;
-        const num_top: usize = if (schema.len > 0)
-            safe.castTo(usize, schema[0].num_children orelse 0) catch 0
-        else
-            0;
-        if (num_top != 0 and num_top != num_leaf_columns) {
-            return error.NestedNotSupported;
         }
 
         // Validate filter column indices.
@@ -415,104 +413,36 @@ pub const DynamicReader = struct {
             return try self.allocator.alloc(Row, 0);
         }
 
-        // Per-column: fetch just the pages intersecting final_ranges and decode.
-        const column_values = try self.allocator.alloc([]Value, num_leaf_columns);
-        @memset(column_values, &.{});
-        defer {
-            for (column_values) |vals| {
-                for (vals) |v| v.deinit(self.allocator);
-                if (vals.len > 0) self.allocator.free(vals);
-            }
-            self.allocator.free(column_values);
-        }
-
-        const column_rg_indices = try self.allocator.alloc([]u64, num_leaf_columns);
-        @memset(column_rg_indices, &.{});
-        defer {
-            for (column_rg_indices) |idx| {
-                if (idx.len > 0) self.allocator.free(idx);
-            }
-            self.allocator.free(column_rg_indices);
-        }
-
-        for (0..num_leaf_columns) |col_idx| {
-            const chunk = &rg.columns[col_idx];
-            const oi = &offset_indexes[col_idx].?;
-
-            var page_result = try page_range_reader_mod.readSelectedPages(
-                self.allocator,
-                self.getSource(),
-                chunk,
-                oi,
-                final_ranges,
-                num_rows,
-            );
-            defer page_result.deinit(self.allocator);
-
-            if (page_result.data.len == 0) {
-                // Nothing selected for this column → no decoded values.
-                continue;
-            }
-
-            // Decode using the substituted buffer.
-            const decoded = try self.readColumnDynamicWithData(col_idx, row_group_index, page_result.data);
-            // We don't use def/rep levels in the flat path; free them if present.
-            if (decoded.def_levels) |dl| self.allocator.free(dl);
-            if (decoded.rep_levels) |rl| self.allocator.free(rl);
-
-            // Build the decoded-row-idx → rg-local-row-idx mapping, constrained
-            // to final_ranges. For flat columns, each decoded value is one row.
-            const total = decoded.values.len;
-            var kept_values = try std.ArrayList(Value).initCapacity(self.allocator, total);
-            errdefer {
-                for (kept_values.items) |v| v.deinit(self.allocator);
-                kept_values.deinit(self.allocator);
-            }
-            var kept_indices = try std.ArrayList(u64).initCapacity(self.allocator, total);
-            errdefer kept_indices.deinit(self.allocator);
-
-            for (decoded.values, 0..) |v, i| {
-                const rg_row = page_result.mapDecodedRow(i) orelse {
-                    // Shouldn't happen if the decoder produced the expected count.
-                    return error.InvalidPageData;
-                };
-                if (final_ranges.contains(rg_row)) {
-                    try kept_values.append(self.allocator, v);
-                    try kept_indices.append(self.allocator, rg_row);
-                } else {
-                    v.deinit(self.allocator);
-                }
-            }
-
-            // Free the now-drained values slice (values themselves were moved or freed above).
-            self.allocator.free(decoded.values);
-
-            column_values[col_idx] = try kept_values.toOwnedSlice(self.allocator);
-            column_rg_indices[col_idx] = try kept_indices.toOwnedSlice(self.allocator);
-        }
-
-        // Every column must agree on the kept row indices.
-        const first_non_empty = blk: {
-            for (column_rg_indices, 0..) |idx, i| {
-                if (idx.len > 0) break :blk i;
-            }
-            break :blk null;
+        var probe_ranges = try extendRanges(self.allocator, final_ranges, num_rows);
+        defer probe_ranges.deinit(self.allocator);
+        const filter: FilteredRead = .{
+            .ranges = final_ranges,
+            .probe_ranges = probe_ranges,
+            .offset_indexes = offset_indexes,
+            .rg_num_rows = num_rows,
         };
-        if (first_non_empty == null) {
-            return try self.allocator.alloc(Row, 0);
-        }
-        const canonical = column_rg_indices[first_non_empty.?];
-        for (column_rg_indices) |idx| {
-            if (idx.len == 0) continue;
-            if (idx.len != canonical.len) return error.InconsistentPageAlignment;
-            for (idx, canonical) |a, b| {
-                if (a != b) return error.InconsistentPageAlignment;
-            }
-        }
-
-        // Assemble flat rows from the kept per-column values.
-        return self.assembleFlatRows(canonical.len, num_leaf_columns, column_values, null);
+        return self.readRowsInternal(row_group_index, null, &filter);
     }
+
+    /// The rows a filtered read keeps, and the page indexes that locate them.
+    const FilteredRead = struct {
+        /// Rows kept, as row-group row indices.
+        ranges: RowRanges,
+        /// `ranges` with each range extended by one row. A column with repetition reads the
+        /// pages that hold these rows: the extra row selects the page after a page whose last
+        /// row is kept, and the first entry of that page shows whether the row continues in it.
+        probe_ranges: RowRanges,
+        /// Offset index of each leaf column; none is null.
+        offset_indexes: []const ?format.OffsetIndex,
+        rg_num_rows: u64,
+    };
+
+    /// Where the row API reads a row group's leaf columns from.
+    const RowSource = struct {
+        row_group_index: usize,
+        /// Set by `readRowsFiltered`: only the pages and rows it selects are read.
+        filter: ?*const FilteredRead = null,
+    };
 
     const StorageScope = struct {
         storage: *value_mod.RowStorage,
@@ -546,7 +476,9 @@ pub const DynamicReader = struct {
         return self.storage.?.arena.allocator();
     }
 
-    fn readRowsInternal(self: *Self, row_group_index: usize, col_indices: ?[]const usize) ![]Row {
+    /// Reads the rows of a row group: all of them or, with `filter`, those it keeps. With
+    /// `col_indices`, only those top-level columns are read.
+    fn readRowsInternal(self: *Self, row_group_index: usize, col_indices: ?[]const usize, filter: ?*const FilteredRead) ![]Row {
         if (row_group_index >= self.metadata.row_groups.len) {
             return try self.allocator.alloc(Row, 0);
         }
@@ -558,12 +490,16 @@ pub const DynamicReader = struct {
         defer self.endStorage(storage);
 
         const rg = &self.metadata.row_groups[row_group_index];
-        const num_rows = try safeRowCount(rg.num_rows);
         const num_leaf_columns = rg.columns.len;
+        const num_rows = if (filter) |f|
+            safe.castTo(usize, f.ranges.rowCount()) catch return error.InvalidRowCount
+        else
+            try safeRowCount(rg.num_rows);
 
         if (num_rows == 0 or num_leaf_columns == 0) {
             return try self.allocator.alloc(Row, 0);
         }
+        const src: RowSource = .{ .row_group_index = row_group_index, .filter = filter };
 
         const schema = self.metadata.schema;
         const num_top: usize = if (schema.len > 0)
@@ -602,11 +538,11 @@ pub const DynamicReader = struct {
             if (tree) |columns| {
                 const node = &columns[top_idx];
                 if (node.kind == .leaf)
-                    try self.readLeafIntoRows(node.physical_start, row_group_index, column_out, num_out, num_rows)
+                    try self.readLeafIntoRows(node.physical_start, src, column_out, num_out, num_rows)
                 else
-                    try self.readNodeIntoRows(node, row_group_index, column_out, num_out, num_rows);
+                    try self.readNodeIntoRows(node, src, column_out, num_out, num_rows);
             } else {
-                try self.readLeafIntoRows(top_idx, row_group_index, column_out, num_out, num_rows);
+                try self.readLeafIntoRows(top_idx, src, column_out, num_out, num_rows);
             }
         }
 
@@ -636,23 +572,29 @@ pub const DynamicReader = struct {
         }
     };
 
-    /// Decodes leaf column `leaf_idx` of a row group for the row API. Byte-array data is handed
-    /// to the row storage, so row values can reference it.
-    fn decodeRowLeaf(self: *Self, leaf_idx: usize, row_group_index: usize, keep_levels: bool) !RowLeaf {
-        const rg = &self.metadata.row_groups[row_group_index];
+    /// Decodes leaf column `leaf_idx` of a row group for the row API: the whole chunk or, with
+    /// a filter, the rows it keeps. Byte-array data is handed to the row storage, so row values
+    /// can reference it.
+    fn decodeRowLeaf(self: *Self, leaf_idx: usize, src: RowSource, keep_levels: bool) !RowLeaf {
+        const rg = &self.metadata.row_groups[src.row_group_index];
         if (leaf_idx >= rg.columns.len) return error.InvalidArgument;
         const chunk = &rg.columns[leaf_idx];
         const meta = chunk.meta_data orelse return error.InvalidArgument;
         const info = format.getColumnInfo(self.metadata.schema, leaf_idx) orelse return error.InvalidArgument;
         const physical = info.element.type_ orelse return error.InvalidSchema;
-        const page_data = try self.readColumnChunkData(chunk);
-        defer self.allocator.free(page_data);
-
-        var leaf = try leaf_decoder.decodeLeaf(self.allocator, page_data, meta, info, .{
+        const options: leaf_decoder.Options = .{
             .keep_levels = keep_levels,
             .checksum = self.checksum_options,
             .large_offsets = true,
-        });
+        };
+
+        var leaf = if (src.filter) |filter|
+            try self.decodeFilteredLeaf(chunk, meta, info, options, filter, &filter.offset_indexes[leaf_idx].?)
+        else blk: {
+            const page_data = try self.readColumnChunkData(chunk);
+            defer self.allocator.free(page_data);
+            break :blk try leaf_decoder.decodeLeaf(self.allocator, page_data, meta, info, options);
+        };
         const values = leaf.buffers.values;
         if (physical == .byte_array or physical == .fixed_len_byte_array) {
             self.storage.?.adopt(values) catch |e| {
@@ -664,20 +606,59 @@ pub const DynamicReader = struct {
         return .{ .leaf = leaf, .values = values, .element = info.element, .max_def = info.max_def_level, .max_rep = info.max_rep_level };
     }
 
+    /// Reads the pages of a leaf column chunk that hold rows `filter` keeps (see
+    /// `page_range_reader`), decodes them, and returns the entries of the kept rows.
+    fn decodeFilteredLeaf(
+        self: *Self,
+        chunk: *const format.ColumnChunk,
+        meta: format.ColumnMetaData,
+        info: format.ColumnInfo,
+        options: leaf_decoder.Options,
+        filter: *const FilteredRead,
+        offset_index: *const format.OffsetIndex,
+    ) !leaf_decoder.Leaf {
+        const allocator = self.allocator;
+        const repeated = info.max_rep_level > 0;
+        var opts = options;
+        // The rows of a column with repetition start at entries with repetition level 0.
+        if (repeated) opts.keep_levels = true;
+
+        const wanted = if (repeated) filter.probe_ranges else filter.ranges;
+        var pages = try page_range_reader_mod.readSelectedPages(allocator, self.getSource(), chunk, offset_index, wanted, filter.rg_num_rows);
+        defer pages.deinit(allocator);
+
+        const page_rows = try allocator.alloc(usize, pages.selected.len);
+        defer allocator.free(page_rows);
+        for (pages.selected, page_rows) |sp, *n| {
+            n.* = safe.castTo(usize, sp.end_row_index - sp.first_row_index) catch return error.IntegerOverflow;
+        }
+
+        var leaf = try leaf_decoder.decodeSelectedPages(allocator, leaf_decoder.PageReader.fromMemory(allocator, pages.data), meta, info, opts, page_rows);
+        errdefer leaf.deinit(allocator);
+
+        const ranges = try keptEntryRanges(allocator, pages.selected, filter.ranges, leaf.rep_levels, leaf.buffers.length);
+        defer allocator.free(ranges);
+        if (ranges.len == 1 and ranges[0].start == 0 and ranges[0].end == leaf.buffers.length) return leaf;
+
+        const kept = try selectLeafEntries(allocator, &leaf, ranges);
+        leaf.deinit(allocator);
+        return kept;
+    }
+
     /// Decodes a top-level primitive column and writes its values to `out[r * stride]` for
     /// `r < num_rows`; rows past the column's entries get null.
-    fn readLeafIntoRows(self: *Self, leaf_idx: usize, row_group_index: usize, out: []Value, stride: usize, num_rows: usize) !void {
-        var rl = try self.decodeRowLeaf(leaf_idx, row_group_index, false);
+    fn readLeafIntoRows(self: *Self, leaf_idx: usize, src: RowSource, out: []Value, stride: usize, num_rows: usize) !void {
+        var rl = try self.decodeRowLeaf(leaf_idx, src, false);
         defer rl.leaf.deinit(self.allocator);
         const view = rl.view(num_rows);
-        try leaf_decoder.writeValues(self.rowAllocator(), &view, rl.element, out, stride, .borrow);
+        try leaf_decoder.writeValues(&view, rl.element, out, stride);
         for (view.length..num_rows) |r| out[r * stride] = .{ .null_val = {} };
     }
 
     /// Reads the leaves of nested top-level column `node`, assembles its values in the row
     /// storage (see `nested_rows`) and writes them to `out[r * stride]` for `r < num_rows`;
     /// rows past the column's values get null.
-    fn readNodeIntoRows(self: *Self, node: *const schema_tree.Node, row_group_index: usize, out: []Value, stride: usize, num_rows: usize) !void {
+    fn readNodeIntoRows(self: *Self, node: *const schema_tree.Node, src: RowSource, out: []Value, stride: usize, num_rows: usize) !void {
         const n = node.physical_count;
         const row_leaves = try self.allocator.alloc(RowLeaf, n);
         var decoded: usize = 0;
@@ -688,7 +669,7 @@ pub const DynamicReader = struct {
         const leaves = try self.allocator.alloc(nested_rows.Leaf, n);
         defer self.allocator.free(leaves);
         for (row_leaves, leaves, 0..) |*rl, *l, k| {
-            rl.* = try self.decodeRowLeaf(node.physical_start + k, row_group_index, true);
+            rl.* = try self.decodeRowLeaf(node.physical_start + k, src, true);
             decoded = k + 1;
             l.* = .{
                 .buffers = rl.view(std.math.maxInt(usize)),
@@ -712,87 +693,6 @@ pub const DynamicReader = struct {
         for (0..num_rows) |r| out[r * stride] = if (r < values.len) values[r] else .{ .null_val = {} };
     }
 
-    /// Read a single column, optionally using caller-supplied page bytes.
-    ///
-    /// When `override_page_data` is non-null it must contain `[dict_page?]
-    /// [data_pages...]` in the layout produced by `PageRangeReader`. This is
-    /// the hook for filtered reads: the caller pre-reads just the data pages
-    /// whose rows intersect the wanted `RowRanges`.
-    fn readColumnDynamicWithData(
-        self: *Self,
-        column_index: usize,
-        row_group_index: usize,
-        override_page_data: ?[]const u8,
-    ) !ColumnValues {
-        const rg = &self.metadata.row_groups[row_group_index];
-        if (column_index >= rg.columns.len) return error.InvalidArgument;
-
-        const chunk = &rg.columns[column_index];
-        const meta = chunk.meta_data orelse return error.InvalidArgument;
-
-        // Read the raw page data (or use caller's buffer).
-        const owned_page_data: ?[]u8 = if (override_page_data == null)
-            try self.readColumnChunkData(chunk)
-        else
-            null;
-        defer if (owned_page_data) |pd| self.allocator.free(pd);
-        const page_data: []const u8 = owned_page_data orelse override_page_data.?;
-
-        const column_info = format.getColumnInfo(self.metadata.schema, column_index) orelse
-            return error.InvalidArgument;
-
-        var leaf = try leaf_decoder.decodeLeaf(self.allocator, page_data, meta, column_info, .{
-            .keep_levels = true,
-            .checksum = self.checksum_options,
-            .large_offsets = true,
-        });
-        defer leaf.buffers.deinit(self.allocator);
-        errdefer {
-            if (leaf.def_levels) |l| self.allocator.free(l);
-            if (leaf.rep_levels) |l| self.allocator.free(l);
-        }
-
-        const values = try leaf_decoder.toValues(self.allocator, &leaf.buffers, column_info.element);
-        return .{
-            .values = values,
-            .def_levels = leaf.def_levels,
-            .rep_levels = leaf.rep_levels,
-        };
-    }
-
-    fn assembleFlatRows(
-        self: *Self,
-        num_rows: usize,
-        num_columns: usize,
-        column_values: [][]Value,
-        projected_col_indices: ?[]const usize,
-    ) ![]Row {
-        const output_indices = projected_col_indices orelse blk: {
-            const all = try self.allocator.alloc(usize, num_columns);
-            for (0..num_columns) |i| all[i] = i;
-            break :blk all;
-        };
-        defer if (projected_col_indices == null) self.allocator.free(output_indices);
-
-        // Every row's values in one block of the row storage; the column values are moved in.
-        const num_output_cols = output_indices.len;
-        const all_values = try self.rowAllocator().alloc(Value, try std.math.mul(usize, num_rows, num_output_cols));
-        const rows = try self.allocator.alloc(Row, num_rows);
-
-        for (rows, 0..) |*row, row_idx| {
-            const values = all_values[row_idx * num_output_cols ..][0..num_output_cols];
-            for (output_indices, 0..) |col_idx, out_idx| {
-                values[out_idx] = if (row_idx < column_values[col_idx].len)
-                    column_values[col_idx][row_idx]
-                else
-                    .{ .null_val = {} };
-            }
-            row.* = .{ .values = values, .allocator = self.allocator, .storage = self.storage };
-        }
-        self.storage.?.retainMany(num_rows);
-        return rows;
-    }
-
     /// Read raw page data for a column chunk
     fn readColumnChunkData(self: *Self, chunk: *const format.ColumnChunk) ![]u8 {
         return parquet_reader.readColumnChunkData(self.allocator, self.getSource(), chunk) catch |e| {
@@ -806,18 +706,96 @@ pub const DynamicReader = struct {
     }
 };
 
-/// One decoded leaf column chunk: a `Value` per level entry and the levels.
-const ColumnValues = struct {
-    values: []Value,
-    /// Null when the column's maximum definition level is 0.
-    def_levels: ?[]u32,
-    /// Null when the column's maximum repetition level is 0.
-    rep_levels: ?[]u32,
+/// `ranges` with each range extended by one row, up to `num_rows`.
+fn extendRanges(allocator: std.mem.Allocator, ranges: RowRanges, num_rows: u64) !RowRanges {
+    const extended = try allocator.alloc(row_ranges_mod.RowRange, ranges.ranges.len);
+    defer allocator.free(extended);
+    for (ranges.ranges, extended) |r, *e| e.* = .{ .first = r.first, .last = @min(r.last +| 1, num_rows) };
+    return RowRanges.fromUnsorted(allocator, extended);
+}
 
-    pub fn deinit(self: *ColumnValues, allocator: std.mem.Allocator) void {
-        for (self.values) |v| v.deinit(allocator);
-        allocator.free(self.values);
-        if (self.def_levels) |dl| allocator.free(dl);
-        if (self.rep_levels) |rl| allocator.free(rl);
+/// The entries of the rows in `ranges`, in a leaf decoded from the `selected` pages. Entries
+/// with repetition level 0 start rows; without `rep_levels` (a column without repetition) each
+/// entry is a row. The entry ranges are in ascending order, with adjacent ones merged.
+fn keptEntryRanges(
+    allocator: std.mem.Allocator,
+    selected: []const page_range_reader_mod.SelectedPage,
+    ranges: RowRanges,
+    rep_levels: ?[]const u32,
+    num_entries: usize,
+) ![]leaf_decoder.EntryRange {
+    // The entry at which each decoded row starts, then `num_entries`.
+    var starts: ?[]usize = null;
+    defer if (starts) |s| allocator.free(s);
+    if (rep_levels) |rep| {
+        if (rep.len != num_entries) return error.InvalidPageData;
+        var count: usize = 0;
+        for (rep) |lv| count += @intFromBool(lv == 0);
+        const s = try allocator.alloc(usize, count + 1);
+        starts = s;
+        var k: usize = 0;
+        for (rep, 0..) |lv, i| {
+            if (lv != 0) continue;
+            s[k] = i;
+            k += 1;
+        }
+        s[count] = num_entries;
     }
-};
+    const decoded_rows: u64 = if (starts) |s| s.len - 1 else num_entries;
+
+    var out: std.ArrayList(leaf_decoder.EntryRange) = .empty;
+    errdefer out.deinit(allocator);
+    // Decoded row index of the first row of the current page.
+    var base: u64 = 0;
+    var kept: u64 = 0;
+    for (selected) |sp| {
+        for (ranges.ranges) |r| {
+            if (r.first >= sp.end_row_index) break;
+            const first = @max(r.first, sp.first_row_index);
+            const last = @min(r.last, sp.end_row_index);
+            if (first >= last) continue;
+            const row_start = base + (first - sp.first_row_index);
+            const row_end = base + (last - sp.first_row_index);
+            if (row_end > decoded_rows) return error.PageRowCountMismatch;
+            kept += last - first;
+            const rs: usize = @intCast(row_start); // row_start < row_end <= decoded_rows, a usize
+            const re: usize = @intCast(row_end); // row_end <= decoded_rows, a usize
+            const start, const end = if (starts) |s| .{ s[rs], s[re] } else .{ rs, re };
+            if (out.items.len > 0 and out.items[out.items.len - 1].end == start) {
+                out.items[out.items.len - 1].end = end;
+            } else {
+                try out.append(allocator, .{ .start = start, .end = end });
+            }
+        }
+        base += sp.end_row_index - sp.first_row_index;
+    }
+    // Every kept row is in a selected page when the pages cover the row group.
+    if (kept != ranges.rowCount()) return error.InvalidPageIndex;
+    return out.toOwnedSlice(allocator);
+}
+
+/// A leaf with the entries of `leaf` in `ranges` (see `keptEntryRanges`) and their levels.
+fn selectLeafEntries(allocator: std.mem.Allocator, leaf: *const leaf_decoder.Leaf, ranges: []const leaf_decoder.EntryRange) !leaf_decoder.Leaf {
+    var buffers = try leaf.buffers.selectRanges(allocator, ranges);
+    errdefer buffers.deinit(allocator);
+    const def_levels = if (leaf.def_levels) |l| try selectLevels(allocator, l, ranges) else null;
+    errdefer if (def_levels) |l| allocator.free(l);
+    const rep_levels = if (leaf.rep_levels) |l| try selectLevels(allocator, l, ranges) else null;
+    return .{ .buffers = buffers, .def_levels = def_levels, .rep_levels = rep_levels };
+}
+
+/// The levels of the entries in `ranges`.
+fn selectLevels(allocator: std.mem.Allocator, levels: []const u32, ranges: []const leaf_decoder.EntryRange) ![]u32 {
+    var count: usize = 0;
+    for (ranges) |r| {
+        if (r.start > r.end or r.end > levels.len) return error.InvalidPageData;
+        count += r.end - r.start;
+    }
+    const out = try allocator.alloc(u32, count);
+    var at: usize = 0;
+    for (ranges) |r| {
+        @memcpy(out[at..][0 .. r.end - r.start], levels[r.start..r.end]);
+        at += r.end - r.start;
+    }
+    return out;
+}

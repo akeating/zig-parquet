@@ -174,6 +174,21 @@ pub const Buffers = struct {
         return self.takeAll();
     }
 
+    /// Copies the entries in `ranges` into new buffers with offsets of the same width. The
+    /// ranges are in ascending order and within `0..length`.
+    pub fn selectRanges(self: *const Buffers, allocator: Allocator, ranges: []const EntryRange) !Buffers {
+        var count: usize = 0;
+        for (ranges) |r| {
+            if (r.start > r.end or r.end > self.length) return error.InvalidArgument;
+            count += r.end - r.start;
+        }
+        var b = Builder{ .allocator = allocator, .kind = self.layout, .large_offsets = self.large_offsets };
+        errdefer b.deinit();
+        try b.init(count);
+        for (ranges) |r| try b.appendRange(self, r.start, r.end - r.start);
+        return b.finish();
+    }
+
     /// Moves the buffers out of `self`, leaving it empty.
     pub fn takeAll(self: *Buffers) Buffers {
         const moved = self.*;
@@ -183,6 +198,12 @@ pub const Buffers = struct {
         self.length = 0;
         return moved;
     }
+};
+
+/// Entries `start..end` of a `Buffers`.
+pub const EntryRange = struct {
+    start: usize,
+    end: usize,
 };
 
 /// How a `Buffers` holds its entries.
@@ -291,6 +312,41 @@ pub fn decodeLeaf(
     var cursor = try ColumnCursor.init(allocator, PageReader.fromMemory(allocator, page_data), meta, info, options, reservedEntries(meta.num_values));
     defer cursor.deinit();
     return cursor.next(std.math.maxInt(usize));
+}
+
+/// Decodes a selection of the data pages of a leaf column chunk. `pages` returns the
+/// chunk's dictionary page first, if the chunk has one, then the selected data pages in
+/// chunk order. Data page `k` must hold `page_rows[k]` rows, and in a column with
+/// repetition it must start at a row (repetition level 0); otherwise the page does not hold
+/// the rows the caller expects, and `error.PageRowCountMismatch` or
+/// `error.PageNotAtRowStart` is returned. Data pages past `page_rows.len` return
+/// `error.PageRowCountMismatch`. Returns the entries of all selected pages, in order.
+pub fn decodeSelectedPages(
+    allocator: Allocator,
+    pages: PageReader,
+    meta: format.ColumnMetaData,
+    info: format.ColumnInfo,
+    options: Options,
+    page_rows: []const usize,
+) !Leaf {
+    var cursor = try ColumnCursor.init(allocator, pages, meta, info, options, 0);
+    defer cursor.deinit();
+    const repeated = info.max_rep_level > 0;
+    for (page_rows) |want| {
+        const rows_before = cursor.dec.row_starts;
+        while (true) {
+            if (!cursor.hasPages()) return error.PageRowCountMismatch;
+            if (try cursor.decodeNextPage()) break;
+        }
+        if (cursor.dec.row_starts - rows_before != want) return error.PageRowCountMismatch;
+        // `dec.rep` holds the levels of the page just decoded, which has at least one entry
+        // when `want > 0`.
+        if (repeated and want > 0 and cursor.dec.rep.items[0] != 0) return error.PageNotAtRowStart;
+    }
+    while (cursor.hasPages()) {
+        if (try cursor.decodeNextPage()) return error.PageRowCountMismatch;
+    }
+    return cursor.take(cursor.builder.length - cursor.start, cursor.dec.row_starts);
 }
 
 /// The pages of a column chunk, from a buffer holding the whole chunk or read from a source
@@ -486,7 +542,7 @@ pub const ColumnCursor = struct {
         const repeated = self.dec.info.max_rep_level > 0;
         // A row of a repeated column is complete once the next row has started.
         const need = if (repeated) rows +| 1 else rows;
-        while (self.dec.row_starts < need and (self.first != null or !self.pages.done())) try self.decodeNextPage();
+        while (self.dec.row_starts < need and self.hasPages()) _ = try self.decodeNextPage();
         if (self.dec.row_starts < need) return self.take(self.builder.length - self.start, self.dec.row_starts);
         if (!repeated) return self.take(rows, rows);
         if (!self.dec.keep_levels) return error.InvalidArgument;
@@ -579,8 +635,9 @@ pub const ColumnCursor = struct {
         list.shrinkRetainingCapacity(rest);
     }
 
-    /// Decodes the next data page into `builder`. Other page types are skipped.
-    fn decodeNextPage(self: *ColumnCursor) !void {
+    /// Decodes the next page into `builder` when it is a data page. Other page types are
+    /// skipped. Returns whether the page was a data page.
+    fn decodeNextPage(self: *ColumnCursor) !bool {
         const allocator = self.dec.allocator;
         const header = if (self.first) |h| h else try self.pages.next();
         self.first = null;
@@ -589,7 +646,7 @@ pub const ColumnCursor = struct {
         if (header.data_page_header == null and header.data_page_header_v2 == null) {
             // Index pages and a second dictionary page are skipped.
             self.pages.skip();
-            return;
+            return false;
         }
         const body = try self.pages.body();
         try checkCrc(self.checksum, header, body);
@@ -599,6 +656,12 @@ pub const ColumnCursor = struct {
         } else if (header.data_page_header_v2) |v2| {
             try self.dec.decodeV2Page(&self.builder, body, v2, header);
         }
+        return true;
+    }
+
+    /// Whether pages remain to be decoded.
+    fn hasPages(self: *const ColumnCursor) bool {
+        return self.first != null or !self.pages.done();
     }
 };
 
@@ -755,29 +818,35 @@ const Builder = struct {
 
     /// Appends the entries of `src`, which has this builder's layout and offset width.
     fn appendBuffers(self: *Builder, src: *const Buffers) !void {
-        const n = src.length;
+        try self.appendRange(src, 0, src.length);
+    }
+
+    /// Appends entries `start..start + n` of `src`, which has this builder's layout and
+    /// offset width.
+    fn appendRange(self: *Builder, src: *const Buffers, start: usize, n: usize) !void {
+        const end = start + n;
         try self.reserve(n);
         switch (self.kind) {
             .bits => {
                 // `pushBit` and `pushValidity` of an entry go together.
-                for (0..n) |i| {
+                for (start..end) |i| {
                     self.pushBit((src.values[i / 8] >> @intCast(i % 8)) & 1 == 1);
                     self.pushValidity(src.isValid(i));
                 }
                 return;
             },
-            .fixed => |w| self.values.appendSliceAssumeCapacity(src.values[0 .. n * w]),
+            .fixed => |w| self.values.appendSliceAssumeCapacity(src.values[start * w .. end * w]),
             .bytes => {
                 const base = self.values.items.len;
-                const first = src.offsetAt(0);
-                try self.values.appendSlice(self.allocator, src.values[first..src.offsetAt(n)]);
-                for (1..n + 1) |i| try pushOffsetAt(self, base + (src.offsetAt(i) - first));
+                const first = src.offsetAt(start);
+                try self.values.appendSlice(self.allocator, src.values[first..src.offsetAt(end)]);
+                for (start + 1..end + 1) |i| try pushOffsetAt(self, base + (src.offsetAt(i) - first));
             },
         }
         if (src.null_count == 0) {
             self.validRun(n);
         } else {
-            for (0..n) |i| self.pushValidity(src.isValid(i));
+            for (start..end) |i| self.pushValidity(src.isValid(i));
         }
     }
 
@@ -1480,45 +1549,22 @@ fn appendBits(b: *Builder, levels: ?[]const u32, n: usize, src: anytype) void {
     }
 }
 
-/// One `Value` per decoded entry: `null_val` for null entries, otherwise the value in the
-/// physical type's `Value` form (INT96 as nanoseconds in `int64_val`). Byte arrays are copied
-/// with `value_mod.dupeBytes`, so they go to the reader's bytes arena when one is set.
-pub fn toValues(allocator: std.mem.Allocator, b: *const Buffers, element: format.SchemaElement) ![]Value {
-    const values = try allocator.alloc(Value, b.length);
-    errdefer allocator.free(values);
-    // On error, copied byte payloads are left to the bytes arena (the only caller sets one).
-    try writeValues(allocator, b, element, values, 1, .copy);
-    return values;
-}
-
-pub const BytesMode = enum {
-    /// Copy byte payloads with `value_mod.dupeBytes`.
-    copy,
-    /// Reference byte payloads in `b.values`; the caller keeps `b.values` alive as long as the
-    /// values.
-    borrow,
-};
-
 /// Writes entry `i` of `b` as a `Value` to `out[i * stride]`, for every entry (`out` must
-/// have room). See `toValues` for the value forms.
-pub fn writeValues(allocator: std.mem.Allocator, b: *const Buffers, element: format.SchemaElement, out: []Value, stride: usize, bytes: BytesMode) !void {
+/// have room): `null_val` for null entries, otherwise the value in the physical type's `Value`
+/// form (INT96 as nanoseconds in `int64_val`). Byte payloads reference `b.values`; the caller
+/// keeps `b.values` alive as long as the values.
+pub fn writeValues(b: *const Buffers, element: format.SchemaElement, out: []Value, stride: usize) !void {
     if (b.length > 0 and (b.length - 1) * stride >= out.len) return error.InvalidArgument;
     const reader = try ValueReader.init(b, element);
     switch (reader.physical) {
         inline else => |physical| for (0..b.length) |i| {
-            var v = reader.atType(physical, i);
-            if (bytes == .copy) switch (v) {
-                .bytes_val => |x| v = .{ .bytes_val = try value_mod.dupeBytes(allocator, x) },
-                .fixed_bytes_val => |x| v = .{ .fixed_bytes_val = try value_mod.dupeBytes(allocator, x) },
-                else => {},
-            };
-            out[i * stride] = v;
+            out[i * stride] = reader.atType(physical, i);
         },
     }
 }
 
-/// Reads single entries of decoded buffers as `Value`s (see `toValues` for the forms). Byte
-/// payloads reference `b.values`.
+/// Reads single entries of decoded buffers as `Value`s (see `writeValues` for the forms).
+/// Byte payloads reference `b.values`.
 pub const ValueReader = struct {
     b: *const Buffers,
     physical: format.PhysicalType,

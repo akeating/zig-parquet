@@ -193,8 +193,7 @@ fn pageKeptTyped(pred: ColumnFilter.Predicate, min_bytes: []const u8, max_bytes:
             return b.min <= hi and b.max >= lo;
         },
         .bytes_between => |b| {
-            return std.mem.lessThan(u8, b.min, max_bytes) or std.mem.eql(u8, b.min, max_bytes) and
-                (std.mem.lessThan(u8, min_bytes, b.max) or std.mem.eql(u8, min_bytes, b.max));
+            return byteLE(b.min, max_bytes) and byteLE(min_bytes, b.max);
         },
         .raw => unreachable, // handled in evaluate()
     }
