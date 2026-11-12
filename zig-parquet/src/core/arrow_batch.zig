@@ -6,7 +6,7 @@
 //! Functions:
 //! - `exportSchemaAsArrow`: Convert Parquet FileMetaData schema to ArrowSchema
 //! - `importSchemaFromArrow`: Convert ArrowSchema to Parquet ColumnDef[]
-//! - `readRowGroupAsArrow`: Decode a row group's columns into ArrowArray[]
+//! - `readColumns` (`DynamicReader.readColumns`): Decode a row group's columns into ArrowArray[]
 //! - `writeRowGroupFromArrow`: Encode ArrowArray[] into a Parquet row group
 
 const std = @import("std");
@@ -771,19 +771,7 @@ pub const ReadResult = struct {
     }
 };
 
-/// Read a row group's columns as Arrow arrays with runtime type dispatch.
-/// Returns one ArrowArray per top-level column read, and a schema whose children describe
-/// those columns in the same order. If `col_indices` is null, all top-level columns are read.
-pub fn readRowGroupAsArrow(
-    allocator: Allocator,
-    source: SeekableReader,
-    metadata: format.FileMetaData,
-    rg_index: usize,
-    col_indices: ?[]const usize,
-) !ReadResult {
-    return readRowGroupAsArrowWith(allocator, source, metadata, rg_index, .{ .columns = col_indices });
-}
-
+/// Options of `readColumns` and `DynamicReader.readColumns`.
 pub const RowGroupOptions = struct {
     /// Top-level columns to read, in this order; null reads all.
     columns: ?[]const usize = null,
@@ -794,8 +782,10 @@ pub const RowGroupOptions = struct {
     io: ?std.Io = null,
 };
 
-/// `readRowGroupAsArrow` with options.
-pub fn readRowGroupAsArrowWith(
+/// Reads the columns of row group `rg_index` as Arrow arrays: one ArrowArray per top-level
+/// column read, and a schema whose children describe those columns in the same order.
+/// `DynamicReader.readColumns` calls this with the reader's source and metadata.
+pub fn readColumns(
     allocator: Allocator,
     source: SeekableReader,
     metadata: format.FileMetaData,
@@ -843,7 +833,7 @@ pub fn readRowGroupAsArrowWith(
     };
 }
 
-/// Reads output column `i` of `readRowGroupAsArrowWith` into `arrays[i]`.
+/// Reads output column `i` of `readColumns` into `arrays[i]`.
 const ColumnTask = struct {
     allocator: Allocator,
     source: SeekableReader,
@@ -3927,7 +3917,7 @@ test "round-trip: write parquet, read as arrow - int32 + string" {
     var dr = try api_reader_mod.openBufferDynamic(allocator, buf, .{});
     defer dr.deinit();
 
-    var result = try readRowGroupAsArrow(allocator, dr.getSource(), dr.metadata, 0, null);
+    var result = try readColumns(allocator, dr.getSource(), dr.metadata, 0, .{});
     defer result.deinit();
 
     // Verify INT32 column
@@ -3982,7 +3972,7 @@ test "projected read returns a schema of the selected columns" {
     var dr = try api_reader_mod.openBufferDynamic(allocator, buf, .{});
     defer dr.deinit();
 
-    var result = try readRowGroupAsArrow(allocator, dr.getSource(), dr.metadata, 0, &.{ 2, 0 });
+    var result = try readColumns(allocator, dr.getSource(), dr.metadata, 0, .{ .columns = &.{ 2, 0 } });
     defer result.deinit();
 
     try std.testing.expectEqual(@as(usize, 2), result.arrays.len);
@@ -4215,7 +4205,7 @@ test "round-trip: arrow write then arrow read - int64 + float64" {
     var dr = try api_reader_mod.openBufferDynamic(allocator, buf, .{});
     defer dr.deinit();
 
-    var result = try readRowGroupAsArrow(allocator, dr.getSource(), dr.metadata, 0, null);
+    var result = try readColumns(allocator, dr.getSource(), dr.metadata, 0, .{});
     defer result.deinit();
 
     // Verify INT64 column
@@ -4298,7 +4288,7 @@ test "round-trip: LIST of int32" {
     var dr = try api_reader_mod.openBufferDynamic(allocator, buf, .{});
     defer dr.deinit();
 
-    var result = try readRowGroupAsArrow(allocator, dr.getSource(), dr.metadata, 0, null);
+    var result = try readColumns(allocator, dr.getSource(), dr.metadata, 0, .{});
     defer result.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), result.arrays.len);
@@ -4362,7 +4352,7 @@ test "round-trip: LIST of strings" {
     var dr = try api_reader_mod.openBufferDynamic(allocator, buf, .{});
     defer dr.deinit();
 
-    var result = try readRowGroupAsArrow(allocator, dr.getSource(), dr.metadata, 0, null);
+    var result = try readColumns(allocator, dr.getSource(), dr.metadata, 0, .{});
     defer result.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), result.arrays.len);
@@ -4417,7 +4407,7 @@ test "round-trip: STRUCT with mixed fields" {
     var dr = try api_reader_mod.openBufferDynamic(allocator, buf, .{});
     defer dr.deinit();
 
-    var result = try readRowGroupAsArrow(allocator, dr.getSource(), dr.metadata, 0, null);
+    var result = try readColumns(allocator, dr.getSource(), dr.metadata, 0, .{});
     defer result.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), result.arrays.len);
@@ -4472,7 +4462,7 @@ test "round-trip: MAP(string->int32)" {
     var dr = try api_reader_mod.openBufferDynamic(allocator, buf, .{});
     defer dr.deinit();
 
-    var result = try readRowGroupAsArrow(allocator, dr.getSource(), dr.metadata, 0, null);
+    var result = try readColumns(allocator, dr.getSource(), dr.metadata, 0, .{});
     defer result.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), result.arrays.len);
@@ -4677,7 +4667,7 @@ test "round-trip: arrow write then read - timestamps and date32" {
     // Read back
     var dr = try api_reader_mod.openBufferDynamic(allocator, buf, .{});
     defer dr.deinit();
-    var result = try readRowGroupAsArrow(allocator, dr.getSource(), dr.metadata, 0, null);
+    var result = try readColumns(allocator, dr.getSource(), dr.metadata, 0, .{});
     defer result.deinit();
 
     try std.testing.expectEqual(@as(usize, 4), result.arrays.len);
@@ -4789,7 +4779,7 @@ test "round-trip: arrow write LIST of timestamp seconds" {
     // Read back
     var dr = try api_reader_mod.openBufferDynamic(allocator, buf, .{});
     defer dr.deinit();
-    var result = try readRowGroupAsArrow(allocator, dr.getSource(), dr.metadata, 0, null);
+    var result = try readColumns(allocator, dr.getSource(), dr.metadata, 0, .{});
     defer result.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), result.arrays.len);
@@ -4902,7 +4892,7 @@ test "round-trip: arrow write STRUCT with timestamp seconds field" {
     // Read back
     var dr = try api_reader_mod.openBufferDynamic(allocator, buf, .{});
     defer dr.deinit();
-    var result = try readRowGroupAsArrow(allocator, dr.getSource(), dr.metadata, 0, null);
+    var result = try readColumns(allocator, dr.getSource(), dr.metadata, 0, .{});
     defer result.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), result.arrays.len);
@@ -5016,7 +5006,7 @@ test "round-trip: arrow write then read - widened integer types" {
     // Read back
     var dr = try api_reader_mod.openBufferDynamic(allocator, buf, .{});
     defer dr.deinit();
-    var result = try readRowGroupAsArrow(allocator, dr.getSource(), dr.metadata, 0, null);
+    var result = try readColumns(allocator, dr.getSource(), dr.metadata, 0, .{});
     defer result.deinit();
 
     try std.testing.expectEqual(@as(usize, 3), result.arrays.len);
@@ -5088,7 +5078,7 @@ test "round-trip: arrow write then read - boolean" {
 
     var dr = try api_reader_mod.openBufferDynamic(allocator, buf, .{});
     defer dr.deinit();
-    var result = try readRowGroupAsArrow(allocator, dr.getSource(), dr.metadata, 0, null);
+    var result = try readColumns(allocator, dr.getSource(), dr.metadata, 0, .{});
     defer result.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), result.arrays.len);
@@ -5157,7 +5147,7 @@ test "round-trip: arrow write then read - large utf8" {
 
     var dr = try api_reader_mod.openBufferDynamic(allocator, buf, .{});
     defer dr.deinit();
-    var result = try readRowGroupAsArrow(allocator, dr.getSource(), dr.metadata, 0, null);
+    var result = try readColumns(allocator, dr.getSource(), dr.metadata, 0, .{});
     defer result.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), result.arrays.len);
@@ -5387,7 +5377,7 @@ test "arrow write honours array offsets" {
     var tree_arena = std.heap.ArenaAllocator.init(allocator);
     defer tree_arena.deinit();
     const tree = try buildSchemaTree(tree_arena.allocator(), dr.metadata.schema);
-    var result = try readRowGroupAsArrow(allocator, dr.getSource(), dr.metadata, 0, null);
+    var result = try readColumns(allocator, dr.getSource(), dr.metadata, 0, .{});
     defer result.deinit();
 
     var got: std.Io.Writer.Allocating = .init(allocator);
@@ -5480,7 +5470,7 @@ test "arrow write of maps keeps key and value types, also when every value is nu
     }
 
     const tree = try buildSchemaTree(arena_state.allocator(), dr.metadata.schema);
-    var result = try readRowGroupAsArrow(allocator, dr.getSource(), dr.metadata, 0, null);
+    var result = try readColumns(allocator, dr.getSource(), dr.metadata, 0, .{});
     defer result.deinit();
     var got: std.Io.Writer.Allocating = .init(allocator);
     defer got.deinit();
@@ -5552,7 +5542,7 @@ test "round-trip: arrow write then read - decimals in Arrow layout" {
 
     var dr = try api_reader_mod.openBufferDynamic(allocator, buf, .{});
     defer dr.deinit();
-    var result = try readRowGroupAsArrow(allocator, dr.getSource(), dr.metadata, 0, null);
+    var result = try readColumns(allocator, dr.getSource(), dr.metadata, 0, .{});
     defer result.deinit();
     for (cases, 0..) |c, i| {
         try std.testing.expectEqualStrings(c.read_format, std.mem.span(result.schema.children.?[i].format));
@@ -5620,7 +5610,7 @@ test "round-trip: arrow write then read - decimals in a list and a struct" {
 
     var dr = try api_reader_mod.openBufferDynamic(allocator, buf, .{});
     defer dr.deinit();
-    var result = try readRowGroupAsArrow(allocator, dr.getSource(), dr.metadata, 0, null);
+    var result = try readColumns(allocator, dr.getSource(), dr.metadata, 0, .{});
     defer result.deinit();
 
     const list = &result.arrays[0];
@@ -5650,7 +5640,7 @@ test "decimal files read as Arrow decimal128" {
         defer file.close(io);
         var reader = try @import("../lib.zig").openFileDynamic(allocator, file, io, .{});
         defer reader.deinit();
-        var result = try readRowGroupAsArrow(allocator, reader.getSource(), reader.metadata, 0, null);
+        var result = try readColumns(allocator, reader.getSource(), reader.metadata, 0, .{});
         defer result.deinit();
         const fmt = std.mem.span(result.schema.children.?[0].format);
         try std.testing.expect(std.mem.startsWith(u8, fmt, "d:") and std.mem.count(u8, fmt, ",") == 1);
@@ -5714,7 +5704,7 @@ test "round-trip: arrow write then read - date64" {
 
     var dr = try api_reader_mod.openBufferDynamic(allocator, buf, .{});
     defer dr.deinit();
-    var result = try readRowGroupAsArrow(allocator, dr.getSource(), dr.metadata, 0, null);
+    var result = try readColumns(allocator, dr.getSource(), dr.metadata, 0, .{});
     defer result.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), result.arrays.len);
@@ -5801,7 +5791,7 @@ test "round-trip: arrow write then read - time32 seconds and millis" {
 
     var dr = try api_reader_mod.openBufferDynamic(allocator, buf, .{});
     defer dr.deinit();
-    var result = try readRowGroupAsArrow(allocator, dr.getSource(), dr.metadata, 0, null);
+    var result = try readColumns(allocator, dr.getSource(), dr.metadata, 0, .{});
     defer result.deinit();
 
     try std.testing.expectEqual(@as(usize, 2), result.arrays.len);
@@ -5967,7 +5957,7 @@ fn expectSpanningBatchesMatch(source: SeekableReader, md: format.FileMetaData, n
     var written: usize = 0;
     for (0..md.row_groups.len) |rg| {
         if (written == max_rows) break;
-        var result = readRowGroupAsArrow(allocator, source, md, rg, &.{c}) catch return false;
+        var result = readColumns(allocator, source, md, rg, .{ .columns = &.{c} }) catch return false;
         defer result.deinit();
         const arr = &result.arrays[0];
         const rows = @min(@as(usize, @intCast(arr.length)), max_rows - written);
@@ -6145,7 +6135,7 @@ fn canonColumn(
     read_ahead: usize,
 ) !void {
     if (batch_rows == null and read_ahead == 0) {
-        var result = try readRowGroupAsArrowWith(allocator, source, md, rg, .{ .columns = &.{c}, .io = decode_io });
+        var result = try readColumns(allocator, source, md, rg, .{ .columns = &.{c}, .io = decode_io });
         defer result.deinit();
         const arr = &result.arrays[0];
         const rows = @min(@as(usize, @intCast(arr.length)), max_rows);

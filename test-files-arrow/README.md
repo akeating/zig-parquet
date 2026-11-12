@@ -94,7 +94,7 @@ validated by `test_interop.py` to confirm cross-implementation compatibility.
 `nested_reference.json` holds PyArrow's reading of every column of the files in this directory
 and in `../test-files-wild` that have a list, map or struct column (first 2,000 rows of each
 row group), as canonical text. zig-parquet's test "Arrow arrays match PyArrow on the test files
-with nested columns" (`zig-parquet/src/core/arrow_batch.zig`) compares `readRowGroupAsArrow`
+with nested columns" (`zig-parquet/src/core/arrow_batch.zig`) compares `readColumns`
 with it. `generate.py` writes it after the test files; `nested_reference.py` describes the
 format.
 

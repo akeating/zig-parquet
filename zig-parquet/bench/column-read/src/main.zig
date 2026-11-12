@@ -154,7 +154,7 @@ pub fn main(init: std.process.Init) !void {
     defer reader.deinit();
 
     const num_rgs = reader.getNumRowGroups();
-    // readRowGroupAsArrow and readRowsProjected take top-level column indices.
+    // readColumns and readRowsProjected take top-level column indices.
     const col_names = try topLevelNames(init.arena.allocator(), reader.metadata.schema);
     const num_cols = col_names.len;
     std.debug.print("file: {s}\nrows: {d}, row groups: {d}, top-level columns: {d}, measured runs: {d}, threads: {d}, row groups ahead: {d}\n\n", .{
@@ -196,9 +196,9 @@ pub fn main(init: std.process.Init) !void {
             const live_before = counting.live;
             const start = std.Io.Clock.awake.now(io);
             check = switch (case.path) {
-                .arrow => try readArrow(allocator, &reader, num_rgs, case.column, decode_io),
-                .groups => try readBatches(allocator, &reader, case.column, null, decode_io, ahead),
-                .batches => try readBatches(allocator, &reader, case.column, batch_rows, decode_io, ahead),
+                .arrow => try readArrow(&reader, num_rgs, case.column, decode_io),
+                .groups => try readBatches(&reader, case.column, null, decode_io, ahead),
+                .batches => try readBatches(&reader, case.column, batch_rows, decode_io, ahead),
                 .cgroups => try readCStream(path, case.column, 0, threads, ahead),
                 .cbatches => try readCStream(path, case.column, batch_rows, threads, ahead),
                 .rows => try readRows(allocator, &reader, num_rgs, case.column),
@@ -256,13 +256,13 @@ fn bytesToMb(bytes: usize) f64 {
     return @as(f64, @floatFromInt(bytes)) / (1024.0 * 1024.0);
 }
 
-/// Reads all row groups through readRowGroupAsArrow. Returns a checksum of the array lengths
+/// Reads all row groups through DynamicReader.readColumns. Returns a checksum of the array lengths
 /// and null counts so the work cannot be skipped.
-fn readArrow(allocator: std.mem.Allocator, reader: *parquet.DynamicReader, num_rgs: usize, column: ?usize, io: ?std.Io) !u64 {
+fn readArrow(reader: *parquet.DynamicReader, num_rgs: usize, column: ?usize, io: ?std.Io) !u64 {
     var check: u64 = 0;
     for (0..num_rgs) |rg| {
         const cols: ?[]const usize = if (column) |c| &.{c} else null;
-        var result = try parquet.readRowGroupAsArrowWith(allocator, reader.getSource(), reader.metadata, rg, .{ .columns = cols, .io = io });
+        var result = try reader.readColumns(rg, .{ .columns = cols, .io = io });
         defer result.deinit();
         for (result.arrays) |arr| {
             check +%= @as(u64, @intCast(arr.length)) *% 31 +% @as(u64, @intCast(arr.null_count));
@@ -274,10 +274,10 @@ fn readArrow(allocator: std.mem.Allocator, reader: *parquet.DynamicReader, num_r
 /// Reads the file through ArrowBatchReader, `rows_per_batch` rows per batch (null: one batch
 /// per row group). Returns the same checksum as readArrow when every row group's rows fit in
 /// one batch; otherwise a checksum of the batches.
-fn readBatches(allocator: std.mem.Allocator, reader: *parquet.DynamicReader, column: ?usize, rows_per_batch: ?usize, io: ?std.Io, ahead: usize) !u64 {
+fn readBatches(reader: *parquet.DynamicReader, column: ?usize, rows_per_batch: ?usize, io: ?std.Io, ahead: usize) !u64 {
     var check: u64 = 0;
     const cols: ?[]const usize = if (column) |c| &.{c} else null;
-    var batches = try parquet.ArrowBatchReader.init(allocator, reader.getSource(), reader.metadata, .{ .columns = cols, .batch_rows = rows_per_batch, .io = io, .read_ahead = ahead });
+    var batches = try reader.columnBatches(.{ .columns = cols, .batch_rows = rows_per_batch, .io = io, .read_ahead = ahead });
     defer batches.deinit();
     while (try batches.next()) |result_const| {
         var result = result_const;

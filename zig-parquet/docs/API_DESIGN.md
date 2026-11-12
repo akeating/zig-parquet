@@ -7,6 +7,7 @@ Status: implemented. This document records the plan for the `core/`, `io/` and `
 - The writer's nested columns go through `core/column_write_values.zig`; `core/column_write_list.zig`, `core/column_write_struct.zig` and `core/column_write_map.zig` are deleted.
 - Every codec has a pure-Zig implementation, used by default; the C/C++ libraries are optional. The `codecs` build option (`all`, `zig-only`, `c-only`, `none`, or a list) replaces the planned `no_compression` flag. The "All Codecs Are C/C++" and "Compile-Time Codec Control" sections describe the state before that.
 - Reads can decode columns on several threads, opt-in through a `std.Io` (see Concurrency Model).
+- `readRowGroupAsArrow` is now `DynamicReader.readColumns` (and `arrow_batch.readColumns` for a source and metadata); `DynamicReader.columnBatches` returns an `ArrowBatchReader`.
 
 This document describes how `zig-parquet` should structure its internals so the same Parquet implementation can cleanly support the Zig API, a future C-facing ABI, `wasm32-wasi`, and `wasm32-freestanding`.
 
@@ -528,7 +529,7 @@ The mapping layer lives in `src/api/c/` and translates at the ABI boundary. The 
 
 Single-threaded access per handle. The library does not synchronize internally. If callers need to share a reader or writer across threads, they must provide their own synchronization.
 
-The library invokes a handle's callbacks one at a time, except when the caller opts into parallel decoding: a C stream with `zp_stream_options.threads` of 2 or more, or a Zig read given a `std.Io` (`RowGroupOptions.io`, `BatchOptions.io`, `DynamicReaderOptions.io`). The columns are then decoded on several threads, and a reader opened with `zp_reader_open_callbacks` calls `read_at` from several threads at once; the source and, in Zig, the allocator must allow concurrent use. The threads are internal to the read: a handle is still used from one thread at a time.
+The library invokes a handle's callbacks one at a time, except when the caller opts into parallel decoding: a C stream with `zp_stream_options.threads` of 2 or more, or a Zig read given a `std.Io` (the `.io` option of `DynamicReader.readColumns`, `DynamicReader.columnBatches` and `DynamicReaderOptions`). The columns are then decoded on several threads, and a reader opened with `zp_reader_open_callbacks` calls `read_at` from several threads at once; the source and, in Zig, the allocator must allow concurrent use. The threads are internal to the read: a handle is still used from one thread at a time.
 
 ## Module Organization
 

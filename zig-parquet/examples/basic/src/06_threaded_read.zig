@@ -39,7 +39,7 @@ pub fn main(init: std.process.Init) !void {
     // the next row group decoded while the current one's batches are returned.
     for ([_]?std.Io{ null, decode_io }) |batch_io| {
         const start = std.Io.Clock.awake.now(io);
-        var batches = try parquet.ArrowBatchReader.init(allocator, reader.getSource(), reader.metadata, .{
+        var batches = try reader.columnBatches(.{
             .batch_rows = 65536,
             .io = batch_io,
             .read_ahead = if (batch_io != null) 1 else 0,

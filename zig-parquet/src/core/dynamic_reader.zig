@@ -38,6 +38,7 @@ const page_filter_mod = @import("page_filter.zig");
 const page_index_reader_mod = @import("page_index_reader.zig");
 const page_selection = @import("page_selection.zig");
 const parallel = @import("parallel.zig");
+const arrow_batch = @import("arrow_batch.zig");
 
 pub const Value = value_mod.Value;
 pub const Row = value_mod.Row;
@@ -326,6 +327,24 @@ pub const DynamicReader = struct {
             .num_rgs = self.metadata.row_groups.len,
             .col_indices = col_indices,
         };
+    }
+
+    /// Reads the columns of a row group as Arrow arrays: one `ArrowArray` per top-level
+    /// column read (`options.columns`, in that order; null reads all), and a schema whose
+    /// children describe them. The columns are decoded with `options.io`, on the calling
+    /// thread when it is null; the reader's `DynamicReaderOptions.io` applies to row reads
+    /// only. The arrays are allocated with the reader's allocator; `ReadResult.deinit`
+    /// releases them.
+    pub fn readColumns(self: *Self, row_group_index: usize, options: arrow_batch.RowGroupOptions) !arrow_batch.ReadResult {
+        return arrow_batch.readColumns(self.allocator, self.getSource(), self.metadata, row_group_index, options);
+    }
+
+    /// An `ArrowBatchReader` over the file's columns: Arrow arrays of `options.batch_rows`
+    /// rows (65,536 by default), taken from as many row groups as needed. The columns are
+    /// decoded with `options.io`, on the calling thread when it is null. The reader must
+    /// outlive the batch reader.
+    pub fn columnBatches(self: *Self, options: arrow_batch.BatchOptions) !arrow_batch.ArrowBatchReader {
+        return arrow_batch.ArrowBatchReader.init(self.allocator, self.getSource(), self.metadata, options);
     }
 
     /// Read all rows from a row group as dynamic Value types

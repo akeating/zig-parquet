@@ -243,14 +243,8 @@ export fn zp_reader_read_row_group(
     defer if (zig_indices) |ci| handle.allocator.free(ci);
     if (col_indices) |ci| zig_indices = columnIndices(handle, ci, num_cols) orelse return handle.err_ctx.code;
 
-    var result = arrow_batch.readRowGroupAsArrow(
-        handle.allocator,
-        handle.source,
-        handle.metadata,
-        rg_idx,
-        zig_indices,
-    ) catch |e| {
-        handle.err_ctx.setErrorFmt(err.mapError(e), "readRowGroupAsArrow failed: {s}", .{err.errorMessage(e)});
+    var result = arrow_batch.readColumns(handle.allocator, handle.source, handle.metadata, rg_idx, .{ .columns = zig_indices }) catch |e| {
+        handle.err_ctx.setErrorFmt(err.mapError(e), "reading the row group failed: {s}", .{err.errorMessage(e)});
         return handle.err_ctx.code;
     };
 

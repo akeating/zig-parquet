@@ -304,13 +304,13 @@ try writer.close();
 
 `writeColumn(T, index, []const T)` accepts a plain slice but is deprecated; it copies the slice into `Optional(T)` values and calls `writeColumnOptional`.
 
-Read with `readRowGroupAsArrow`, which returns one `ArrowArray` per top-level column of a row group, in [Arrow C Data Interface](https://arrow.apache.org/docs/format/CDataInterface.html) layout. Pass column indices to read a subset, or `null` for all columns:
+Read with `reader.readColumns`, which returns one `ArrowArray` per top-level column of a row group, in [Arrow C Data Interface](https://arrow.apache.org/docs/format/CDataInterface.html) layout. Pass column indices in `.columns` to read a subset; without them it reads all columns:
 
 ```zig
 var reader = try parquet.openFileDynamic(allocator, file, io, .{});
 defer reader.deinit();
 
-var result = try parquet.readRowGroupAsArrow(allocator, reader.getSource(), reader.metadata, 0, &.{0});
+var result = try reader.readColumns(0, .{ .columns = &.{0} });
 defer result.deinit();
 
 const col = &result.arrays[0]; // column 0 ("id"), required, so it has no nulls
@@ -331,12 +331,12 @@ Buffer layout:
 | Byte array / string | Validity bitmap | `i32` offsets, `length + 1` entries | Bytes |
 | List, struct, map | Validity bitmap | Offsets (list, map) | — (values are in `children`) |
 
-`result.schema` is a struct `ArrowSchema` whose children give each column's Arrow type (format string), name and nullability, for the columns read and in the order of `col_indices`. `parquet.exportSchemaAsArrow` returns the schema of all columns without reading data. `result.deinit()` releases all arrays and the schema.
+`result.schema` is a struct `ArrowSchema` whose children give each column's Arrow type (format string), name and nullability, for the columns read and in the order of `.columns`. `parquet.exportSchemaAsArrow` returns the schema of all columns without reading data. `result.deinit()` releases all arrays and the schema.
 
-To read in batches of a fixed number of rows instead of whole row groups, use `ArrowBatchReader`:
+To read in batches of a fixed number of rows instead of whole row groups, use `reader.columnBatches`, which returns an `ArrowBatchReader`:
 
 ```zig
-var batches = try parquet.ArrowBatchReader.init(allocator, reader.getSource(), reader.metadata, .{
+var batches = try reader.columnBatches(.{
     .columns = &.{0}, // null: all columns
     .batch_rows = 65536,
 });
@@ -350,7 +350,7 @@ while (try batches.next()) |batch| {
 
 Batches take rows from as many row groups as they need, so only the last batch can have fewer rows; with `.batch_rows = null`, each batch is one row group. The reader reads and decodes pages as batches need them; between batches it holds, per leaf column, one compressed page, the dictionary, at most one page of decoded entries, and buffers with room for the next batch's entries.
 
-Reads can decode on several threads. `BatchOptions`, `readRowGroupAsArrowWith` (`RowGroupOptions`) and `DynamicReaderOptions` take an `io: ?std.Io`. With a `std.Io.Threaded`, the columns of a row group, and the leaf columns of nested columns, are decoded as tasks on its threads; the allocator and the source must then allow concurrent use (`std.heap.smp_allocator`, a file). `BatchOptions.read_ahead = k` also decodes each row group whole and keeps k row groups decoding ahead of the batches; between batches the reader then holds the decoded entries of up to k + 1 row groups, and an error in a row group is returned by the first batch that takes rows from it.
+Reads can decode on several threads. The options of `readColumns` (`RowGroupOptions`), `columnBatches` (`BatchOptions`) and `openFileDynamic` (`DynamicReaderOptions`, for row reads) take an `io: ?std.Io`. With a `std.Io.Threaded`, the columns of a row group, and the leaf columns of nested columns, are decoded as tasks on its threads; the allocator and the source must then allow concurrent use (`std.heap.smp_allocator`, a file). `BatchOptions.read_ahead = k` also decodes each row group whole and keeps k row groups decoding ahead of the batches; between batches the reader then holds the decoded entries of up to k + 1 row groups, and an error in a row group is returned by the first batch that takes rows from it.
 
 ```zig
 // Up to 8 threads: 7 in the pool and the calling one.
@@ -363,7 +363,7 @@ var reader = try parquet.openFileDynamic(std.heap.smp_allocator, file, io, .{ .i
 defer reader.deinit();
 
 // Arrow batches, decoded on the pool's threads with one row group read ahead.
-var batches = try parquet.ArrowBatchReader.init(std.heap.smp_allocator, reader.getSource(), reader.metadata, .{
+var batches = try reader.columnBatches(.{
     .batch_rows = 65536,
     .io = threaded.io(),
     .read_ahead = 1,

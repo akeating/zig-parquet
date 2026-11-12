@@ -38,7 +38,7 @@ pub fn main(init: std.process.Init) !void {
 
     std.debug.print("Reading columns from {s}...\n", .{output_path});
 
-    // Read phase — readRowGroupAsArrow returns one Arrow array per column,
+    // Read phase — readColumns returns one Arrow array per column,
     // each with its values in one contiguous buffer
     {
         const file = try std.Io.Dir.cwd().openFile(io, output_path, .{});
@@ -48,7 +48,7 @@ pub fn main(init: std.process.Init) !void {
         defer reader.deinit();
 
         // null reads all columns; pass e.g. &.{ 0, 2 } to read only those columns
-        var result = try parquet.readRowGroupAsArrow(allocator, reader.getSource(), reader.metadata, 0, null);
+        var result = try reader.readColumns(0, .{});
         defer result.deinit();
 
         const id_col = &result.arrays[0];

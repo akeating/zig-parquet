@@ -151,13 +151,7 @@ test "C ABI: write and read round-trip" {
     // 2. Read source data as Arrow using the Zig batch API
     var src_reader = try parquet.openBufferDynamic(allocator, src_buf, .{});
     defer src_reader.deinit();
-    var read_result = try parquet.readRowGroupAsArrow(
-        allocator,
-        src_reader.getSource(),
-        src_reader.metadata,
-        0,
-        null,
-    );
+    var read_result = try src_reader.readColumns(0, .{});
     defer read_result.deinit();
 
     // 3. Write via C ABI writer
@@ -448,13 +442,7 @@ test "C ABI: writer handle unusable after transport error" {
 
     var src_reader = try parquet.openBufferDynamic(allocator, src_buf, .{});
     defer src_reader.deinit();
-    var read_result = try parquet.readRowGroupAsArrow(
-        allocator,
-        src_reader.getSource(),
-        src_reader.metadata,
-        0,
-        null,
-    );
+    var read_result = try src_reader.readColumns(0, .{});
     defer read_result.deinit();
 
     // Open writer with a callback that fails after a few writes
@@ -1449,7 +1437,7 @@ test "Test B: Regular Writer baseline (known-good)" {
 
     var reader = try parquet.openBufferDynamic(allocator, buf, .{});
     defer reader.deinit();
-    var rr = try parquet.readRowGroupAsArrow(allocator, reader.getSource(), reader.metadata, 0, null);
+    var rr = try reader.readColumns(0, .{});
     defer rr.deinit();
     try std.testing.expectEqual(@as(i64, 3), rr.arrays[0].length);
 }
@@ -1492,7 +1480,7 @@ test "Test C: RowWriterHandle minimal flat write via Zig methods" {
     var reader = try parquet.openBufferDynamic(allocator, written, .{});
     defer reader.deinit();
     try std.testing.expectEqual(@as(usize, 1), reader.metadata.schema.len - 1);
-    var rr = try parquet.readRowGroupAsArrow(allocator, reader.getSource(), reader.metadata, 0, null);
+    var rr = try reader.readColumns(0, .{});
     defer rr.deinit();
     try std.testing.expectEqual(@as(i64, 3), rr.arrays[0].length);
 }
@@ -1549,14 +1537,14 @@ test "Test D: RowWriterHandle vs Writer both produce readable files" {
     {
         var reader = try parquet.openBufferDynamic(allocator, good_buf, .{});
         defer reader.deinit();
-        var rr = try parquet.readRowGroupAsArrow(allocator, reader.getSource(), reader.metadata, 0, null);
+        var rr = try reader.readColumns(0, .{});
         defer rr.deinit();
         try std.testing.expectEqual(@as(i64, 3), rr.arrays[0].length);
     }
     {
         var reader = try parquet.openBufferDynamic(allocator, rw_buf, .{});
         defer reader.deinit();
-        var rr = try parquet.readRowGroupAsArrow(allocator, reader.getSource(), reader.metadata, 0, null);
+        var rr = try reader.readColumns(0, .{});
         defer rr.deinit();
         try std.testing.expectEqual(@as(i64, 3), rr.arrays[0].length);
     }

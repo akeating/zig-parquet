@@ -1,6 +1,6 @@
 # Column read benchmark
 
-Measures reading every row group of a Parquet file through `readRowGroupAsArrow` (Arrow path, one row group at a time), `ArrowBatchReader` (groups path, one batch per row group; batches path, 65,536 rows at a time) and `readRowsProjected` / `readAllRows` (row path), one top-level column at a time and all columns together. Reports wall time and allocator activity, and compares with PyArrow on the same file.
+Measures reading every row group of a Parquet file through `DynamicReader.readColumns` (Arrow path, one row group at a time), `DynamicReader.columnBatches` (groups path, one batch per row group; batches path, 65,536 rows at a time) and `readRowsProjected` / `readAllRows` (row path), one top-level column at a time and all columns together. Reports wall time and allocator activity, and compares with PyArrow on the same file.
 
 ## Run
 

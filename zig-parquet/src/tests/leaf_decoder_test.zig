@@ -414,7 +414,7 @@ test "page reader reads each span with one read" {
 // Values checked against PyArrow 23.0.1
 // =============================================================================
 
-/// Row group 0, one top-level column, read through readRowGroupAsArrow.
+/// Row group 0, one top-level column, read through arrow_batch.readColumns.
 const ArrowRead = struct {
     result: arrow_batch.ReadResult,
     reader: parquet.DynamicReader,
@@ -432,7 +432,7 @@ fn readArrow(allocator: std.mem.Allocator, path: []const u8, col: usize) !ArrowR
     errdefer file.close(io);
     var reader = try parquet.openFileDynamic(allocator, file, io, .{});
     errdefer reader.deinit();
-    const result = try arrow_batch.readRowGroupAsArrow(allocator, reader.getSource(), reader.metadata, 0, &.{col});
+    const result = try arrow_batch.readColumns(allocator, reader.getSource(), reader.metadata, 0, .{ .columns = &.{col} });
     return .{ .result = result, .reader = reader, .file = file };
 }
 
