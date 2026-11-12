@@ -4,9 +4,7 @@
 
 pub const page_writer = @import("page_writer.zig");
 pub const column_writer = @import("column_writer.zig");
-pub const column_write_list = @import("column_write_list.zig");
-pub const column_write_struct = @import("column_write_struct.zig");
-pub const column_write_map = @import("column_write_map.zig");
+pub const column_write_values = @import("column_write_values.zig");
 pub const list_encoder = @import("list_encoder.zig");
 pub const map_encoder = @import("map_encoder.zig");
 pub const dynamic_writer = @import("dynamic_writer.zig");
@@ -35,9 +33,7 @@ pub const BackendCleanup = @import("parquet_reader.zig").BackendCleanup;
 test {
     _ = page_writer;
     _ = column_writer;
-    _ = column_write_list;
-    _ = column_write_struct;
-    _ = column_write_map;
+    _ = column_write_values;
     _ = list_encoder;
     _ = map_encoder;
     _ = dynamic_writer;

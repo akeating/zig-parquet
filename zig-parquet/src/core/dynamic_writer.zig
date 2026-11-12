@@ -250,9 +250,8 @@ pub const DynamicWriter = struct {
     dictionary_size_limit: ?usize = 1_048_576, // 1MB default, matches Arrow/parquet-go
     dictionary_cardinality_threshold: ?f32 = null,
     write_page_checksum: bool = true,
-    /// Emit OffsetIndex + ColumnIndex blobs after each row group (pre-footer)
-    /// and patch `ColumnChunk` fields 4-7 to point to them. Currently covers
-    /// flat columns only; nested leaves are skipped silently.
+    /// Write an OffsetIndex and a ColumnIndex for every leaf column chunk, after the last
+    /// row group and before the footer, and point the chunk's metadata at them.
     write_page_index: bool = false,
 
     path_properties: std.StringHashMapUnmanaged(ColumnProperties) = .empty,
@@ -274,8 +273,7 @@ pub const DynamicWriter = struct {
     schema_arena: std.heap.ArenaAllocator,
 
     row_groups: std.ArrayListUnmanaged(RowGroupMeta) = .empty,
-    /// Per row group × leaf column, `null` means "no page index for this slot".
-    /// Nested leaves produce `null`; flat columns produce a populated builder.
+    /// Per row group and leaf column, the page index entries of the chunk's data pages.
     page_index_builders: std.ArrayListUnmanaged([]?page_index_writer.PageIndexBuilder) = .empty,
     current_offset: i64 = 4, // after PAR1 magic
 
@@ -805,63 +803,6 @@ pub const DynamicWriter = struct {
 
     // -- Flush (writes one row group) --
 
-    /// Record a single-page entry into `builder` using the chunk-level
-    /// metadata we already have. Used as the fallback for paths where
-    /// column_writer didn't emit per-page entries (e.g. dict-encoded chunks).
-    fn recordFlatPageInto(
-        _: *DynamicWriter,
-        builder: *page_index_writer.PageIndexBuilder,
-        result: *const column_writer.ColumnChunkResult,
-        n: usize,
-    ) DynamicWriterError!void {
-        const meta = result.metadata;
-
-        // Data page offset + compressed size. If the chunk carries a dict
-        // page, the dict occupies [file_offset, data_page_offset); we want
-        // only the data-page portion in OffsetIndex.
-        const dict_bytes: i64 = blk: {
-            if (meta.dictionary_page_offset) |d_off| {
-                if (d_off > 0) break :blk meta.data_page_offset - d_off;
-            }
-            break :blk 0;
-        };
-        const total_i64 = safe.castTo(i64, result.total_bytes) catch return error.IntegerOverflow;
-        const data_page_compressed = total_i64 - dict_bytes;
-        if (data_page_compressed <= 0) return; // defensive
-
-        var min_bytes: []const u8 = &.{};
-        var max_bytes: []const u8 = &.{};
-        var null_count: i64 = 0;
-        var all_null = true;
-        if (meta.statistics) |st| {
-            null_count = st.null_count orelse 0;
-            if (st.getMinBytes()) |mb| {
-                min_bytes = mb;
-                all_null = false;
-            }
-            if (st.getMaxBytes()) |mb| {
-                max_bytes = mb;
-                all_null = false;
-            }
-            if (null_count == safe.castTo(i64, n) catch @as(i64, std.math.maxInt(i32))) {
-                all_null = true;
-            }
-        }
-
-        const data_page_compressed_i32 = safe.castTo(i32, data_page_compressed) catch return error.IntegerOverflow;
-        const n_i64 = safe.castTo(i64, n) catch return error.TooManyValues;
-        builder.recordPage(
-            meta.data_page_offset,
-            data_page_compressed_i32,
-            0,
-            n_i64,
-            min_bytes,
-            max_bytes,
-            null_count,
-            all_null,
-        ) catch return error.OutOfMemory;
-    }
-
     /// Sum the leaf column count across every top-level column. Flat columns
     /// contribute 1; nested columns delegate to their schema node.
     fn countLeafColumns(self: *const DynamicWriter) DynamicWriterError!usize {
@@ -928,8 +869,7 @@ pub const DynamicWriter = struct {
                 const opts = self.resolveOpts(col, &.{col_name});
                 const is_optional = !self.column_required[col];
 
-                // Pre-create the builder so column_writer can populate per-page
-                // entries directly (multi-page path).
+                // The column writer records each data page in this builder.
                 const leaf_idx = col_chunks_list.items.len;
                 var pib_ptr: ?*page_index_writer.PageIndexBuilder = null;
                 if (pi_builders) |pb| {
@@ -939,7 +879,7 @@ pub const DynamicWriter = struct {
                 }
 
                 const result: column_writer.ColumnChunkResult = switch (self.column_types[col]) {
-                    .bool_ => flushColumnBool(allocator, writer, path, items, n, self.current_offset, codec, is_optional, opts) catch |e| return mapFlushError(e),
+                    .bool_ => flushColumnBool(allocator, writer, path, items, n, self.current_offset, codec, is_optional, opts, pib_ptr) catch |e| return mapFlushError(e),
                     .int32 => flushColumnTyped(i32, allocator, writer, path, items, n, self.current_offset, codec, is_optional, opts, pib_ptr) catch |e| return mapFlushError(e),
                     .int64 => flushColumnTyped(i64, allocator, writer, path, items, n, self.current_offset, codec, is_optional, opts, pib_ptr) catch |e| return mapFlushError(e),
                     .float_ => flushColumnTyped(f32, allocator, writer, path, items, n, self.current_offset, codec, is_optional, opts, pib_ptr) catch |e| return mapFlushError(e),
@@ -947,7 +887,7 @@ pub const DynamicWriter = struct {
                     .bytes => flushColumnBytes(allocator, writer, path, items, n, self.current_offset, codec, is_optional, opts, pib_ptr) catch |e| return mapFlushError(e),
                     .fixed_bytes => flushColumnFixedBytes(
                         allocator, writer, path, items, n, self.current_offset, codec,
-                        self.column_type_lengths[col] orelse return error.InvalidState, is_optional, opts,
+                        self.column_type_lengths[col] orelse return error.InvalidState, is_optional, opts, pib_ptr,
                     ) catch |e| return mapFlushError(e),
                     .nested => return error.InvalidState,
                 };
@@ -961,14 +901,6 @@ pub const DynamicWriter = struct {
                 }) catch return error.OutOfMemory;
                 total_byte_size += result.metadata.total_compressed_size;
                 self.current_offset += safe.castTo(i64, result.total_bytes) catch return error.IntegerOverflow;
-
-                // Bool and fixed_bytes columns are written as one page and do not
-                // fill the builder; record that page from the chunk metadata.
-                if (pib_ptr) |pib| {
-                    if (pib.pageCount() == 0) {
-                        try self.recordFlatPageInto(pib, &result, n);
-                    }
-                }
             }
         }
 
@@ -1105,7 +1037,7 @@ pub const DynamicWriter = struct {
                     .physical_type = leaf_type,
                     .page_index = page_index,
                 },
-            ) catch return error.WriteError;
+            ) catch |e| return mapFlushError(e);
 
             self.target_writer.flush() catch return error.WriteError;
 
@@ -1176,6 +1108,8 @@ pub const DynamicWriter = struct {
         return switch (e) {
             error.UnsupportedEncoding => error.UnsupportedEncoding,
             error.OutOfMemory => error.OutOfMemory,
+            // A value of another type than its column.
+            error.InvalidData, error.TypeMismatch => error.InvalidData,
             else => error.WriteError,
         };
     }
@@ -1190,6 +1124,7 @@ pub const DynamicWriter = struct {
         codec: format.CompressionCodec,
         is_optional: bool,
         opts: EncodingOpts,
+        page_index_builder: ?*page_index_writer.PageIndexBuilder,
     ) !column_writer.ColumnChunkResult {
         const typed = try allocator.alloc(types.Optional(bool), n);
         defer allocator.free(typed);
@@ -1198,9 +1133,10 @@ pub const DynamicWriter = struct {
                 .value = v.asBool() orelse return error.InvalidData,
             };
         }
-        return column_writer.writeColumnChunkOptionalWithPathArray(
+        return column_writer.writeColumnChunkOptionalWithEncoding(
             bool, allocator, writer, path, typed,
-            is_optional, offset, codec, opts.write_page_checksum,
+            is_optional, offset, codec, .plain, opts.max_page_size, opts.write_page_checksum,
+            page_index_builder,
         );
     }
 
@@ -1315,6 +1251,7 @@ pub const DynamicWriter = struct {
         type_length: i32,
         is_optional: bool,
         opts: EncodingOpts,
+        page_index_builder: ?*page_index_writer.PageIndexBuilder,
     ) !column_writer.ColumnChunkResult {
         const typed = try allocator.alloc(types.Optional([]const u8), n);
         defer allocator.free(typed);
@@ -1324,9 +1261,10 @@ pub const DynamicWriter = struct {
             };
         }
         const fixed_len = safe.castTo(u32, type_length) catch return error.InvalidTypeLength;
-        return column_writer.writeColumnChunkFixedByteArrayOptionalWithPathArray(
+        return column_writer.writeColumnChunkFixedByteArrayOptionalWithEncoding(
             allocator, writer, path, typed,
-            fixed_len, is_optional, offset, codec, opts.write_page_checksum,
+            fixed_len, is_optional, offset, codec, .plain, opts.max_page_size, opts.write_page_checksum,
+            page_index_builder,
         );
     }
 

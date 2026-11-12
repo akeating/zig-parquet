@@ -444,3 +444,42 @@ class TestNestedPages:
             col = rg.column(c)
             assert col.has_offset_index, col.path_in_schema
             assert col.has_column_index, col.path_in_schema
+
+
+# ── Typed Writer columns in several pages, with page indexes ─────────────────
+
+
+def _typed_pages_rows():
+    """The rows that writeTypedFile in writer_page_index_test.zig writes."""
+    rows = []
+    for i in range(300):
+        rows.append({
+            "id": i,
+            "big": None if i % 5 == 0 else i * 1000,
+            "score": float(i // 4),
+            "ratio": i * 0.5,
+            "flag": None if i % 11 == 0 else i % 3 == 0,
+            "name": None if i % 6 == 1 else f"n{i}",
+            "code": i.to_bytes(4, "big"),
+            "values": None if i % 7 == 3 else [None if j == 1 else i * 10 + j for j in range(i % 4)],
+            "tags": [f"t{i}_{j}" for j in range(i % 3)],
+            "s": None if i % 5 == 2 else {"a": i * 1000, "b": None if i % 3 == 0 else f"b{i // 16:03d}"},
+            "m": None if i % 9 == 4 else [(f"k{i}_{j}", None if j == 2 else i * 10 + j) for j in range(i % 4)],
+        })
+    return rows
+
+
+class TestTypedPages:
+    def test_values(self):
+        table = pq.read_table(interop_path("typed_pages.parquet"))
+        assert table.to_pylist() == _typed_pages_rows()
+
+    def test_page_indexes(self):
+        md = pq.ParquetFile(interop_path("typed_pages.parquet")).metadata
+        assert md.num_row_groups == 1
+        rg = md.row_group(0)
+        assert rg.num_columns == 13
+        for c in range(rg.num_columns):
+            col = rg.column(c)
+            assert col.has_offset_index, col.path_in_schema
+            assert col.has_column_index, col.path_in_schema

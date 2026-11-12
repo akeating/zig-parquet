@@ -1,6 +1,9 @@
-//! Writes one leaf column chunk of a nested column from flattened values and levels: the
-//! output of `nested.flattenValue`, one `Value` per level entry, with `null_val` where the
-//! entry has no value.
+//! Writes one leaf column chunk of a nested column from values and levels.
+//!
+//! `writeLeafChunk` takes the non-null values of the chunk's entries as one typed slice. An
+//! entry holds a value when its definition level equals the maximum; the values are in entry
+//! order. `writeColumnChunkFromValues` takes the output of `nested.flattenValue` instead: one
+//! `Value` per level entry, with `null_val` where the entry has no value.
 //!
 //! The chunk is split into data pages of about `max_page_size` bytes of encoded values. A
 //! page ends only before an entry with repetition level 0, so every page starts at a row;
@@ -36,13 +39,16 @@ pub const NestedEncodingOpts = struct {
     dictionary_size_limit: ?usize = 1_048_576,
     dictionary_cardinality_threshold: ?f32 = null,
     write_page_checksum: bool = true,
-    /// The column's physical type, used when no value is non-null (otherwise the type is
-    /// taken from the values).
+    /// The column's physical type. `writeColumnChunkFromValues` requires every value to have
+    /// this type; when it is null, the type of the first non-null value is used.
+    /// `writeLeafChunk` takes the type as its `kind` parameter and does not read this field.
     physical_type: ?format.PhysicalType = null,
     /// Receives one entry per data page.
     page_index: ?*page_index_writer.PageIndexBuilder = null,
 };
 
+/// Definition and repetition levels of a chunk's entries, one of each per entry. `rep` is
+/// not read when `max_rep` is 0.
 pub const Levels = struct {
     def: []const u32,
     rep: []const u32,
@@ -50,9 +56,11 @@ pub const Levels = struct {
     max_rep: u8,
 };
 
-const Kind = enum { int32, int64, float, double, boolean, byte_array, fixed_len_byte_array };
+/// The physical type of a leaf column, without INT96.
+pub const Kind = enum { int32, int64, float, double, boolean, byte_array, fixed_len_byte_array };
 
-fn Elem(comptime kind: Kind) type {
+/// The element type of a column of `kind`.
+pub fn Elem(comptime kind: Kind) type {
     return switch (kind) {
         .int32 => i32,
         .int64 => i64,
@@ -67,7 +75,25 @@ fn isBytes(comptime kind: Kind) bool {
     return kind == .byte_array or kind == .fixed_len_byte_array;
 }
 
+/// The kind of a column whose values have Zig type `T`. `[]const u8` is a BYTE_ARRAY column.
+pub fn kindOf(comptime T: type) Kind {
+    return switch (T) {
+        i32 => .int32,
+        i64 => .int64,
+        f32 => .float,
+        f64 => .double,
+        bool => .boolean,
+        []const u8 => .byte_array,
+        else => @compileError("Unsupported column type: " ++ @typeName(T)),
+    };
+}
+
 /// Write a column chunk from Value data with definition and repetition levels.
+///
+/// An entry whose definition level equals `max_def_level` must hold a value of the column's
+/// type, and every other entry must hold `null_val`; otherwise the function returns
+/// `error.TypeMismatch`. The column's type is `opts.physical_type`, or, when that is null,
+/// the type of the first non-null value.
 pub fn writeColumnChunkFromValues(
     allocator: Allocator,
     output: *std.Io.Writer,
@@ -83,10 +109,9 @@ pub fn writeColumnChunkFromValues(
 ) ColumnWriteError!ColumnChunkResult {
     // The flattener appends a value and both levels for every entry.
     if (values.len != def_levels.len) return error.WriteError;
-    if (max_rep_level > 0 and rep_levels.len != def_levels.len) return error.WriteError;
 
     const levels: Levels = .{ .def = def_levels, .rep = rep_levels, .max_def = max_def_level, .max_rep = max_rep_level };
-    const kind: Kind = detectKind(values) orelse if (opts.physical_type) |t| switch (t) {
+    const kind: Kind = if (opts.physical_type) |t| switch (t) {
         .int32, .int96 => .int32,
         .int64 => .int64,
         .float => .float,
@@ -94,21 +119,65 @@ pub fn writeColumnChunkFromValues(
         .byte_array => .byte_array,
         .fixed_len_byte_array => .fixed_len_byte_array,
         .boolean => .boolean,
-    } else .int32;
+    } else detectKind(values) orelse .int32;
 
-    const chunk: Chunk = .{
+    switch (kind) {
+        inline else => |k| {
+            var present: std.ArrayListUnmanaged(Elem(k)) = .empty;
+            defer present.deinit(allocator);
+            for (values, def_levels) |v, d| {
+                if (d == max_def_level) {
+                    try present.append(allocator, extract(k, v) orelse return error.TypeMismatch);
+                } else if (v != .null_val) {
+                    return error.TypeMismatch;
+                }
+            }
+            return writeLeafChunk(k, allocator, output, path_in_schema, present.items, levels, start_offset, codec, opts);
+        },
+    }
+}
+
+/// Write a column chunk of `kind` from levels and the non-null values of its entries.
+///
+/// Entry `i` holds a value when `levels.def[i] == levels.max_def`; `values` holds those values
+/// in entry order. Returns `error.WriteError` when the levels are inconsistent: a level above
+/// its maximum, repetition levels of another length than the definition levels, a first
+/// entry that does not start a row, or a value count that differs from the number of entries
+/// at the maximum definition level.
+pub fn writeLeafChunk(
+    comptime kind: Kind,
+    allocator: Allocator,
+    output: *std.Io.Writer,
+    path_in_schema: []const []const u8,
+    values: []const Elem(kind),
+    levels: Levels,
+    start_offset: i64,
+    codec: format.CompressionCodec,
+    opts: NestedEncodingOpts,
+) ColumnWriteError!ColumnChunkResult {
+    var present: usize = 0;
+    for (levels.def) |d| {
+        if (d > levels.max_def) return error.WriteError;
+        if (d == levels.max_def) present += 1;
+    }
+    if (present != values.len) return error.WriteError;
+    if (levels.max_rep > 0) {
+        if (levels.rep.len != levels.def.len) return error.WriteError;
+        for (levels.rep) |r| if (r > levels.max_rep) return error.WriteError;
+        if (levels.rep.len > 0 and levels.rep[0] != 0) return error.WriteError;
+    }
+
+    const chunk: Chunk(kind) = .{
         .allocator = allocator,
         .output = output,
         .path_in_schema = path_in_schema,
-        .values = values,
+        .vals = values,
         .levels = levels,
         .start_offset = start_offset,
         .codec = codec,
         .opts = opts,
     };
-    return switch (kind) {
-        inline else => |k| chunk.write(k),
-    };
+    return chunk.write();
 }
 
 /// The kind of the first non-null value, or null when there is none or it is not a
@@ -130,8 +199,8 @@ fn detectKind(values: []const Value) ?Kind {
     return null;
 }
 
-/// The entry's value as the column's element type, or null when the entry has none. A
-/// value of another type is treated as absent.
+/// The entry's value as the column's element type, or null when the entry holds `null_val`
+/// or a value of another type.
 fn extract(comptime kind: Kind, v: Value) ?Elem(kind) {
     return switch (kind) {
         .int32 => if (v == .int32_val) v.int32_val else null,
@@ -390,147 +459,147 @@ fn pageBody(allocator: Allocator, levels: Levels, e0: usize, e1: usize, value_by
     return body;
 }
 
-const Chunk = struct {
-    allocator: Allocator,
-    output: *std.Io.Writer,
-    path_in_schema: []const []const u8,
-    values: []const Value,
-    levels: Levels,
-    start_offset: i64,
-    codec: format.CompressionCodec,
-    opts: NestedEncodingOpts,
+/// One column chunk being written.
+fn Chunk(comptime kind: Kind) type {
+    return struct {
+        allocator: Allocator,
+        output: *std.Io.Writer,
+        path_in_schema: []const []const u8,
+        /// The non-null values, one per entry at the maximum definition level.
+        vals: []const Elem(kind),
+        levels: Levels,
+        start_offset: i64,
+        codec: format.CompressionCodec,
+        opts: NestedEncodingOpts,
 
-    fn write(self: *const Chunk, comptime kind: Kind) ColumnWriteError!ColumnChunkResult {
-        const allocator = self.allocator;
-        const T = Elem(kind);
-        const num_entries = self.levels.def.len;
+        fn write(self: *const @This()) ColumnWriteError!ColumnChunkResult {
+            const allocator = self.allocator;
+            const num_entries = self.levels.def.len;
+            const vals = self.vals;
 
-        var vals: std.ArrayListUnmanaged(T) = .empty;
-        defer vals.deinit(allocator);
-        for (self.values) |v| if (extract(kind, v)) |x| try vals.append(allocator, x);
+            var fixed_len: usize = 0;
+            if (comptime kind == .fixed_len_byte_array) if (vals.len > 0) {
+                fixed_len = vals[0].len;
+                if (fixed_len == 0) return error.InvalidFixedLength;
+            };
 
-        var fixed_len: usize = 0;
-        if (comptime kind == .fixed_len_byte_array) if (vals.items.len > 0) {
-            fixed_len = vals.items[0].len;
-            if (fixed_len == 0) return error.InvalidFixedLength;
-        };
+            const chosen = chosenEncoding(kind, self.opts);
+            var dict: ?Dictionary(kind) = if (chosen == null and vals.len > 0)
+                try Dictionary(kind).build(allocator, vals, self.opts)
+            else
+                null;
+            defer if (dict) |*d| d.deinit(allocator);
+            const value_encoding: format.Encoding = if (dict != null)
+                .rle_dictionary
+            else
+                chosen orelse fallbackEncoding(kind, self.opts);
 
-        const chosen = chosenEncoding(kind, self.opts);
-        var dict: ?Dictionary(kind) = if (chosen == null and vals.items.len > 0)
-            try Dictionary(kind).build(allocator, vals.items, self.opts)
-        else
-            null;
-        defer if (dict) |*d| d.deinit(allocator);
-        const value_encoding: format.Encoding = if (dict != null)
-            .rle_dictionary
-        else
-            chosen orelse fallbackEncoding(kind, self.opts);
-
-        var out: PageOutput = .{
-            .allocator = allocator,
-            .output = self.output,
-            .codec = self.codec,
-            .write_page_checksum = self.opts.write_page_checksum,
-        };
-        if (dict) |d| _ = try out.write(d.page, .{ .dictionary = d.count });
-        const data_page_offset = self.start_offset + try safe.castTo(i64, out.compressed_bytes);
-
-        // Pages are cut before a row start once the page's values reach this many bits.
-        const limit_bits: ?u64 = if (self.opts.max_page_size) |m| std.math.mul(u64, m, 8) catch std.math.maxInt(u64) else null;
-
-        var e0: usize = 0;
-        var v0: usize = 0;
-        var first_row: i64 = 0;
-        while (true) {
-            // Extend the page to the first row start past the size limit.
-            var e = e0;
-            var v = v0;
-            var rows: i64 = 0;
-            var bits: u64 = 0;
-            while (e < num_entries) : (e += 1) {
-                if (self.levels.max_rep == 0 or self.levels.rep[e] == 0) {
-                    if (limit_bits) |lim| if (e > e0 and bits >= lim) break;
-                    rows += 1;
-                }
-                if (extract(kind, self.values[e])) |x| {
-                    bits +|= if (dict) |d| @max(d.bit_width, 1) else plainBits(kind, x);
-                    v += 1;
-                }
-            }
-
-            const page_vals = vals.items[v0..v];
-            var value_bytes: []u8 = undefined;
-            var bit_width_byte: [1]u8 = undefined;
-            if (dict) |d| {
-                bit_width_byte[0] = d.bit_width;
-                value_bytes = rle_encoder.encode(allocator, d.indices[v0..v], d.bit_width) catch return error.OutOfMemory;
-            } else {
-                value_bytes = try encodeValues(kind, allocator, page_vals, value_encoding, fixed_len);
-            }
-            defer allocator.free(value_bytes);
-            const parts: []const []const u8 = if (dict != null) &.{ &bit_width_byte, value_bytes } else &.{value_bytes};
-            const body = try pageBody(allocator, self.levels, e0, e, parts);
-            defer allocator.free(body);
-
-            const page_offset = self.start_offset + try safe.castTo(i64, out.compressed_bytes);
-            const page_bytes = try out.write(body, .{ .data = .{ .num_values = e - e0, .encoding = value_encoding } });
-
-            if (self.opts.page_index) |pib| {
-                const nulls = try safe.castTo(i64, (e - e0) - page_vals.len);
-                const st = try buildStatistics(kind, allocator, page_vals, nulls);
-                defer if (st) |x| column_writer.freeStatistics(allocator, x);
-                const empty: []const u8 = &.{};
-                pib.recordPage(
-                    page_offset,
-                    try safe.castTo(i32, page_bytes),
-                    first_row,
-                    rows,
-                    if (st) |x| x.getMinBytes() orelse empty else empty,
-                    if (st) |x| x.getMaxBytes() orelse empty else empty,
-                    nulls,
-                    page_vals.len == 0,
-                ) catch return error.OutOfMemory;
-            }
-
-            first_row = std.math.add(i64, first_row, rows) catch return error.IntegerOverflow;
-            e0 = e;
-            v0 = v;
-            if (e0 >= num_entries) break;
-        }
-
-        const path = try allocator.alloc([]const u8, self.path_in_schema.len);
-        var copied: usize = 0;
-        errdefer {
-            for (path[0..copied]) |seg| allocator.free(seg);
-            allocator.free(path);
-        }
-        for (self.path_in_schema, path) |seg, *p| {
-            p.* = try allocator.dupe(u8, seg);
-            copied += 1;
-        }
-        const encodings = if (dict != null)
-            try allocator.dupe(format.Encoding, &.{ .plain, .rle, .rle_dictionary })
-        else
-            try allocator.dupe(format.Encoding, &.{ .rle, value_encoding });
-        errdefer allocator.free(encodings);
-
-        const nulls = try safe.castTo(i64, num_entries - vals.items.len);
-        return .{
-            .metadata = .{
-                .type_ = physicalType(kind),
-                .encodings = encodings,
-                .path_in_schema = path,
+            var out: PageOutput = .{
+                .allocator = allocator,
+                .output = self.output,
                 .codec = self.codec,
-                .num_values = try safe.castTo(i64, num_entries),
-                .total_uncompressed_size = try safe.castTo(i64, out.uncompressed_bytes),
-                .total_compressed_size = try safe.castTo(i64, out.compressed_bytes),
-                .data_page_offset = data_page_offset,
-                .index_page_offset = null,
-                .dictionary_page_offset = if (dict != null) self.start_offset else null,
-                .statistics = try buildStatistics(kind, allocator, vals.items, nulls),
-            },
-            .file_offset = self.start_offset,
-            .total_bytes = out.compressed_bytes,
-        };
-    }
-};
+                .write_page_checksum = self.opts.write_page_checksum,
+            };
+            if (dict) |d| _ = try out.write(d.page, .{ .dictionary = d.count });
+            const data_page_offset = self.start_offset + try safe.castTo(i64, out.compressed_bytes);
+
+            // Pages are cut before a row start once the page's values reach this many bits.
+            const limit_bits: ?u64 = if (self.opts.max_page_size) |m| std.math.mul(u64, m, 8) catch std.math.maxInt(u64) else null;
+
+            var e0: usize = 0;
+            var v0: usize = 0;
+            var first_row: i64 = 0;
+            while (true) {
+                // Extend the page to the first row start past the size limit.
+                var e = e0;
+                var v = v0;
+                var rows: i64 = 0;
+                var bits: u64 = 0;
+                while (e < num_entries) : (e += 1) {
+                    if (self.levels.max_rep == 0 or self.levels.rep[e] == 0) {
+                        if (limit_bits) |lim| if (e > e0 and bits >= lim) break;
+                        rows += 1;
+                    }
+                    if (self.levels.def[e] == self.levels.max_def) {
+                        bits +|= if (dict) |d| @max(d.bit_width, 1) else plainBits(kind, vals[v]);
+                        v += 1;
+                    }
+                }
+
+                const page_vals = vals[v0..v];
+                var value_bytes: []u8 = undefined;
+                var bit_width_byte: [1]u8 = undefined;
+                if (dict) |d| {
+                    bit_width_byte[0] = d.bit_width;
+                    value_bytes = rle_encoder.encode(allocator, d.indices[v0..v], d.bit_width) catch return error.OutOfMemory;
+                } else {
+                    value_bytes = try encodeValues(kind, allocator, page_vals, value_encoding, fixed_len);
+                }
+                defer allocator.free(value_bytes);
+                const parts: []const []const u8 = if (dict != null) &.{ &bit_width_byte, value_bytes } else &.{value_bytes};
+                const body = try pageBody(allocator, self.levels, e0, e, parts);
+                defer allocator.free(body);
+
+                const page_offset = self.start_offset + try safe.castTo(i64, out.compressed_bytes);
+                const page_bytes = try out.write(body, .{ .data = .{ .num_values = e - e0, .encoding = value_encoding } });
+
+                if (self.opts.page_index) |pib| {
+                    const nulls = try safe.castTo(i64, (e - e0) - page_vals.len);
+                    const st = try buildStatistics(kind, allocator, page_vals, nulls);
+                    defer if (st) |x| column_writer.freeStatistics(allocator, x);
+                    const empty: []const u8 = &.{};
+                    pib.recordPage(
+                        page_offset,
+                        try safe.castTo(i32, page_bytes),
+                        first_row,
+                        rows,
+                        if (st) |x| x.getMinBytes() orelse empty else empty,
+                        if (st) |x| x.getMaxBytes() orelse empty else empty,
+                        nulls,
+                        page_vals.len == 0,
+                    ) catch return error.OutOfMemory;
+                }
+
+                first_row = std.math.add(i64, first_row, rows) catch return error.IntegerOverflow;
+                e0 = e;
+                v0 = v;
+                if (e0 >= num_entries) break;
+            }
+
+            const path = try allocator.alloc([]const u8, self.path_in_schema.len);
+            var copied: usize = 0;
+            errdefer {
+                for (path[0..copied]) |seg| allocator.free(seg);
+                allocator.free(path);
+            }
+            for (self.path_in_schema, path) |seg, *p| {
+                p.* = try allocator.dupe(u8, seg);
+                copied += 1;
+            }
+            const encodings = if (dict != null)
+                try allocator.dupe(format.Encoding, &.{ .plain, .rle, .rle_dictionary })
+            else
+                try allocator.dupe(format.Encoding, &.{ .rle, value_encoding });
+            errdefer allocator.free(encodings);
+
+            const nulls = try safe.castTo(i64, num_entries - vals.len);
+            return .{
+                .metadata = .{
+                    .type_ = physicalType(kind),
+                    .encodings = encodings,
+                    .path_in_schema = path,
+                    .codec = self.codec,
+                    .num_values = try safe.castTo(i64, num_entries),
+                    .total_uncompressed_size = try safe.castTo(i64, out.uncompressed_bytes),
+                    .total_compressed_size = try safe.castTo(i64, out.compressed_bytes),
+                    .data_page_offset = data_page_offset,
+                    .index_page_offset = null,
+                    .dictionary_page_offset = if (dict != null) self.start_offset else null,
+                    .statistics = try buildStatistics(kind, allocator, vals, nulls),
+                },
+                .file_offset = self.start_offset,
+                .total_bytes = out.compressed_bytes,
+            };
+        }
+    };
+}

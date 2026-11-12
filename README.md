@@ -249,16 +249,21 @@ The filter is conservative: kept rows come from pages whose stats *could* match,
 
 Filters target leaf columns, including the leaves of lists, structs and maps; a filter on a list or map leaf keeps the rows of pages that might hold a matching element. Nested columns are returned as by `readAllRows`. Their data pages must start at row boundaries, as the format requires of files with an offset index; a page that is read and does not start at a row returns `error.PageNotAtRowStart`. Pages that are not read are not checked.
 
-Writing files with indexes is opt-in:
+Writing files with indexes is opt-in, with the same two fields on `DynamicWriter` and on the column-based `Writer`:
 
 ```zig
 var writer = try parquet.createFileDynamic(allocator, file);
 writer.write_page_index = true;
 writer.max_page_size = 64 * 1024; // roll pages at 64 KiB of encoded data
 // ... addColumn / begin / rows / close as usual
+
+var col_writer = try parquet.writeToFile(allocator, file, io, &columns);
+col_writer.write_page_index = true;
+col_writer.max_page_size = 64 * 1024;
+// ... write*Column calls / close as usual
 ```
 
-Per-page min/max is captured automatically during multi-page writes for non-dictionary-encoded flat primitive columns (i32/i64/f32/f64). Dictionary-encoded or byte-array columns still emit a valid single-page index with chunk-level stats. Inspect what you wrote with `pqi page-index <file>`.
+`max_page_size` defaults to null, which writes each column chunk as one data page; `write_page_index` defaults to false. The page indexes are written after the last row group, before the footer. Each data page of a flat or nested column gets an index entry with its own min, max and null count. Pages of list, struct and map columns end only before a row, so a page can hold more than `max_page_size` bytes when one row does. Inspect what you wrote with `pqi page-index <file>`.
 
 ### Row Iterator
 

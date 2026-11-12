@@ -37,4 +37,5 @@ test {
     _ = @import("brotli_cross_test.zig");
     _ = @import("page_index_test.zig");
     _ = @import("leaf_decoder_test.zig");
+    _ = @import("writer_page_index_test.zig");
 }

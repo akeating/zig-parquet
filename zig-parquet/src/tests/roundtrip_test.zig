@@ -3466,7 +3466,8 @@ test "nested struct leaf statistics include null count" {
     const fields = try writer.allocSchemaFields(1);
     fields[0] = .{ .name = "val", .node = try writer.allocSchemaNode(.{ .int32 = .{} }) };
     const struct_node = try writer.allocSchemaNode(.{ .struct_ = .{ .fields = fields } });
-    try writer.addColumnNested("item", struct_node, .{});
+    // Optional, so that a row can hold a null struct.
+    try writer.addColumnNested("item", try writer.allocSchemaNode(.{ .optional = struct_node }), .{});
 
     writer.setUseDictionary(false);
     try writer.begin();

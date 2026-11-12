@@ -51,6 +51,9 @@ pub const ColumnWriteError = error{
     ValueTooLarge,
     UnsupportedEncoding,
     NullInRequiredColumn,
+    /// A nested leaf's value has another type than the column, or an entry's value does not
+    /// match its definition level (see `column_write_values.writeColumnChunkFromValues`).
+    TypeMismatch,
 };
 
 /// Result of writing a column chunk
@@ -103,16 +106,7 @@ fn recordFlatPage(
     page_bytes: usize,
     first_row: i64,
 ) ColumnWriteError!void {
-    const stats: ?format.Statistics = if (T == []const u8) blk: {
-        var b = statistics.ByteArrayStatisticsBuilder.init(allocator);
-        defer b.deinit();
-        try b.updateOptional(page_values);
-        break :blk b.build();
-    } else blk: {
-        var b = statistics.StatisticsBuilder(T){};
-        b.updateOptional(page_values);
-        break :blk b.build(allocator) catch return error.OutOfMemory;
-    };
+    const stats = try flatStatistics(T, allocator, page_values);
     defer if (stats) |st| freeStatistics(allocator, st);
 
     const empty: []const u8 = &.{};
@@ -690,27 +684,12 @@ pub fn writeColumnChunkByteArrayDictOptionalWithPathArray(
     };
 }
 
-/// Fixed byte array column chunk with Optional values (unified API).
+/// Write a FIXED_LEN_BYTE_ARRAY column chunk with Optional values and a specific encoding.
+/// With `max_page_size`, a data page holds `max_page_size / fixed_len` values (at least one);
+/// without it, the chunk is one page.
 /// is_optional: true if column is optional in schema (writes def levels), false for required columns.
-pub fn writeColumnChunkFixedByteArrayOptionalWithPathArray(
-    allocator: std.mem.Allocator,
-    output: *std.Io.Writer,
-    path_in_schema: []const []const u8,
-    values: []const Optional([]const u8),
-    fixed_len: u32,
-    is_optional: bool,
-    start_offset: i64,
-    codec: format.CompressionCodec,
-    write_page_checksum: bool,
-) ColumnWriteError!ColumnChunkResult {
-    return writeColumnChunkFixedByteArrayOptionalWithPathArrayAndEncoding(
-        allocator, output, path_in_schema, values, fixed_len, is_optional,
-        start_offset, codec, .plain, write_page_checksum,
-    );
-}
-
-/// Fixed byte array column chunk with Optional values and a specific encoding.
-pub fn writeColumnChunkFixedByteArrayOptionalWithPathArrayAndEncoding(
+/// page_index_builder (optional) receives one entry per data page.
+pub fn writeColumnChunkFixedByteArrayOptionalWithEncoding(
     allocator: std.mem.Allocator,
     output: *std.Io.Writer,
     path_in_schema: []const []const u8,
@@ -720,128 +699,17 @@ pub fn writeColumnChunkFixedByteArrayOptionalWithPathArrayAndEncoding(
     start_offset: i64,
     codec: format.CompressionCodec,
     value_encoding: format.Encoding,
+    max_page_size: ?usize,
     write_page_checksum: bool,
+    page_index_builder: ?*page_index_writer.PageIndexBuilder,
 ) ColumnWriteError!ColumnChunkResult {
-    // Compute statistics using unified API
-    var stats_builder = statistics.ByteArrayStatisticsBuilder.init(allocator);
-    defer stats_builder.deinit();
-    stats_builder.updateOptional(values) catch return error.OutOfMemory;
-    const stats = stats_builder.build();
-    errdefer if (stats) |s| freeStatistics(allocator, s);
-
-    var page_result = page_writer.writeDataPageFixedByteArrayOptionalWithEncoding(allocator, values, fixed_len, is_optional, value_encoding) catch |e| switch (e) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.InvalidFixedLength => return error.InvalidFixedLength,
-        error.IntegerOverflow => return error.IntegerOverflow,
-        error.ValueTooLarge => return error.ValueTooLarge,
-        error.NullInRequiredColumn => return error.NullInRequiredColumn,
-        error.UnsupportedEncoding => return error.UnsupportedEncoding,
-    };
-    defer page_result.deinit(allocator);
-
-    // Compress if needed
-    const compressed_data = if (codec != .uncompressed) blk: {
-        break :blk compress.compress(allocator, page_result.data, codec) catch |err| switch (err) {
-            error.UnsupportedCompression => return error.UnsupportedCompression,
-            else => return error.CompressionError,
-        };
-    } else page_result.data;
-    defer if (codec != .uncompressed) allocator.free(compressed_data);
-
-    // Create page header with correct encoding
-    const page_header = format.PageHeader{
-        .type_ = .data_page,
-        .uncompressed_page_size = try safe.castTo(i32, page_result.data.len),
-        .compressed_page_size = try safe.castTo(i32, compressed_data.len),
-        .crc = if (write_page_checksum) computePageCrc(compressed_data) else null,
-        .data_page_header = .{
-            .num_values = try safe.castTo(i32, page_result.num_values),
-            .encoding = value_encoding,
-            .definition_level_encoding = .rle,
-            .repetition_level_encoding = .rle,
-            .statistics = null,
-        },
-        .dictionary_page_header = null,
-    };
-
-    var thrift_writer = thrift.CompactWriter.init(allocator);
-    defer thrift_writer.deinit();
-    page_header.serialize(&thrift_writer) catch return error.OutOfMemory;
-    const header_bytes = thrift_writer.getWritten();
-
-    output.writeAll(header_bytes) catch return error.WriteError;
-    output.writeAll(compressed_data) catch return error.WriteError;
-
-    const total_bytes_written = header_bytes.len + compressed_data.len;
-
-    const path = allocator.alloc([]const u8, path_in_schema.len) catch return error.OutOfMemory;
-    for (path_in_schema, 0..) |segment, i| {
-        path[i] = allocator.dupe(u8, segment) catch return error.OutOfMemory;
-    }
-
-    const encodings = allocator.alloc(format.Encoding, 2) catch return error.OutOfMemory;
-    encodings[0] = .rle;
-    encodings[1] = value_encoding;
-
-    var result = ColumnChunkResult{
-        .metadata = .{
-            .type_ = .fixed_len_byte_array,
-            .encodings = encodings,
-            .path_in_schema = path,
-            .codec = codec,
-            .num_values = try safe.castTo(i64, page_result.num_values),
-            .total_uncompressed_size = try safe.castTo(i64, header_bytes.len + page_result.data.len),
-            .total_compressed_size = try safe.castTo(i64, total_bytes_written),
-            .data_page_offset = start_offset,
-            .index_page_offset = null,
-            .dictionary_page_offset = null,
-            .statistics = null,
-        },
-        .file_offset = start_offset,
-        .total_bytes = total_bytes_written,
-    };
-    result.metadata.statistics = stats;
-    return result;
+    if (fixed_len == 0) return error.InvalidFixedLength;
+    const values_per_page = if (max_page_size) |mps| @max(1, mps / fixed_len) else values.len;
+    return writeFlatChunk([]const u8, allocator, output, path_in_schema, values, .fixed_len_byte_array, fixed_len, is_optional, start_offset, codec, value_encoding, values_per_page, write_page_checksum, page_index_builder);
 }
 
 // =============================================================================
-// Re-exports from domain-specific modules
-// =============================================================================
-
-// List writing functions
-pub const list_writer = @import("column_write_list.zig");
-pub const writeColumnChunkList = list_writer.writeColumnChunkList;
-pub const writeColumnChunkListFixedByteArray = list_writer.writeColumnChunkListFixedByteArray;
-pub const writeColumnChunkListWithPathArray = list_writer.writeColumnChunkListWithPathArray;
-pub const writeColumnChunkListWithPathArrayMultiPage = list_writer.writeColumnChunkListWithPathArrayMultiPage;
-pub const writeColumnChunkListDictWithPathArray = list_writer.writeColumnChunkListDictWithPathArray;
-pub const writeColumnChunkListFixedByteArrayWithPathArray = list_writer.writeColumnChunkListFixedByteArrayWithPathArray;
-pub const writeColumnChunkListFixedByteArrayWithPathArrayAndEncoding = list_writer.writeColumnChunkListFixedByteArrayWithPathArrayAndEncoding;
-pub const writeColumnChunkListFixedByteArrayWithPathArrayMultiPage = list_writer.writeColumnChunkListFixedByteArrayWithPathArrayMultiPage;
-pub const writeColumnChunkNestedListWithPathArray = list_writer.writeColumnChunkNestedListWithPathArray;
-pub const writeColumnChunkNestedListWithPathArrayMultiPage = list_writer.writeColumnChunkNestedListWithPathArrayMultiPage;
-pub const writeColumnChunkNestedListFixedByteArrayWithPathArray = list_writer.writeColumnChunkNestedListFixedByteArrayWithPathArray;
-pub const writeColumnChunkWithLevelsAndFullPath = list_writer.writeColumnChunkWithLevelsAndFullPath;
-pub const writeColumnChunkFixedByteArrayWithLevelsAndFullPath = list_writer.writeColumnChunkFixedByteArrayWithLevelsAndFullPath;
-pub const writeColumnChunkListInt96WithPathArray = list_writer.writeColumnChunkListInt96WithPathArray;
-pub const writeColumnChunkInt96WithLevelsAndFullPath = list_writer.writeColumnChunkInt96WithLevelsAndFullPath;
-
-// Struct writing functions
-pub const struct_writer = @import("column_write_struct.zig");
-pub const writeColumnChunkStruct = struct_writer.writeColumnChunkStruct;
-pub const writeColumnChunkStructMultiPage = struct_writer.writeColumnChunkStructMultiPage;
-pub const writeColumnChunkStructByteArray = struct_writer.writeColumnChunkStructByteArray;
-pub const writeColumnChunkStructByteArrayMultiPage = struct_writer.writeColumnChunkStructByteArrayMultiPage;
-
-// Map writing functions
-pub const map_writer = @import("column_write_map.zig");
-pub const writeColumnChunkMapKey = map_writer.writeColumnChunkMapKey;
-pub const writeColumnChunkMapKeyMultiPage = map_writer.writeColumnChunkMapKeyMultiPage;
-pub const writeColumnChunkMapValue = map_writer.writeColumnChunkMapValue;
-pub const writeColumnChunkMapValueMultiPage = map_writer.writeColumnChunkMapValueMultiPage;
-
-// =============================================================================
-// Generic Value-based column writing for nested types
+// Value-based column writing for nested types
 // =============================================================================
 
 pub const values_writer = @import("column_write_values.zig");
@@ -1071,11 +939,10 @@ fn writeColumnChunkWithEncoding(
 // =============================================================================
 
 /// Write a column chunk with Optional(T) values and a specific encoding.
-/// This is the unified function that handles both nullable and non-nullable cases.
-/// Supports multi-page output when max_page_size is specified.
+/// With `max_page_size`, the chunk is split into data pages of about that many bytes of
+/// PLAIN-encoded values; without it, the chunk is one page.
 /// is_optional: true if column is optional in schema (writes def levels), false for required columns.
-/// page_index_builder (optional) receives a PageEntry per emitted page so the
-/// caller can later emit OffsetIndex + ColumnIndex.
+/// page_index_builder (optional) receives one entry per data page.
 pub fn writeColumnChunkOptionalWithEncoding(
     comptime T: type,
     allocator: std.mem.Allocator,
@@ -1090,117 +957,17 @@ pub fn writeColumnChunkOptionalWithEncoding(
     write_page_checksum: bool,
     page_index_builder: ?*page_index_writer.PageIndexBuilder,
 ) ColumnWriteError!ColumnChunkResult {
-    // Compute statistics from Optional values (including null count)
-    var stats_builder = statistics.StatisticsBuilder(T){};
-    stats_builder.updateOptional(values);
-    const stats = stats_builder.build(allocator) catch return error.OutOfMemory;
-    errdefer if (stats) |s| freeStatistics(allocator, s);
-
-    // Determine page size
-    const values_per_page = if (max_page_size) |mps| @max(1, mps / @sizeOf(T)) else values.len;
-
-    var total_bytes_written: usize = 0;
-    var total_uncompressed_written: usize = 0;
-    var total_values: usize = 0;
-    var offset: usize = 0;
-
-    while (offset < values.len) {
-        const chunk_end = @min(offset + values_per_page, values.len);
-        const chunk = values[offset..chunk_end];
-
-        // Write data page with specified encoding using unified function
-        var page_result = page_writer.writeDataPageOptionalWithEncoding(allocator, T, chunk, is_optional, value_encoding) catch |e| switch (e) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.InvalidFixedLength => return error.InvalidFixedLength,
-            error.IntegerOverflow => return error.IntegerOverflow,
-            error.ValueTooLarge => return error.ValueTooLarge,
-            error.NullInRequiredColumn => return error.NullInRequiredColumn,
-            error.UnsupportedEncoding => return error.UnsupportedEncoding,
-        };
-        defer page_result.deinit(allocator);
-
-        // Compress if needed
-        const compressed_data = if (codec != .uncompressed) blk: {
-            break :blk compress.compress(allocator, page_result.data, codec) catch |err| switch (err) {
-                error.UnsupportedCompression => return error.UnsupportedCompression,
-                else => return error.CompressionError,
-            };
-        } else page_result.data;
-        defer if (codec != .uncompressed) allocator.free(compressed_data);
-
-        // Create page header with correct encoding
-        const page_header = format.PageHeader{
-            .type_ = .data_page,
-            .uncompressed_page_size = try safe.castTo(i32, page_result.data.len),
-            .compressed_page_size = try safe.castTo(i32, compressed_data.len),
-            .crc = if (write_page_checksum) computePageCrc(compressed_data) else null,
-            .data_page_header = .{
-                .num_values = try safe.castTo(i32, page_result.num_values),
-                .encoding = value_encoding,
-                .definition_level_encoding = .rle,
-                .repetition_level_encoding = .rle,
-                .statistics = null,
-            },
-            .dictionary_page_header = null,
-        };
-
-        // Serialize page header
-        var thrift_writer = thrift.CompactWriter.init(allocator);
-        defer thrift_writer.deinit();
-
-        page_header.serialize(&thrift_writer) catch return error.OutOfMemory;
-        const header_bytes = thrift_writer.getWritten();
-
-        // Write header and compressed data
-        output.writeAll(header_bytes) catch return error.WriteError;
-        output.writeAll(compressed_data) catch return error.WriteError;
-
-        const page_bytes = std.math.add(usize, header_bytes.len, compressed_data.len) catch return error.IntegerOverflow;
-
-        if (page_index_builder) |pib| try recordFlatPage(T, allocator, pib, chunk, start_offset + try safe.castTo(i64, total_bytes_written), page_bytes, try safe.castTo(i64, offset));
-
-        total_bytes_written = std.math.add(usize, total_bytes_written, page_bytes) catch return error.IntegerOverflow;
-        const uncompressed_page_bytes = std.math.add(usize, header_bytes.len, page_result.data.len) catch return error.IntegerOverflow;
-        total_uncompressed_written = std.math.add(usize, total_uncompressed_written, uncompressed_page_bytes) catch return error.IntegerOverflow;
-        total_values += page_result.num_values;
-        offset = chunk_end;
-    }
-
-    // Duplicate path_in_schema for metadata (writeColumnChunkOptionalWithEncoding)
-    const path = allocator.alloc([]const u8, path_in_schema.len) catch return error.OutOfMemory;
-    for (path_in_schema, 0..) |segment, i| {
-        path[i] = allocator.dupe(u8, segment) catch return error.OutOfMemory;
-    }
-
-    // Build encodings list with the actual encoding used
-    const encodings = allocator.alloc(format.Encoding, 2) catch return error.OutOfMemory;
-    encodings[0] = .rle; // Definition levels
-    encodings[1] = value_encoding; // Values
-
-    var result = ColumnChunkResult{
-        .metadata = .{
-            .type_ = comptime typeToPhysicalType(T),
-            .encodings = encodings,
-            .path_in_schema = path,
-            .codec = codec,
-            .num_values = try safe.castTo(i64, total_values),
-            .total_uncompressed_size = try safe.castTo(i64, total_uncompressed_written),
-            .total_compressed_size = try safe.castTo(i64, total_bytes_written),
-            .data_page_offset = start_offset,
-            .index_page_offset = null,
-            .dictionary_page_offset = null,
-            .statistics = null,
-        },
-        .file_offset = start_offset,
-        .total_bytes = total_bytes_written,
-    };
-    result.metadata.statistics = stats;
-    return result;
+    // PLAIN encodes a boolean in one bit.
+    const value_bits: usize = if (T == bool) 1 else @bitSizeOf(T);
+    const values_per_page = if (max_page_size) |mps| @max(1, (mps *| 8) / value_bits) else values.len;
+    return writeFlatChunk(T, allocator, output, path_in_schema, values, comptime typeToPhysicalType(T), 0, is_optional, start_offset, codec, value_encoding, values_per_page, write_page_checksum, page_index_builder);
 }
 
 /// Write a byte array column chunk with Optional values and a specific encoding.
-/// Unified function for byte arrays (Phase 11 style).
+/// With `max_page_size`, a data page holds `max_page_size / 100` values (at least one); without
+/// it, the chunk is one page.
 /// is_optional: true if column is optional in schema (writes def levels), false for required columns.
+/// page_index_builder (optional) receives one entry per data page.
 pub fn writeColumnChunkByteArrayOptionalWithEncoding(
     allocator: std.mem.Allocator,
     output: *std.Io.Writer,
@@ -1214,15 +981,57 @@ pub fn writeColumnChunkByteArrayOptionalWithEncoding(
     write_page_checksum: bool,
     page_index_builder: ?*page_index_writer.PageIndexBuilder,
 ) ColumnWriteError!ColumnChunkResult {
-    // Compute statistics from Optional values
-    var stats_builder = statistics.ByteArrayStatisticsBuilder.init(allocator);
-    stats_builder.updateOptional(values) catch return error.OutOfMemory;
-    const stats = stats_builder.build();
-    errdefer if (stats) |s| freeStatistics(allocator, s);
-
-    // Determine page size (estimate ~100 bytes average for byte arrays)
+    // Pages are sized for an average value of 100 bytes.
     const avg_value_size = 100;
     const values_per_page = if (max_page_size) |mps| @max(1, mps / avg_value_size) else values.len;
+    return writeFlatChunk([]const u8, allocator, output, path_in_schema, values, .byte_array, 0, is_optional, start_offset, codec, value_encoding, values_per_page, write_page_checksum, page_index_builder);
+}
+
+/// Statistics of a flat column's values, including the null count.
+fn flatStatistics(comptime T: type, allocator: std.mem.Allocator, values: []const Optional(T)) ColumnWriteError!?format.Statistics {
+    if (T == []const u8) {
+        var b = statistics.ByteArrayStatisticsBuilder.init(allocator);
+        defer b.deinit();
+        try b.updateOptional(values);
+        return b.build();
+    }
+    var b = statistics.StatisticsBuilder(T){};
+    b.updateOptional(values);
+    return b.build(allocator) catch error.OutOfMemory;
+}
+
+fn mapPageWriteError(e: page_writer.PageWriteError) ColumnWriteError {
+    return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.InvalidFixedLength => error.InvalidFixedLength,
+        error.IntegerOverflow => error.IntegerOverflow,
+        error.ValueTooLarge => error.ValueTooLarge,
+        error.NullInRequiredColumn => error.NullInRequiredColumn,
+        error.UnsupportedEncoding => error.UnsupportedEncoding,
+    };
+}
+
+/// Writes a flat column chunk as data pages of at most `values_per_page` values (one row per
+/// value) and records each page in `page_index_builder`. `fixed_len` is the value length of a
+/// FIXED_LEN_BYTE_ARRAY column and 0 for every other type.
+fn writeFlatChunk(
+    comptime T: type,
+    allocator: std.mem.Allocator,
+    output: *std.Io.Writer,
+    path_in_schema: []const []const u8,
+    values: []const Optional(T),
+    physical_type: format.PhysicalType,
+    fixed_len: usize,
+    is_optional: bool,
+    start_offset: i64,
+    codec: format.CompressionCodec,
+    value_encoding: format.Encoding,
+    values_per_page: usize,
+    write_page_checksum: bool,
+    page_index_builder: ?*page_index_writer.PageIndexBuilder,
+) ColumnWriteError!ColumnChunkResult {
+    const stats = try flatStatistics(T, allocator, values);
+    errdefer if (stats) |s| freeStatistics(allocator, s);
 
     var total_bytes_written: usize = 0;
     var total_uncompressed_written: usize = 0;
@@ -1230,21 +1039,17 @@ pub fn writeColumnChunkByteArrayOptionalWithEncoding(
     var offset: usize = 0;
 
     while (offset < values.len) {
-        const chunk_end = @min(offset + values_per_page, values.len);
+        const chunk_end = offset + @min(@max(values_per_page, 1), values.len - offset);
         const chunk = values[offset..chunk_end];
 
-        // Write data page with specified encoding using unified function
-        var page_result = page_writer.writeDataPageByteArrayOptionalWithEncoding(allocator, chunk, is_optional, value_encoding) catch |e| switch (e) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.InvalidFixedLength => return error.InvalidFixedLength,
-            error.IntegerOverflow => return error.IntegerOverflow,
-            error.ValueTooLarge => return error.ValueTooLarge,
-            error.NullInRequiredColumn => return error.NullInRequiredColumn,
-            error.UnsupportedEncoding => return error.UnsupportedEncoding,
-        };
+        var page_result = (if (T == []const u8 and physical_type == .fixed_len_byte_array)
+            page_writer.writeDataPageFixedByteArrayOptionalWithEncoding(allocator, chunk, fixed_len, is_optional, value_encoding)
+        else if (T == []const u8)
+            page_writer.writeDataPageByteArrayOptionalWithEncoding(allocator, chunk, is_optional, value_encoding)
+        else
+            page_writer.writeDataPageOptionalWithEncoding(allocator, T, chunk, is_optional, value_encoding)) catch |e| return mapPageWriteError(e);
         defer page_result.deinit(allocator);
 
-        // Compress if needed
         const compressed_data = if (codec != .uncompressed) blk: {
             break :blk compress.compress(allocator, page_result.data, codec) catch |err| switch (err) {
                 error.UnsupportedCompression => return error.UnsupportedCompression,
@@ -1253,7 +1058,6 @@ pub fn writeColumnChunkByteArrayOptionalWithEncoding(
         } else page_result.data;
         defer if (codec != .uncompressed) allocator.free(compressed_data);
 
-        // Create page header with correct encoding
         const page_header = format.PageHeader{
             .type_ = .data_page,
             .uncompressed_page_size = try safe.castTo(i32, page_result.data.len),
@@ -1269,19 +1073,17 @@ pub fn writeColumnChunkByteArrayOptionalWithEncoding(
             .dictionary_page_header = null,
         };
 
-        // Serialize page header
         var thrift_writer = thrift.CompactWriter.init(allocator);
         defer thrift_writer.deinit();
-
         page_header.serialize(&thrift_writer) catch return error.OutOfMemory;
         const header_bytes = thrift_writer.getWritten();
 
-        // Write header and compressed data
         output.writeAll(header_bytes) catch return error.WriteError;
         output.writeAll(compressed_data) catch return error.WriteError;
 
         const page_bytes = std.math.add(usize, header_bytes.len, compressed_data.len) catch return error.IntegerOverflow;
-        if (page_index_builder) |pib| try recordFlatPage([]const u8, allocator, pib, chunk, start_offset + try safe.castTo(i64, total_bytes_written), page_bytes, try safe.castTo(i64, offset));
+        if (page_index_builder) |pib| try recordFlatPage(T, allocator, pib, chunk, start_offset + try safe.castTo(i64, total_bytes_written), page_bytes, try safe.castTo(i64, offset));
+
         total_bytes_written = std.math.add(usize, total_bytes_written, page_bytes) catch return error.IntegerOverflow;
         const uncompressed_page_bytes = std.math.add(usize, header_bytes.len, page_result.data.len) catch return error.IntegerOverflow;
         total_uncompressed_written = std.math.add(usize, total_uncompressed_written, uncompressed_page_bytes) catch return error.IntegerOverflow;
@@ -1289,20 +1091,23 @@ pub fn writeColumnChunkByteArrayOptionalWithEncoding(
         offset = chunk_end;
     }
 
-    // Duplicate path_in_schema for metadata (writeColumnChunkByteArrayOptionalWithEncoding)
     const path = allocator.alloc([]const u8, path_in_schema.len) catch return error.OutOfMemory;
-    for (path_in_schema, 0..) |segment, i| {
-        path[i] = allocator.dupe(u8, segment) catch return error.OutOfMemory;
+    var copied: usize = 0;
+    errdefer {
+        for (path[0..copied]) |seg| allocator.free(seg);
+        allocator.free(path);
+    }
+    for (path_in_schema, path) |segment, *dst| {
+        dst.* = allocator.dupe(u8, segment) catch return error.OutOfMemory;
+        copied += 1;
     }
 
-    // Build encodings list with the actual encoding used
-    const encodings = allocator.alloc(format.Encoding, 2) catch return error.OutOfMemory;
-    encodings[0] = .rle; // Definition levels
-    encodings[1] = value_encoding; // Values
+    // Definition levels, then values.
+    const encodings = allocator.dupe(format.Encoding, &.{ .rle, value_encoding }) catch return error.OutOfMemory;
 
-    var result = ColumnChunkResult{
+    return .{
         .metadata = .{
-            .type_ = .byte_array,
+            .type_ = physical_type,
             .encodings = encodings,
             .path_in_schema = path,
             .codec = codec,
@@ -1312,13 +1117,11 @@ pub fn writeColumnChunkByteArrayOptionalWithEncoding(
             .data_page_offset = start_offset,
             .index_page_offset = null,
             .dictionary_page_offset = null,
-            .statistics = null,
+            .statistics = stats,
         },
         .file_offset = start_offset,
         .total_bytes = total_bytes_written,
     };
-    result.metadata.statistics = stats;
-    return result;
 }
 
 /// Write a column chunk with Optional(T) values (unified API).

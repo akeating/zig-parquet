@@ -29,7 +29,6 @@ const safe = @import("safe.zig");
 const format = @import("format.zig");
 const thrift = @import("thrift/mod.zig");
 const column_writer = @import("column_writer.zig");
-const list_encoder = @import("list_encoder.zig");
 const geo = @import("geo/mod.zig");
 const statistics = @import("statistics.zig");
 const map_encoder = @import("map_encoder.zig");
@@ -39,6 +38,8 @@ const value_mod = @import("value.zig");
 const nested_mod = @import("nested.zig");
 const column_def_mod = @import("column_def.zig");
 const write_target = @import("write_target.zig");
+const page_index_writer = @import("page_index_writer.zig");
+const values_writer = @import("column_write_values.zig");
 
 const Optional = types.Optional;
 const MapEntry = map_encoder.MapEntry;
@@ -65,6 +66,29 @@ const State = enum {
 
 pub const WriterError = types.WriterError;
 
+/// The entries of one leaf column of a list, struct or map column: definition and repetition
+/// levels, and the non-null values in entry order.
+fn LeafEntries(comptime T: type) type {
+    return struct {
+        values: std.ArrayListUnmanaged(T) = .empty,
+        def: std.ArrayListUnmanaged(u32) = .empty,
+        rep: std.ArrayListUnmanaged(u32) = .empty,
+
+        fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+            self.values.deinit(allocator);
+            self.def.deinit(allocator);
+            self.rep.deinit(allocator);
+        }
+
+        /// Appends an entry. `value` is null for an entry below the maximum definition level.
+        fn append(self: *@This(), allocator: std.mem.Allocator, def: u32, rep: u32, value: ?T) error{OutOfMemory}!void {
+            try self.def.append(allocator, def);
+            try self.rep.append(allocator, rep);
+            if (value) |v| try self.values.append(allocator, v);
+        }
+    };
+}
+
 /// Parquet file writer
 pub const Writer = struct {
     allocator: std.mem.Allocator,
@@ -81,6 +105,18 @@ pub const Writer = struct {
     geo_stats_builders: std.AutoHashMapUnmanaged(usize, *statistics.GeospatialStatisticsBuilder),
 
     sorting_columns: ?[]const format.SortingColumn = null,
+
+    /// Target size of a data page, in bytes. Null writes each column chunk as one data page.
+    /// Pages of list, struct and map columns end only before a row, so a page holds whole
+    /// rows and can exceed this size. Set before writing columns.
+    max_page_size: ?usize = null,
+    /// Write an OffsetIndex and a ColumnIndex for every column chunk, after the column data
+    /// and before the footer, and point the chunk's metadata at them. Set before writing
+    /// columns.
+    write_page_index: bool = false,
+    /// Per physical column, the page index entries of its data pages. Null for a column not
+    /// yet written, and for every column when `write_page_index` is off.
+    page_index_builders: []?page_index_writer.PageIndexBuilder,
 
     _backend_cleanup: ?BackendCleanup = null,
     _to_owned_slice_fn: ?*const fn (*anyopaque) error{OutOfMemory}![]u8 = null,
@@ -190,6 +226,10 @@ pub const Writer = struct {
         errdefer allocator.free(column_chunks);
         @memset(column_chunks, null);
 
+        const page_index_builders = allocator.alloc(?page_index_writer.PageIndexBuilder, num_physical) catch return error.OutOfMemory;
+        errdefer allocator.free(page_index_builders);
+        @memset(page_index_builders, null);
+
         var geo_stats_builders: std.AutoHashMapUnmanaged(usize, *statistics.GeospatialStatisticsBuilder) = .empty;
         initGeoStatsBuilders(allocator, columns, &geo_stats_builders) catch return error.OutOfMemory;
 
@@ -204,6 +244,7 @@ pub const Writer = struct {
             .columns_written = columns_written,
             .column_chunks = column_chunks,
             .geo_stats_builders = geo_stats_builders,
+            .page_index_builders = page_index_builders,
         };
     }
 
@@ -242,6 +283,8 @@ pub const Writer = struct {
         }
         self.allocator.free(self.column_chunks);
         self.allocator.free(self.columns_written);
+        for (self.page_index_builders) |*maybe| if (maybe.*) |*b| b.deinit();
+        self.allocator.free(self.page_index_builders);
 
         // Clean up geospatial statistics builders
         var iter = self.geo_stats_builders.iterator();
@@ -306,8 +349,9 @@ pub const Writer = struct {
         const col_def = self.columns[column_index];
         const writer = self.getWriter();
 
+        const page_index = self.pageIndexFor(physical_idx, physical_type, sortOrderDefined(col_def));
         var result = if (T == []const u8)
-            column_writer.writeColumnChunkByteArrayOptionalWithPathArray(
+            column_writer.writeColumnChunkByteArrayOptionalWithEncoding(
                 self.allocator,
                 writer,
                 &.{col_def.name},
@@ -315,10 +359,13 @@ pub const Writer = struct {
                 col_def.optional,
                 self.current_offset,
                 col_def.codec,
+                .plain,
+                self.max_page_size,
                 true, // write_page_checksum
+                page_index,
             ) catch |e| return mapColumnError(e)
         else
-            column_writer.writeColumnChunkOptionalWithPathArray(
+            column_writer.writeColumnChunkOptionalWithEncoding(
                 T,
                 self.allocator,
                 writer,
@@ -327,7 +374,10 @@ pub const Writer = struct {
                 col_def.optional,
                 self.current_offset,
                 col_def.codec,
+                .plain,
+                self.max_page_size,
                 true, // write_page_checksum
+                page_index,
             ) catch |e| return mapColumnError(e);
 
         // For byte_array geometry/geography columns, update bbox tracking
@@ -372,7 +422,7 @@ pub const Writer = struct {
         const fixed_len = try safe.castTo(u32, col_def.type_length orelse return error.InvalidFixedLength);
         const writer = self.getWriter();
 
-        var result = column_writer.writeColumnChunkFixedByteArrayOptionalWithPathArrayAndEncoding(
+        var result = column_writer.writeColumnChunkFixedByteArrayOptionalWithEncoding(
             self.allocator,
             writer,
             &.{col_def.name},
@@ -382,7 +432,9 @@ pub const Writer = struct {
             self.current_offset,
             col_def.codec,
             col_def.value_encoding,
+            self.max_page_size,
             true, // write_page_checksum
+            self.pageIndexFor(physical_idx, .fixed_len_byte_array, sortOrderDefined(col_def)),
         ) catch |e| return mapColumnError(e);
 
         // INTERVAL type: skip statistics (sort order undefined per Parquet spec)
@@ -434,40 +486,12 @@ pub const Writer = struct {
         column_index: usize,
         lists: []const Optional([]const Optional(i32)),
     ) WriterError!void {
-        try self.validateListColumnWrite(column_index, .int32);
-        const physical_idx = try self.getPhysicalColumnIndex(column_index, 0);
-
-        const col_def = self.columns[column_index];
-        const writer = self.getWriter();
-
-        // Flatten the list data
-        var flattened = list_encoder.flattenList(
-            i32,
-            self.allocator,
-            lists,
-            3,
-        ) catch return error.OutOfMemory;
-        defer flattened.deinit();
-
-        var result = column_writer.writeColumnChunkList(
-            i32,
-            self.allocator,
-            writer,
-            col_def.name,
-            flattened.values,
-            flattened.def_levels,
-            flattened.rep_levels,
-            3,
-            1,
-            self.current_offset,
-            col_def.codec,
-        ) catch |e| return mapColumnError(e);
-
-        try self.flushWriter();
-        try self.recordColumnWrite(physical_idx, &result, lists.len);
+        return self.writeListColumn(i32, column_index, lists);
     }
 
     /// Write a list column for any supported element type (i32, i64, f32, f64, bool, []const u8).
+    /// A null list requires an optional column (`optional`), and a null element an optional
+    /// element (`element_optional`); otherwise the call returns `error.NullInRequiredColumn`.
     pub fn writeListColumn(
         self: *Self,
         comptime T: type,
@@ -477,34 +501,39 @@ pub const Writer = struct {
         const pt = comptime physicalTypeFor(T);
         try self.validateListColumnWrite(column_index, pt);
         const physical_idx = try self.getPhysicalColumnIndex(column_index, 0);
-
         const col_def = self.columns[column_index];
-        const writer = self.getWriter();
 
-        var flattened = list_encoder.flattenList(
-            T,
-            self.allocator,
-            lists,
-            3,
-        ) catch return error.OutOfMemory;
-        defer flattened.deinit();
+        // Definition levels: 0 for a null list (optional list only), `empty_def` for an empty
+        // list, `empty_def + 1` for a null element (optional element only), `max_def` for a
+        // value.
+        const empty_def: u32 = @intFromBool(col_def.optional);
+        const max_def: u8 = @intCast(empty_def + 1 + @intFromBool(col_def.element_optional));
 
-        var result = column_writer.writeColumnChunkList(
-            T,
-            self.allocator,
-            writer,
-            col_def.name,
-            flattened.values,
-            flattened.def_levels,
-            flattened.rep_levels,
-            3,
-            1,
-            self.current_offset,
-            col_def.codec,
-        ) catch |e| return mapColumnError(e);
+        var leaf: LeafEntries(T) = .{};
+        defer leaf.deinit(self.allocator);
+        for (lists) |list| switch (list) {
+            .null_value => {
+                if (!col_def.optional) return error.NullInRequiredColumn;
+                try leaf.append(self.allocator, 0, 0, null);
+            },
+            .value => |elements| {
+                if (elements.len == 0) try leaf.append(self.allocator, empty_def, 0, null);
+                for (elements, 0..) |element, i| {
+                    const r: u32 = if (i == 0) 0 else 1;
+                    switch (element) {
+                        .null_value => {
+                            if (!col_def.element_optional) return error.NullInRequiredColumn;
+                            try leaf.append(self.allocator, empty_def + 1, r, null);
+                        },
+                        .value => |v| try leaf.append(self.allocator, max_def, r, v),
+                    }
+                }
+            },
+        };
 
-        try self.flushWriter();
-        try self.recordColumnWrite(physical_idx, &result, lists.len);
+        try self.writeNestedLeaf(T, physical_idx, &.{ col_def.name, "list", "element" }, &leaf, max_def, 1, col_def.codec, sortOrderDefinedFor(col_def.logical_type));
+        try self.setRowCount(lists.len);
+        self.state = .writing_columns;
     }
 
     fn validateListColumnWrite(self: *Self, column_index: usize, expected_type: format.PhysicalType) WriterError!void {
@@ -526,8 +555,10 @@ pub const Writer = struct {
     // =========================================================================
 
     /// Write a struct field
-    /// Supports: i32, i64, []const u8
-    /// parent_nulls indicates which rows have a null parent struct
+    /// Supports: i32, i64, f32, f64, bool, []const u8
+    /// parent_nulls indicates which rows have a null parent struct. A null parent requires an
+    /// optional struct, and a null value an optional field; otherwise the call returns
+    /// `error.NullInRequiredColumn`.
     pub fn writeStructField(
         self: *Self,
         comptime T: type,
@@ -539,69 +570,34 @@ pub const Writer = struct {
         const physical_type = comptime physicalTypeFor(T);
         try self.validateStructFieldWrite(struct_col_index, field_index, physical_type);
         const physical_idx = try self.getPhysicalColumnIndex(struct_col_index, field_index);
+        if (parent_nulls.len != values.len) return error.RowCountMismatch;
 
         const col_def = self.columns[struct_col_index];
         const fields = col_def.struct_fields orelse return error.InvalidColumnIndex;
         const field = fields[field_index];
 
-        // Compute definition levels:
-        // def=0: parent struct is null
-        // def=1: parent present, but field is null
-        // def=2: field is present
-        const max_def_level: u8 = 2;
-        const def_levels = self.allocator.alloc(u32, values.len) catch return error.OutOfMemory;
-        defer self.allocator.free(def_levels);
+        // Definition levels: 0 for a null struct (optional struct only), `null_def` for a null
+        // field (optional field only), `max_def` for a value.
+        const null_def: u32 = @intFromBool(col_def.optional);
+        const max_def: u8 = @intCast(null_def + @intFromBool(field.optional));
 
-        var actual_values: std.ArrayList(T) = .empty;
-        defer actual_values.deinit(self.allocator);
-
-        for (values, parent_nulls, 0..) |maybe_val, parent_null, i| {
+        var leaf: LeafEntries(T) = .{};
+        defer leaf.deinit(self.allocator);
+        for (values, parent_nulls) |maybe_val, parent_null| {
             if (parent_null) {
-                def_levels[i] = 0;
+                if (!col_def.optional) return error.NullInRequiredColumn;
+                try leaf.append(self.allocator, 0, 0, null);
             } else if (maybe_val) |val| {
-                def_levels[i] = 2;
-                actual_values.append(self.allocator, val) catch return error.OutOfMemory;
+                try leaf.append(self.allocator, max_def, 0, val);
             } else {
-                def_levels[i] = 1;
+                if (!field.optional) return error.NullInRequiredColumn;
+                try leaf.append(self.allocator, null_def, 0, null);
             }
         }
 
-        // All rep levels are 0 for struct fields
-        const rep_levels = self.allocator.alloc(u32, values.len) catch return error.OutOfMemory;
-        defer self.allocator.free(rep_levels);
-        @memset(rep_levels, 0);
-
-        const writer = self.getWriter();
-        var result = if (T == []const u8)
-            column_writer.writeColumnChunkStructByteArray(
-                self.allocator,
-                writer,
-                col_def.name,
-                field.name,
-                actual_values.items,
-                def_levels,
-                rep_levels,
-                max_def_level,
-                self.current_offset,
-                col_def.codec,
-            ) catch |e| return mapColumnError(e)
-        else
-            column_writer.writeColumnChunkStruct(
-                T,
-                self.allocator,
-                writer,
-                col_def.name,
-                field.name,
-                actual_values.items,
-                def_levels,
-                rep_levels,
-                max_def_level,
-                self.current_offset,
-                col_def.codec,
-            ) catch |e| return mapColumnError(e);
-
-        try self.flushWriter();
-        try self.recordColumnWrite(physical_idx, &result, values.len);
+        try self.writeNestedLeaf(T, physical_idx, &.{ col_def.name, field.name }, &leaf, max_def, 0, col_def.codec, sortOrderDefinedFor(field.logical_type));
+        try self.setRowCount(values.len);
+        self.state = .writing_columns;
     }
 
     fn validateStructFieldWrite(self: *Self, struct_col_index: usize, field_index: usize, expected_type: format.PhysicalType) WriterError!void {
@@ -629,6 +625,8 @@ pub const Writer = struct {
 
     /// Write a map column with the given key and value types.
     /// Supported types: i32, i64, f32, f64, bool, []const u8.
+    /// A null map requires an optional column (`optional`), and a null value an optional
+    /// value (`map_value_optional`); otherwise the call returns `error.NullInRequiredColumn`.
     pub fn writeMapColumn(
         self: *Self,
         comptime K: type,
@@ -641,74 +639,47 @@ pub const Writer = struct {
         try self.validateMapColumnWrite(column_index, key_pt, value_pt);
         const key_physical_idx = try self.getPhysicalColumnIndex(column_index, 0);
         const value_physical_idx = try self.getPhysicalColumnIndex(column_index, 1);
-
         const col_def = self.columns[column_index];
-        const writer = self.getWriter();
 
-        var flattened = map_encoder.flattenMap(
-            K,
-            V,
-            self.allocator,
-            maps,
-            3,
-        ) catch return error.OutOfMemory;
-        defer flattened.deinit();
+        // Definition levels of both leaves: 0 for a null map (optional map only), `empty_def`
+        // for an empty map. A key is at `empty_def + 1`. A value is at `value_max_def`, a null
+        // value (optional value only) at `empty_def + 1`.
+        const empty_def: u32 = @intFromBool(col_def.optional);
+        const key_max_def: u8 = @intCast(empty_def + 1);
+        const value_max_def: u8 = @intCast(empty_def + 1 + @intFromBool(col_def.map_value_optional));
 
-        const key_result = column_writer.writeColumnChunkMapKey(
-            self.allocator,
-            writer,
-            col_def.name,
-            K,
-            flattened.keys,
-            flattened.key_def_levels,
-            flattened.rep_levels,
-            2,
-            1,
-            self.current_offset,
-            col_def.codec,
-        ) catch |e| return mapColumnError(e);
-
-        try self.flushWriter();
-        self.columns_written[key_physical_idx] = true;
-        self.current_offset = std.math.add(i64, self.current_offset, try safe.castTo(i64, key_result.total_bytes)) catch return error.IntegerOverflow;
-        self.column_chunks[key_physical_idx] = .{
-            .file_path = null,
-            .file_offset = key_result.file_offset,
-            .meta_data = key_result.metadata,
+        var keys: LeafEntries(K) = .{};
+        defer keys.deinit(self.allocator);
+        var vals: LeafEntries(V) = .{};
+        defer vals.deinit(self.allocator);
+        for (maps) |map| switch (map) {
+            .null_value => {
+                if (!col_def.optional) return error.NullInRequiredColumn;
+                try keys.append(self.allocator, 0, 0, null);
+                try vals.append(self.allocator, 0, 0, null);
+            },
+            .value => |entries| {
+                if (entries.len == 0) {
+                    try keys.append(self.allocator, empty_def, 0, null);
+                    try vals.append(self.allocator, empty_def, 0, null);
+                }
+                for (entries, 0..) |entry, i| {
+                    const r: u32 = if (i == 0) 0 else 1;
+                    try keys.append(self.allocator, key_max_def, r, entry.key);
+                    switch (entry.value) {
+                        .null_value => {
+                            if (!col_def.map_value_optional) return error.NullInRequiredColumn;
+                            try vals.append(self.allocator, empty_def + 1, r, null);
+                        },
+                        .value => |v| try vals.append(self.allocator, value_max_def, r, v),
+                    }
+                }
+            },
         };
 
-        const value_result = column_writer.writeColumnChunkMapValue(
-            self.allocator,
-            writer,
-            col_def.name,
-            V,
-            flattened.values,
-            flattened.value_def_levels,
-            flattened.rep_levels,
-            3,
-            1,
-            self.current_offset,
-            col_def.codec,
-        ) catch |e| return mapColumnError(e);
-
-        try self.flushWriter();
-        self.columns_written[value_physical_idx] = true;
-        self.current_offset = std.math.add(i64, self.current_offset, try safe.castTo(i64, value_result.total_bytes)) catch return error.IntegerOverflow;
-        self.column_chunks[value_physical_idx] = .{
-            .file_path = null,
-            .file_offset = value_result.file_offset,
-            .meta_data = value_result.metadata,
-        };
-
-        if (self.num_rows) |existing| {
-            if (existing != (safe.castTo(i64, maps.len) catch return error.RowCountMismatch)) {
-                return error.RowCountMismatch;
-            }
-        } else {
-            if (maps.len > std.math.maxInt(i64)) return error.TooManyRows;
-            self.num_rows = try safe.castTo(i64, maps.len);
-        }
-
+        try self.writeNestedLeaf(K, key_physical_idx, &.{ col_def.name, "key_value", "key" }, &keys, key_max_def, 1, col_def.codec, sortOrderDefinedFor(col_def.logical_type));
+        try self.writeNestedLeaf(V, value_physical_idx, &.{ col_def.name, "key_value", "value" }, &vals, value_max_def, 1, col_def.codec, sortOrderDefinedFor(col_def.map_value_logical_type));
+        try self.setRowCount(maps.len);
         self.state = .writing_columns;
     }
 
@@ -870,6 +841,7 @@ pub const Writer = struct {
 
             // Write the column chunk using the generic Value-based writer
             const writer = self.getWriter();
+            const leaf_type: ?format.PhysicalType = if (leaf_idx < leaf_types.len) leaf_types[leaf_idx] else null;
             var result = column_writer.writeColumnChunkFromValues(
                 self.allocator,
                 writer,
@@ -881,12 +853,12 @@ pub const Writer = struct {
                 levels.max_rep,
                 self.current_offset,
                 col_def.codec,
-                .{ .physical_type = if (leaf_idx < leaf_types.len) leaf_types[leaf_idx] else null },
-            ) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                error.WriteError => return error.WriteError,
-                else => return error.WriteError,
-            };
+                .{
+                    .physical_type = leaf_type,
+                    .max_page_size = self.max_page_size,
+                    .page_index = if (leaf_type) |t| self.pageIndexFor(physical_idx, t, true) else null,
+                },
+            ) catch |e| return mapColumnError(e);
 
             try self.flushWriter();
 
@@ -1002,6 +974,7 @@ pub const Writer = struct {
     pub fn close(self: *Self) WriterError!void {
         if (self.state == .closed) return error.InvalidState;
 
+        if (self.write_page_index) try self.writePageIndexes();
         try self.writeFooterToWriter(self.getWriter());
         try self.flushWriter();
         self.target_writer.target.close() catch return error.WriteError;
@@ -1217,17 +1190,23 @@ pub const Writer = struct {
     }
 
     fn recordColumnWrite(self: *Self, physical_column_index: usize, result: *column_writer.ColumnChunkResult, num_values: usize) WriterError!void {
+        try self.storeChunk(physical_column_index, result);
+        try self.setRowCount(num_values);
+    }
+
+    /// Marks the physical column written and keeps the chunk's metadata for the footer.
+    fn storeChunk(self: *Self, physical_column_index: usize, result: *column_writer.ColumnChunkResult) WriterError!void {
         self.columns_written[physical_column_index] = true;
         self.current_offset = std.math.add(i64, self.current_offset, try safe.castTo(i64, result.total_bytes)) catch return error.IntegerOverflow;
-
-        // Create column chunk
         self.column_chunks[physical_column_index] = .{
             .file_path = null,
             .file_offset = result.file_offset,
             .meta_data = result.metadata,
         };
+    }
 
-        // Verify/set row count
+    /// Sets the file's row count, or checks it against the count of an earlier column.
+    fn setRowCount(self: *Self, num_values: usize) WriterError!void {
         if (self.num_rows) |existing| {
             if (existing != (safe.castTo(i64, num_values) catch return error.RowCountMismatch)) {
                 return error.RowCountMismatch;
@@ -1671,6 +1650,103 @@ pub const Writer = struct {
         return schema;
     }
 
+    /// A new page index builder for physical column `physical_idx`, or null when
+    /// `write_page_index` is off.
+    fn pageIndexFor(self: *Self, physical_idx: usize, physical_type: format.PhysicalType, sort_order_defined: bool) ?*page_index_writer.PageIndexBuilder {
+        if (!self.write_page_index) return null;
+        // A failed write of the column leaves a builder behind.
+        if (self.page_index_builders[physical_idx]) |*b| b.deinit();
+        self.page_index_builders[physical_idx] = page_index_writer.PageIndexBuilder.init(self.allocator, physical_type, sort_order_defined);
+        return &self.page_index_builders[physical_idx].?;
+    }
+
+    /// False for the types whose min and max the writer leaves out of the statistics:
+    /// GEOMETRY, GEOGRAPHY and INTERVAL. Their pages get no ColumnIndex.
+    fn sortOrderDefined(col_def: ColumnDef) bool {
+        if (col_def.converted_type) |ct| if (ct == format.ConvertedType.INTERVAL) return false;
+        return sortOrderDefinedFor(col_def.logical_type);
+    }
+
+    fn sortOrderDefinedFor(logical_type: ?format.LogicalType) bool {
+        if (logical_type) |lt| switch (lt) {
+            .geometry, .geography => return false,
+            else => {},
+        };
+        return true;
+    }
+
+    /// Writes one leaf column chunk of a list, struct or map column and keeps its metadata.
+    /// Pages end only before a row; with `write_page_index`, each page is recorded.
+    fn writeNestedLeaf(
+        self: *Self,
+        comptime T: type,
+        physical_idx: usize,
+        path: []const []const u8,
+        leaf: *const LeafEntries(T),
+        max_def: u8,
+        max_rep: u8,
+        codec: format.CompressionCodec,
+        sort_order_defined: bool,
+    ) WriterError!void {
+        const pt = comptime physicalTypeFor(T);
+        var result = values_writer.writeLeafChunk(
+            comptime values_writer.kindOf(T),
+            self.allocator,
+            self.getWriter(),
+            path,
+            leaf.values.items,
+            .{ .def = leaf.def.items, .rep = leaf.rep.items, .max_def = max_def, .max_rep = max_rep },
+            self.current_offset,
+            codec,
+            .{
+                .max_page_size = self.max_page_size,
+                .physical_type = pt,
+                .page_index = self.pageIndexFor(physical_idx, pt, sort_order_defined),
+            },
+        ) catch |e| return mapColumnError(e);
+        try self.flushWriter();
+        try self.storeChunk(physical_idx, &result);
+    }
+
+    /// Writes the ColumnIndex of every column chunk, then the OffsetIndex of every column
+    /// chunk, at the current offset, and records their locations in the chunks' metadata.
+    /// DynamicWriter uses the same order.
+    fn writePageIndexes(self: *Self) WriterError!void {
+        const allocator = self.allocator;
+        const writer = self.getWriter();
+        for ([_]bool{ true, false }) |column_index| {
+            for (self.page_index_builders, self.column_chunks) |*maybe, *maybe_chunk| {
+                const builder = if (maybe.*) |*b| b else continue;
+                const chunk = if (maybe_chunk.*) |*c| c else continue;
+
+                var tw = thrift.CompactWriter.init(allocator);
+                defer tw.deinit();
+                if (column_index) {
+                    var ci = (builder.buildColumnIndex(allocator) catch return error.OutOfMemory) orelse continue;
+                    defer ci.deinit(allocator);
+                    ci.serialize(&tw) catch return error.OutOfMemory;
+                } else {
+                    var oi = builder.buildOffsetIndex(allocator) catch return error.OutOfMemory;
+                    defer oi.deinit(allocator);
+                    oi.serialize(&tw) catch return error.OutOfMemory;
+                }
+                const blob = tw.getWritten();
+                writer.writeAll(blob) catch return error.WriteError;
+
+                const length = try safe.castTo(i32, blob.len);
+                if (column_index) {
+                    chunk.column_index_offset = self.current_offset;
+                    chunk.column_index_length = length;
+                } else {
+                    chunk.offset_index_offset = self.current_offset;
+                    chunk.offset_index_length = length;
+                }
+                self.current_offset = std.math.add(i64, self.current_offset, length) catch return error.IntegerOverflow;
+            }
+        }
+        try self.flushWriter();
+    }
+
     fn mapColumnError(e: column_writer.ColumnWriteError) WriterError {
         return switch (e) {
             error.OutOfMemory => error.OutOfMemory,
@@ -1682,6 +1758,7 @@ pub const Writer = struct {
             error.ValueTooLarge => error.ValueTooLarge,
             error.NullInRequiredColumn => error.NullInRequiredColumn,
             error.UnsupportedEncoding => error.UnsupportedEncoding,
+            error.TypeMismatch => error.TypeMismatch,
         };
     }
 };
