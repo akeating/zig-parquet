@@ -230,6 +230,11 @@ pub const Options = struct {
     /// i64 BYTE_ARRAY offsets. With i32 offsets, a chunk whose entries total more than
     /// 2^31 - 1 bytes returns `error.IntegerOverflow`.
     large_offsets: bool = false,
+    /// Entries with a definition level below this have no slot in the buffers, which then
+    /// have fewer entries than the levels. For a leaf under a list or map, the definition
+    /// level of its innermost list or map: the entries below it are empty or null lists and
+    /// maps, which have no element. Needs `keep_levels`. 0 gives every entry a slot.
+    slot_level: u32 = 0,
 };
 
 /// A decoded leaf column chunk.
@@ -251,7 +256,8 @@ pub const Leaf = struct {
 
 /// Joins leaves of one column, each starting at a row (from consecutive row groups, say),
 /// into one leaf. `pieces` must not be empty and have the same layout, offset width and
-/// levels kept; they are left unchanged.
+/// levels kept; they are left unchanged. A piece decoded with `Options.slot_level` has fewer
+/// buffer entries than levels.
 pub fn concatLeaves(allocator: Allocator, pieces: []const Leaf) !Leaf {
     const first = &pieces[0].buffers;
     var total: usize = 0;
@@ -266,21 +272,27 @@ pub fn concatLeaves(allocator: Allocator, pieces: []const Leaf) !Leaf {
     for (pieces) |*p| try b.appendBuffers(&p.buffers);
     var buffers = try b.finish();
     errdefer buffers.deinit(allocator);
-    const def_levels = if (pieces[0].def_levels != null) try concatLevels(allocator, pieces, .def, total) else null;
+    // Each piece's levels: as many as its entries, at least as many as its buffer entries.
+    for (pieces) |*p| {
+        const def_len = if (p.def_levels) |l| l.len else null;
+        const rep_len = if (p.rep_levels) |l| l.len else null;
+        if (def_len != null and rep_len != null and def_len.? != rep_len.?) return error.InvalidPageData;
+        const entries = def_len orelse rep_len orelse p.buffers.length;
+        if (entries < p.buffers.length) return error.InvalidPageData;
+    }
+    const def_levels = if (pieces[0].def_levels != null) try concatLevels(allocator, pieces, .def) else null;
     errdefer if (def_levels) |l| allocator.free(l);
-    const rep_levels = if (pieces[0].rep_levels != null) try concatLevels(allocator, pieces, .rep, total) else null;
+    const rep_levels = if (pieces[0].rep_levels != null) try concatLevels(allocator, pieces, .rep) else null;
     return .{ .buffers = buffers, .def_levels = def_levels, .rep_levels = rep_levels };
 }
 
-fn concatLevels(allocator: Allocator, pieces: []const Leaf, comptime which: enum { def, rep }, total: usize) ![]u32 {
+fn concatLevels(allocator: Allocator, pieces: []const Leaf, comptime which: enum { def, rep }) ![]u32 {
+    var total: usize = 0;
+    for (pieces) |*p| total += (if (which == .def) p.def_levels else p.rep_levels).?.len;
     const out = try allocator.alloc(u32, total);
     var at: usize = 0;
     for (pieces) |*p| {
         const levels = (if (which == .def) p.def_levels else p.rep_levels).?;
-        if (levels.len != p.buffers.length) {
-            allocator.free(out);
-            return error.InvalidPageData;
-        }
         @memcpy(out[at..][0..levels.len], levels);
         at += levels.len;
     }
@@ -339,14 +351,12 @@ pub fn decodeSelectedPages(
             if (try cursor.decodeNextPage()) break;
         }
         if (cursor.dec.row_starts - rows_before != want) return error.PageRowCountMismatch;
-        // `dec.rep` holds the levels of the page just decoded, which has at least one entry
-        // when `want > 0`.
-        if (repeated and want > 0 and cursor.dec.rep.items[0] != 0) return error.PageNotAtRowStart;
+        if (repeated and want > 0 and !cursor.dec.page_starts_row) return error.PageNotAtRowStart;
     }
     while (cursor.hasPages()) {
         if (try cursor.decodeNextPage()) return error.PageRowCountMismatch;
     }
-    return cursor.take(cursor.builder.length - cursor.start, cursor.dec.row_starts);
+    return cursor.take(cursor.pendingEntries(), cursor.dec.row_starts);
 }
 
 /// The pages of a column chunk, from a buffer holding the whole chunk, or read from a source
@@ -494,9 +504,12 @@ pub const ColumnCursor = struct {
     first: ?format.PageHeader = null,
     checksum: parquet_reader.ChecksumOptions,
     dec: ChunkDecoder,
-    /// Entries decoded; those from `start` on are not yet returned.
+    /// Entries decoded; those from `start` on are not yet returned. With
+    /// `Options.slot_level`, the builder holds slots of only some entries, and those from
+    /// `slot_start` on are not yet returned; otherwise `slot_start` equals `start`.
     builder: Builder,
     start: usize = 0,
+    slot_start: usize = 0,
 
     /// Reads the dictionary page, if any. Takes ownership of `pages`, also on error.
     /// `reserve` is the number of entries to allocate room for before the first page.
@@ -534,8 +547,14 @@ pub const ColumnCursor = struct {
             .def_bits = format.computeBitWidth(info.max_def_level),
             .rep_bits = format.computeBitWidth(info.max_rep_level),
             .keep_levels = options.keep_levels,
+            .slot_level = if (info.max_def_level > 0) options.slot_level else 0,
         };
         errdefer dec.deinit();
+        if (dec.slot_level > 0 and !options.keep_levels) return error.InvalidArgument;
+        if (options.keep_levels) {
+            if (info.max_def_level > 0) try dec.out_def.ensureTotalCapacity(allocator, reserve);
+            if (info.max_rep_level > 0) try dec.out_rep.ensureTotalCapacity(allocator, reserve);
+        }
 
         // A dictionary page can only be the first page of the chunk.
         var first: ?format.PageHeader = null;
@@ -570,7 +589,7 @@ pub const ColumnCursor = struct {
         // A row of a repeated column is complete once the next row has started.
         const need = if (repeated) rows +| 1 else rows;
         while (self.dec.row_starts < need and self.hasPages()) _ = try self.decodeNextPage();
-        if (self.dec.row_starts < need) return self.take(self.builder.length - self.start, self.dec.row_starts);
+        if (self.dec.row_starts < need) return self.take(self.pendingEntries(), self.dec.row_starts);
         if (!repeated) return self.take(rows, rows);
         if (!self.dec.keep_levels) return error.InvalidArgument;
         // Entry index of the start of row `rows`.
@@ -596,10 +615,13 @@ pub const ColumnCursor = struct {
         const keep_def = dec.keep_levels and dec.info.max_def_level > 0;
         const keep_rep = dec.keep_levels and dec.info.max_rep_level > 0;
         const end = self.start + n;
-        const rest = self.builder.length - end;
+        // Slots of the entries, and the slots after them.
+        const slots = if (dec.slot_level == 0) n else countAtLeast(dec.out_def.items[self.start..end], dec.slot_level);
+        const slot_end = self.slot_start + slots;
+        const rest = self.builder.length - slot_end;
 
-        if (self.start == 0 and n >= rest) {
-            var tail = try self.builder.splitOff(n);
+        if (self.start == 0 and slots >= rest) {
+            var tail = try self.builder.splitOff(slots);
             errdefer tail.deinit();
             var tail_def = try levelsFrom(allocator, &dec.out_def, n, keep_def);
             errdefer tail_def.deinit(allocator);
@@ -624,7 +646,7 @@ pub const ColumnCursor = struct {
             return .{ .buffers = buffers, .def_levels = def_levels, .rep_levels = rep_levels };
         }
 
-        var head = try self.builder.copyRange(self.start, n);
+        var head = try self.builder.copyRange(self.slot_start, slots);
         var buffers = head.finish() catch |e| {
             head.deinit();
             return e;
@@ -635,18 +657,32 @@ pub const ColumnCursor = struct {
         const rep_levels = if (keep_rep) try allocator.dupe(u32, dec.out_rep.items[self.start..end]) else null;
         errdefer if (rep_levels) |l| allocator.free(l);
 
-        if (end * 2 > self.builder.length) {
-            const tail = try self.builder.copyRange(end, rest);
+        if (slot_end * 2 > self.builder.length or (keep_def and end * 2 > dec.out_def.items.len)) {
+            const tail = try self.builder.copyRange(slot_end, rest);
             self.builder.deinit();
             self.builder = tail;
             if (keep_def) dropFront(&dec.out_def, end);
             if (keep_rep) dropFront(&dec.out_rep, end);
             self.start = 0;
+            self.slot_start = 0;
         } else {
             self.start = end;
+            self.slot_start = slot_end;
         }
         dec.row_starts -= rows;
         return .{ .buffers = buffers, .def_levels = def_levels, .rep_levels = rep_levels };
+    }
+
+    /// Entries decoded and not yet returned.
+    fn pendingEntries(self: *const ColumnCursor) usize {
+        if (self.dec.slot_level > 0) return self.dec.out_def.items.len - self.start;
+        return self.builder.length - self.start;
+    }
+
+    fn countAtLeast(levels: []const u32, min: u32) usize {
+        var count: usize = 0;
+        for (levels) |lv| count += @intFromBool(lv >= min);
+        return count;
     }
 
     /// A list with `list.items[from..]`, or an empty list when `keep` is false.
@@ -983,6 +1019,8 @@ const ChunkDecoder = struct {
     rep_bits: u5,
     /// Whether to collect all pages' levels in `out_def` and `out_rep`.
     keep_levels: bool,
+    /// `Options.slot_level`; 0 when the column has no definition levels.
+    slot_level: u32 = 0,
     /// Definition levels of the current page.
     levels: std.ArrayList(u32) = .empty,
     /// Repetition levels of the current page.
@@ -992,6 +1030,9 @@ const ChunkDecoder = struct {
     mask: std.ArrayList(u32) = .empty,
     out_def: std.ArrayList(u32) = .empty,
     out_rep: std.ArrayList(u32) = .empty,
+    /// Whether the page decoded last starts at a row: its first repetition level is 0, or
+    /// the column has no repetition.
+    page_starts_row: bool = true,
     /// Rows started in the entries decoded and not yet returned by `ColumnCursor`: entries
     /// with repetition level 0, or all entries when the column has no repetition.
     row_starts: usize = 0,
@@ -1076,13 +1117,13 @@ const ChunkDecoder = struct {
         // Repetition levels come before definition levels.
         var rep: ?[]const u32 = null;
         if (self.info.max_rep_level > 0) {
-            const out = try resizeList(self.allocator, &self.rep, n);
+            const out = try self.levelsOut(&self.out_rep, &self.rep, n);
             data = try decodeV1Levels(data, dph.repetition_level_encoding, self.rep_bits, out);
             rep = out;
         }
         var def: ?[]const u32 = null;
         if (self.info.max_def_level > 0) {
-            const out = try resizeList(self.allocator, &self.levels, n);
+            const out = try self.levelsOut(&self.out_def, &self.levels, n);
             data = try decodeV1Levels(data, dph.definition_level_encoding, self.def_bits, out);
             def = out;
         }
@@ -1129,13 +1170,13 @@ const ChunkDecoder = struct {
         // are 0 (repetition) or the maximum (definition).
         var rep: ?[]const u32 = null;
         if (self.info.max_rep_level > 0) {
-            const out = try resizeList(self.allocator, &self.rep, n);
+            const out = try self.levelsOut(&self.out_rep, &self.rep, n);
             if (rep_data.len > 0) try rle.decodeInto(rep_data, self.rep_bits, out) else @memset(out, 0);
             rep = out;
         }
         var def: ?[]const u32 = null;
         if (self.info.max_def_level > 0) {
-            const out = try resizeList(self.allocator, &self.levels, n);
+            const out = try self.levelsOut(&self.out_def, &self.levels, n);
             if (def_data.len > 0) try rle.decodeInto(def_data, self.def_bits, out) else @memset(out, self.info.max_def_level);
             def = out;
         }
@@ -1154,17 +1195,30 @@ const ChunkDecoder = struct {
         encoding: format.Encoding,
     ) !void {
         if (self.keep_levels) {
-            if (def) |d| try self.out_def.appendSlice(self.allocator, d);
-            if (rep) |r| try self.out_rep.appendSlice(self.allocator, r);
+            if (def) |d| try self.keepLevels(&self.out_def, d);
+            if (rep) |r| try self.keepLevels(&self.out_rep, r);
         }
+        self.page_starts_row = if (rep) |r| r.len == 0 or r[0] == 0 else true;
         if (rep) |r| {
             for (r) |lv| self.row_starts += @intFromBool(lv == 0);
         } else self.row_starts += n;
         var present: ?[]const u32 = null;
         var non_null = n;
+        var slots = n;
         if (def) |d| {
             const max_def = self.info.max_def_level;
-            if (max_def == 1) {
+            if (self.slot_level > 0) {
+                // The presence of the entries that have a slot.
+                const m = try resizeList(self.allocator, &self.mask, n);
+                const slot_level = self.slot_level;
+                var k: usize = 0;
+                for (d) |lv| {
+                    m[k] = @intFromBool(lv == max_def);
+                    k += @intFromBool(lv >= slot_level);
+                }
+                slots = k;
+                present = m[0..k];
+            } else if (max_def == 1) {
                 // Levels are 0 or 1 (bit width 1), so they serve as the presence mask.
                 present = d;
             } else {
@@ -1174,7 +1228,25 @@ const ChunkDecoder = struct {
             }
             non_null = countPresent(present.?);
         }
-        try self.decodeValues(b, data, n, present, non_null, encoding);
+        try self.decodeValues(b, data, slots, present, non_null, encoding);
+    }
+
+    /// Where a page's `n` levels are decoded. When levels are kept, that is the unused
+    /// capacity of `kept`, so `keepLevels` adds them without copying; otherwise `scratch`.
+    fn levelsOut(self: *ChunkDecoder, kept: *std.ArrayList(u32), scratch: *std.ArrayList(u32), n: usize) ![]u32 {
+        if (!self.keep_levels) return resizeList(self.allocator, scratch, n);
+        try kept.ensureUnusedCapacity(self.allocator, n);
+        return kept.unusedCapacitySlice()[0..n];
+    }
+
+    /// Adds a page's levels to `list`; levels decoded into its unused capacity by
+    /// `levelsOut` are not copied.
+    fn keepLevels(self: *ChunkDecoder, list: *std.ArrayList(u32), levels: []const u32) !void {
+        if (list.capacity > list.items.len and levels.ptr == list.items.ptr + list.items.len) {
+            list.items.len += levels.len;
+        } else {
+            try list.appendSlice(self.allocator, levels);
+        }
     }
 
     fn resizeList(allocator: Allocator, list: *std.ArrayList(u32), n: usize) ![]u32 {

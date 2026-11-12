@@ -32,6 +32,8 @@ const Totals = struct {
     skipped_large: usize = 0,
     /// Page headers longer than the page reader's first read.
     long_headers: usize = 0,
+    /// Chunks of repeated columns decoded with each slot level.
+    slotted: usize = 0,
 };
 
 test "leaf decoder decodes every leaf column chunk of the test files without leaks" {
@@ -85,10 +87,11 @@ test "leaf decoder decodes every leaf column chunk of the test files without lea
     totals.files = jobs.items.len;
 
     std.debug.print(
-        "\nleaf decoder sweep: {d} files ({d} unreadable), {d} leaf chunks: {d} decoded, {d} errors, {d} skipped (over {d} MiB); {d} page headers over 1 KiB\n",
-        .{ totals.files, totals.files_unreadable, totals.chunks, totals.decoded, totals.errors, totals.skipped_large, @divExact(max_sweep_chunk_bytes, 1024 * 1024), totals.long_headers },
+        "\nleaf decoder sweep: {d} files ({d} unreadable), {d} leaf chunks: {d} decoded, {d} errors, {d} skipped (over {d} MiB); {d} page headers over 1 KiB; {d} repeated chunks equal with each slot level\n",
+        .{ totals.files, totals.files_unreadable, totals.chunks, totals.decoded, totals.errors, totals.skipped_large, @divExact(max_sweep_chunk_bytes, 1024 * 1024), totals.long_headers, totals.slotted },
     );
     try std.testing.expect(totals.decoded > 0);
+    try std.testing.expect(totals.slotted > 0);
 }
 
 fn decodeFile(allocator: std.mem.Allocator, dir: std.Io.Dir, basename: []const u8, totals: *Totals) !void {
@@ -138,10 +141,23 @@ fn decodeFile(allocator: std.mem.Allocator, dir: std.Io.Dir, basename: []const u
             const entries = leaf.buffers.length;
             for ([_]usize{ 1, 7, 1000 }) |rows| {
                 if (entries > rows * 1000) continue;
-                expectCursorMatches(allocator, page_data, meta, info, &leaf, rows) catch |err| {
+                expectCursorMatches(allocator, page_data, meta, info, &leaf, rows, 0) catch |err| {
                     std.debug.print("cursor mismatch, {d} rows per batch: {s} column {d}: {s}\n", .{ rows, basename, col, @errorName(err) });
                     return err;
                 };
+            }
+
+            // With each slot level of a repeated column, the buffers hold the entries at or
+            // above it, whole and through a cursor, and the levels are unchanged.
+            if (info.max_rep_level > 0 and leaf.def_levels != null) {
+                var slot_level: u32 = 1;
+                while (slot_level <= info.max_def_level) : (slot_level += 1) {
+                    expectSlotsMatch(allocator, page_data, meta, info, &leaf, slot_level) catch |err| {
+                        std.debug.print("slot level {d} mismatch: {s} column {d}: {s}\n", .{ slot_level, basename, col, @errorName(err) });
+                        return err;
+                    };
+                }
+                totals.slotted += 1;
             }
 
             if (leaf_decoder.isFlat(info)) {
@@ -162,24 +178,28 @@ fn expectCursorMatches(
     info: format.ColumnInfo,
     full: *const leaf_decoder.Leaf,
     rows: usize,
+    slot_level: u32,
 ) !void {
-    var cursor = try leaf_decoder.ColumnCursor.init(allocator, leaf_decoder.PageReader.fromMemory(allocator, page_data), meta, info, .{ .keep_levels = true, .large_offsets = true }, 0);
+    var cursor = try leaf_decoder.ColumnCursor.init(allocator, leaf_decoder.PageReader.fromMemory(allocator, page_data), meta, info, .{ .keep_levels = true, .large_offsets = true, .slot_level = slot_level }, 0);
     defer cursor.deinit();
+    // Buffer entries and levels returned so far; they differ with a slot level.
     var at: usize = 0;
+    var level_at: usize = 0;
     var short = false;
     while (true) {
         var batch = try cursor.next(rows);
         defer batch.deinit(allocator);
         const b = &batch.buffers;
-        if (b.length == 0) break;
+        const batch_entries = if (batch.def_levels) |d| d.len else b.length;
+        if (batch_entries == 0) break;
         // Only the last batch may hold fewer rows.
         try std.testing.expect(!short);
-        const batch_rows = if (batch.rep_levels) |r| countZeros(r) else b.length;
+        const batch_rows = if (batch.rep_levels) |r| countZeros(r) else batch_entries;
         if (batch_rows < rows) short = true;
         try std.testing.expect(batch_rows <= rows);
         // A batch starts at a row boundary (except in files whose levels do not start at 0).
         if (batch.rep_levels) |r| {
-            if (at > 0 or full.rep_levels.?[0] == 0) try std.testing.expectEqual(@as(u32, 0), r[0]);
+            if (level_at > 0 or full.rep_levels.?[0] == 0) try std.testing.expectEqual(@as(u32, 0), r[0]);
         }
 
         try std.testing.expect(at + b.length <= full.buffers.length);
@@ -200,11 +220,43 @@ fn expectCursorMatches(
             const pad: u8 = ~((@as(u8, 1) << @intCast(b.length % 8)) - 1);
             try std.testing.expectEqual(pad, b.validity[b.length / 8] & pad);
         }
-        if (full.def_levels) |d| try std.testing.expectEqualSlices(u32, d[at..][0..b.length], batch.def_levels.?);
-        if (full.rep_levels) |r| try std.testing.expectEqualSlices(u32, r[at..][0..b.length], batch.rep_levels.?);
+        if (full.def_levels) |d| try std.testing.expectEqualSlices(u32, d[level_at..][0..batch_entries], batch.def_levels.?);
+        if (full.rep_levels) |r| try std.testing.expectEqualSlices(u32, r[level_at..][0..batch_entries], batch.rep_levels.?);
         at += b.length;
+        level_at += batch_entries;
     }
     try std.testing.expectEqual(full.buffers.length, at);
+}
+
+/// Decodes the chunk with `slot_level` and checks that the buffers hold the entries of
+/// `full` (decoded without it) whose definition level is at least `slot_level`, and that the
+/// levels are those of `full`; then the same through a cursor, 7 rows per call.
+fn expectSlotsMatch(
+    allocator: std.mem.Allocator,
+    page_data: []const u8,
+    meta: format.ColumnMetaData,
+    info: format.ColumnInfo,
+    full: *const leaf_decoder.Leaf,
+    slot_level: u32,
+) !void {
+    var slotted = try leaf_decoder.decodeLeaf(allocator, page_data, meta, info, .{ .keep_levels = true, .large_offsets = true, .slot_level = slot_level });
+    defer slotted.deinit(allocator);
+    var want = try full.buffers.select(allocator, full.def_levels.?, slot_level, std.math.maxInt(usize));
+    defer want.deinit(allocator);
+    const b = &slotted.buffers;
+    try std.testing.expectEqual(want.length, b.length);
+    try std.testing.expectEqual(want.null_count, b.null_count);
+    for (0..b.length) |i| {
+        try std.testing.expectEqual(want.isValid(i), b.isValid(i));
+        switch (b.layout) {
+            .bits => try std.testing.expectEqual(getBit(want.values.ptr, i), getBit(b.values.ptr, i)),
+            .fixed => |w| try std.testing.expectEqualSlices(u8, want.values[i * w ..][0..w], b.values[i * w ..][0..w]),
+            .bytes => try std.testing.expectEqualSlices(u8, want.bytesAt(i), b.bytesAt(i)),
+        }
+    }
+    try std.testing.expectEqualSlices(u32, full.def_levels.?, slotted.def_levels.?);
+    if (full.rep_levels) |r| try std.testing.expectEqualSlices(u32, r, slotted.rep_levels.?);
+    if (full.def_levels.?.len <= 7000) try expectCursorMatches(allocator, page_data, meta, info, &slotted, 7, slot_level);
 }
 
 /// Reads a chunk's pages from memory and from the source, and checks that headers and bodies

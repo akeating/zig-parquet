@@ -261,6 +261,97 @@ pub fn levelShape(
     info: LevelInfo,
     is_list: bool,
 ) ShapeError!LevelShape {
+    if (def) |d| if (d.len < entries) return error.InvalidPageData;
+    if (rep) |r| if (r.len < entries) return error.InvalidPageData;
+    // Specialized on which levels exist and the node kind, so the loops have no branches
+    // on them.
+    const has_def = def != null;
+    const has_rep = rep != null;
+    inline for (.{ false, true }) |hd| inline for (.{ false, true }) |hr| inline for (.{ false, true }) |list| {
+        if (hd == has_def and hr == has_rep and list == is_list) {
+            return shapeOf(hd, hr, list, allocator, if (hd) def.?[0..entries] else &.{}, if (hr) rep.?[0..entries] else &.{}, entries, info);
+        }
+    };
+    unreachable;
+}
+
+/// `levelShape` for one combination of levels and node kind. An entry starts a slot when its
+/// repetition level is below the node's (at or below it for a struct) and its definition
+/// level is at least `ancestor_def_level`; such an entry of a list or map at the node's
+/// repetition level is another element of the current slot. The loops do not branch on the
+/// levels except at null slots: an offset is written at the current slot for every entry,
+/// and the entry that starts the slot writes last (`length + 1` offsets have room for the
+/// writes after the last slot starts).
+fn shapeOf(
+    comptime has_def: bool,
+    comptime has_rep: bool,
+    comptime is_list: bool,
+    allocator: Allocator,
+    def: []const u32,
+    rep: []const u32,
+    entries: usize,
+    info: LevelInfo,
+) ShapeError!LevelShape {
+    const rl = info.rep_level;
+    const al = info.ancestor_def_level;
+    const dl = info.def_level;
+
+    var length: usize = 0;
+    for (0..entries) |i| {
+        const d: u32 = if (has_def) def[i] else 0;
+        const r: u32 = if (has_rep) rep[i] else 0;
+        const starts = (if (is_list) r < rl else r <= rl) and d >= al;
+        length += @intFromBool(starts);
+    }
+
+    const validity = try allocBuffer(allocator, (length + 7) / 8);
+    errdefer allocator.free(validity);
+    @memset(validity, 0xFF);
+    const offsets_buf: ?Buffer = if (is_list) try allocBuffer(allocator, (length + 1) * 4) else null;
+    errdefer if (offsets_buf) |o| allocator.free(o);
+    const offsets: []u32 = if (is_list) @as([*]u32, @ptrCast(@alignCast(offsets_buf.?.ptr)))[0 .. length + 1] else &.{};
+
+    var slot: usize = 0;
+    var end: usize = 0;
+    var null_count: usize = 0;
+    // An element before the first slot: levels that do not start at a row.
+    var orphan = false;
+    for (0..entries) |i| {
+        const d: u32 = if (has_def) def[i] else 0;
+        const r: u32 = if (has_rep) rep[i] else 0;
+        const counted = d >= al;
+        const starts = (if (is_list) r < rl else r <= rl) and counted;
+        const valid = if (is_list) d + 1 >= dl else d >= dl;
+        if (is_list) {
+            const another = r == rl and counted;
+            orphan = orphan or (another and slot == 0);
+            // When `starts`, slot `slot` starts here; otherwise this write is replaced by the
+            // entry that starts it, or by the last offset.
+            offsets[slot] = @truncate(end);
+            end += @intFromBool(another or (starts and d >= dl));
+        }
+        if (starts and !valid) {
+            arrow.clearBit(validity, slot);
+            null_count += 1;
+        }
+        slot += @intFromBool(starts);
+    }
+    if (orphan) return error.InvalidPageData;
+    if (is_list) {
+        if (end > std.math.maxInt(i32)) return error.IntegerOverflow;
+        offsets[length] = @intCast(end);
+    }
+    return .{ .length = length, .elements = end, .validity = validity, .null_count = @intCast(null_count), .offsets = offsets_buf };
+}
+
+fn levelShapeReference(
+    allocator: Allocator,
+    def: ?[]const u32,
+    rep: ?[]const u32,
+    entries: usize,
+    info: LevelInfo,
+    is_list: bool,
+) ShapeError!LevelShape {
     var length: usize = 0;
     for (0..entries) |i| {
         const d = if (def) |x| x[i] else 0;
@@ -307,4 +398,49 @@ pub fn levelShape(
     if (is_list) offsets[length] = try safe.castTo(i32, end);
 
     return .{ .length = length, .elements = end, .validity = validity, .null_count = null_count, .offsets = offsets_buf };
+}
+
+test "levelShape equals the reference on random levels" {
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x5eed);
+    const random = prng.random();
+    var def: [300]u32 = undefined;
+    var rep: [300]u32 = undefined;
+    for (0..2000) |_| {
+        const n = random.uintAtMost(usize, def.len);
+        const max_def = random.uintAtMost(u32, 4);
+        const max_rep = random.uintAtMost(u32, 2);
+        for (def[0..n], rep[0..n], 0..) |*d, *r, i| {
+            d.* = random.uintAtMost(u32, max_def);
+            // Mostly well-formed: the first entry starts a row.
+            r.* = if (i == 0 and random.boolean()) 0 else random.uintAtMost(u32, max_rep);
+        }
+        const info: LevelInfo = .{
+            .def_level = random.uintAtMost(u32, max_def + 1),
+            .rep_level = random.uintAtMost(u32, max_rep),
+            .ancestor_def_level = random.uintAtMost(u32, max_def),
+        };
+        const d: ?[]const u32 = if (max_def > 0) def[0..n] else null;
+        const r: ?[]const u32 = if (max_rep > 0) rep[0..n] else null;
+        for ([_]bool{ false, true }) |is_list| {
+            const want = levelShapeReference(allocator, d, r, n, info, is_list);
+            const got = levelShape(allocator, d, r, n, info, is_list);
+            if (want) |w| {
+                const g = try got;
+                defer {
+                    allocator.free(w.validity);
+                    allocator.free(g.validity);
+                    if (w.offsets) |o| allocator.free(o);
+                    if (g.offsets) |o| allocator.free(o);
+                }
+                try std.testing.expectEqual(w.length, g.length);
+                try std.testing.expectEqual(w.elements, g.elements);
+                try std.testing.expectEqual(w.null_count, g.null_count);
+                try std.testing.expectEqualSlices(u8, w.validity, g.validity);
+                if (is_list) try std.testing.expectEqualSlices(u8, w.offsets.?, g.offsets.?);
+            } else |e| {
+                try std.testing.expectError(e, got);
+            }
+        }
+    }
 }

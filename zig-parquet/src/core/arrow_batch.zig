@@ -946,6 +946,8 @@ pub const ArrowBatchReader = struct {
         col_idx: usize,
         /// Whether the leaf is part of a list, map or struct column, which needs its levels.
         nested: bool,
+        /// `leaf_decoder.Options.slot_level` of the leaf (see `slotLevels`).
+        slot_level: u32,
     };
 
     /// A row group decoded by `RowGroupJob`, cut into the pieces batches take.
@@ -1004,10 +1006,18 @@ pub const ArrowBatchReader = struct {
         for (columns) |c| {
             const node = &tree[c];
             if (node.physical_count == 0) return error.InvalidSchema;
+            const slot_levels = try a.alloc(u32, node.physical_count);
+            slotLevels(node, node.physical_start, slot_levels);
             for (0..node.physical_count) |j| {
                 const col_idx = node.physical_start + j;
                 const info = format.getColumnInfo(metadata.schema, col_idx) orelse return error.InvalidSchema;
-                leaf_info[k] = .{ .max_def = info.max_def_level, .max_rep = info.max_rep_level, .col_idx = col_idx, .nested = node.kind != .leaf };
+                leaf_info[k] = .{
+                    .max_def = info.max_def_level,
+                    .max_rep = info.max_rep_level,
+                    .col_idx = col_idx,
+                    .nested = node.kind != .leaf,
+                    .slot_level = slot_levels[j],
+                };
                 k += 1;
             }
         }
@@ -1253,7 +1263,11 @@ pub const ArrowBatchReader = struct {
         const range = try parquet_reader.columnChunkRange(chunk);
         const pages = leaf_decoder.PageReader.fromSource(allocator, source, range.start, range.size);
         const reserve = @min(batch_rows orelse std.math.maxInt(usize), safe.castTo(usize, meta.num_values) catch 0);
-        return leaf_decoder.ColumnCursor.init(allocator, pages, meta, col_info, .{ .keep_levels = info.nested, .large_offsets = large_offsets }, reserve);
+        return leaf_decoder.ColumnCursor.init(allocator, pages, meta, col_info, .{
+            .keep_levels = info.nested,
+            .large_offsets = large_offsets,
+            .slot_level = if (info.nested) info.slot_level else 0,
+        }, reserve);
     }
 
     const CursorError = @typeInfo(@typeInfo(@TypeOf(leaf_decoder.ColumnCursor.next)).@"fn".return_type.?).error_union.error_set;
@@ -1310,7 +1324,7 @@ pub const ArrowBatchReader = struct {
             } else {
                 l.leaf = leaf_decoder.concatLeaves(allocator, p.items) catch |e| return asErrorOf(ReaderError, e);
             }
-            l.entries = l.leaf.buffers.length;
+            l.entries = levelCount(&l.leaf);
             l.max_def = levels.max_def;
             l.max_rep = levels.max_rep;
             joined = k + 1;
@@ -1381,8 +1395,10 @@ pub const ArrowBatchReader = struct {
 
 /// A leaf column of a nested column, decoded with its levels.
 const NestedLeaf = struct {
+    /// Decoded with `Options.slot_level` from `slotLevels`: the buffers have no slots for
+    /// the entries of empty and null lists and maps.
     leaf: leaf_decoder.Leaf,
-    /// Entries decoded. The buffers can be moved out before the levels are used.
+    /// Entries decoded: the number of levels.
     entries: usize,
     max_def: u32,
     max_rep: u32,
@@ -1401,19 +1417,21 @@ fn readNestedColumn(
     if (node.physical_count == 0) return error.InvalidSchema;
     if (node.physical_start + node.physical_count > rg.columns.len) return error.InvalidArgument;
     const leaves = try allocator.alloc(NestedLeaf, node.physical_count);
+    defer allocator.free(leaves);
     const decoded = try allocator.alloc(bool, node.physical_count);
+    defer allocator.free(decoded);
     @memset(decoded, false);
-    defer {
-        for (leaves, decoded) |*l, d| if (d) l.leaf.deinit(allocator);
-        allocator.free(leaves);
-        allocator.free(decoded);
-    }
+    defer for (leaves, decoded) |*l, d| if (d) l.leaf.deinit(allocator);
+    const slot_levels = try allocator.alloc(u32, node.physical_count);
+    defer allocator.free(slot_levels);
+    slotLevels(node, node.physical_start, slot_levels);
     const task: NestedLeafTask = .{
         .allocator = allocator,
         .source = source,
         .metadata = metadata,
         .rg = rg,
         .first = node.physical_start,
+        .slot_levels = slot_levels,
         .leaves = leaves,
         .decoded = decoded,
     };
@@ -1428,6 +1446,7 @@ const NestedLeafTask = struct {
     metadata: format.FileMetaData,
     rg: *const format.RowGroup,
     first: usize,
+    slot_levels: []const u32,
     leaves: []NestedLeaf,
     decoded: []bool,
 
@@ -1440,14 +1459,31 @@ const NestedLeafTask = struct {
         defer allocator.free(page_data);
         const info = format.getColumnInfo(self.metadata.schema, col_idx) orelse return error.InvalidArgument;
         const l = &self.leaves[k];
-        l.leaf = leaf_decoder.decodeLeaf(allocator, page_data, meta, info, .{ .keep_levels = true }) catch |e|
+        l.leaf = leaf_decoder.decodeLeaf(allocator, page_data, meta, info, .{ .keep_levels = true, .slot_level = self.slot_levels[k] }) catch |e|
             return asErrorOf(ReaderError, e);
-        l.entries = l.leaf.buffers.length;
+        l.entries = levelCount(&l.leaf);
         l.max_def = info.max_def_level;
         l.max_rep = info.max_rep_level;
         self.decoded[k] = true;
     }
 };
+
+/// Sets `out[k]` to the `leaf_decoder.Options.slot_level` of leaf column `base + k` under
+/// `node`: the definition level of its innermost list or map, or 0 outside lists and maps.
+fn slotLevels(node: *const Node, base: usize, out: []u32) void {
+    if (node.kind == .leaf) {
+        out[node.physical_start - base] = node.levels.ancestor_def_level;
+        return;
+    }
+    for (node.children) |*c| slotLevels(c, base, out);
+}
+
+/// The number of entries of a leaf decoded with levels.
+fn levelCount(leaf: *const leaf_decoder.Leaf) usize {
+    if (leaf.def_levels) |d| return d.len;
+    if (leaf.rep_levels) |r| return r.len;
+    return leaf.buffers.length;
+}
 
 /// Assembles `node` from its decoded leaves; `leaves[k]` is leaf column `base + k`.
 /// Shapes are computed from the node's first leaf before the children take their buffers.
@@ -1457,9 +1493,14 @@ fn assembleNode(allocator: Allocator, schema: []const format.SchemaElement, node
         .leaf => {
             if (first.max_def != node.levels.def_level or first.max_rep != node.levels.rep_level) return error.InvalidSchema;
             // Slots: entries at or above the nearest repeated ancestor's definition level.
+            // A leaf decoded with that `slot_level` has buffers with fewer entries than
+            // levels, or the same number when every entry has a slot.
             const bufs = if (first.leaf.def_levels) |d|
-                first.leaf.buffers.take(allocator, d, node.levels.ancestor_def_level, std.math.maxInt(usize)) catch |e|
-                    return asErrorOf(ReaderError, e)
+                if (first.leaf.buffers.length < d.len)
+                    first.leaf.buffers.takeAll()
+                else
+                    first.leaf.buffers.take(allocator, d, node.levels.ancestor_def_level, std.math.maxInt(usize)) catch |e|
+                        return asErrorOf(ReaderError, e)
             else
                 first.leaf.buffers.takeAll();
             return leafToArrow(allocator, bufs, schema[node.schema_idx]);
