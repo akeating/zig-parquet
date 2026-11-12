@@ -45,12 +45,7 @@ jobs:
         run: zig build wasm-smoke
 
       - name: Build examples
-        run: |
-          cd zig-parquet/examples/basic && zig build
-          cd ../../examples/large_file && zig build
-          cd ../../examples/gen-eeg && zig build
-          cd ../../examples/wasm_demo && zig build
-          cd ../../examples/wasm_freestanding && zig build
+        run: make examples
 
       - name: Run freestanding WASM example
         working-directory: zig-parquet/examples/wasm_freestanding

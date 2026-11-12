@@ -24,6 +24,7 @@ help:
 	@echo "  make test-lib          Library tests only (honors CODECS, OPT)"
 	@echo "  make test-cli          CLI tests only (honors OPT)"
 	@echo "  make example NAME=...  Build an example (honors OPT)"
+	@echo "  make examples          Build every example (honors OPT)"
 	@echo "  make wasm              Verify WASM targets compile and link"
 	@echo "  make validate-wild     Validate pqi against wild files (failures only)"
 	@echo "  make validate-wild-all Validate pqi against wild files (show all)"
@@ -38,7 +39,7 @@ help:
 	@echo "  make example NAME=basic"
 	@echo "  make example NAME=wasm_demo OPT=ReleaseSmall"
 	@echo ""
-	@echo "Examples (NAME=): basic, gen-eeg, gen-power-grid, large_file,"
+	@echo "Examples (NAME=): basic, gen-power-grid, large_file,"
 	@echo "                  wasm_demo, wasm_freestanding"
 	@echo ""
 	@echo "CODECS values: all (default), none, zig-only, c-only,"
@@ -69,9 +70,17 @@ test-cli:
 
 .PHONY: example
 example:
-	@test -n "$(NAME)" || { echo "usage: make example NAME=<basic|gen-eeg|gen-power-grid|large_file|wasm_demo|wasm_freestanding>"; exit 1; }
-	@test -d $(EXAMPLES_DIR)/$(NAME) || { echo "no such example: $(NAME)"; ls $(EXAMPLES_DIR); exit 1; }
+	@test -n "$(NAME)" || { echo "usage: make example NAME=<basic|gen-power-grid|large_file|wasm_demo|wasm_freestanding>"; exit 1; }
+	@test -f $(EXAMPLES_DIR)/$(NAME)/build.zig || { echo "no such example: $(NAME)"; ls $(EXAMPLES_DIR); exit 1; }
 	cd $(EXAMPLES_DIR)/$(NAME) && zig build $(OPT_FLAG)
+
+.PHONY: examples
+examples:
+	@for d in $(EXAMPLES_DIR)/*/; do \
+		test -f $$d/build.zig || continue; \
+		echo "cd $$d && zig build $(OPT_FLAG)"; \
+		(cd $$d && zig build $(OPT_FLAG)) || exit 1; \
+	done
 
 .PHONY: wasm
 wasm:

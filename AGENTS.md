@@ -53,6 +53,7 @@ make test CODECS=c-zstd,zstd           # Cross-implementation (both zstd codecs)
 make lib CODECS=c-brotli OPT=ReleaseSmall  # Size-measured release build
 make example NAME=basic                # Build an example (NAME is required)
 make example NAME=wasm_demo OPT=ReleaseSmall
+make examples                          # Build every example (CI runs this)
 make wasm                              # Verify WASM targets compile and link
 make validate-wild                     # Validate pqi against wild files (failures)
 make validate-wild-all                 # Validate pqi against wild files (all)
@@ -61,6 +62,8 @@ make clean                             # Remove .zig-cache and zig-out everywher
 ```
 
 `CODECS` values: `all` (default), `none`, `zig-only`, `c-only`, or comma-separated list from `zstd,snappy,gzip,lz4,brotli` (Zig) and `c-zstd,c-snappy,c-gzip,c-lz4,c-brotli` (C/C++).
+
+The build runner prints a step's stderr under a `run test stderr` heading followed by `failed command: <command line>`, also when the step passed. Several tests print summary lines (for example `PyArrow comparison: …`), so that block appears on passing runs. Use the exit status or `zig build test --summary all` (`Build Summary: N/N steps succeeded`) to tell whether tests passed.
 
 ## Zig 0.17 — Key API Patterns
 
@@ -162,7 +165,12 @@ const name_z = try allocator.dupeSentinel(u8, name, 0);
 
 // std.hash.crc.Crc32 moved
 const sum = std.hash.Crc32.hash(data);
+
+// Build.args was removed; run steps take the arguments after `--` themselves
+run_cmd.addPassthruArgs();                          // NOT if (b.args) |args| run_cmd.addArgs(args)
 ```
+
+`@min` and `@max` with a comptime-known operand return the narrowest type that holds the result: `@min(remaining, 1024)` is a `u11`. Give the variable an explicit type when it grows later (`var want: usize = @min(remaining, 1024);`); otherwise `want * 4` overflows.
 
 `@cImport` was removed. C headers are translated by the build system: each C codec has a header in `src/core/compress/c/<name>.h`, `addCImport` in `build.zig` translates it, and the Zig code imports it with `@import("c_<name>")`.
 

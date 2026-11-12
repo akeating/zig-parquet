@@ -45,9 +45,7 @@ pub fn build(b: *std.Build) void {
 
     const run_read = b.addRunArtifact(read_exe);
     run_read.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        run_read.addArgs(args);
-    }
+    run_read.addPassthruArgs();
     const run_read_step = b.step("read", "Read random segment from grid data file");
     run_read_step.dependOn(&run_read.step);
 }
