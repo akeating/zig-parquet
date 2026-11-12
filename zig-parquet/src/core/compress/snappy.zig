@@ -254,7 +254,8 @@ fn snappyDecode(src: []const u8, dst: []u8) error{DecompressionError}!usize {
                     const extra = upper6 - 59; // 1..4
                     const raw = std.mem.readInt(u32, src[sp..][0..4], .little) & trailer_mask[extra];
                     sp += extra;
-                    lit_len = @as(usize, raw) + 1;
+                    // On 32-bit targets a 4-byte length of 0xffffffff would overflow usize.
+                    lit_len = std.math.add(usize, raw, 1) catch return error.DecompressionError;
                 }
                 if (lit_len <= 16) {
                     // 21 input bytes were left before the header of at most 5 bytes, and the
@@ -316,11 +317,11 @@ fn snappyDecode(src: []const u8, dst: []u8) error{DecompressionError}!usize {
                         raw |= @as(u32, src[sp + j]) << (safe.castTo(u5, j * 8) catch unreachable); // j*8 is 0,8,16,24
                     }
                     sp += extra;
-                    lit_len = (safe.cast(raw) catch return error.DecompressionError) + 1;
+                    lit_len = std.math.add(usize, safe.cast(raw) catch return error.DecompressionError, 1) catch return error.DecompressionError;
                 }
 
-                if (sp + lit_len > src.len) return error.DecompressionError;
-                if (dp + lit_len > expected_len) return error.DecompressionError;
+                if (lit_len > src.len - sp) return error.DecompressionError;
+                if (lit_len > expected_len - dp) return error.DecompressionError;
                 if (lit_len <= 16 and src.len - sp >= 16 and expected_len - dp >= 16) {
                     // Copy 16 bytes; the bytes past `lit_len` are overwritten by what follows.
                     dst[dp..][0..16].* = src[sp..][0..16].*;

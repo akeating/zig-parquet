@@ -61,6 +61,11 @@ const max_reserved_entries: usize = 64 * 1024 * 1024;
 /// column chunk's `total_uncompressed_size`.
 const max_reserved_bytes: usize = 256 * 1024 * 1024;
 
+/// Upper bound on the entries of one data page. The entries are reserved, and their levels
+/// decoded, before the values: a few bytes of run-length levels can declare billions of
+/// entries. Writers end pages far below this (PyArrow at 1 MiB or 20,000 rows).
+const max_page_entries: usize = 64 * 1024 * 1024;
+
 /// Alignment of the output buffers. The Arrow C Data Interface requires at least 8 bytes and
 /// recommends 64.
 pub const buffer_alignment: std.mem.Alignment = .@"64";
@@ -486,6 +491,10 @@ pub const PageReader = struct {
         const source = self.source orelse return error.EndOfData;
         const more = std.math.cast(usize, @min(extra, self.end - (at + n))) orelse return error.OutOfMemory;
         const len = std.math.add(usize, n, more) catch return error.OutOfMemory;
+        // The bytes must lie in the source; the buffer is allocated before it is read, so
+        // sizes from a damaged footer or page header are bounded by the file's size.
+        const source_size = source.size();
+        if (at > source_size or len > source_size - at) return error.EndOfData;
         // The window is refilled below; until then it must not point into the buffer, which
         // may be freed or overwritten, in case the allocation or the read fails.
         self.window = &.{};
@@ -547,7 +556,13 @@ pub const ColumnCursor = struct {
             },
         };
         errdefer builder.deinit();
-        try builder.init(reserve);
+        // A FIXED_LEN_BYTE_ARRAY type length comes from the file and can be up to 2^31-1:
+        // the entries reserved are capped in bytes as well.
+        const reserve_entries = switch (builder.kind) {
+            .fixed => |w| @min(reserve, max_reserved_bytes / @max(w, 1)),
+            else => reserve,
+        };
+        try builder.init(reserve_entries);
         // A cursor that returns the whole chunk at once reserves the bytes of byte-array
         // entries: the chunk's uncompressed size bounds those of PLAIN pages (each value has
         // a 4-byte length before it). Growing the buffer page by page instead copies the
@@ -1149,10 +1164,12 @@ const ChunkDecoder = struct {
 
     fn decodeV1Page(self: *ChunkDecoder, b: *Builder, body: []const u8, dph: format.DataPageHeader, header: format.PageHeader) !void {
         const n = safe.cast(dph.num_values) catch return error.InvalidPageSize;
+        if (n > max_page_entries) return error.InvalidPageSize;
         if (n == 0) return;
 
         const decompressed = if (self.codec != .uncompressed) blk: {
             const size = safe.cast(header.uncompressed_page_size) catch return error.InvalidPageSize;
+            try parquet_reader.AllocationLimits.default.checkPageSize(size);
             break :blk compress.decompress(self.allocator, body, self.codec, size) catch return error.DecompressionError;
         } else body;
         defer if (self.codec != .uncompressed) self.allocator.free(decompressed);
@@ -1190,6 +1207,7 @@ const ChunkDecoder = struct {
 
     fn decodeV2Page(self: *ChunkDecoder, b: *Builder, body: []const u8, v2: format.DataPageHeaderV2, header: format.PageHeader) !void {
         const n = safe.cast(v2.num_values) catch return error.InvalidPageSize;
+        if (n > max_page_entries) return error.InvalidPageSize;
         if (n == 0) return;
         const rep_len = safe.cast(v2.repetition_levels_byte_length) catch return error.InvalidPageSize;
         const def_len = safe.cast(v2.definition_levels_byte_length) catch return error.InvalidPageSize;
@@ -1202,6 +1220,7 @@ const ChunkDecoder = struct {
         var allocated = false;
         const data = if (v2.is_compressed and self.codec != .uncompressed) blk: {
             const total = safe.cast(header.uncompressed_page_size) catch return error.InvalidPageSize;
+            try parquet_reader.AllocationLimits.default.checkPageSize(total);
             if (total < levels_len) return error.EndOfData;
             const size = total - levels_len;
             if (size == 0 or values_raw.len == 0) break :blk values_raw;

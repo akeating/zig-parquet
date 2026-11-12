@@ -128,7 +128,9 @@ pub fn decodeBitPackedLevelsInto(data: []const u8, bit_width: u5, result: anytyp
 
 /// Calculate the byte size needed for bit-packed levels
 pub fn bitPackedSize(num_values: usize, bit_width: u5) usize {
-    return (num_values * bit_width + 7) / 8;
+    // Saturating: on 32-bit targets the product can overflow; callers slice with this size,
+    // which then fails as too short.
+    return ((num_values *| bit_width) +| 7) / 8;
 }
 
 const VarIntResult = struct {

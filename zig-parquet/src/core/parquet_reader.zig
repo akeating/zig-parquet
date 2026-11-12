@@ -143,6 +143,8 @@ pub fn readColumnChunkData(
 ) ReaderError![]u8 {
     const range = try columnChunkRange(chunk);
     const size = try safe.cast(range.size);
+    // The chunk must lie in the file; it is allocated before it is read.
+    if (range.start > source.size() or range.size > source.size() - range.start) return error.InvalidArgument;
 
     // Read the data
     const data = allocator.alloc(u8, size) catch return error.OutOfMemory;

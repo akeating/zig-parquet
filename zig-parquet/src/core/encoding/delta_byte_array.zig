@@ -26,8 +26,14 @@ pub const Error = error{
     InvalidSuffixLength,
     PrefixLengthTooLarge,
     InsufficientData,
+    OutputTooLarge,
     OutOfMemory,
 } || delta_binary_packed.Error;
+
+/// Upper bound on the bytes of the values decoded from one page. Each value can repeat all of
+/// the previous one as its prefix, so N values of a few encoded bytes each can decode to about
+/// N^2 / 2 bytes.
+pub const max_decoded_bytes: usize = 256 * 1024 * 1024;
 
 /// Decode DELTA_BYTE_ARRAY encoded strings
 /// Returns `error.InvalidValueCount` when the data declares more than `max_values` values.
@@ -87,6 +93,7 @@ pub fn decode(allocator: std.mem.Allocator, data: []const u8, max_values: usize)
     
     var suffix_offset: usize = 0;
     var last_value: []const u8 = "";
+    var decoded_bytes: usize = 0;
     
     for (0..num_values) |i| {
         const prefix_len = prefix_lengths[i];
@@ -105,6 +112,8 @@ pub fn decode(allocator: std.mem.Allocator, data: []const u8, max_values: usize)
         
         // Allocate space for this value
         const value_len = prefix_length + suffix_length;
+        decoded_bytes += value_len;
+        if (decoded_bytes > max_decoded_bytes) return error.OutputTooLarge;
         const value = allocator.alloc(u8, value_len) catch return error.OutOfMemory;
         errdefer allocator.free(value);
         

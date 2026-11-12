@@ -51,6 +51,7 @@ Real-world Parquet files from various sources for compatibility testing.
 | `nation.dict-malformed.parquet` | EndOfData | Intentionally corrupted dictionary | Expected failure |
 | `datapage_v1-corrupt-checksum.parquet` | PageChecksumMismatch | Intentionally corrupt CRC32 | Expected failure |
 | `rle-dict-uncompressed-corrupt-checksum.parquet` | PageChecksumMismatch | Intentionally corrupt CRC32 | Expected failure |
+| `large_string_map.brotli.parquet` | AllocationLimitExceeded | A 3 KB file with a page of about 2 GiB, above the 128 MiB page limit | Expected failure |
 
 ### Error Categories
 

@@ -139,6 +139,8 @@ pub const PageIndexReader = struct {
             return out;
         }
 
+        // The blobs must lie in the file; the span is allocated before it is read.
+        if (span_hi > self.source.size()) return error.InvalidPageIndex;
         const total_len_u64 = span_hi - span_lo.?;
         const total_len = safe.castTo(usize, total_len_u64) catch return error.IntegerOverflow;
         const buffer = try self.allocator.alloc(u8, total_len);
