@@ -747,7 +747,7 @@ const void* zp_value_get_struct_field_value(const void* value,
  * Supports multiple row groups via explicit flush() calls.
  *
  * Lifecycle: open -> add_column* -> [set_compression] -> begin
- *            -> [set_*/add_row]* -> [flush] -> close -> [get_buffer] -> free.
+ *            -> (set_* or add_row, repeated) -> [flush] -> close -> [get_buffer] -> free.
  *
  * Each flush() writes buffered rows as a new row group.
  * close() flushes remaining rows and writes the Parquet footer.
