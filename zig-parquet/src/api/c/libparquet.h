@@ -278,7 +278,8 @@ const char* zp_reader_error_message(zp_reader_t handle);
  * The stream borrows the reader handle; the reader must remain open
  * for the lifetime of the stream. Call stream->release() when done.
  *
- * @param handle      Reader handle (must stay open while stream is active).
+ * @param handle      Reader handle. zp_reader_close() with the stream open frees the
+ *                    reader when the stream is released.
  * @param stream_out  Output: initialized ArrowArrayStream.
  */
 int zp_reader_get_stream(zp_reader_t handle,
@@ -341,7 +342,8 @@ typedef struct zp_stream_options {
  *
  * The stream copies what it needs from options.
  *
- * @param handle      Reader handle (must stay open while stream is active).
+ * @param handle      Reader handle. zp_reader_close() with the stream open frees the
+ *                    reader when the stream is released.
  * @param options     Stream options, or NULL.
  * @param stream_out  Output: initialized ArrowArrayStream.
  * @return ZP_OK, or ZP_ERROR_INVALID_ARGUMENT for an invalid option (a
@@ -354,7 +356,11 @@ int zp_reader_get_stream_with_options(zp_reader_t handle,
                                       const zp_stream_options* options,
                                       struct ArrowArrayStream* stream_out);
 
-/** Close the reader and release all resources. */
+/**
+ * Close the reader and release all resources. Streams opened on the reader
+ * keep it until they are released; the handle must not be used after this
+ * call.
+ */
 void zp_reader_close(zp_reader_t handle);
 
 /* ========================================================================

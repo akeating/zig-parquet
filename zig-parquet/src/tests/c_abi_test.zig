@@ -2076,3 +2076,23 @@ test "C ABI reader: struct<id:i32, tags:list<i32>>" {
     try std.testing.expectEqual(@as(c_int, 1), c_row_reader.zp_value_get_list_len(tags1));
     try std.testing.expectEqual(@as(i32, 40), c_row_reader.zp_value_get_int32(c_row_reader.zp_value_get_list_element(tags1, 0)));
 }
+
+test "C ABI: a stream outlives zp_reader_close until it is released" {
+    const allocator = std.testing.allocator;
+    const buf = try createTestParquetBuffer(allocator);
+    defer allocator.free(buf);
+
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(c_err.ZP_OK, c_reader.zp_reader_open_memory(buf.ptr, buf.len, &handle));
+    var stream: ArrowArrayStream = undefined;
+    try std.testing.expectEqual(c_err.ZP_OK, c_reader.zp_reader_get_stream(handle, &stream));
+
+    // Closed while the stream is open: the stream still reads from the reader, and releasing
+    // the stream frees it. Before, the stream read freed memory.
+    c_reader.zp_reader_close(handle);
+    var batch: ArrowArray = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), stream.get_next.?(&stream, &batch));
+    try std.testing.expectEqual(@as(i64, 5), batch.length);
+    batch.doRelease();
+    stream.release.?(&stream);
+}

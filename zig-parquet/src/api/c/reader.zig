@@ -305,6 +305,7 @@ pub export fn zp_reader_get_stream_with_options(
         }
         return handle.err_ctx.code;
     };
+    handle.streamOpened();
 
     out.* = .{
         .get_schema = &streamGetSchema,
@@ -523,7 +524,7 @@ pub export fn zp_reader_get_kv_metadata_value(
 /// Close the reader handle and release all associated resources.
 pub export fn zp_reader_close(handle_ptr: ?*anyopaque) callconv(.c) void {
     const handle = castHandle(ReaderHandle, handle_ptr) orelse return;
-    handle.close();
+    handle.requestClose();
 }
 
 // ============================================================================
@@ -610,10 +611,12 @@ fn streamGetLastError(stream: *ArrowArrayStream) callconv(.c) ?[*:0]const u8 {
 
 fn streamRelease(stream: *ArrowArrayStream) callconv(.c) void {
     const pd: *StreamPrivateData = @ptrCast(@alignCast(stream.private_data));
+    const handle = pd.handle;
     pd.batches.deinit();
     pd.threads.deinit();
-    pd.handle.allocator.destroy(pd);
+    handle.allocator.destroy(pd);
     stream.release = null;
+    handle.streamReleased();
 }
 
 /// Private data for the wrapper struct ArrowArray.

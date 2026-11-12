@@ -76,13 +76,15 @@ pub const AllocationLimits = struct {
 /// Result of parsing a Parquet file footer
 pub const FooterInfo = struct {
     metadata: format.FileMetaData,
-    footer_data: []u8, // Caller must free with allocator
+    /// Holds the footer bytes and everything in `metadata`; `arena.deinit()` frees them.
+    arena: std.heap.ArenaAllocator,
 };
 
 /// Parse Parquet file footer from a SeekableReader.
 ///
 /// This validates the magic bytes, reads the footer, and parses the Thrift-encoded
-/// FileMetaData. The caller owns the returned footer_data and must free it.
+/// FileMetaData into an arena, which the caller owns (`FooterInfo.arena`). On error the arena
+/// is freed, so a malformed footer leaks nothing whichever field it breaks or repeats.
 ///
 /// This is the shared implementation used by Reader, DynamicReader, and RowReader.
 pub fn parseFooter(allocator: std.mem.Allocator, source: SeekableReader) ReaderError!FooterInfo {
@@ -103,9 +105,12 @@ pub fn parseFooter(allocator: std.mem.Allocator, source: SeekableReader) ReaderE
     const footer_size = std.mem.readInt(u32, tail[0..4], .little);
     if (footer_size > file_size - 8) return error.FooterTooLarge;
 
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+
     // Read footer data
-    const footer_data = allocator.alloc(u8, footer_size) catch return error.OutOfMemory;
-    errdefer allocator.free(footer_data);
+    const footer_data = a.alloc(u8, footer_size) catch return error.OutOfMemory;
 
     const footer_read = source.readAt(file_size - 8 - footer_size, footer_data) catch return error.InputOutput;
     if (footer_read != footer_size) return error.InputOutput;
@@ -120,13 +125,11 @@ pub fn parseFooter(allocator: std.mem.Allocator, source: SeekableReader) ReaderE
 
     // Parse the Thrift-encoded metadata
     var thrift_reader = thrift.CompactReader.init(footer_data);
-    const metadata = format.FileMetaData.parse(allocator, &thrift_reader) catch |e| {
-        return e;
-    };
+    const metadata = try format.FileMetaData.parse(a, &thrift_reader);
 
     return .{
         .metadata = metadata,
-        .footer_data = footer_data,
+        .arena = arena,
     };
 }
 

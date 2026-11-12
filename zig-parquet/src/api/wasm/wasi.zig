@@ -475,6 +475,7 @@ export fn zp_reader_get_stream_with_options(
         return handle.err_ctx.code;
     };
     pd.* = .{ .handle = handle, .batches = batches };
+    handle.streamOpened();
 
     out.* = .{
         .get_schema = &streamGetSchema,
@@ -510,7 +511,7 @@ fn columnIndices(handle: *ReaderHandle, col_indices: [*]const i32, num_cols: i32
 
 export fn zp_reader_close(handle_ptr: ?*anyopaque) void {
     const handle = castHandle(ReaderHandle, handle_ptr) orelse return;
-    handle.close();
+    handle.requestClose();
 }
 
 // ============================================================================
@@ -2129,9 +2130,11 @@ fn streamGetLastError(stream: *ArrowArrayStream) callconv(.c) ?[*:0]const u8 {
 
 fn streamRelease(stream: *ArrowArrayStream) callconv(.c) void {
     const pd: *StreamPrivateData = @ptrCast(@alignCast(stream.private_data));
+    const handle = pd.handle;
     pd.batches.deinit();
-    pd.handle.allocator.destroy(pd);
+    handle.allocator.destroy(pd);
     stream.release = null;
+    handle.streamReleased();
 }
 
 fn wasiGetStats(handle: *ReaderHandle, col_index: i32, rg_index: i32) ?format.Statistics {

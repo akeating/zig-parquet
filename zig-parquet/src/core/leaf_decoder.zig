@@ -61,6 +61,9 @@ const max_reserved_entries: usize = 64 * 1024 * 1024;
 /// column chunk's `total_uncompressed_size`.
 const max_reserved_bytes: usize = 256 * 1024 * 1024;
 
+/// Bytes of byte-array entries reserved per byte of the chunk's compressed data.
+const max_reserve_ratio: u64 = 16;
+
 /// Upper bound on the entries of one data page. The entries are reserved, and their levels
 /// decoded, before the values: a few bytes of run-length levels can declare billions of
 /// entries. Writers end pages far below this (PyArrow at 1 MiB or 20,000 rows).
@@ -427,6 +430,15 @@ pub const PageReader = struct {
         self.allocator.free(self.buf);
     }
 
+    /// Bytes of pages not yet read, as far as they lie in the source.
+    pub fn bytesLeft(self: *const PageReader) u64 {
+        var end = self.end;
+        if (self.source) |src| end = @min(end, src.size());
+        var total = end -| self.pos;
+        for (self.spans) |sp| total +|= sp.size;
+        return total;
+    }
+
     /// Whether all pages have been returned.
     pub fn done(self: *const PageReader) bool {
         return self.pos >= self.end and self.spans.len == 0;
@@ -569,8 +581,12 @@ pub const ColumnCursor = struct {
         // bytes decoded so far each time it grows. Dictionary pages can produce more bytes;
         // the buffer then grows.
         if (builder.kind == .bytes and reserve >= (safe.castTo(usize, meta.num_values) catch std.math.maxInt(usize))) {
-            const bytes = safe.castTo(usize, meta.total_uncompressed_size) catch 0;
-            try builder.values.ensureTotalCapacityPrecise(allocator, @min(bytes, max_reserved_bytes));
+            // The sizes in the footer are not checked against the data, so the reservation is
+            // also bounded by the chunk's bytes in the source, times a compression ratio
+            // larger than PLAIN strings usually reach. Past it the buffer grows.
+            const declared = safe.castTo(usize, meta.total_uncompressed_size) catch 0;
+            const from_data = std.math.cast(usize, pages.bytesLeft() *| max_reserve_ratio) orelse std.math.maxInt(usize);
+            try builder.values.ensureTotalCapacityPrecise(allocator, @min(declared, from_data, max_reserved_bytes));
         }
 
         var dec = ChunkDecoder{

@@ -95,8 +95,8 @@ test "leaf decoder decodes every leaf column chunk of the test files without lea
 }
 
 fn decodeFile(allocator: std.mem.Allocator, dir: std.Io.Dir, basename: []const u8, totals: *Totals) !void {
-    // The reader uses an arena: footer parsing leaks on some malformed files. The decoder
-    // uses `allocator` (the testing allocator).
+    // The reader and the decoder use `allocator`, which fails the file's job on a leak; the
+    // arena holds the column chunk bytes.
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const ref = arena.allocator();
@@ -106,7 +106,7 @@ fn decodeFile(allocator: std.mem.Allocator, dir: std.Io.Dir, basename: []const u
         return;
     };
     defer file.close(io);
-    var reader = parquet.openFileDynamic(ref, file, io, .{}) catch {
+    var reader = parquet.openFileDynamic(allocator, file, io, .{}) catch {
         totals.files_unreadable += 1;
         return;
     };

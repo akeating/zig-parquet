@@ -27,8 +27,8 @@ const Totals = struct {
 };
 
 test "row reads decoded on 4 threads equal row reads on the calling thread" {
-    // The readers use a thread-safe allocator without leak checks: footer parsing leaks on
-    // some malformed files.
+    // The readers decode on 4 threads: smp_allocator is thread-safe and records nothing per
+    // allocation. Leaks are checked by corrupt_read_test.zig.
     const allocator = std.heap.smp_allocator;
     var threaded: std.Io.Threaded = .init(allocator, .{ .async_limit = .limited(3) });
     defer threaded.deinit();

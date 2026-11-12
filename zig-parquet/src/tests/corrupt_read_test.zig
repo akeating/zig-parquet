@@ -3,9 +3,10 @@
 //! reachable `unreachable`; the test build has safety checks) and no leaked memory.
 //!
 //! Each file in test-files-arrow and test-files-wild that opens cleanly is copied
-//! `copies_per_file` times. Each copy has bytes changed between the magic number and the
-//! footer: the column chunks and the page indexes. The footer is left as it is, so the copy
-//! still opens and the damage reaches the page and level decoders. The changes are chosen by
+//! `copies_per_file` times. Two thirds of the copies have bytes changed between the magic
+//! number and the footer (the column chunks and the page indexes), so the copy still opens
+//! and the damage reaches the page and level decoders; the other third have bytes of the
+//! footer changed, which the footer parser must reject or read without leaking. The changes are chosen by
 //! a generator seeded from the file's path and the copy number, so a failure can be
 //! reproduced.
 //!
@@ -114,7 +115,11 @@ fn readDamagedCopies(path: []const u8, totals: *Totals) !void {
         seed +%= 0x9e3779b97f4a7c15;
         @memcpy(copy, original);
         var prng = std.Random.DefaultPrng.init(seed);
-        damage(prng.random(), copy[4..data_end]);
+        if (n % 3 == 2) {
+            damage(prng.random(), copy[data_end .. original.len - 8]);
+        } else {
+            damage(prng.random(), copy[4..data_end]);
+        }
         totals.copies += 1;
 
         var gpa: test_util.LeakCheckAllocator = .init;

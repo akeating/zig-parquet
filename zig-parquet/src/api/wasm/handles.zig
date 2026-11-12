@@ -122,9 +122,34 @@ pub const ReaderHandle = struct {
     allocator: Allocator,
     source: SeekableReader,
     metadata: format.FileMetaData,
-    footer_data: []u8,
+    /// Holds the footer and `metadata` (`parquet_reader.FooterInfo.arena`).
+    footer_arena: std.heap.ArenaAllocator,
     backend: ReaderBackend,
     err_ctx: ErrorContext = .{},
+
+    /// Streams open on this reader. They hold a pointer to it, so `requestClose` with streams
+    /// open frees the handle when the last one is released instead of at once.
+    open_streams: usize = 0,
+    close_requested: bool = false,
+
+    /// Frees the handle now, or, while streams are open, when the last is released.
+    pub fn requestClose(self: *ReaderHandle) void {
+        if (self.open_streams > 0) {
+            self.close_requested = true;
+            return;
+        }
+        self.close();
+    }
+
+    pub fn streamOpened(self: *ReaderHandle) void {
+        self.open_streams += 1;
+    }
+
+    /// Called after a stream's own memory is freed; may free the handle.
+    pub fn streamReleased(self: *ReaderHandle) void {
+        self.open_streams -= 1;
+        if (self.open_streams == 0 and self.close_requested) self.close();
+    }
 
     pub fn openMemory(data: [*]const u8, len: usize) !*ReaderHandle {
         const allocator = backing_allocator;
@@ -139,7 +164,7 @@ pub const ReaderHandle = struct {
             .allocator = allocator,
             .source = br.reader(),
             .metadata = info.metadata,
-            .footer_data = info.footer_data,
+            .footer_arena = info.arena,
             .backend = .{ .buffer = br },
         };
         return handle;
@@ -155,7 +180,7 @@ pub const ReaderHandle = struct {
             .allocator = allocator,
             .source = cb_reader.reader(),
             .metadata = info.metadata,
-            .footer_data = info.footer_data,
+            .footer_arena = info.arena,
             .backend = .{ .callback = cb_reader },
         };
         return handle;
@@ -163,44 +188,7 @@ pub const ReaderHandle = struct {
 
     pub fn close(self: *ReaderHandle) void {
         const allocator = self.allocator;
-
-        for (self.metadata.schema) |elem| {
-            if (elem.name.len > 0) allocator.free(elem.name);
-            if (elem.logical_type) |lt| lt.deinit(allocator);
-        }
-        allocator.free(self.metadata.schema);
-
-        for (self.metadata.row_groups) |rg| {
-            for (rg.columns) |col| {
-                if (col.meta_data) |meta| {
-                    allocator.free(meta.encodings);
-                    for (meta.path_in_schema) |path| allocator.free(path);
-                    allocator.free(meta.path_in_schema);
-                    if (meta.statistics) |stats| {
-                        if (stats.max) |m| allocator.free(m);
-                        if (stats.min) |m| allocator.free(m);
-                        if (stats.max_value) |m| allocator.free(m);
-                        if (stats.min_value) |m| allocator.free(m);
-                    }
-                    if (meta.geospatial_statistics) |geo_stats| {
-                        if (geo_stats.geospatial_types) |gt| allocator.free(gt);
-                    }
-                }
-            }
-            if (rg.sorting_columns) |sc| allocator.free(sc);
-            allocator.free(rg.columns);
-        }
-        allocator.free(self.metadata.row_groups);
-
-        if (self.metadata.key_value_metadata) |kvs| {
-            for (kvs) |kv| {
-                allocator.free(kv.key);
-                if (kv.value) |v| allocator.free(v);
-            }
-            allocator.free(kvs);
-        }
-        if (self.metadata.created_by) |cb| allocator.free(cb);
-        allocator.free(self.footer_data);
+        self.footer_arena.deinit();
 
         switch (self.backend) {
             .buffer => |br| allocator.destroy(br),

@@ -6377,15 +6377,15 @@ fn compareAllFiles(reference: std.json.ObjectMap, batch_rows: ?usize, large: boo
 
 fn compareFileWithReference(allocator: Allocator, path: []const u8, reference: std.json.ObjectMap, totals: *NestedTotals, batch_rows: ?usize, large: bool, decode_io: ?std.Io, read_ahead: usize) !void {
     const io = std.testing.io;
-    // The reader uses an arena (footer parsing leaks on some malformed files); the Arrow read
-    // uses `allocator`.
+    // The reader and the Arrow read use `allocator`, which fails the file's job on a leak; the
+    // arena holds the test's own text.
     var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
     const file = try std.Io.Dir.cwd().openFile(io, path, .{});
     defer file.close(io);
-    var reader = @import("../lib.zig").openFileDynamic(arena, file, io, .{}) catch |err| {
+    var reader = @import("../lib.zig").openFileDynamic(allocator, file, io, .{}) catch |err| {
         totals.read_errors += 1;
         std.debug.print("READ ERROR {s}: {s}\n", .{ path, @errorName(err) });
         return;

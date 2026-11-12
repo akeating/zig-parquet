@@ -74,7 +74,8 @@ pub const DynamicReader = struct {
     allocator: std.mem.Allocator,
     source: SeekableReader,
     metadata: format.FileMetaData,
-    footer_data: []u8,
+    /// Holds the footer and `metadata` (`parquet_reader.FooterInfo.arena`).
+    footer_arena: std.heap.ArenaAllocator,
     checksum_options: ChecksumOptions,
     /// `DynamicReaderOptions.io`.
     decode_io: ?std.Io = null,
@@ -101,64 +102,14 @@ pub const DynamicReader = struct {
             .allocator = allocator,
             .source = source,
             .metadata = info.metadata,
-            .footer_data = info.footer_data,
+            .footer_arena = info.arena,
             .checksum_options = options.checksum,
             .decode_io = options.io,
         };
     }
 
     pub fn deinit(self: *Self) void {
-        // Free schema element names
-        for (self.metadata.schema) |elem| {
-            if (elem.name.len > 0) {
-                self.allocator.free(elem.name);
-            }
-            if (elem.logical_type) |lt| lt.deinit(self.allocator);
-        }
-        self.allocator.free(self.metadata.schema);
-
-        // Free row groups
-        for (self.metadata.row_groups) |rg| {
-            for (rg.columns) |col| {
-                if (col.file_path) |fp| self.allocator.free(fp);
-                if (col.meta_data) |meta| {
-                    self.allocator.free(meta.encodings);
-                    for (meta.path_in_schema) |path| {
-                        self.allocator.free(path);
-                    }
-                    self.allocator.free(meta.path_in_schema);
-                    if (meta.statistics) |stats| {
-                        if (stats.max) |m| self.allocator.free(m);
-                        if (stats.min) |m| self.allocator.free(m);
-                        if (stats.max_value) |m| self.allocator.free(m);
-                        if (stats.min_value) |m| self.allocator.free(m);
-                    }
-                    // Free geospatial statistics if present
-                    if (meta.geospatial_statistics) |geo_stats| {
-                        if (geo_stats.geospatial_types) |gt| self.allocator.free(gt);
-                    }
-                }
-            }
-            if (rg.sorting_columns) |sc| self.allocator.free(sc);
-            self.allocator.free(rg.columns);
-        }
-        self.allocator.free(self.metadata.row_groups);
-
-        // Free key-value metadata
-        if (self.metadata.key_value_metadata) |kvs| {
-            for (kvs) |kv| {
-                self.allocator.free(kv.key);
-                if (kv.value) |v| self.allocator.free(v);
-            }
-            self.allocator.free(kvs);
-        }
-
-        // Free created_by
-        if (self.metadata.created_by) |cb| {
-            self.allocator.free(cb);
-        }
-
-        self.allocator.free(self.footer_data);
+        self.footer_arena.deinit();
 
         if (self._backend_cleanup) |cleanup| {
             cleanup.deinit_fn(cleanup.ptr, self.allocator);

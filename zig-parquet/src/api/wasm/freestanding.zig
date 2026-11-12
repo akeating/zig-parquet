@@ -528,7 +528,8 @@ export fn zp_reader_get_kv_metadata_value_len(handle_id: i32, index: i32) u32 {
 
 export fn zp_reader_close(handle_id: i32) void {
     const handle = getReaderHandle(handle_id) orelse return;
-    handle.close();
+    // Streams opened on the reader keep it until they are closed.
+    handle.requestClose();
     freeHandleSlot(handle_id);
 }
 
@@ -1959,7 +1960,8 @@ export fn zp_row_writer_free(handle_id: i32) void {
 // ============================================================================
 
 /// Opens a stream over all columns, one batch per row group. Returns a stream handle ID
-/// (>= 0) or a negative error code. The reader must stay open while the stream is used.
+/// (>= 0) or a negative error code. Closing the reader with the stream open frees it when
+/// the stream is closed.
 export fn zp_reader_stream_init(reader_handle_id: i32) i32 {
     return zp_reader_stream_init_with_options(reader_handle_id, null);
 }
@@ -1996,6 +1998,7 @@ export fn zp_reader_stream_init_with_options(reader_handle_id: i32, options: ?*c
         return -err.ZP_ERROR_OUT_OF_MEMORY;
     };
     sh.* = .{ .reader = reader, .batches = batches };
+    reader.streamOpened();
 
     const idx = safe.castTo(usize, slot) catch unreachable; // allocHandleSlot returns valid index
     handle_table[idx] = .{ .stream = sh };
@@ -2044,9 +2047,11 @@ export fn zp_reader_stream_get_next(stream_handle_id: i32, array_out: ?*ArrowArr
 
 export fn zp_reader_stream_close(stream_handle_id: i32) void {
     const sh = getStreamHandle(stream_handle_id) orelse return;
+    const reader = sh.reader;
     sh.batches.deinit();
     backing_allocator.destroy(sh);
     freeHandleSlot(stream_handle_id);
+    reader.streamReleased();
 }
 
 fn toUsize(v: i32) ?usize {
