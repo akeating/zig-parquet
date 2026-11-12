@@ -238,6 +238,12 @@ pub export fn zp_writer_write_row_group(
             handle.err_ctx.setError(err.ZP_ERROR_INVALID_ARGUMENT, "invalid offset");
             return handle.err_ctx.code;
         };
+        // A struct's children must hold the entries its offset and length address.
+        const needed = std.math.add(i64, b.offset, b.length) catch std.math.maxInt(i64);
+        if (arr_children[i].length < needed) {
+            handle.err_ctx.setError(err.ZP_ERROR_INVALID_ARGUMENT, "a column is shorter than the batch");
+            return handle.err_ctx.code;
+        }
         arrays[i].length = b.length;
         schemas[i] = sch_children[i].*;
     }

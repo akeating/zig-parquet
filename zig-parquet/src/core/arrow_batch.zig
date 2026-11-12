@@ -28,6 +28,7 @@ const buildSchemaTree = schema_tree.buildSchemaTree;
 const levelShape = schema_tree.levelShape;
 
 const Allocator = std.mem.Allocator;
+const native_endian = @import("builtin").cpu.arch.endian();
 
 fn fmtZ(allocator: Allocator, comptime fmt_str: []const u8, args: anytype) error{OutOfMemory}![:0]u8 {
     return std.fmt.allocPrintSentinel(allocator, fmt_str, args, 0);
@@ -446,7 +447,9 @@ fn hasNestedFormat(fmt: []const u8) bool {
 }
 
 /// Allocates the schema node tree of an Arrow schema; free it with `freeSchemaNode`.
-fn arrowSchemaToSchemaNode(allocator: Allocator, schema: *const ArrowSchema, nullable: bool) !*const SchemaNode {
+fn arrowSchemaToSchemaNode(allocator: Allocator, schema: *const ArrowSchema, nullable: bool, depth: usize) !*const SchemaNode {
+    // The schema comes from the caller and recursion is per level, so the depth is bounded.
+    if (depth > max_arrow_depth) return error.InvalidSchema;
     const fmt = std.mem.sliceTo(schema.format, 0);
 
     // The optional wrapper is allocated first, so nothing can fail after the children exist.
@@ -460,7 +463,7 @@ fn arrowSchemaToSchemaNode(allocator: Allocator, schema: *const ArrowSchema, nul
         const children: [*]*ArrowSchema = schema.children orelse return error.InvalidSchema;
         const elem = children[0];
         const elem_nullable = (elem.flags & arrow.ARROW_FLAG_NULLABLE) != 0;
-        const elem_node = try arrowSchemaToSchemaNode(allocator, elem, elem_nullable);
+        const elem_node = try arrowSchemaToSchemaNode(allocator, elem, elem_nullable, depth + 1);
         node.* = .{ .list = elem_node };
     } else if (std.mem.eql(u8, fmt, "+s")) {
         const nc = safe.castTo(usize, schema.n_children) catch return error.InvalidSchema;
@@ -481,7 +484,7 @@ fn arrowSchemaToSchemaNode(allocator: Allocator, schema: *const ArrowSchema, nul
             const child_nullable = (child.flags & arrow.ARROW_FLAG_NULLABLE) != 0;
             fields[i] = .{
                 .name = child_name,
-                .node = try arrowSchemaToSchemaNode(allocator, child, child_nullable),
+                .node = try arrowSchemaToSchemaNode(allocator, child, child_nullable, depth + 1),
             };
             built = i + 1;
         }
@@ -492,10 +495,10 @@ fn arrowSchemaToSchemaNode(allocator: Allocator, schema: *const ArrowSchema, nul
         const entries_sch = entries[0];
         if (entries_sch.n_children != 2) return error.InvalidSchema;
         const kv_children: [*]*ArrowSchema = entries_sch.children orelse return error.InvalidSchema;
-        const key_node = try arrowSchemaToSchemaNode(allocator, kv_children[0], false);
+        const key_node = try arrowSchemaToSchemaNode(allocator, kv_children[0], false, depth + 1);
         errdefer freeSchemaNode(allocator, key_node);
         const val_nullable = (kv_children[1].flags & arrow.ARROW_FLAG_NULLABLE) != 0;
-        const val_node = try arrowSchemaToSchemaNode(allocator, kv_children[1], val_nullable);
+        const val_node = try arrowSchemaToSchemaNode(allocator, kv_children[1], val_nullable, depth + 1);
         node.* = .{ .map = .{ .key = key_node, .value = val_node } };
     } else {
         node.* = try arrowFormatToSchemaNode(fmt);
@@ -561,6 +564,8 @@ const ArrowFormatInfo = struct {
         }
         if (fmt.len >= 2 and fmt[0] == 'w' and fmt[1] == ':') {
             const type_length = std.fmt.parseInt(i32, fmt[2..], 10) catch return error.InvalidSchema;
+            // toSchemaNode casts it to u32.
+            if (type_length <= 0) return error.InvalidSchema;
             const logical: ?format.LogicalType = if (type_length == 16) .uuid else null;
             return .{ .physical_type = .fixed_len_byte_array, .type_length = type_length, .logical_type = logical };
         }
@@ -638,7 +643,7 @@ fn arrowListToColumnDef(allocator: Allocator, schema: *const ArrowSchema, name: 
     const elem_nullable = (element.flags & arrow.ARROW_FLAG_NULLABLE) != 0;
 
     if (hasNestedFormat(elem_fmt)) {
-        const node = try arrowSchemaToSchemaNode(allocator, schema, nullable);
+        const node = try arrowSchemaToSchemaNode(allocator, schema, nullable, 0);
         return ColumnDef.fromNode(name, node);
     }
 
@@ -654,7 +659,7 @@ fn arrowMapToColumnDef(allocator: Allocator, schema: *const ArrowSchema, name: [
     if (schema.n_children != 1) return error.InvalidSchema;
     const entries: [*]*ArrowSchema = schema.children orelse return error.InvalidSchema;
     if (entries[0].n_children != 2) return error.InvalidSchema;
-    const node = try arrowSchemaToSchemaNode(allocator, schema, nullable);
+    const node = try arrowSchemaToSchemaNode(allocator, schema, nullable, 0);
     return ColumnDef.fromNode(name, node);
 }
 
@@ -679,7 +684,7 @@ fn arrowStructToColumnDef(allocator: Allocator, schema: *const ArrowSchema, name
     }
 
     if (needs_node) {
-        const node = try arrowSchemaToSchemaNode(allocator, schema, nullable);
+        const node = try arrowSchemaToSchemaNode(allocator, schema, nullable, 0);
         return ColumnDef.fromNode(name, node);
     }
 
@@ -2000,12 +2005,139 @@ pub fn writeRowGroupFromArrow(
 
     // The column writers index buffers from 0, so arrays with an offset (slices) are first
     // rewritten without one.
+    // Arrays from C callers are checked before any buffer is read: the writers index buffers
+    // by the lengths and offsets they carry.
+    for (arrays, schemas) |*arr, *sch| {
+        const len = safe.castTo(usize, arr.length) catch return error.TypeMismatch;
+        try validateArrow(arr, sch, 0, len, 0);
+    }
+
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     for (arrays, schemas, 0..) |arr, sch, col_idx| {
         const flat = try withoutOffset(arena.allocator(), arr, &sch, 0, arr.length);
         try writeArrowColumnToParquet(writer, allocator, col_idx, flat, sch);
     }
+}
+
+/// Arrow arrays nested deeper than this are rejected by `validateArrow`.
+const max_arrow_depth = 64;
+
+/// How an Arrow format lays out its buffers, as far as `validateArrow` checks them.
+const ArrowLayout = union(enum) {
+    null_,
+    bits,
+    fixed: usize,
+    /// Offsets of 4 or 8 bytes and a data buffer.
+    bytes: usize,
+    /// Offsets of 4 or 8 bytes and one child; `map` requires the child to be a struct of two.
+    list: struct { offset_bytes: usize, map: bool },
+    struct_,
+    fixed_list: usize,
+
+    fn of(fmt: []const u8) ?ArrowLayout {
+        if (std.mem.eql(u8, fmt, "n")) return .null_;
+        if (std.mem.eql(u8, fmt, "b")) return .bits;
+        if (std.mem.eql(u8, fmt, "u") or std.mem.eql(u8, fmt, "z")) return .{ .bytes = 4 };
+        if (std.mem.eql(u8, fmt, "U") or std.mem.eql(u8, fmt, "Z")) return .{ .bytes = 8 };
+        if (std.mem.eql(u8, fmt, "+l")) return .{ .list = .{ .offset_bytes = 4, .map = false } };
+        if (std.mem.eql(u8, fmt, "+L")) return .{ .list = .{ .offset_bytes = 8, .map = false } };
+        if (std.mem.eql(u8, fmt, "+m")) return .{ .list = .{ .offset_bytes = 4, .map = true } };
+        if (std.mem.eql(u8, fmt, "+s")) return .struct_;
+        if (std.mem.startsWith(u8, fmt, "+w:")) {
+            const size = std.fmt.parseInt(usize, fmt[3..], 10) catch return null;
+            return .{ .fixed_list = size };
+        }
+        if (fixedWidthOf(fmt)) |w| return if (w == 0) null else .{ .fixed = w };
+        return null;
+    }
+
+    fn bufferCount(self: ArrowLayout) usize {
+        return switch (self) {
+            .null_ => 0,
+            .struct_, .fixed_list => 1,
+            .bits, .fixed, .list => 2,
+            .bytes => 3,
+        };
+    }
+};
+
+/// Returns `error.TypeMismatch` unless entries `start .. start + count` of `arr` (counted
+/// from `arr.offset`) can be read through `sch` without leaving the array: lengths and
+/// offsets are non-negative and in range, there are as many buffers as the format uses and
+/// the child counts match it, the buffers the entries use are present, offsets do not
+/// decrease, and the entries they address lie in the child. The size of a byte-array data
+/// buffer is not part of the Arrow C interface, so the last offset is not checked against it.
+fn validateArrow(arr: *const ArrowArray, sch: *const ArrowSchema, start: usize, count: usize, depth: usize) WriterError!void {
+    if (depth > max_arrow_depth) return error.TypeMismatch;
+    const fmt = std.mem.sliceTo(sch.format, 0);
+    const layout = ArrowLayout.of(fmt) orelse return error.TypeMismatch;
+    const off = safe.castTo(usize, arr.offset) catch return error.TypeMismatch;
+    const len = safe.castTo(usize, arr.length) catch return error.TypeMismatch;
+    if (start > len or count > len - start) return error.TypeMismatch;
+    const first = std.math.add(usize, off, start) catch return error.IntegerOverflow;
+    const end = std.math.add(usize, first, count) catch return error.IntegerOverflow;
+
+    const nb = safe.castTo(usize, arr.n_buffers) catch return error.TypeMismatch;
+    const nc = safe.castTo(usize, arr.n_children) catch return error.TypeMismatch;
+    // Fewer buffers than the format uses would be read past; more are not read.
+    if (nb < layout.bufferCount()) return error.TypeMismatch;
+    if (nb > 0 and @intFromPtr(arr.buffers) == 0) return error.TypeMismatch;
+    if (arr.n_children != sch.n_children) return error.TypeMismatch;
+    if (nc > 0 and (arr.children == null or sch.children == null)) return error.TypeMismatch;
+
+    switch (layout) {
+        .null_ => {},
+        .bits => if (count > 0 and arr.buffers[1] == null) return error.TypeMismatch,
+        .fixed => |w| {
+            if (count > 0 and arr.buffers[1] == null) return error.TypeMismatch;
+            _ = std.math.mul(usize, end, w) catch return error.IntegerOverflow;
+        },
+        .bytes => |ob| {
+            const range = try offsetRange(arr, ob, first, end);
+            if (range.last > range.first and arr.buffers[2] == null) return error.TypeMismatch;
+        },
+        .list => |l| {
+            if (nc != 1) return error.TypeMismatch;
+            const range = try offsetRange(arr, l.offset_bytes, first, end);
+            const child = arr.children.?[0];
+            const child_sch = sch.children.?[0];
+            if (l.map) {
+                if (!std.mem.eql(u8, std.mem.sliceTo(child_sch.format, 0), "+s") or child_sch.n_children != 2) return error.TypeMismatch;
+            }
+            try validateArrow(child, child_sch, range.first, range.last - range.first, depth + 1);
+        },
+        .struct_ => for (0..nc) |i| {
+            // A struct's offset applies to its children.
+            try validateArrow(arr.children.?[i], sch.children.?[i], first, count, depth + 1);
+        },
+        .fixed_list => |size| {
+            if (nc != 1) return error.TypeMismatch;
+            const child_start = std.math.mul(usize, first, size) catch return error.IntegerOverflow;
+            const child_count = std.math.mul(usize, count, size) catch return error.IntegerOverflow;
+            try validateArrow(arr.children.?[0], sch.children.?[0], child_start, child_count, depth + 1);
+        },
+    }
+}
+
+/// The first and last offsets of entries `first .. end` of a byte-array or list array, after
+/// checking that the offsets buffer is present and the offsets are non-negative and do not
+/// decrease.
+fn offsetRange(arr: *const ArrowArray, offset_bytes: usize, first: usize, end: usize) WriterError!struct { first: usize, last: usize } {
+    const raw: [*]const u8 = @ptrCast(arr.buffers[1] orelse return error.TypeMismatch);
+    _ = std.math.mul(usize, end +| 1, offset_bytes) catch return error.IntegerOverflow;
+    var prev: usize = 0;
+    var first_offset: usize = 0;
+    for (first..end + 1) |i| {
+        const v: i64 = if (offset_bytes == 4)
+            std.mem.readInt(i32, raw[i * 4 ..][0..4], native_endian)
+        else
+            std.mem.readInt(i64, raw[i * 8 ..][0..8], native_endian);
+        const o = safe.castTo(usize, v) catch return error.TypeMismatch;
+        if (i == first) first_offset = o else if (o < prev) return error.TypeMismatch;
+        prev = o;
+    }
+    return .{ .first = first_offset, .last = prev };
 }
 
 /// Bytes per entry of an Arrow format with one fixed-width values buffer, or null.
@@ -2047,6 +2179,13 @@ fn withoutOffset(arena: Allocator, arr: ArrowArray, sch: *const ArrowSchema, ext
     const buffers = arena.alloc(?*anyopaque, nb) catch return error.OutOfMemory;
     @memcpy(buffers, src_buffers[0..nb]);
     out.buffers = @ptrCast(buffers.ptr);
+    if (n == 0) {
+        // The Arrow format lets an empty array leave its buffers null; the writers read the
+        // data buffer, and an offsets buffer's first entry, regardless.
+        for (buffers[1..]) |*b| if (b.* == null) {
+            b.* = @ptrCast(@constCast(&empty_buffer));
+        };
+    }
 
     if (off != 0 and !std.mem.eql(u8, fmt, "n")) {
         // Validity bitmap.
@@ -2098,6 +2237,9 @@ fn withoutOffset(arena: Allocator, arr: ArrowArray, sch: *const ArrowSchema, ext
     out.children = @ptrCast(children.ptr);
     return out;
 }
+
+/// Zeros standing in for the null buffers of an empty array: one offset of 0 of either width.
+const empty_buffer: [16]u8 align(16) = @splat(0);
 
 /// Bits `off` to `off + n` of `bits`, starting at bit 0 of a new bitmap.
 fn shiftedBitmap(arena: Allocator, bits: [*]const u8, off: usize, n: usize) WriterError!?*anyopaque {
@@ -6408,4 +6550,53 @@ fn canonLeaf(w: *std.Io.Writer, elem: format.SchemaElement, arr: *const ArrowArr
 fn writeDouble(w: *std.Io.Writer, v: f64) !void {
     try w.writeByte('d');
     for (std.mem.toBytes(std.mem.nativeToLittle(u64, @bitCast(v)))) |b| try w.print("{x:0>2}", .{b});
+}
+
+test "validateArrow rejects offsets and lengths outside the array" {
+    const ints = [_]i32{ 1, 2, 3 };
+    var int_buffers = [_]?*anyopaque{ null, @ptrCast(@constCast(&ints)) };
+    var int_sch = std.mem.zeroes(ArrowSchema);
+    int_sch.format = "i";
+    var arr = std.mem.zeroes(ArrowArray);
+    arr.length = 3;
+    arr.n_buffers = 2;
+    arr.buffers = &int_buffers;
+    try validateArrow(&arr, &int_sch, 0, 3, 0);
+    arr.offset = -1;
+    try std.testing.expectError(error.TypeMismatch, validateArrow(&arr, &int_sch, 0, 3, 0));
+    arr.offset = 0;
+    arr.n_buffers = 1; // fewer than the 2 buffers of "i"
+    try std.testing.expectError(error.TypeMismatch, validateArrow(&arr, &int_sch, 0, 3, 0));
+
+    // Strings with decreasing offsets.
+    const offsets = [_]i32{ 0, 5, 2 };
+    const data = "hello";
+    var str_buffers = [_]?*anyopaque{ null, @ptrCast(@constCast(&offsets)), @ptrCast(@constCast(data.ptr)) };
+    var str_sch = std.mem.zeroes(ArrowSchema);
+    str_sch.format = "u";
+    var str = std.mem.zeroes(ArrowArray);
+    str.length = 2;
+    str.n_buffers = 3;
+    str.buffers = &str_buffers;
+    try std.testing.expectError(error.TypeMismatch, validateArrow(&str, &str_sch, 0, 2, 0));
+
+    // A list whose offsets address more entries than its child holds.
+    const list_offsets = [_]i32{ 0, 100 };
+    var list_buffers = [_]?*anyopaque{ null, @ptrCast(@constCast(&list_offsets)) };
+    var child_ptr: *ArrowArray = &arr;
+    var child_sch_ptr: *ArrowSchema = &int_sch;
+    var list_sch = std.mem.zeroes(ArrowSchema);
+    list_sch.format = "+l";
+    list_sch.n_children = 1;
+    list_sch.children = @ptrCast(&child_sch_ptr);
+    var list = std.mem.zeroes(ArrowArray);
+    list.length = 1;
+    list.n_buffers = 2;
+    list.n_children = 1;
+    list.buffers = &list_buffers;
+    list.children = @ptrCast(&child_ptr);
+    try std.testing.expectError(error.TypeMismatch, validateArrow(&list, &list_sch, 0, 1, 0));
+
+    // A fixed-size binary width of -1.
+    try std.testing.expectError(error.InvalidSchema, ArrowFormatInfo.parse("w:-1"));
 }
