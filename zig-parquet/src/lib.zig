@@ -219,7 +219,7 @@ comptime {
         _ = &c_api.reader.zp_reader_error_code;
         _ = &c_api.reader.zp_reader_error_message;
         _ = &c_api.reader.zp_reader_get_stream;
-        _ = &c_api.reader.zp_reader_get_stream_columns;
+        _ = &c_api.reader.zp_reader_get_stream_with_options;
         _ = &c_api.reader.zp_reader_has_statistics;
         _ = &c_api.reader.zp_reader_get_null_count;
         _ = &c_api.reader.zp_reader_get_distinct_count;
@@ -371,7 +371,7 @@ comptime {
             _ = &wasi.zp_reader_get_schema;
             _ = &wasi.zp_reader_read_row_group;
             _ = &wasi.zp_reader_get_stream;
-            _ = &wasi.zp_reader_get_stream_columns;
+            _ = &wasi.zp_reader_get_stream_with_options;
             _ = &wasi.zp_reader_error_code;
             _ = &wasi.zp_reader_error_message;
             _ = &wasi.zp_reader_has_statistics;
@@ -536,9 +536,12 @@ comptime {
             _ = &freestanding.zp_version;
             _ = &freestanding.zp_codec_supported;
             _ = &freestanding.zp_reader_stream_init;
+            _ = &freestanding.zp_reader_stream_init_with_options;
             _ = &freestanding.zp_reader_stream_get_schema;
             _ = &freestanding.zp_reader_stream_get_next;
             _ = &freestanding.zp_reader_stream_close;
+            _ = &freestanding.zp_arrow_array_release;
+            _ = &freestanding.zp_arrow_schema_release;
             _ = &freestanding.zp_arrow_array_get_length;
             _ = &freestanding.zp_arrow_array_get_null_count;
             _ = &freestanding.zp_arrow_array_get_n_children;
@@ -702,4 +705,5 @@ test {
     }
 
     _ = @import("tests/mod.zig");
+    _ = @import("api/stream_options.zig");
 }

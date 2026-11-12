@@ -282,41 +282,58 @@ const char* zp_reader_error_message(zp_reader_t handle);
 int zp_reader_get_stream(zp_reader_t handle,
                          struct ArrowArrayStream* stream_out);
 
+/** Stream flag: read byte-array columns as large_string / large_binary. */
+#define ZP_STREAM_LARGE_OFFSETS 1u
+
 /**
- * Like zp_reader_get_stream(), reading only the top-level columns in
- * col_indices, in that order, and optionally in batches of a fixed number
- * of rows. get_schema() describes the selected columns.
+ * Options of zp_reader_get_stream_with_options() (and of
+ * zp_reader_stream_init_with_options() in the freestanding WASM build).
+ *
+ * Set size to sizeof(zp_stream_options), so that later versions can add
+ * fields: a library given a larger size accepts it only when the bytes it
+ * does not know are zero. ZP_STREAM_OPTIONS_INIT gives the defaults.
+ */
+typedef struct zp_stream_options {
+    uint32_t size;          /* sizeof(zp_stream_options) */
+    uint32_t flags;         /* 0, or ZP_STREAM_LARGE_OFFSETS */
+    const int* col_indices; /* top-level columns, in this order; NULL: all */
+    int num_cols;           /* entries in col_indices */
+    const int* row_groups;  /* row groups, in this order; NULL: all */
+    int num_row_groups;     /* entries in row_groups */
+    int64_t batch_rows;     /* rows per batch; 0: one batch per row group */
+} zp_stream_options;
+
+#define ZP_STREAM_OPTIONS_INIT { sizeof(zp_stream_options), 0, NULL, 0, NULL, 0, 0 }
+
+/**
+ * Like zp_reader_get_stream(), configured by options (NULL: the defaults).
+ * get_schema() describes the selected columns.
  *
  * With batch_rows 0, each batch is one row group. With batch_rows > 0,
  * each batch has batch_rows rows, taken from as many row groups as
- * needed; only the last batch can have fewer. Pages are
- * read and decoded as batches need them; between batches the stream holds,
- * per leaf column, one compressed page, the dictionary, and at most one
- * page of decoded entries.
- *
- * Columns not selected are not read or decoded. The stream keeps its own
- * copy of col_indices.
+ * needed; only the last batch can have fewer. Pages are read and decoded
+ * as batches need them; between batches the stream holds, per leaf
+ * column, one compressed page, the dictionary, and at most one page of
+ * decoded entries. Columns not selected are not read or decoded.
  *
  * Byte-array columns are string ("u") or binary ("z") with int32 offsets;
  * a batch whose column holds more than 2^31 - 1 bytes then fails with
  * ZP_ERROR_INVALID_DATA. With ZP_STREAM_LARGE_OFFSETS in flags they are
  * large_string ("U") or large_binary ("Z") with int64 offsets.
  *
- * @param handle       Reader handle (must stay open while stream is active).
- * @param col_indices  Top-level column indices, or NULL for all columns.
- * @param num_cols     Number of entries in col_indices (ignored if NULL).
- * @param batch_rows   Rows per batch, or 0 for one batch per row group.
- * @param flags        0, or ZP_STREAM_LARGE_OFFSETS.
- * @param stream_out   Output: initialized ArrowArrayStream.
- * @return ZP_OK, or ZP_ERROR_INVALID_ARGUMENT if an index is out of range,
- *         batch_rows is negative or flags has unknown bits.
+ * The stream copies what it needs from options.
+ *
+ * @param handle      Reader handle (must stay open while stream is active).
+ * @param options     Stream options, or NULL.
+ * @param stream_out  Output: initialized ArrowArrayStream.
+ * @return ZP_OK, or ZP_ERROR_INVALID_ARGUMENT for an invalid option (a
+ *         column or row group index out of range, a negative batch_rows,
+ *         unknown flags, or a size this version cannot read); the reader's
+ *         error message says which.
  */
-#define ZP_STREAM_LARGE_OFFSETS 1u
-
-int zp_reader_get_stream_columns(zp_reader_t handle,
-                                 const int* col_indices, int num_cols,
-                                 int64_t batch_rows, uint32_t flags,
-                                 struct ArrowArrayStream* stream_out);
+int zp_reader_get_stream_with_options(zp_reader_t handle,
+                                      const zp_stream_options* options,
+                                      struct ArrowArrayStream* stream_out);
 
 /** Close the reader and release all resources. */
 void zp_reader_close(zp_reader_t handle);

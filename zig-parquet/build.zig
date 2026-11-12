@@ -172,6 +172,15 @@ pub fn build(b: *std.Build) void {
     });
     test_mod.addImport("build_options", build_options.createModule());
 
+    // The tests compare the C header's declarations with the Zig API (src/tests/c_header_test.zig).
+    // Translating the header also fails the build when it is not valid C.
+    const c_header = b.addTranslateC(.{
+        .root_source_file = b.path("src/api/c/libparquet.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_mod.addImport("c_libparquet", c_header.createModule());
+
     const lib_unit_tests = b.addTest(.{
         .root_module = test_mod,
     });

@@ -13,6 +13,7 @@
 import type { HostImports, ParquetFreestandingExports } from "./types.d.ts";
 
 const ZP_OK = 0;
+const ZP_ROW_END = 11;
 
 const ZP_TYPE_NULL = 0;
 const ZP_TYPE_BOOL = 1;
@@ -304,6 +305,67 @@ async function main() {
   // Clean up
   zp.zp_row_reader_close(handle);
   console.log("\nRow reader closed.");
+
+  // -----------------------------------------------------------------------
+  // Read the first column as Arrow batches of 2 rows through a stream
+  // -----------------------------------------------------------------------
+  console.log("\n--- Arrow Stream Demo ---");
+  const arrowReader = zp.zp_reader_open_host(ctx);
+  if (arrowReader < 0) {
+    console.error(`Failed to open reader: error code ${-arrowReader}`);
+    Deno.exit(1);
+  }
+  // zp_stream_options (32 bytes on wasm32): size, flags, col_indices, num_cols,
+  // row_groups, num_row_groups, batch_rows.
+  const colsPtr = zp.zp_alloc(4);
+  new DataView(wasmMemory.buffer).setInt32(colsPtr, 0, true);
+  const optionsPtr = zp.zp_alloc(32);
+  new Uint8Array(wasmMemory.buffer, optionsPtr, 32).fill(0);
+  const options = new DataView(wasmMemory.buffer, optionsPtr, 32);
+  options.setUint32(0, 32, true);
+  options.setUint32(8, colsPtr, true);
+  options.setInt32(12, 1, true);
+  options.setBigInt64(24, 2n, true);
+
+  const stream = zp.zp_reader_stream_init_with_options(arrowReader, optionsPtr);
+  if (stream < 0) {
+    const msg = readCString(wasmMemory, zp.zp_reader_error_message(arrowReader));
+    console.error(`Failed to open stream: ${msg}`);
+    Deno.exit(1);
+  }
+  const arrayPtr = zp.zp_alloc(64);
+  const schemaPtr = zp.zp_alloc(48);
+  const lengths: number[] = [];
+  for (;;) {
+    rc = zp.zp_reader_stream_get_next(stream, arrayPtr, schemaPtr);
+    if (rc === ZP_ROW_END) break;
+    if (rc !== ZP_OK) {
+      const msg = readCString(wasmMemory, zp.zp_reader_error_message(arrowReader));
+      console.error(`Failed to read batch: ${msg}`);
+      Deno.exit(1);
+    }
+    lengths.push(Number(zp.zp_arrow_array_get_length(arrayPtr)));
+    // The host releases each batch; WASM memory stays bounded.
+    zp.zp_arrow_array_release(arrayPtr);
+    zp.zp_arrow_schema_release(schemaPtr);
+  }
+  zp.zp_reader_stream_close(stream);
+  zp.zp_free(arrayPtr, 64);
+  zp.zp_free(schemaPtr, 48);
+  zp.zp_free(optionsPtr, 32);
+  zp.zp_free(colsPtr, 4);
+
+  const countPtr = zp.zp_alloc(8);
+  zp.zp_reader_get_num_rows(arrowReader, countPtr);
+  const fileRows = Number(new DataView(wasmMemory.buffer, countPtr, 8).getBigInt64(0, true));
+  zp.zp_free(countPtr, 8);
+  zp.zp_reader_close(arrowReader);
+  const streamedRows = lengths.reduce((a, b) => a + b, 0);
+  console.log(`Batches of column 0: ${lengths.join(", ")} rows (${streamedRows} of ${fileRows})`);
+  if (streamedRows !== fileRows) {
+    console.error("Streamed row count differs from the file's row count");
+    Deno.exit(1);
+  }
 
   // -----------------------------------------------------------------------
   // Write a small Parquet file using the row writer API

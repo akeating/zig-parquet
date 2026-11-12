@@ -343,7 +343,27 @@ while (try batches.next()) |batch| {
 
 Batches take rows from as many row groups as they need, so only the last batch can have fewer rows; with `.batch_rows = null`, each batch is one row group. The reader reads and decodes pages as batches need them; between batches it holds, per leaf column, one compressed page, the dictionary, and at most one page of decoded entries.
 
-C callers have the same functions as `zp_reader_read_row_group` and `zp_reader_get_stream_columns`. The second returns an `ArrowArrayStream` over the selected columns with `batch_rows` rows per batch, or one batch per row group when `batch_rows` is 0; `zp_reader_get_stream` is the same with all columns and one batch per row group.
+C callers have the same functions as `zp_reader_read_row_group` and `zp_reader_get_stream_with_options`. The second returns an `ArrowArrayStream` configured by a `zp_stream_options` struct: columns and row groups to read, rows per batch (0: one batch per row group) and flags such as `ZP_STREAM_LARGE_OFFSETS`. `zp_reader_get_stream` reads all columns, one batch per row group.
+
+```c
+int cols[] = {0, 2};
+zp_stream_options options = ZP_STREAM_OPTIONS_INIT;
+options.col_indices = cols;
+options.num_cols = 2;
+options.batch_rows = 65536;
+
+struct ArrowArrayStream stream;
+if (zp_reader_get_stream_with_options(reader, &options, &stream) == ZP_OK) {
+    struct ArrowArray batch;
+    while (stream.get_next(&stream, &batch) == 0 && batch.release != NULL) {
+        /* use batch */
+        batch.release(&batch);
+    }
+    stream.release(&stream);
+}
+```
+
+The freestanding WASM build has the same stream behind handle IDs (`zp_reader_stream_init_with_options`, `zp_reader_stream_get_next`, `zp_reader_stream_close`), and `zp_arrow_array_release` / `zp_arrow_schema_release` for hosts that cannot call WASM function pointers.
 
 The reader loads a column chunk's compressed bytes whole, then decompresses and decodes one page at a time directly into the Arrow buffers.
 

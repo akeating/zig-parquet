@@ -647,7 +647,22 @@ test "C ABI: reader get_stream iterates row groups" {
     try std.testing.expect(end.release == null);
 }
 
-test "C ABI: reader get_stream_columns reads the selected columns" {
+const StreamOptions = @import("../api/stream_options.zig").StreamOptions;
+
+/// Stream options with the given fields; the others keep their defaults.
+fn streamOptions(fields: struct { cols: ?[]const c_int = null, row_groups: ?[]const c_int = null, batch_rows: i64 = 0, flags: u32 = 0 }) StreamOptions {
+    return .{
+        .size = @sizeOf(StreamOptions),
+        .flags = fields.flags,
+        .col_indices = if (fields.cols) |c| c.ptr else null,
+        .num_cols = if (fields.cols) |c| @intCast(c.len) else 0,
+        .row_groups = if (fields.row_groups) |r| r.ptr else null,
+        .num_row_groups = if (fields.row_groups) |r| @intCast(r.len) else 0,
+        .batch_rows = fields.batch_rows,
+    };
+}
+
+test "C ABI: stream with options reads the selected columns" {
     const allocator = std.testing.allocator;
     const buf = try createTestParquetBuffer(allocator);
     defer allocator.free(buf);
@@ -657,8 +672,9 @@ test "C ABI: reader get_stream_columns reads the selected columns" {
     defer c_reader.zp_reader_close(handle);
 
     var cols = [_]c_int{1};
+    const options = streamOptions(.{ .cols = &cols });
     var stream: ArrowArrayStream = undefined;
-    try std.testing.expectEqual(c_err.ZP_OK, c_reader.zp_reader_get_stream_columns(handle, &cols, 1, 0, 0, &stream));
+    try std.testing.expectEqual(c_err.ZP_OK, c_reader.zp_reader_get_stream_with_options(handle, &options, &stream));
     defer stream.release.?(&stream);
     // The stream keeps its own copy of the indices.
     cols[0] = 0;
@@ -682,7 +698,7 @@ test "C ABI: reader get_stream_columns reads the selected columns" {
     try std.testing.expect(end.release == null);
 }
 
-test "C ABI: reader get_stream_columns rejects out-of-range indices" {
+test "C ABI: stream with options rejects invalid options" {
     const allocator = std.testing.allocator;
     const buf = try createTestParquetBuffer(allocator);
     defer allocator.free(buf);
@@ -691,17 +707,27 @@ test "C ABI: reader get_stream_columns rejects out-of-range indices" {
     try std.testing.expectEqual(c_err.ZP_OK, c_reader.zp_reader_open_memory(buf.ptr, buf.len, &handle));
     defer c_reader.zp_reader_close(handle);
 
-    var stream: ArrowArrayStream = undefined;
     const too_high = [_]c_int{ 0, 2 };
-    try std.testing.expectEqual(c_err.ZP_ERROR_INVALID_ARGUMENT, c_reader.zp_reader_get_stream_columns(handle, &too_high, 2, 0, 0, &stream));
     const negative = [_]c_int{-1};
-    try std.testing.expectEqual(c_err.ZP_ERROR_INVALID_ARGUMENT, c_reader.zp_reader_get_stream_columns(handle, &negative, 1, 0, 0, &stream));
-    try std.testing.expectEqual(c_err.ZP_ERROR_INVALID_ARGUMENT, c_reader.zp_reader_get_stream_columns(handle, &too_high, 0, 0, 0, &stream));
-    try std.testing.expectEqual(c_err.ZP_ERROR_INVALID_ARGUMENT, c_reader.zp_reader_get_stream_columns(handle, null, 0, -1, 0, &stream));
-    try std.testing.expectEqual(c_err.ZP_ERROR_INVALID_ARGUMENT, c_reader.zp_reader_get_stream_columns(handle, null, 0, 0, 2, &stream));
+    const no_such_row_group = [_]c_int{1};
+    var small = streamOptions(.{});
+    small.size = 8;
+    const cases = [_]StreamOptions{
+        streamOptions(.{ .cols = &too_high }),
+        streamOptions(.{ .cols = &negative }),
+        streamOptions(.{ .row_groups = &no_such_row_group }),
+        streamOptions(.{ .batch_rows = -1 }),
+        streamOptions(.{ .flags = 2 }),
+        small,
+    };
+    for (cases) |options| {
+        var stream: ArrowArrayStream = undefined;
+        try std.testing.expectEqual(c_err.ZP_ERROR_INVALID_ARGUMENT, c_reader.zp_reader_get_stream_with_options(handle, &options, &stream));
+        try std.testing.expect(c_reader.zp_reader_error_message(handle)[0] != 0);
+    }
 }
 
-test "C ABI: reader get_stream_columns with ZP_STREAM_LARGE_OFFSETS returns large_string" {
+test "C ABI: stream with ZP_STREAM_LARGE_OFFSETS returns large_string" {
     const allocator = std.testing.allocator;
     const buf = try createTestParquetBuffer(allocator);
     defer allocator.free(buf);
@@ -710,9 +736,9 @@ test "C ABI: reader get_stream_columns with ZP_STREAM_LARGE_OFFSETS returns larg
     try std.testing.expectEqual(c_err.ZP_OK, c_reader.zp_reader_open_memory(buf.ptr, buf.len, &handle));
     defer c_reader.zp_reader_close(handle);
 
-    const cols = [_]c_int{1};
+    const options = streamOptions(.{ .cols = &.{1}, .flags = c_reader.ZP_STREAM_LARGE_OFFSETS });
     var stream: ArrowArrayStream = undefined;
-    try std.testing.expectEqual(c_err.ZP_OK, c_reader.zp_reader_get_stream_columns(handle, &cols, 1, 0, c_reader.ZP_STREAM_LARGE_OFFSETS, &stream));
+    try std.testing.expectEqual(c_err.ZP_OK, c_reader.zp_reader_get_stream_with_options(handle, &options, &stream));
     defer stream.release.?(&stream);
 
     var schema: ArrowSchema = undefined;
@@ -730,7 +756,7 @@ test "C ABI: reader get_stream_columns with ZP_STREAM_LARGE_OFFSETS returns larg
     try std.testing.expectEqualStrings("charlie", data[@intCast(offsets[2])..@intCast(offsets[3])]);
 }
 
-test "C ABI: reader get_stream_columns returns batches of batch_rows rows" {
+test "C ABI: stream with options returns batches of batch_rows rows" {
     const allocator = std.testing.allocator;
     const buf = try createTestParquetBuffer(allocator);
     defer allocator.free(buf);
@@ -739,9 +765,9 @@ test "C ABI: reader get_stream_columns returns batches of batch_rows rows" {
     try std.testing.expectEqual(c_err.ZP_OK, c_reader.zp_reader_open_memory(buf.ptr, buf.len, &handle));
     defer c_reader.zp_reader_close(handle);
 
-    const cols = [_]c_int{ 1, 0 };
+    const options = streamOptions(.{ .cols = &.{ 1, 0 }, .batch_rows = 2 });
     var stream: ArrowArrayStream = undefined;
-    try std.testing.expectEqual(c_err.ZP_OK, c_reader.zp_reader_get_stream_columns(handle, &cols, 2, 2, 0, &stream));
+    try std.testing.expectEqual(c_err.ZP_OK, c_reader.zp_reader_get_stream_with_options(handle, &options, &stream));
     defer stream.release.?(&stream);
 
     var schema: ArrowSchema = undefined;
@@ -769,6 +795,47 @@ test "C ABI: reader get_stream_columns returns batches of batch_rows rows" {
         }
     }
 
+    var end: ArrowArray = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), stream.get_next.?(&stream, &end));
+    try std.testing.expect(end.release == null);
+}
+
+test "C ABI: stream with options reads the selected row groups in the given order" {
+    const allocator = std.testing.allocator;
+
+    // ids 1..5 in row groups of 2, 2 and 1.
+    var writer = try parquet.createBufferDynamic(allocator);
+    defer writer.deinit();
+    try writer.addColumn("id", parquet.TypeInfo.int32, .{});
+    writer.setRowGroupSize(2);
+    try writer.begin();
+    for (1..6) |i| {
+        try writer.setInt32(0, @intCast(i));
+        try writer.addRow();
+    }
+    try writer.close();
+    const buf = try writer.toOwnedSlice();
+    defer allocator.free(buf);
+
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(c_err.ZP_OK, c_reader.zp_reader_open_memory(buf.ptr, buf.len, &handle));
+    defer c_reader.zp_reader_close(handle);
+
+    // Row groups 2 then 0, in batches of 2: [5, 1], [2].
+    const options = streamOptions(.{ .row_groups = &.{ 2, 0 }, .batch_rows = 2 });
+    var stream: ArrowArrayStream = undefined;
+    try std.testing.expectEqual(c_err.ZP_OK, c_reader.zp_reader_get_stream_with_options(handle, &options, &stream));
+    defer stream.release.?(&stream);
+
+    const expected = [_][]const i32{ &.{ 5, 1 }, &.{2} };
+    for (expected) |ids| {
+        var batch: ArrowArray = undefined;
+        try std.testing.expectEqual(@as(c_int, 0), stream.get_next.?(&stream, &batch));
+        defer batch.doRelease();
+        try std.testing.expectEqual(@as(i64, @intCast(ids.len)), batch.length);
+        const values: [*]const i32 = @ptrCast(@alignCast(batch.children.?[0].buffers[1].?));
+        try std.testing.expectEqualSlices(i32, ids, values[0..ids.len]);
+    }
     var end: ArrowArray = undefined;
     try std.testing.expectEqual(@as(c_int, 0), stream.get_next.?(&stream, &end));
     try std.testing.expect(end.release == null);

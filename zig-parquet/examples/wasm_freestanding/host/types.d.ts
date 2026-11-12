@@ -329,6 +329,25 @@ export interface ParquetFreestandingExports {
     arrays_out_ptr: number,
     schema_out_ptr: number,
   ): StatusCode;
+
+  // -- Arrow stream (handle-based) --
+
+  /** Stream over all columns, one batch per row group. Returns a stream handle or -error. */
+  zp_reader_stream_init(reader_handle_id: HandleId): HandleId;
+  /**
+   * Stream configured by a zp_stream_options struct (see libparquet.h; 32 bytes on wasm32:
+   * size u32 @0, flags u32 @4, col_indices ptr @8, num_cols i32 @12, row_groups ptr @16,
+   * num_row_groups i32 @20, batch_rows i64 @24), or 0 for the defaults.
+   */
+  zp_reader_stream_init_with_options(reader_handle_id: HandleId, options_ptr: number): HandleId;
+  zp_reader_stream_get_schema(stream_handle_id: HandleId, schema_out_ptr: number): StatusCode;
+  /** Next batch and its schema; ZP_ROW_END (11) after the last. Release both outputs. */
+  zp_reader_stream_get_next(
+    stream_handle_id: HandleId,
+    array_out_ptr: number,
+    schema_out_ptr: number,
+  ): StatusCode;
+  zp_reader_stream_close(stream_handle_id: HandleId): void;
   zp_reader_error_code(handle_id: HandleId): StatusCode;
   zp_reader_error_message(handle_id: HandleId): number;
   zp_reader_close(handle_id: HandleId): void;
@@ -379,6 +398,10 @@ export interface ParquetFreestandingExports {
   zp_arrow_array_get_child(arr_ptr: number, index: number): number;
   zp_arrow_array_get_buffer(arr_ptr: number, index: number): number;
   zp_arrow_schema_get_format(schema_ptr: number): number;
+  /** Release an ArrowArray returned by this module (zp_reader_read_row_group, streams). */
+  zp_arrow_array_release(arr_ptr: number): void;
+  /** Release an ArrowSchema returned by this module. */
+  zp_arrow_schema_release(schema_ptr: number): void;
   zp_arrow_schema_get_name(schema_ptr: number): number;
   zp_arrow_schema_get_n_children(schema_ptr: number): bigint;
   zp_arrow_schema_get_child(schema_ptr: number, index: number): number;

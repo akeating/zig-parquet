@@ -240,12 +240,10 @@ export interface ParquetWasiExports {
     handle: HandlePtr,
     stream_out_ptr: number,
   ): StatusCode;
-  zp_reader_get_stream_columns(
+  /** options_ptr: a zp_stream_options struct (32 bytes on wasm32), or 0 for the defaults. */
+  zp_reader_get_stream_with_options(
     handle: HandlePtr,
-    col_indices_ptr: number,
-    num_cols: number,
-    batch_rows: bigint,
-    flags: number,
+    options_ptr: number,
     stream_out_ptr: number,
   ): StatusCode;
   zp_reader_error_code(handle: HandlePtr): StatusCode;

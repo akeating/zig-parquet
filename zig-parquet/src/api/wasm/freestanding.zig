@@ -15,6 +15,7 @@ const handles = @import("handles.zig");
 const err = @import("../../api/c/error.zig");
 const introspect = @import("../../api/c/introspect.zig");
 const arrow_batch = @import("../../core/arrow_batch.zig");
+const stream_options = @import("../stream_options.zig");
 const safe = @import("../../core/safe.zig");
 const format = @import("../../core/format.zig");
 const seekable_reader_mod = @import("../../core/seekable_reader.zig");
@@ -117,7 +118,7 @@ const HandleSlot = union(enum) {
 
 const StreamHandle = struct {
     reader: *ReaderHandle,
-    rg_index: usize,
+    batches: arrow_batch.ArrowBatchReader,
 };
 
 var handle_table: [MAX_HANDLES]HandleSlot = @splat(.{ .empty = {} });
@@ -1957,52 +1958,76 @@ export fn zp_row_writer_free(handle_id: i32) void {
 // Arrow Stream exports (handle-based iteration for freestanding)
 // ============================================================================
 
+/// Opens a stream over all columns, one batch per row group. Returns a stream handle ID
+/// (>= 0) or a negative error code. The reader must stay open while the stream is used.
 export fn zp_reader_stream_init(reader_handle_id: i32) i32 {
+    return zp_reader_stream_init_with_options(reader_handle_id, null);
+}
+
+/// Opens a stream configured by `options` (`zp_stream_options`, see libparquet.h; null for
+/// the defaults of `zp_reader_stream_init`): columns and row groups to read, rows per batch
+/// and flags. Returns a stream handle ID (>= 0) or a negative error code; the reader
+/// handle's error message says which option is invalid.
+export fn zp_reader_stream_init_with_options(reader_handle_id: i32, options: ?*const stream_options.StreamOptions) i32 {
     const reader = getReaderHandle(reader_handle_id) orelse return -err.ZP_ERROR_INVALID_ARGUMENT;
+    reader.err_ctx.setOk();
+
+    var message: []const u8 = "";
+    var parsed = stream_options.parse(reader.allocator, options, &message) catch |e| {
+        reader.err_ctx.setError(err.mapError(e), if (e == error.InvalidArgument) message else err.errorMessage(e));
+        return -reader.err_ctx.code;
+    };
+    // The batch reader keeps its own copies of the index lists.
+    defer parsed.deinit(reader.allocator);
+
     const slot = allocHandleSlot();
     if (slot < 0) return slot;
 
-    const sh = backing_allocator.create(StreamHandle) catch return -err.ZP_ERROR_OUT_OF_MEMORY;
-    sh.* = .{ .reader = reader, .rg_index = 0 };
+    var batches = arrow_batch.ArrowBatchReader.init(reader.allocator, reader.source, reader.metadata, parsed.batchOptions()) catch |e| {
+        if (e == error.InvalidArgument) {
+            reader.err_ctx.setError(err.ZP_ERROR_INVALID_ARGUMENT, "column or row group index out of range");
+        } else {
+            reader.err_ctx.setError(err.mapError(e), err.errorMessage(e));
+        }
+        return -reader.err_ctx.code;
+    };
+    const sh = backing_allocator.create(StreamHandle) catch {
+        batches.deinit();
+        return -err.ZP_ERROR_OUT_OF_MEMORY;
+    };
+    sh.* = .{ .reader = reader, .batches = batches };
 
     const idx = safe.castTo(usize, slot) catch unreachable; // allocHandleSlot returns valid index
     handle_table[idx] = .{ .stream = sh };
     return slot;
 }
 
+/// The schema of the stream's batches: a struct whose children are the selected columns.
 export fn zp_reader_stream_get_schema(stream_handle_id: i32, schema_out: ?*ArrowSchema) i32 {
     const sh = getStreamHandle(stream_handle_id) orelse return err.ZP_ERROR_INVALID_ARGUMENT;
     const out = schema_out orelse return err.ZP_ERROR_INVALID_ARGUMENT;
     const handle = sh.reader;
 
-    const schema = arrow_batch.exportSchemaAsArrow(handle.allocator, handle.metadata) catch |e| {
+    out.* = sh.batches.schema() catch |e| {
         handle.err_ctx.setError(err.mapError(e), err.errorMessage(e));
         return handle.err_ctx.code;
     };
-    out.* = schema;
     return ZP_OK;
 }
 
+/// The next batch as a struct array and its schema, or ZP_ROW_END after the last batch. Both
+/// outputs must be released by the caller.
 export fn zp_reader_stream_get_next(stream_handle_id: i32, array_out: ?*ArrowArray, schema_out: ?*ArrowSchema) i32 {
     const sh = getStreamHandle(stream_handle_id) orelse return err.ZP_ERROR_INVALID_ARGUMENT;
     const a_out = array_out orelse return err.ZP_ERROR_INVALID_ARGUMENT;
     const s_out = schema_out orelse return err.ZP_ERROR_INVALID_ARGUMENT;
     const handle = sh.reader;
 
-    if (sh.rg_index >= handle.metadata.row_groups.len) {
-        return err.ZP_ROW_END;
-    }
-
-    var result = arrow_batch.readRowGroupAsArrow(
-        handle.allocator,
-        handle.source,
-        handle.metadata,
-        sh.rg_index,
-        null,
-    ) catch |e| {
-        handle.err_ctx.setErrorFmt(err.mapError(e), "readRowGroupAsArrow failed: {s}", .{err.errorMessage(e)});
+    const batch = sh.batches.next() catch |e| {
+        handle.err_ctx.setErrorFmt(err.mapError(e), "reading the next batch failed: {s}", .{err.errorMessage(e)});
         return handle.err_ctx.code;
     };
+    var result = batch orelse return err.ZP_ROW_END;
 
     const wrapper = handles.wrapColumnsAsStruct(handle.allocator, result.arrays, &result.schema) catch |e| {
         result.deinit();
@@ -2012,13 +2037,14 @@ export fn zp_reader_stream_get_next(stream_handle_id: i32, array_out: ?*ArrowArr
 
     a_out.* = wrapper.array;
     s_out.* = result.schema;
+    // The wrapper owns the column arrays; only the slice is freed.
     handle.allocator.free(result.arrays);
-    sh.rg_index += 1;
     return ZP_OK;
 }
 
 export fn zp_reader_stream_close(stream_handle_id: i32) void {
     const sh = getStreamHandle(stream_handle_id) orelse return;
+    sh.batches.deinit();
     backing_allocator.destroy(sh);
     freeHandleSlot(stream_handle_id);
 }
@@ -2054,6 +2080,19 @@ fn schemaNodeFromTypeInfo(handle: *RowWriterHandle, info: TypeInfo) !*const Sche
 // These let the host read Arrow C Data Interface structs without knowing
 // the exact byte layout, which may vary across compiler versions.
 // ============================================================================
+
+/// Releases an ArrowArray returned by this module (its `release` callback), so a host that
+/// cannot call WASM function pointers can free batches. Does nothing when already released.
+export fn zp_arrow_array_release(arr: ?*ArrowArray) void {
+    const a = arr orelse return;
+    if (a.release) |release| release(a);
+}
+
+/// Releases an ArrowSchema returned by this module. Does nothing when already released.
+export fn zp_arrow_schema_release(sch: ?*ArrowSchema) void {
+    const s = sch orelse return;
+    if (s.release) |release| release(s);
+}
 
 export fn zp_arrow_array_get_length(arr: ?*const ArrowArray) i64 {
     return if (arr) |a| a.length else 0;

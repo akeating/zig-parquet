@@ -18,6 +18,7 @@ export fn main() i32 {
 const err = @import("../../api/c/error.zig");
 const introspect = @import("../../api/c/introspect.zig");
 const arrow_batch = @import("../../core/arrow_batch.zig");
+const stream_options = @import("../stream_options.zig");
 const safe = @import("../../core/safe.zig");
 const format = @import("../../core/format.zig");
 const seekable_reader_mod = @import("../../core/seekable_reader.zig");
@@ -435,51 +436,39 @@ export fn zp_reader_get_kv_metadata_value(handle_ptr: ?*anyopaque, index: i32, v
     return ZP_OK;
 }
 
+/// Get an Arrow C Stream Interface over all columns, one batch per row group.
 export fn zp_reader_get_stream(
     handle_ptr: ?*anyopaque,
     stream_out: ?*ArrowArrayStream,
 ) i32 {
-    return zp_reader_get_stream_columns(handle_ptr, null, 0, 0, 0, stream_out);
+    return zp_reader_get_stream_with_options(handle_ptr, null, stream_out);
 }
 
-/// Like `zp_reader_get_stream`, reading only the top-level columns `col_indices`, in that
-/// order. If `col_indices` is null, all columns are read and `num_cols` is ignored. With
-/// `batch_rows` 0, each batch is one row group; with `batch_rows` > 0, each batch has
-/// `batch_rows` rows, taken from as many row groups as needed; only the last batch can have
-/// fewer. `flags`: 0, or
-/// `ZP_STREAM_LARGE_OFFSETS` to read BYTE_ARRAY columns as large_string / large_binary.
-export fn zp_reader_get_stream_columns(
+/// Get an Arrow C Stream Interface configured by `options` (`zp_stream_options`; null for
+/// the defaults of `zp_reader_get_stream`): the top-level columns and row groups to read,
+/// in the given order, rows per batch (0: one batch per row group; otherwise batches take
+/// rows from as many row groups as needed and only the last can have fewer), and flags. The
+/// stream copies what it needs from `options`.
+export fn zp_reader_get_stream_with_options(
     handle_ptr: ?*anyopaque,
-    col_indices: ?[*]const i32,
-    num_cols: i32,
-    batch_rows: i64,
-    flags: u32,
+    options: ?*const stream_options.StreamOptions,
     stream_out: ?*ArrowArrayStream,
 ) i32 {
     const handle = castHandle(ReaderHandle, handle_ptr) orelse return err.ZP_ERROR_INVALID_ARGUMENT;
     const out = stream_out orelse return err.ZP_ERROR_INVALID_ARGUMENT;
     handle.err_ctx.setOk();
 
-    if (batch_rows < 0) {
-        handle.err_ctx.setError(err.ZP_ERROR_INVALID_ARGUMENT, "batch_rows must not be negative");
+    var message: []const u8 = "";
+    var parsed = stream_options.parse(handle.allocator, options, &message) catch |e| {
+        handle.err_ctx.setError(err.mapError(e), if (e == error.InvalidArgument) message else err.errorMessage(e));
         return handle.err_ctx.code;
-    }
-    if (flags & ~stream_known_flags != 0) {
-        handle.err_ctx.setError(err.ZP_ERROR_INVALID_ARGUMENT, "unknown flags");
-        return handle.err_ctx.code;
-    }
-    var indices: ?[]usize = null;
-    if (col_indices) |ci| indices = columnIndices(handle, ci, num_cols) orelse return handle.err_ctx.code;
-    // The batch reader keeps its own copy.
-    defer if (indices) |ci| handle.allocator.free(ci);
+    };
+    // The batch reader keeps its own copies of the index lists.
+    defer parsed.deinit(handle.allocator);
 
-    var batches = arrow_batch.ArrowBatchReader.init(handle.allocator, handle.source, handle.metadata, .{
-        .columns = indices,
-        .batch_rows = if (batch_rows == 0) null else safe.castTo(usize, batch_rows) catch std.math.maxInt(usize),
-        .large_offsets = flags & ZP_STREAM_LARGE_OFFSETS != 0,
-    }) catch |e| {
+    var batches = arrow_batch.ArrowBatchReader.init(handle.allocator, handle.source, handle.metadata, parsed.batchOptions()) catch |e| {
         if (e == error.InvalidArgument) {
-            handle.err_ctx.setError(err.ZP_ERROR_INVALID_ARGUMENT, "column index out of range");
+            handle.err_ctx.setError(err.ZP_ERROR_INVALID_ARGUMENT, "column or row group index out of range");
         } else {
             handle.err_ctx.setError(err.mapError(e), err.errorMessage(e));
         }
@@ -2071,10 +2060,7 @@ fn schemaNodeFromTypeInfo(handle: *RowWriterHandle, info: TypeInfo) !*const Sche
 
 const ArrowArrayStream = @import("../../core/arrow.zig").ArrowArrayStream;
 
-/// `zp_reader_get_stream_columns` flag: read BYTE_ARRAY columns as Arrow large_string /
-/// large_binary (i64 offsets).
-pub const ZP_STREAM_LARGE_OFFSETS: u32 = 1;
-const stream_known_flags: u32 = ZP_STREAM_LARGE_OFFSETS;
+pub const ZP_STREAM_LARGE_OFFSETS = stream_options.ZP_STREAM_LARGE_OFFSETS;
 
 const StreamPrivateData = struct {
     handle: *ReaderHandle,
