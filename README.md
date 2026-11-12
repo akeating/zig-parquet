@@ -8,16 +8,14 @@ Requires Zig 0.17.0 or later. Uses the unified `std.Io` reader/writer interfaces
 [![Zig](https://img.shields.io/badge/Zig-0.17-f7a41d?logo=zig)](https://ziglang.org/)
 [![License](https://img.shields.io/badge/License-MIT%2FApache--2.0-blue.svg)](COPYRIGHT)
 
-## Build Sizes
+## Why zig-parquet?
 
-Pure Zig, all five compression codecs, no C compiler required. Measured with `ReleaseSmall`.
+If you need Parquet support inside a native application, zig-parquet is a straightforward way to ship it.
 
-| Target | Size |
-|--------|------|
-| Static library (macOS arm64) | 1,365 KB |
-| WASM (brotli-compressed) | 199 KB |
-
-The 1,365 KB figure includes all five Zig codecs. Per-codec cost (on top of a 992 KB codec-less baseline) ranges from 89 KB for lz4 to 254 KB for brotli — use `-Dcodecs=` to pick a subset. See [COMPRESSION.md](COMPRESSION.md) for the full breakdown.
+- **Embed directly** - Use Parquet from Zig or through the C ABI instead of shelling out to a separate tool or service
+- **Keep deployment simple** - Stay native without requiring the JVM, Python, or the full Arrow C++ stack
+- **Ship across targets** - Use the same core library on desktops, servers, edge devices, serverless workloads, and WASM
+- **Start with the CLI** - Use `pqi` to inspect and validate files, then embed the same implementation in your application
 
 ## Features
 
@@ -28,7 +26,8 @@ The 1,365 KB figure includes all five Zig codecs. Per-codec cost (on top of a 99
 - **Compression** - zstd, gzip, snappy, lz4, brotli — pure Zig by default, no C/C++ required; C backends available as opt-in via `-Dcodecs=c-only`
 - **Logical Types** - STRING, DATE, TIME, TIMESTAMP (millis/micros/nanos), DECIMAL, UUID, INT annotations, FLOAT16, ENUM, JSON, BSON, INTERVAL, GEOMETRY, GEOGRAPHY
 - **Dynamic Row API** - Runtime `DynamicWriter` / `DynamicReader` for all types and arbitrary nesting depth
-- **Column API** - Write one column at a time from a slice; read a row group's columns as Arrow arrays with contiguous value buffers (see [Column-Based API](#column-based-api))
+- **Column API** - Write one column at a time from a slice; read columns as Arrow arrays with contiguous value buffers, a row group at a time or in batches of a fixed number of rows (see [Column-Based API](#column-based-api))
+- **Parallel Decoding** - Optionally decode a row group's columns on several threads and read row groups ahead of the batches, from Zig (a `std.Io`) or C (`zp_stream_options.threads`)
 - **Schema-Agnostic Reading** - Read any Parquet file without knowing the schema at compile time
 - **Column Statistics** - Min/max/null_count in column metadata
 - **Page Index** - Read and write OffsetIndex + ColumnIndex; `readRowsFiltered` skips pages whose min/max can't match a predicate, reading only needed byte ranges
@@ -39,56 +38,8 @@ The 1,365 KB figure includes all five Zig codecs. Per-codec cost (on top of a 99
 - **Hardened Against Malformed Input** - Designed for safe casting, bounds checking, and no undefined behavior on untrusted data
 - **C ABI with Arrow C Data Interface** - Call from C, C++, and other languages via ArrowSchema, ArrowArray, and ArrowArrayStream
 - **Portable Deployment** - Native library and CLI for desktops, servers, edge devices, and serverless jobs
-- **WASM Compatible** - 103 KB plain, 184 KB with all pure Zig codecs, or 446 KB with C codecs (brotli-compressed)
+- **WASM Compatible** - `wasm32-wasi` and `wasm32-freestanding` builds; sizes in [Build Sizes](#build-sizes)
 - **CLI Tool** - `pqi` for inspecting and validating Parquet files
-
-## CLI Tool
-
-The `pqi` command-line tool is included for working with Parquet files:
-
-```bash
-# Build the CLI
-cd cli && zig build
-
-# Show schema
-pqi schema data.parquet
-
-# Preview rows
-pqi head data.parquet -n 10
-
-# Output all rows as JSON
-pqi cat data.parquet --json
-
-# Row count
-pqi count data.parquet
-
-# File statistics
-pqi stats data.parquet
-
-# Row group details
-pqi rowgroups data.parquet
-
-# File size breakdown
-pqi size data.parquet
-
-# Column detail across row groups
-pqi column data.parquet price quantity
-
-# Validate file integrity
-pqi validate data.parquet
-
-# Show OffsetIndex + ColumnIndex for each row group / column
-pqi page-index data.parquet
-```
-
-## Why zig-parquet?
-
-If you need Parquet support inside a native application, zig-parquet is a straightforward way to ship it.
-
-- **Embed directly** - Use Parquet from Zig or through the C ABI instead of shelling out to a separate tool or service
-- **Keep deployment simple** - Stay native without requiring the JVM, Python, or the full Arrow C++ stack
-- **Ship across targets** - Use the same core library on desktops, servers, edge devices, serverless workloads, and WASM
-- **Start with the CLI** - Use `pqi` to inspect and validate files, then embed the same implementation in your application
 
 ## Installation
 
@@ -114,177 +65,13 @@ exe.linkLibrary(parquet.artifact("parquet"));
 
 ## Quick Start
 
-### Row-Based API (Recommended)
-
-Define your schema at runtime, write rows with typed setters, and read back dynamically:
-
-```zig
-const std = @import("std");
-const parquet = @import("parquet");
-
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    // Write
-    {
-        const file = try std.fs.cwd().createFile("sensors.parquet", .{});
-        defer file.close();
-
-        var writer = try parquet.createFileDynamic(allocator, file);
-        defer writer.deinit();
-
-        // Columns are OPTIONAL by default; use .asRequired() for non-nullable
-        const TypeInfo = parquet.TypeInfo;
-        try writer.addColumn("sensor_id", TypeInfo.int32.asRequired(), .{});
-        try writer.addColumn("timestamp", TypeInfo.timestamp_micros, .{});
-        try writer.addColumn("temperature", TypeInfo.double_, .{});
-        try writer.addColumn("location", TypeInfo.string, .{});
-        writer.setCompression(.zstd);
-        try writer.begin();
-
-        try writer.setInt32(0, 1);
-        try writer.setInt64(1, 1704067200000000);
-        try writer.setDouble(2, 23.5);
-        try writer.setBytes(3, "Building A");
-        try writer.addRow();
-
-        try writer.close();
-    }
-
-    // Read
-    {
-        const file = try std.fs.cwd().openFile("sensors.parquet", .{});
-        defer file.close();
-
-        var reader = try parquet.openFileDynamic(allocator, file, .{});
-        defer reader.deinit();
-
-        const rows = try reader.readAllRows(0);
-        defer {
-            for (rows) |row| row.deinit();
-            allocator.free(rows);
-        }
-
-        for (rows) |row| {
-            const id = if (row.getColumn(0)) |v| v.asInt32() orelse 0 else 0;
-            const temp = if (row.getColumn(2)) |v| v.asDouble() orelse 0 else 0;
-            std.debug.print("Sensor {}: {d}°C\n", .{ id, temp });
-        }
-    }
-}
-```
-
-### Column Projection
-
-Read only a subset of top-level columns (skips I/O for unrequested columns):
-
-```zig
-var reader = try parquet.openFileDynamic(allocator, file, .{});
-defer reader.deinit();
-
-// Read only columns 1 and 3 (dense-packed: returned rows have 2 values)
-const rows = try reader.readRowsProjected(0, &.{ 1, 3 });
-defer {
-    for (rows) |row| row.deinit();
-    allocator.free(rows);
-}
-
-for (rows) |row| {
-    const name = if (row.getColumn(0)) |v| v.asBytes() orelse "" else "";
-    const score = if (row.getColumn(1)) |v| v.asDouble() orelse 0 else 0;
-    std.debug.print("{s}: {d}\n", .{ name, score });
-}
-```
-
-### Row Group Filtering
-
-Use column statistics to skip row groups that don't match your criteria:
-
-```zig
-var reader = try parquet.openFileDynamic(allocator, file, .{});
-defer reader.deinit();
-
-for (0..reader.getNumRowGroups()) |rg| {
-    const stats = reader.getColumnStatistics(0, rg) orelse continue;
-    const min_bytes = stats.min_value orelse stats.min orelse continue;
-    const max_bytes = stats.max_value orelse stats.max orelse continue;
-    const min = std.mem.readInt(i32, min_bytes[0..4], .little);
-    const max = std.mem.readInt(i32, max_bytes[0..4], .little);
-
-    if (target < min or target > max) continue; // skip this row group
-
-    const rows = try reader.readAllRows(rg);
-    defer {
-        for (rows) |row| row.deinit();
-        allocator.free(rows);
-    }
-    // ... process matching rows ...
-}
-```
-
-### Page-Index Filtering
-
-For files written with page indexes, `readRowsFiltered` evaluates column-level predicates against per-page min/max and reads only the pages whose ranges might match. Non-matching pages are never fetched from the source and never decompressed. The pages that match are read as they are decoded, adjacent pages together in reads of up to 8 MiB:
-
-```zig
-var reader = try parquet.openFileDynamic(allocator, file, .{});
-defer reader.deinit();
-
-// Keep rows where col 0 is between 100 and 200 AND col 1 equals the bytes "active".
-const filters = [_]parquet.ColumnFilter{
-    parquet.page_filter.betweenI32(0, 100, 200),
-    parquet.page_filter.cmpBytes(1, .eq, "active"),
-};
-
-const rows = try reader.readRowsFiltered(0, &filters);
-defer {
-    for (rows) |row| row.deinit();
-    allocator.free(rows);
-}
-```
-
-The filter is conservative: kept rows come from pages whose stats *could* match, so you may still need a value-level check post-decode. `readRowsFiltered` requires every leaf column in the row group to carry an `OffsetIndex`; use `readAllRows` for unindexed files.
-
-Filters target leaf columns, including the leaves of lists, structs and maps; a filter on a list or map leaf keeps the rows of pages that might hold a matching element. Nested columns are returned as by `readAllRows`. Their data pages must start at row boundaries, as the format requires of files with an offset index; a page that is read and does not start at a row returns `error.PageNotAtRowStart`. Pages that are not read are not checked.
-
-Writing files with indexes is opt-in, with the same two fields on `DynamicWriter` and on the column-based `Writer`:
-
-```zig
-var writer = try parquet.createFileDynamic(allocator, file);
-writer.write_page_index = true;
-writer.max_page_size = 64 * 1024; // roll pages at 64 KiB of encoded data
-// ... addColumn / begin / rows / close as usual
-
-var col_writer = try parquet.writeToFile(allocator, file, io, &columns);
-col_writer.write_page_index = true;
-col_writer.max_page_size = 64 * 1024;
-// ... write*Column calls / close as usual
-```
-
-`max_page_size` defaults to null, which writes each column chunk as one data page; `write_page_index` defaults to false. Set `write_page_index` before writing: changing it after the first column is written (`Writer`) or after `begin()` (`DynamicWriter`) returns `error.InvalidState` at the next write or at `close`. The page indexes are written after the last row group, before the footer. Each data page of a flat or nested column gets an index entry with its own min, max and null count. Pages of list, struct and map columns end only before a row, so a page can hold more than `max_page_size` bytes when one row does. Inspect what you wrote with `pqi page-index <file>`.
-
-### Row Iterator
-
-Stream through all rows without managing row groups manually. Only one row group's data is held in memory at a time:
-
-```zig
-var reader = try parquet.openFileDynamic(allocator, file, .{});
-defer reader.deinit();
-
-var iter = reader.rowIterator();
-defer iter.deinit();
-
-while (try iter.next()) |row| {
-    const id = if (row.getColumn(0)) |v| v.asInt32() orelse 0 else 0;
-    std.debug.print("id={}\n", .{id});
-}
-```
+There are two APIs. The column-based API (`Writer`, `DynamicReader.readColumns`, `DynamicReader.columnBatches`) writes whole columns and reads them as Arrow arrays; use it to read many rows, for analytics, and to pass data to Arrow. The row-based API (`DynamicWriter`, `DynamicReader`) writes and reads one record at a time, as a row of `Value`s; use it to write records as they arrive, to read small files or a few rows, and for page-index filtering (`readRowsFiltered`). Reading all columns of a 10-million-row file one row group at a time took 160 ms and 45 MB through the column API, and 340 ms and 161 MB through the row API (bench/column-read).
 
 ### Column-Based API
 
 Write each column from one slice, and read each column back as an Arrow array whose values sit in one contiguous buffer. Full example: [`examples/basic/src/05_column_api.zig`](zig-parquet/examples/basic/src/05_column_api.zig).
+
+#### Writing Columns
 
 Write with `writeToFile` (or `writeToBuffer`) and one `writeColumnOptional` call per column. It takes a slice of `Optional(T)` for both required and nullable columns. List, map, struct and nested columns have their own `write*Column` functions.
 
@@ -303,6 +90,8 @@ try writer.close();
 ```
 
 `writeColumn(T, index, []const T)` accepts a plain slice but is deprecated; it copies the slice into `Optional(T)` values and calls `writeColumnOptional`.
+
+#### Reading Columns
 
 Read with `reader.readColumns`, which returns one `ArrowArray` per top-level column of a row group, in [Arrow C Data Interface](https://arrow.apache.org/docs/format/CDataInterface.html) layout. Pass column indices in `.columns` to read a subset; without them it reads all columns:
 
@@ -333,6 +122,10 @@ Buffer layout:
 
 `result.schema` is a struct `ArrowSchema` whose children give each column's Arrow type (format string), name and nullability, for the columns read and in the order of `.columns`. `parquet.exportSchemaAsArrow` returns the schema of all columns without reading data. `result.deinit()` releases all arrays and the schema.
 
+The reader loads a column chunk's compressed bytes whole, then decompresses and decodes one page at a time directly into the Arrow buffers.
+
+#### Reading in Batches
+
 To read in batches of a fixed number of rows instead of whole row groups, use `reader.columnBatches`, which returns an `ArrowBatchReader`:
 
 ```zig
@@ -349,6 +142,8 @@ while (try batches.next()) |batch| {
 ```
 
 Batches take rows from as many row groups as they need, so only the last batch can have fewer rows; with `.batch_rows = null`, each batch is one row group. The reader reads and decodes pages as batches need them; between batches it holds, per leaf column, one compressed page, the dictionary, at most one page of decoded entries, and buffers with room for the next batch's entries.
+
+#### Decoding on Several Threads
 
 Reads can decode on several threads. The options of `readColumns` (`RowGroupOptions`), `columnBatches` (`BatchOptions`) and `openFileDynamic` (`DynamicReaderOptions`, for row reads) take an `io: ?std.Io`. With a `std.Io.Threaded`, the columns of a row group, and the leaf columns of nested columns, are decoded as tasks on its threads; the allocator and the source must then allow concurrent use (`std.heap.smp_allocator`, a file). `BatchOptions.read_ahead = k` also decodes each row group whole and keeps k row groups decoding ahead of the batches; between batches the reader then holds the decoded entries of up to k + 1 row groups, and an error in a row group is returned by the first batch that takes rows from it.
 
@@ -375,7 +170,9 @@ defer batches.deinit();
 
 Reading all 3 columns of a 10-million-row file with 10 row groups in 65,536-row batches on an Apple M2 Max (bench/column-read) took 149 ms on the calling thread, 75 ms on 8 threads, and 36 ms on 8 threads with `read_ahead = 1`; the peak memory was 11 MB, 11 MB and 76 MB.
 
-C callers have the same functions as `zp_reader_read_row_group` and `zp_reader_get_stream_with_options`. The second returns an `ArrowArrayStream` configured by a `zp_stream_options` struct: columns and row groups to read, rows per batch (0: one batch per row group), flags such as `ZP_STREAM_LARGE_OFFSETS`, and `threads` and `read_ahead`, which start a thread pool for the stream as above (WASM builds ignore them). With `threads` of 2 or more, a reader opened with `zp_reader_open_callbacks` calls `read_at` from several threads at once. `zp_reader_get_stream` reads all columns, one batch per row group, on the calling thread.
+#### C and WASM
+
+C callers read a row group with `zp_reader_read_row_group`, and batches with `zp_reader_get_stream_with_options`, which returns an `ArrowArrayStream` configured by a `zp_stream_options` struct: columns and row groups to read, rows per batch (0: one batch per row group), flags such as `ZP_STREAM_LARGE_OFFSETS`, and `threads` and `read_ahead`, which start a thread pool for the stream as above (WASM builds ignore them). With `threads` of 2 or more, a reader opened with `zp_reader_open_callbacks` calls `read_at` from several threads at once. `zp_reader_get_stream` reads all columns, one batch per row group, on the calling thread.
 
 ```c
 int cols[] = {0, 2};
@@ -399,7 +196,172 @@ if (zp_reader_get_stream_with_options(reader, &options, &stream) == ZP_OK) {
 
 The freestanding WASM build has the same stream behind handle IDs (`zp_reader_stream_init_with_options`, `zp_reader_stream_get_next`, `zp_reader_stream_close`), and `zp_arrow_array_release` / `zp_arrow_schema_release` for hosts that cannot call WASM function pointers.
 
-The reader loads a column chunk's compressed bytes whole, then decompresses and decodes one page at a time directly into the Arrow buffers.
+### Row-Based API
+
+Define your schema at runtime, write rows with typed setters, and read back dynamically:
+
+```zig
+const std = @import("std");
+const parquet = @import("parquet");
+
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const io = init.io;
+
+    // Write
+    {
+        const file = try std.Io.Dir.cwd().createFile(io, "sensors.parquet", .{});
+        defer file.close(io);
+
+        var writer = try parquet.createFileDynamic(allocator, file, io);
+        defer writer.deinit();
+
+        // Columns are OPTIONAL by default; use .asRequired() for non-nullable
+        const TypeInfo = parquet.TypeInfo;
+        try writer.addColumn("sensor_id", TypeInfo.int32.asRequired(), .{});
+        try writer.addColumn("timestamp", TypeInfo.timestamp_micros, .{});
+        try writer.addColumn("temperature", TypeInfo.double_, .{});
+        try writer.addColumn("location", TypeInfo.string, .{});
+        writer.setCompression(.zstd);
+        try writer.begin();
+
+        try writer.setInt32(0, 1);
+        try writer.setInt64(1, 1704067200000000);
+        try writer.setDouble(2, 23.5);
+        try writer.setBytes(3, "Building A");
+        try writer.addRow();
+
+        try writer.close();
+    }
+
+    // Read
+    {
+        const file = try std.Io.Dir.cwd().openFile(io, "sensors.parquet", .{});
+        defer file.close(io);
+
+        var reader = try parquet.openFileDynamic(allocator, file, io, .{});
+        defer reader.deinit();
+
+        const rows = try reader.readAllRows(0);
+        defer {
+            for (rows) |row| row.deinit();
+            allocator.free(rows);
+        }
+
+        for (rows) |row| {
+            const id = if (row.getColumn(0)) |v| v.asInt32() orelse 0 else 0;
+            const temp = if (row.getColumn(2)) |v| v.asDouble() orelse 0 else 0;
+            std.debug.print("Sensor {}: {d}°C\n", .{ id, temp });
+        }
+    }
+}
+```
+
+#### Row Iterator
+
+Stream through all rows without managing row groups manually. Only one row group's data is held in memory at a time:
+
+```zig
+var reader = try parquet.openFileDynamic(allocator, file, io, .{});
+defer reader.deinit();
+
+var iter = reader.rowIterator();
+defer iter.deinit();
+
+while (try iter.next()) |row| {
+    const id = if (row.getColumn(0)) |v| v.asInt32() orelse 0 else 0;
+    std.debug.print("id={}\n", .{id});
+}
+```
+
+#### Column Projection
+
+Read only a subset of top-level columns (skips I/O for unrequested columns):
+
+```zig
+var reader = try parquet.openFileDynamic(allocator, file, io, .{});
+defer reader.deinit();
+
+// Read only columns 1 and 3 (dense-packed: returned rows have 2 values)
+const rows = try reader.readRowsProjected(0, &.{ 1, 3 });
+defer {
+    for (rows) |row| row.deinit();
+    allocator.free(rows);
+}
+
+for (rows) |row| {
+    const name = if (row.getColumn(0)) |v| v.asBytes() orelse "" else "";
+    const score = if (row.getColumn(1)) |v| v.asDouble() orelse 0 else 0;
+    std.debug.print("{s}: {d}\n", .{ name, score });
+}
+```
+
+#### Row Group Filtering
+
+Use column statistics to skip row groups that don't match your criteria:
+
+```zig
+var reader = try parquet.openFileDynamic(allocator, file, io, .{});
+defer reader.deinit();
+
+for (0..reader.getNumRowGroups()) |rg| {
+    const stats = reader.getColumnStatistics(0, rg) orelse continue;
+    const min_bytes = stats.min_value orelse stats.min orelse continue;
+    const max_bytes = stats.max_value orelse stats.max orelse continue;
+    const min = std.mem.readInt(i32, min_bytes[0..4], .little);
+    const max = std.mem.readInt(i32, max_bytes[0..4], .little);
+
+    if (target < min or target > max) continue; // skip this row group
+
+    const rows = try reader.readAllRows(rg);
+    defer {
+        for (rows) |row| row.deinit();
+        allocator.free(rows);
+    }
+    // ... process matching rows ...
+}
+```
+
+#### Page-Index Filtering
+
+For files written with page indexes, `readRowsFiltered` evaluates column-level predicates against per-page min/max and reads only the pages whose ranges might match. Non-matching pages are never fetched from the source and never decompressed. The pages that match are read as they are decoded, adjacent pages together in reads of up to 8 MiB:
+
+```zig
+var reader = try parquet.openFileDynamic(allocator, file, io, .{});
+defer reader.deinit();
+
+// Keep rows where col 0 is between 100 and 200 AND col 1 equals the bytes "active".
+const filters = [_]parquet.ColumnFilter{
+    parquet.page_filter.betweenI32(0, 100, 200),
+    parquet.page_filter.cmpBytes(1, .eq, "active"),
+};
+
+const rows = try reader.readRowsFiltered(0, &filters);
+defer {
+    for (rows) |row| row.deinit();
+    allocator.free(rows);
+}
+```
+
+The filter is conservative: kept rows come from pages whose stats *could* match, so you may still need a value-level check post-decode. `readRowsFiltered` requires every leaf column in the row group to carry an `OffsetIndex`; use `readAllRows` for unindexed files.
+
+Filters target leaf columns, including the leaves of lists, structs and maps; a filter on a list or map leaf keeps the rows of pages that might hold a matching element. Nested columns are returned as by `readAllRows`. Their data pages must start at row boundaries, as the format requires of files with an offset index; a page that is read and does not start at a row returns `error.PageNotAtRowStart`. Pages that are not read are not checked.
+
+Writing files with indexes is opt-in, with the same two fields on `DynamicWriter` and on the column-based `Writer`:
+
+```zig
+var writer = try parquet.createFileDynamic(allocator, file, io);
+writer.write_page_index = true;
+writer.max_page_size = 64 * 1024; // roll pages at 64 KiB of encoded data
+// ... addColumn / begin / rows / close as usual
+
+var col_writer = try parquet.writeToFile(allocator, file, io, &columns);
+col_writer.write_page_index = true;
+col_writer.max_page_size = 64 * 1024;
+// ... write*Column calls / close as usual
+```
+
+`max_page_size` defaults to null, which writes each column chunk as one data page; `write_page_index` defaults to false. Set `write_page_index` before writing: changing it after the first column is written (`Writer`) or after `begin()` (`DynamicWriter`) returns `error.InvalidState` at the next write or at `close`. The page indexes are written after the last row group, before the footer. Each data page of a flat or nested column gets an index entry with its own min, max and null count. Pages of list, struct and map columns end only before a row, so a page can hold more than `max_page_size` bytes when one row does. Inspect what you wrote with `pqi page-index <file>`.
 
 ## Supported Types
 
@@ -468,7 +430,7 @@ All major Parquet compression codecs are supported, individually selectable at b
 C backends available via `-Dcodecs=c-only` for maximum compression performance.
 
 ```zig
-var writer = try parquet.createFileDynamic(allocator, file);
+var writer = try parquet.createFileDynamic(allocator, file, io);
 writer.setCompression(.zstd);
 ```
 
@@ -506,6 +468,17 @@ writer.setUseDictionary(false);        // disable dictionary encoding globally
 writer.setIntEncoding(.delta_binary_packed);  // default for int columns
 writer.setMaxPageSize(1_048_576);      // 1MB page size limit
 ```
+
+### Build Sizes
+
+Pure Zig, all five compression codecs, no C compiler required. Measured with `ReleaseSmall`.
+
+| Target | Size |
+|--------|------|
+| Static library (macOS arm64) | 1,365 KB |
+| WASM (brotli-compressed) | 199 KB |
+
+The 1,365 KB figure includes all five Zig codecs. Per-codec cost (on top of a 992 KB codec-less baseline) ranges from 89 KB for lz4 to 254 KB for brotli — use `-Dcodecs=` to pick a subset. See [COMPRESSION.md](COMPRESSION.md) for the full breakdown.
 
 ## Spec Coverage
 
@@ -597,6 +570,45 @@ wasmtime --dir=. zig-out/bin/parquet_wasi.wasm
 ```
 
 See `examples/wasm_demo/` and `examples/wasm_freestanding/` for usage examples.
+
+## CLI Tool
+
+The `pqi` command-line tool is included for working with Parquet files:
+
+```bash
+# Build the CLI
+cd cli && zig build
+
+# Show schema
+pqi schema data.parquet
+
+# Preview rows
+pqi head data.parquet -n 10
+
+# Output all rows as JSON
+pqi cat data.parquet --json
+
+# Row count
+pqi count data.parquet
+
+# File statistics
+pqi stats data.parquet
+
+# Row group details
+pqi rowgroups data.parquet
+
+# File size breakdown
+pqi size data.parquet
+
+# Column detail across row groups
+pqi column data.parquet price quantity
+
+# Validate file integrity
+pqi validate data.parquet
+
+# Show OffsetIndex + ColumnIndex for each row group / column
+pqi page-index data.parquet
+```
 
 ## Requirements
 
