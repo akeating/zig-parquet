@@ -57,6 +57,10 @@ const native_little = builtin.cpu.arch.endian() == .little;
 /// pages are decoded instead.
 const max_reserved_entries: usize = 64 * 1024 * 1024;
 
+/// Upper bound on the bytes of byte-array entries reserved before decoding, taken from the
+/// column chunk's `total_uncompressed_size`.
+const max_reserved_bytes: usize = 256 * 1024 * 1024;
+
 /// Alignment of the output buffers. The Arrow C Data Interface requires at least 8 bytes and
 /// recommends 64.
 pub const buffer_alignment: std.mem.Alignment = .@"64";
@@ -541,6 +545,15 @@ pub const ColumnCursor = struct {
         };
         errdefer builder.deinit();
         try builder.init(reserve);
+        // A cursor that returns the whole chunk at once reserves the bytes of byte-array
+        // entries: the chunk's uncompressed size bounds those of PLAIN pages (each value has
+        // a 4-byte length before it). Growing the buffer page by page instead copies the
+        // bytes decoded so far each time it grows. Dictionary pages can produce more bytes;
+        // the buffer then grows.
+        if (builder.kind == .bytes and reserve >= (safe.castTo(usize, meta.num_values) catch std.math.maxInt(usize))) {
+            const bytes = safe.castTo(usize, meta.total_uncompressed_size) catch 0;
+            try builder.values.ensureTotalCapacityPrecise(allocator, @min(bytes, max_reserved_bytes));
+        }
 
         var dec = ChunkDecoder{
             .allocator = allocator,
@@ -644,6 +657,10 @@ pub const ColumnCursor = struct {
         if (self.start == 0 and slots >= rest) {
             var tail = try self.builder.splitOff(slots);
             errdefer tail.deinit();
+            // The next call likely returns as many entries and bytes as this one: room for
+            // them now saves growing the buffers, and copying them, page by page.
+            try tail.reserve(slots);
+            if (tail.kind == .bytes) try tail.values.ensureUnusedCapacity(allocator, self.builder.values.items.len);
             var tail_def = try levelsFrom(allocator, &dec.out_def, n, keep_def);
             errdefer tail_def.deinit(allocator);
             var tail_rep = try levelsFrom(allocator, &dec.out_rep, n, keep_rep);
