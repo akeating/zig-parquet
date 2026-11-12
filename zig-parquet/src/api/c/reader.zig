@@ -42,7 +42,8 @@ pub export fn zp_reader_open_memory(
 /// Open a Parquet reader using caller-provided random-access callbacks.
 ///
 /// The callback context and function pointers must remain valid for the
-/// lifetime of the reader handle. The library invokes callbacks synchronously.
+/// lifetime of the reader handle. The library invokes callbacks synchronously; a stream
+/// with `threads` of 2 or more invokes `read_at` from several threads at once.
 pub export fn zp_reader_open_callbacks(
     ctx: ?*anyopaque,
     read_at_fn: ?*const fn (?*anyopaque, u64, [*]u8, usize, *usize) callconv(.c) c_int,
@@ -274,8 +275,8 @@ pub export fn zp_reader_get_stream(
 /// Get an Arrow C Stream Interface configured by `options` (`zp_stream_options`; null for
 /// the defaults of `zp_reader_get_stream`): the top-level columns and row groups to read,
 /// in the given order, rows per batch (0: one batch per row group; otherwise batches take
-/// rows from as many row groups as needed and only the last can have fewer), and flags. The
-/// stream copies what it needs from `options`.
+/// rows from as many row groups as needed and only the last can have fewer), flags, and the
+/// threads and read-ahead of the decoding. The stream copies what it needs from `options`.
 pub export fn zp_reader_get_stream_with_options(
     handle_ptr: ?*anyopaque,
     options: ?*const stream_options.StreamOptions,
@@ -293,7 +294,16 @@ pub export fn zp_reader_get_stream_with_options(
     // The batch reader keeps its own copies of the index lists.
     defer parsed.deinit(handle.allocator);
 
-    var batches = arrow_batch.ArrowBatchReader.init(handle.allocator, handle.source, handle.metadata, parsed.batchOptions()) catch |e| {
+    // The batch reader refers to the threads, so they are started in their final place.
+    const pd = handle.allocator.create(StreamPrivateData) catch {
+        handle.err_ctx.setError(err.ZP_ERROR_OUT_OF_MEMORY, "OutOfMemory");
+        return handle.err_ctx.code;
+    };
+    pd.* = .{ .handle = handle, .threads = .{}, .batches = undefined };
+    pd.threads.start(parsed.threads);
+    pd.batches = arrow_batch.ArrowBatchReader.init(handle.allocator, handle.source, handle.metadata, parsed.batchOptions(pd.threads.io())) catch |e| {
+        pd.threads.deinit();
+        handle.allocator.destroy(pd);
         if (e == error.InvalidArgument) {
             handle.err_ctx.setError(err.ZP_ERROR_INVALID_ARGUMENT, "column or row group index out of range");
         } else {
@@ -301,13 +311,6 @@ pub export fn zp_reader_get_stream_with_options(
         }
         return handle.err_ctx.code;
     };
-
-    const pd = handle.allocator.create(StreamPrivateData) catch {
-        batches.deinit();
-        handle.err_ctx.setError(err.ZP_ERROR_OUT_OF_MEMORY, "OutOfMemory");
-        return handle.err_ctx.code;
-    };
-    pd.* = .{ .handle = handle, .batches = batches };
 
     out.* = .{
         .get_schema = &streamGetSchema,
@@ -547,6 +550,7 @@ pub const ZP_STREAM_LARGE_OFFSETS = stream_options.ZP_STREAM_LARGE_OFFSETS;
 
 const StreamPrivateData = struct {
     handle: *ReaderHandle,
+    threads: stream_options.Threads,
     batches: arrow_batch.ArrowBatchReader,
 };
 
@@ -613,6 +617,7 @@ fn streamGetLastError(stream: *ArrowArrayStream) callconv(.c) ?[*:0]const u8 {
 fn streamRelease(stream: *ArrowArrayStream) callconv(.c) void {
     const pd: *StreamPrivateData = @ptrCast(@alignCast(stream.private_data));
     pd.batches.deinit();
+    pd.threads.deinit();
     pd.handle.allocator.destroy(pd);
     stream.release = null;
 }

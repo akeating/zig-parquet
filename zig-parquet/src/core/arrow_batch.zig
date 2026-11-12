@@ -882,15 +882,26 @@ pub const BatchOptions = struct {
     /// `parallel`. Then the allocator and the source must allow concurrent use. Null does
     /// them one after another on the calling thread.
     io: ?std.Io = null,
+    /// Row groups to decode ahead of the batches, as tasks of `io` (required when this is
+    /// above 0). Each such row group is decoded whole and cut into the pieces the batches
+    /// take, while the caller consumes earlier batches; see `ArrowBatchReader`. 0 decodes
+    /// pages as batches need them.
+    read_ahead: usize = 0,
 };
 
 /// Reads a file's columns as Arrow arrays, `batch_rows` rows at a time. A batch takes rows
 /// from as many row groups as it needs.
 ///
-/// Pages of the selected columns are read from the source and decoded as batches need them;
-/// a page's entries past the end of a batch are kept for the next one. Memory held between
-/// calls, per leaf column: one compressed page plus up to 1 KiB after it (the start of the
-/// next page header), the dictionary, and at most one page of decoded entries.
+/// With `read_ahead` 0, pages of the selected columns are read from the source and decoded
+/// as batches need them; a page's entries past the end of a batch are kept for the next one.
+/// Memory held between calls, per leaf column: one compressed page plus up to 1 KiB after it
+/// (the start of the next page header), the dictionary, and at most one page of decoded
+/// entries.
+///
+/// With `read_ahead` k above 0, the selected columns of a row group are decoded whole, as
+/// one task of `io` per row group, and k row groups are decoded ahead of the one the batches
+/// take rows from. Memory held between calls: the decoded entries of up to k + 1 row groups.
+/// An error in a row group is returned by the first batch that takes rows from it.
 ///
 /// After `next` returns an error, the reader's position is undefined; call `deinit`.
 pub const ArrowBatchReader = struct {
@@ -916,6 +927,14 @@ pub const ArrowBatchReader = struct {
     /// The cursors of `open`'s leaves, in column order.
     cursors: []*leaf_decoder.ColumnCursor = &.{},
 
+    /// With `read_ahead`: row groups being decoded, in `row_groups` order.
+    read_ahead: usize,
+    pending: std.ArrayList(std.Io.Future(ReaderError!Decoded)) = .empty,
+    /// With `read_ahead`: the decoded row group the batches take rows from.
+    current: ?Decoded = null,
+    /// With `read_ahead`: rows a batch holds when row group `next_rg` starts.
+    next_fill: usize = 0,
+
     const BatchLeaf = struct {
         cursor: leaf_decoder.ColumnCursor,
     };
@@ -923,6 +942,32 @@ pub const ArrowBatchReader = struct {
     const LeafInfo = struct {
         max_def: u32,
         max_rep: u32,
+        /// The leaf's column chunk index.
+        col_idx: usize,
+        /// Whether the leaf is part of a list, map or struct column, which needs its levels.
+        nested: bool,
+    };
+
+    /// A row group decoded by `RowGroupJob`, cut into the pieces batches take.
+    const Decoded = struct {
+        allocator: Allocator,
+        /// Rows of each piece.
+        piece_rows: []usize,
+        /// Piece `p` of leaf `k` is `pieces[k * piece_rows.len + p]`.
+        pieces: []leaf_decoder.Leaf,
+        /// Pieces before this one have been taken by batches.
+        next_piece: usize = 0,
+
+        fn deinit(self: *Decoded) void {
+            const n = self.piece_rows.len;
+            if (n > 0) {
+                for (0..self.pieces.len / n) |k| {
+                    for (self.pieces[k * n + self.next_piece .. (k + 1) * n]) |*l| l.deinit(self.allocator);
+                }
+            }
+            self.allocator.free(self.pieces);
+            self.allocator.free(self.piece_rows);
+        }
     };
 
     const BatchColumn = struct {
@@ -932,6 +977,7 @@ pub const ArrowBatchReader = struct {
 
     pub fn init(allocator: Allocator, source: SeekableReader, metadata: format.FileMetaData, options: BatchOptions) !ArrowBatchReader {
         if (options.batch_rows == 0) return error.InvalidArgument;
+        if (options.read_ahead > 0 and options.io == null) return error.InvalidArgument;
         var arena = std.heap.ArenaAllocator.init(allocator);
         errdefer arena.deinit();
         const a = arena.allocator();
@@ -959,8 +1005,9 @@ pub const ArrowBatchReader = struct {
             const node = &tree[c];
             if (node.physical_count == 0) return error.InvalidSchema;
             for (0..node.physical_count) |j| {
-                const info = format.getColumnInfo(metadata.schema, node.physical_start + j) orelse return error.InvalidSchema;
-                leaf_info[k] = .{ .max_def = info.max_def_level, .max_rep = info.max_rep_level };
+                const col_idx = node.physical_start + j;
+                const info = format.getColumnInfo(metadata.schema, col_idx) orelse return error.InvalidSchema;
+                leaf_info[k] = .{ .max_def = info.max_def_level, .max_rep = info.max_rep_level, .col_idx = col_idx, .nested = node.kind != .leaf };
                 k += 1;
             }
         }
@@ -976,12 +1023,19 @@ pub const ArrowBatchReader = struct {
             .batch_rows = options.batch_rows,
             .large_offsets = options.large_offsets,
             .io = options.io,
+            .read_ahead = options.read_ahead,
             .leaf_info = leaf_info,
         };
     }
 
     pub fn deinit(self: *ArrowBatchReader) void {
         self.closeRowGroup();
+        for (self.pending.items) |*f| {
+            var d = f.cancel(self.io.?) catch continue;
+            d.deinit();
+        }
+        self.pending.deinit(self.allocator);
+        if (self.current) |*d| d.deinit();
         self.arena.deinit();
     }
 
@@ -1004,24 +1058,7 @@ pub const ArrowBatchReader = struct {
             allocator.free(parts);
         }
 
-        var rows: usize = 0;
-        while (true) {
-            if (self.batch_rows) |b| if (rows == b) break;
-            if (self.rows_left == 0) {
-                // Without batch_rows, a batch is one row group.
-                if (self.batch_rows == null and rows > 0) break;
-                self.closeRowGroup();
-                if (self.next_rg == self.row_groups.len) break;
-                try self.openRowGroup(self.row_groups[self.next_rg]);
-                self.next_rg += 1;
-                continue;
-            }
-            const n = if (self.batch_rows) |b| @min(b - rows, self.rows_left) else self.rows_left;
-            const pieces: PieceTask = .{ .allocator = allocator, .cursors = self.cursors, .parts = parts, .rows = n };
-            try parallel.forEach(self.io, allocator, self.cursors.len, &pieces, PieceTask.run);
-            self.rows_left -= n;
-            rows += n;
-        }
+        const rows = if (self.read_ahead > 0) try self.takeDecoded(parts) else try self.decodePieces(parts);
         if (rows == 0) return null;
 
         const arrays = try allocator.alloc(ArrowArray, self.columns.len);
@@ -1044,6 +1081,179 @@ pub const ArrowBatchReader = struct {
         var sch = try self.schema();
         errdefer sch.doRelease();
         return .{ .arrays = arrays, .schema = sch, .allocator = allocator };
+    }
+
+    /// Decodes the rows of the next batch from the open row group's cursors, opening row
+    /// groups as needed, and appends them to `parts`. Returns the number of rows.
+    fn decodePieces(self: *ArrowBatchReader, parts: []std.ArrayList(leaf_decoder.Leaf)) !usize {
+        var rows: usize = 0;
+        while (true) {
+            if (self.batch_rows) |b| if (rows == b) break;
+            if (self.rows_left == 0) {
+                // Without batch_rows, a batch is one row group.
+                if (self.batch_rows == null and rows > 0) break;
+                self.closeRowGroup();
+                if (self.next_rg == self.row_groups.len) break;
+                try self.openRowGroup(self.row_groups[self.next_rg]);
+                self.next_rg += 1;
+                continue;
+            }
+            const n = if (self.batch_rows) |b| @min(b - rows, self.rows_left) else self.rows_left;
+            const pieces: PieceTask = .{ .allocator = self.allocator, .cursors = self.cursors, .parts = parts, .rows = n };
+            try parallel.forEach(self.io, self.allocator, self.cursors.len, &pieces, PieceTask.run);
+            self.rows_left -= n;
+            rows += n;
+        }
+        return rows;
+    }
+
+    /// Moves the pieces of the next batch from decoded row groups to `parts`, starting the
+    /// decoding of further row groups. Returns the number of rows.
+    fn takeDecoded(self: *ArrowBatchReader, parts: []std.ArrayList(leaf_decoder.Leaf)) !usize {
+        const allocator = self.allocator;
+        var rows: usize = 0;
+        while (true) {
+            if (self.batch_rows) |b| if (rows == b) break;
+            const cur = if (self.current) |*c| c else null;
+            if (cur == null or cur.?.next_piece == cur.?.piece_rows.len) {
+                // Without batch_rows, a batch is one row group.
+                if (self.batch_rows == null and rows > 0) break;
+                if (self.current) |*c| c.deinit();
+                self.current = null;
+                try self.startDecoding();
+                if (self.pending.items.len == 0) break;
+                var future = self.pending.orderedRemove(0);
+                self.current = try future.await(self.io.?);
+                continue;
+            }
+            const c = cur.?;
+            for (parts) |*p| try p.ensureUnusedCapacity(allocator, 1);
+            const n = c.piece_rows.len;
+            for (parts, 0..) |*p, k| p.appendAssumeCapacity(c.pieces[k * n + c.next_piece]);
+            rows += c.piece_rows[c.next_piece];
+            c.next_piece += 1;
+        }
+        return rows;
+    }
+
+    /// Starts decoding row groups until `read_ahead` + 1 are decoding or decoded and not
+    /// yet taken from, besides the current one.
+    fn startDecoding(self: *ArrowBatchReader) !void {
+        const io = self.io.?;
+        while (self.pending.items.len < self.read_ahead + 1 and self.next_rg < self.row_groups.len) {
+            try self.pending.ensureUnusedCapacity(self.allocator, 1);
+            const rg = &self.metadata.row_groups[self.row_groups[self.next_rg]];
+            const job: RowGroupJob = .{
+                .allocator = self.allocator,
+                .source = self.source,
+                .schema = self.metadata.schema,
+                .rg = rg,
+                .leaf_info = self.leaf_info,
+                .batch_rows = self.batch_rows,
+                .fill = self.next_fill,
+                .large_offsets = self.large_offsets,
+                .io = io,
+            };
+            self.pending.appendAssumeCapacity(io.async(RowGroupJob.run, .{job}));
+            self.next_rg += 1;
+            // The job returns error.InvalidRowCount for a negative row count; the fill of
+            // later row groups does not matter then.
+            if (self.batch_rows) |b| {
+                const n = safe.castTo(usize, rg.num_rows) catch 0;
+                self.next_fill = (self.next_fill + n % b) % b;
+            }
+        }
+    }
+
+    /// Decodes the selected columns of a row group and cuts each leaf into the pieces the
+    /// batches take: a batch holding `fill` rows takes the first piece.
+    const RowGroupJob = struct {
+        allocator: Allocator,
+        source: SeekableReader,
+        schema: []const format.SchemaElement,
+        rg: *const format.RowGroup,
+        leaf_info: []const LeafInfo,
+        batch_rows: ?usize,
+        fill: usize,
+        large_offsets: bool,
+        io: std.Io,
+
+        fn run(job: RowGroupJob) ReaderError!Decoded {
+            return job.decode() catch |e| asErrorOf(ReaderError, e);
+        }
+
+        fn decode(job: RowGroupJob) !Decoded {
+            const allocator = job.allocator;
+            const num_rows = safe.castTo(usize, job.rg.num_rows) catch return error.InvalidRowCount;
+
+            var piece_rows: std.ArrayList(usize) = .empty;
+            defer piece_rows.deinit(allocator);
+            var left = num_rows;
+            var fill = job.fill;
+            while (left > 0) {
+                const n = if (job.batch_rows) |b| @min(b - fill, left) else left;
+                try piece_rows.append(allocator, n);
+                left -= n;
+                fill = if (job.batch_rows) |b| (fill + n) % b else 0;
+            }
+
+            const np = piece_rows.items.len;
+            const pieces = try allocator.alloc(leaf_decoder.Leaf, job.leaf_info.len * np);
+            errdefer allocator.free(pieces);
+            const done = try allocator.alloc(bool, job.leaf_info.len);
+            defer allocator.free(done);
+            @memset(done, false);
+            errdefer for (done, 0..) |d, k| if (d) for (pieces[k * np ..][0..np]) |*l| l.deinit(allocator);
+
+            const task: LeafPiecesTask = .{ .job = &job, .piece_rows = piece_rows.items, .pieces = pieces, .done = done };
+            try parallel.forEach(job.io, allocator, job.leaf_info.len, &task, LeafPiecesTask.run);
+            return .{ .allocator = allocator, .piece_rows = try piece_rows.toOwnedSlice(allocator), .pieces = pieces };
+        }
+    };
+
+    /// Decodes leaf `k` of a `RowGroupJob` into its pieces.
+    const LeafPiecesTask = struct {
+        job: *const RowGroupJob,
+        piece_rows: []const usize,
+        pieces: []leaf_decoder.Leaf,
+        done: []bool,
+
+        fn run(self: *const LeafPiecesTask, k: usize) ReaderError!void {
+            const job = self.job;
+            const allocator = job.allocator;
+            const info = job.leaf_info[k];
+            var cursor = openCursor(allocator, job.source, job.schema, job.rg, info, job.large_offsets, job.batch_rows) catch |e|
+                return asErrorOf(ReaderError, e);
+            defer cursor.deinit();
+            const out = self.pieces[k * self.piece_rows.len ..][0..self.piece_rows.len];
+            for (out, self.piece_rows, 0..) |*l, n, p| {
+                l.* = cursor.next(n) catch |e| {
+                    for (out[0..p]) |*prev| prev.deinit(allocator);
+                    return asErrorOf(ReaderError, e);
+                };
+            }
+            self.done[k] = true;
+        }
+    };
+
+    /// Opens a cursor over the column chunk of leaf `info` in row group `rg`.
+    fn openCursor(
+        allocator: Allocator,
+        source: SeekableReader,
+        schema_elems: []const format.SchemaElement,
+        rg: *const format.RowGroup,
+        info: LeafInfo,
+        large_offsets: bool,
+        batch_rows: ?usize,
+    ) !leaf_decoder.ColumnCursor {
+        if (info.col_idx >= rg.columns.len) return error.InvalidArgument;
+        const chunk = &rg.columns[info.col_idx];
+        const meta = chunk.meta_data orelse return error.InvalidArgument;
+        const col_info = format.getColumnInfo(schema_elems, info.col_idx) orelse return error.InvalidArgument;
+        const range = try parquet_reader.columnChunkRange(chunk);
+        const pages = leaf_decoder.PageReader.fromSource(allocator, source, range.start, range.size);
+        const reserve = @min(batch_rows orelse std.math.maxInt(usize), safe.castTo(usize, meta.num_values) catch 0);
+        return leaf_decoder.ColumnCursor.init(allocator, pages, meta, col_info, .{ .keep_levels = info.nested, .large_offsets = large_offsets }, reserve);
     }
 
     const CursorError = @typeInfo(@typeInfo(@TypeOf(leaf_decoder.ColumnCursor.next)).@"fn".return_type.?).error_union.error_set;
@@ -1120,6 +1330,7 @@ pub const ArrowBatchReader = struct {
             for (open[0..opened]) |*col| freeColumn(allocator, col);
             allocator.free(open);
         }
+        var first_leaf: usize = 0;
         for (open, self.columns) |*col, c| {
             const node = &self.tree[c];
             if (node.physical_count == 0) return error.InvalidSchema;
@@ -1129,19 +1340,12 @@ pub const ArrowBatchReader = struct {
                 for (leaves[0..leaf_count]) |*l| freeLeaf(l);
                 allocator.free(leaves);
             }
-            for (leaves, 0..) |*l, k| {
-                const col_idx = node.physical_start + k;
-                if (col_idx >= rg.columns.len) return error.InvalidArgument;
-                const chunk = &rg.columns[col_idx];
-                const meta = chunk.meta_data orelse return error.InvalidArgument;
-                const info = format.getColumnInfo(self.metadata.schema, col_idx) orelse return error.InvalidArgument;
-                const range = try parquet_reader.columnChunkRange(chunk);
-                const pages = leaf_decoder.PageReader.fromSource(allocator, self.source, range.start, range.size);
-                const reserve = @min(self.batch_rows orelse std.math.maxInt(usize), safe.castTo(usize, meta.num_values) catch 0);
-                const cursor = try leaf_decoder.ColumnCursor.init(allocator, pages, meta, info, .{ .keep_levels = node.kind != .leaf, .large_offsets = self.large_offsets }, reserve);
+            for (leaves, self.leaf_info[first_leaf..][0..leaves.len], 0..) |*l, info, k| {
+                const cursor = try openCursor(allocator, self.source, self.metadata.schema, rg, info, self.large_offsets, self.batch_rows);
                 l.* = .{ .cursor = cursor };
                 leaf_count = k + 1;
             }
+            first_leaf += leaves.len;
             col.* = .{ .node = node, .leaves = leaves };
             opened += 1;
         }
@@ -5484,7 +5688,7 @@ test "Arrow arrays match PyArrow on the test files with nested columns" {
     };
     const reference = try std.json.parseFromSliceLeaky(std.json.Value, arena, json_text, .{});
 
-    const totals = try compareAllFiles(reference.object, null, false, null);
+    const totals = try compareAllFiles(reference.object, null, false, null, 0);
     std.debug.print("\nPyArrow comparison: {d} files ({d} more unreadable by PyArrow), {d} columns: {d} equal, {d} differ, {d} read errors\n", .{
         totals.files, totals.pyarrow_errors, totals.columns, totals.equal, totals.differ, totals.read_errors,
     });
@@ -5504,7 +5708,7 @@ test "Arrow batches match PyArrow on the test files with nested columns" {
     // 7 rows per batch cuts inside pages; 1000 cuts mostly at or near page ends. The second
     // pass reads byte arrays with i64 offsets.
     for ([_]usize{ 7, 1000 }, [_]bool{ false, true }) |batch_rows, large| {
-        const totals = try compareAllFiles(reference.object, batch_rows, large, null);
+        const totals = try compareAllFiles(reference.object, batch_rows, large, null, 0);
         std.debug.print("\nPyArrow comparison, {d} rows per batch{s}: {d} files, {d} columns: {d} equal, {d} differ, {d} read errors\n", .{
             batch_rows, if (large) ", i64 offsets" else "", totals.files, totals.columns, totals.equal, totals.differ, totals.read_errors,
         });
@@ -5525,20 +5729,23 @@ test "Arrow arrays and batches match PyArrow when leaves are decoded on 4 thread
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{ .async_limit = .limited(3) });
     defer threaded.deinit();
 
-    // Whole row groups, then batches of 7 rows.
-    for ([_]?usize{ null, 7 }) |batch_rows| {
-        const totals = try compareAllFiles(reference.object, batch_rows, false, threaded.io());
-        std.debug.print("\nPyArrow comparison, 4 threads, {s}: {d} files, {d} columns: {d} equal, {d} differ, {d} read errors\n", .{
-            if (batch_rows == null) "row groups" else "7 rows per batch", totals.files, totals.columns, totals.equal, totals.differ, totals.read_errors,
+    // Whole row groups, then batches of 7 rows; each without and with read-ahead (one row
+    // group per read here, so the batches take rows from the one decoded row group).
+    for ([_]?usize{ null, 7 }) |batch_rows| for ([_]usize{ 0, 1 }) |read_ahead| {
+        const totals = try compareAllFiles(reference.object, batch_rows, false, threaded.io(), read_ahead);
+        std.debug.print("\nPyArrow comparison, 4 threads, {s}{s}: {d} files, {d} columns: {d} equal, {d} differ, {d} read errors\n", .{
+            if (batch_rows == null) "row groups" else "7 rows per batch", if (read_ahead > 0) ", read-ahead" else "", totals.files, totals.columns, totals.equal, totals.differ, totals.read_errors,
         });
         try std.testing.expectEqual(@as(usize, 0), totals.differ);
         try std.testing.expectEqual(@as(usize, 0), totals.read_errors);
-    }
+    };
 }
 
 test "Arrow batches spanning row groups equal row group reads on the test files" {
     const io = std.testing.io;
     const allocator = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(allocator, .{ .async_limit = .limited(3) });
+    defer threaded.deinit();
     var totals: SpanTotals = .{};
     for ([_][]const u8{ "../test-files-arrow", "../test-files-wild" }) |root| {
         var dir = std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true }) catch continue;
@@ -5548,7 +5755,7 @@ test "Arrow batches spanning row groups equal row group reads on the test files"
         while (try walker.next(io)) |entry| {
             if (entry.kind != .file or !std.mem.endsWith(u8, entry.basename, ".parquet")) continue;
             if (std.mem.indexOf(u8, entry.path, ".venv") != null) continue;
-            try compareSpanningBatches(entry.dir, entry.basename, &totals);
+            try compareSpanningBatches(entry.dir, entry.basename, &totals, threaded.io());
         }
     }
     std.debug.print("\nbatches spanning row groups: {d} files with several row groups, {d} columns equal to row group reads ({d} columns with row group read errors skipped)\n", .{ totals.files, totals.columns, totals.skipped });
@@ -5562,9 +5769,10 @@ const SpanTotals = struct {
 };
 
 /// Reads each column of a file with several row groups row group by row group and in batches
-/// of 7 and 1000 rows, which span row groups, and checks that the first rows agree. Only
-/// columns whose row groups all read without error are compared.
-fn compareSpanningBatches(dir: std.Io.Dir, basename: []const u8, totals: *SpanTotals) !void {
+/// of 7 and 1000 rows, which span row groups, without and with read-ahead on `ahead_io`, and
+/// checks that the first rows agree. Only columns whose row groups all read without error are
+/// compared.
+fn compareSpanningBatches(dir: std.Io.Dir, basename: []const u8, totals: *SpanTotals, ahead_io: std.Io) !void {
     const io = std.testing.io;
     // Rows compared per column, from the start of the file.
     const max_rows = 3000;
@@ -5582,7 +5790,7 @@ fn compareSpanningBatches(dir: std.Io.Dir, basename: []const u8, totals: *SpanTo
     totals.files += 1;
 
     for (tree, 0..) |*node, c| {
-        const compared = expectSpanningBatchesMatch(reader.getSource(), md, node, c, max_rows, &.{ 7, 1000 }) catch |err| {
+        const compared = expectSpanningBatchesMatch(reader.getSource(), md, node, c, max_rows, &.{ 7, 1000 }, ahead_io) catch |err| {
             std.debug.print("spanning batches: {s} column {d}: {s}\n", .{ basename, c, @errorName(err) });
             return err;
         };
@@ -5593,7 +5801,7 @@ fn compareSpanningBatches(dir: std.Io.Dir, basename: []const u8, totals: *SpanTo
 /// Reads the first `max_rows` rows of column `c` row group by row group, and in batches of
 /// each size in `batch_sizes` (which span row groups), and checks that they agree. Returns
 /// false, comparing nothing, when a row group read fails.
-fn expectSpanningBatchesMatch(source: SeekableReader, md: format.FileMetaData, node: *const Node, c: usize, max_rows: usize, batch_sizes: []const usize) !bool {
+fn expectSpanningBatchesMatch(source: SeekableReader, md: format.FileMetaData, node: *const Node, c: usize, max_rows: usize, batch_sizes: []const usize, ahead_io: ?std.Io) !bool {
     const allocator = std.testing.allocator;
     var expected: std.Io.Writer.Allocating = .init(allocator);
     defer expected.deinit();
@@ -5611,10 +5819,21 @@ fn expectSpanningBatchesMatch(source: SeekableReader, md: format.FileMetaData, n
         written += rows;
     }
 
-    for (batch_sizes) |batch_rows| {
+    // Each batch size without read-ahead, then, with `ahead_io`, with 1 and 3 row groups
+    // decoded ahead; and with `ahead_io`, one batch per row group with 2 decoded ahead.
+    const reads_per_size: usize = if (ahead_io == null) 1 else 3;
+    const reads = batch_sizes.len * reads_per_size + @intFromBool(ahead_io != null);
+    for (0..reads) |r| {
+        const batch_rows: ?usize = if (r < batch_sizes.len * reads_per_size) batch_sizes[r / reads_per_size] else null;
+        const read_ahead: usize = if (batch_rows == null) 2 else ([_]usize{ 0, 1, 3 })[r % reads_per_size];
         var got: std.Io.Writer.Allocating = .init(allocator);
         defer got.deinit();
-        var batches = try ArrowBatchReader.init(allocator, source, md, .{ .columns = &.{c}, .batch_rows = batch_rows });
+        var batches = try ArrowBatchReader.init(allocator, source, md, .{
+            .columns = &.{c},
+            .batch_rows = batch_rows,
+            .io = if (read_ahead > 0) ahead_io else null,
+            .read_ahead = read_ahead,
+        });
         defer batches.deinit();
         var got_rows: usize = 0;
         while (got_rows < written) {
@@ -5623,7 +5842,7 @@ fn expectSpanningBatchesMatch(source: SeekableReader, md: format.FileMetaData, n
             const arr = &result.arrays[0];
             const len: usize = @intCast(arr.length);
             // Every batch but the last has batch_rows rows.
-            if (got_rows + len < written) try std.testing.expectEqual(batch_rows, len);
+            if (batch_rows) |b| if (got_rows + len < written) try std.testing.expectEqual(b, len);
             const rows = @min(len, written - got_rows);
             for (0..rows) |i| {
                 try canonEntry(&got.writer, md.schema, node, arr, i, false);
@@ -5632,11 +5851,69 @@ fn expectSpanningBatchesMatch(source: SeekableReader, md: format.FileMetaData, n
             got_rows += rows;
         }
         std.testing.expectEqualStrings(expected.written(), got.written()) catch |err| {
-            std.debug.print("{d} rows per batch differ from row group reads\n", .{batch_rows});
+            std.debug.print("{?d} rows per batch, {d} row groups ahead, differ from row group reads\n", .{ batch_rows, read_ahead });
             return err;
         };
     }
     return true;
+}
+
+test "with read-ahead, an error in a row group is returned by the first batch that takes rows from it" {
+    const allocator = std.testing.allocator;
+
+    // 30 rows in row groups of 10; the page header of row group 1 is overwritten.
+    var writer = try api_writer_mod.createBufferDynamic(allocator);
+    defer writer.deinit();
+    try writer.addColumn("x", @import("dynamic_writer.zig").TypeInfo.int64, .{});
+    writer.setRowGroupSize(10);
+    try writer.begin();
+    for (0..30) |i| {
+        try writer.setInt64(0, @intCast(i));
+        try writer.addRow();
+    }
+    try writer.close();
+    const buf = try writer.toOwnedSlice();
+    defer allocator.free(buf);
+    {
+        var dr = try api_reader_mod.openBufferDynamic(allocator, buf, .{});
+        defer dr.deinit();
+        try std.testing.expectEqual(@as(usize, 3), dr.metadata.row_groups.len);
+        const offset: usize = @intCast(dr.metadata.row_groups[1].columns[0].meta_data.?.data_page_offset);
+        @memset(buf[offset..][0..16], 0xff);
+    }
+    var dr = try api_reader_mod.openBufferDynamic(allocator, buf, .{});
+    defer dr.deinit();
+
+    var threaded: std.Io.Threaded = .init(allocator, .{ .async_limit = .limited(3) });
+    defer threaded.deinit();
+
+    // Batches of 4: rows 0-3 and 4-7, then rows 8-11 need row group 1. One batch per row
+    // group: row group 0, then row group 1. The same holds without read-ahead. Row group 2
+    // may still be decoding when `deinit` runs.
+    for ([_]?usize{ 4, null }) |batch_rows| for ([_]usize{ 0, 1, 2 }) |read_ahead| {
+        var batches = try ArrowBatchReader.init(allocator, dr.getSource(), dr.metadata, .{
+            .batch_rows = batch_rows,
+            .io = threaded.io(),
+            .read_ahead = read_ahead,
+        });
+        defer batches.deinit();
+        var first: i64 = 0;
+        const ok_batches: usize = if (batch_rows == null) 1 else 2;
+        for (0..ok_batches) |_| {
+            var result = (try batches.next()).?;
+            defer result.deinit();
+            const values: [*]const i64 = @ptrCast(@alignCast(result.arrays[0].buffers[1].?));
+            try std.testing.expectEqual(first, values[0]);
+            first += result.arrays[0].length;
+        }
+        if (batches.next()) |result| {
+            var r = result;
+            if (r) |*b| b.deinit();
+            return error.TestUnexpectedResult;
+        } else |_| {}
+    };
+
+    try std.testing.expectError(error.InvalidArgument, ArrowBatchReader.init(allocator, dr.getSource(), dr.metadata, .{ .read_ahead = 1 }));
 }
 
 test "batches of list and map columns span row groups" {
@@ -5682,11 +5959,13 @@ test "batches of list and map columns span row groups" {
     var dr = try api_reader_mod.openBufferDynamic(allocator, buf, .{});
     defer dr.deinit();
     try std.testing.expectEqual(@as(usize, 5), dr.metadata.row_groups.len);
+    var threaded: std.Io.Threaded = .init(allocator, .{ .async_limit = .limited(3) });
+    defer threaded.deinit();
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const tree = try buildSchemaTree(arena.allocator(), dr.metadata.schema);
     for (tree, 0..) |*node, c| {
-        try std.testing.expect(try expectSpanningBatchesMatch(dr.getSource(), dr.metadata, node, c, 50, &.{ 1, 3, 7, 13, 50 }));
+        try std.testing.expect(try expectSpanningBatchesMatch(dr.getSource(), dr.metadata, node, c, 50, &.{ 1, 3, 7, 13, 50 }, threaded.io()));
     }
 }
 
@@ -5704,8 +5983,9 @@ fn canonColumn(
     large: bool,
     max_rows: usize,
     decode_io: ?std.Io,
+    read_ahead: usize,
 ) !void {
-    if (batch_rows == null) {
+    if (batch_rows == null and read_ahead == 0) {
         var result = try readRowGroupAsArrowWith(allocator, source, md, rg, .{ .columns = &.{c}, .io = decode_io });
         defer result.deinit();
         const arr = &result.arrays[0];
@@ -5716,14 +5996,14 @@ fn canonColumn(
         }
         return;
     }
-    var batches = try ArrowBatchReader.init(allocator, source, md, .{ .columns = &.{c}, .row_groups = &.{rg}, .batch_rows = batch_rows.?, .large_offsets = large, .io = decode_io });
+    var batches = try ArrowBatchReader.init(allocator, source, md, .{ .columns = &.{c}, .row_groups = &.{rg}, .batch_rows = batch_rows, .large_offsets = large, .io = decode_io, .read_ahead = read_ahead });
     defer batches.deinit();
     var written: usize = 0;
     while (written < max_rows) {
         var result = (try batches.next()) orelse break;
         defer result.deinit();
         const arr = &result.arrays[0];
-        if (arr.length > batch_rows.?) return error.TestUnexpectedResult;
+        if (batch_rows) |b| if (arr.length > b) return error.TestUnexpectedResult;
         const rows = @min(@as(usize, @intCast(arr.length)), max_rows - written);
         for (0..rows) |i| {
             if (written > 0) try w.writeByte('\n');
@@ -5738,7 +6018,7 @@ fn canonColumn(
 /// comparison of the file that leaked.
 const test_util = @import("test_util.zig");
 
-fn compareAllFiles(reference: std.json.ObjectMap, batch_rows: ?usize, large: bool, decode_io: ?std.Io) !NestedTotals {
+fn compareAllFiles(reference: std.json.ObjectMap, batch_rows: ?usize, large: bool, decode_io: ?std.Io, read_ahead: usize) !NestedTotals {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const FileJob = struct {
@@ -5751,9 +6031,9 @@ fn compareAllFiles(reference: std.json.ObjectMap, batch_rows: ?usize, large: boo
         /// one allocator's lock; it fails the job when memory leaks. The allocator records
         /// no stack traces: on macOS, capturing one per allocation made the 7-row batch pass
         /// take about 90 s for each of the largest files.
-        fn run(job: *@This(), rows: ?usize, large_offsets: bool, dio: ?std.Io) void {
+        fn run(job: *@This(), rows: ?usize, large_offsets: bool, dio: ?std.Io, ahead: usize) void {
             var gpa: test_util.LeakCheckAllocator = .init;
-            compareFileWithReference(gpa.allocator(), job.path, job.columns, &job.totals, rows, large_offsets, dio) catch |e| {
+            compareFileWithReference(gpa.allocator(), job.path, job.columns, &job.totals, rows, large_offsets, dio, ahead) catch |e| {
                 job.err = e;
             };
             if (gpa.deinit() == .leak and job.err == null) job.err = error.MemoryLeak;
@@ -5773,7 +6053,7 @@ fn compareAllFiles(reference: std.json.ObjectMap, batch_rows: ?usize, large: boo
         try jobs.append(allocator, .{ .path = entry.key_ptr.*, .columns = columns });
     }
     var group: std.Io.Group = .init;
-    for (jobs.items) |*job| group.async(io, FileJob.run, .{ job, batch_rows, large, decode_io });
+    for (jobs.items) |*job| group.async(io, FileJob.run, .{ job, batch_rows, large, decode_io, read_ahead });
     try group.await(io);
 
     totals.files = jobs.items.len;
@@ -5787,7 +6067,7 @@ fn compareAllFiles(reference: std.json.ObjectMap, batch_rows: ?usize, large: boo
     return totals;
 }
 
-fn compareFileWithReference(allocator: Allocator, path: []const u8, reference: std.json.ObjectMap, totals: *NestedTotals, batch_rows: ?usize, large: bool, decode_io: ?std.Io) !void {
+fn compareFileWithReference(allocator: Allocator, path: []const u8, reference: std.json.ObjectMap, totals: *NestedTotals, batch_rows: ?usize, large: bool, decode_io: ?std.Io, read_ahead: usize) !void {
     const io = std.testing.io;
     // The reader uses an arena (footer parsing leaks on some malformed files); the Arrow read
     // uses `allocator`.
@@ -5819,7 +6099,7 @@ fn compareFileWithReference(allocator: Allocator, path: []const u8, reference: s
 
             var out: std.Io.Writer.Allocating = .init(allocator);
             defer out.deinit();
-            canonColumn(allocator, &out.writer, reader.getSource(), md, node, rg, c, batch_rows, large, 2000, decode_io) catch |err| {
+            canonColumn(allocator, &out.writer, reader.getSource(), md, node, rg, c, batch_rows, large, 2000, decode_io, read_ahead) catch |err| {
                 totals.read_errors += 1;
                 std.debug.print("READ ERROR {s} {s} ({s}): {s}\n", .{ path, key, md.schema[node.schema_idx].name, @errorName(err) });
                 continue;

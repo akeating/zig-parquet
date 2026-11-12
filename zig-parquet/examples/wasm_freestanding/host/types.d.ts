@@ -335,9 +335,11 @@ export interface ParquetFreestandingExports {
   /** Stream over all columns, one batch per row group. Returns a stream handle or -error. */
   zp_reader_stream_init(reader_handle_id: HandleId): HandleId;
   /**
-   * Stream configured by a zp_stream_options struct (see libparquet.h; 32 bytes on wasm32:
+   * Stream configured by a zp_stream_options struct (see libparquet.h; 40 bytes on wasm32:
    * size u32 @0, flags u32 @4, col_indices ptr @8, num_cols i32 @12, row_groups ptr @16,
-   * num_row_groups i32 @20, batch_rows i64 @24), or 0 for the defaults.
+   * num_row_groups i32 @20, batch_rows i64 @24, threads i32 @32, read_ahead i32 @36; a size
+   * of 32 without the last two is accepted), or 0 for the defaults. This build decodes on
+   * the calling thread and ignores threads and read_ahead.
    */
   zp_reader_stream_init_with_options(reader_handle_id: HandleId, options_ptr: number): HandleId;
   zp_reader_stream_get_schema(stream_handle_id: HandleId, schema_out_ptr: number): StatusCode;

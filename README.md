@@ -350,7 +350,22 @@ while (try batches.next()) |batch| {
 
 Batches take rows from as many row groups as they need, so only the last batch can have fewer rows; with `.batch_rows = null`, each batch is one row group. The reader reads and decodes pages as batches need them; between batches it holds, per leaf column, one compressed page, the dictionary, and at most one page of decoded entries.
 
-C callers have the same functions as `zp_reader_read_row_group` and `zp_reader_get_stream_with_options`. The second returns an `ArrowArrayStream` configured by a `zp_stream_options` struct: columns and row groups to read, rows per batch (0: one batch per row group) and flags such as `ZP_STREAM_LARGE_OFFSETS`. `zp_reader_get_stream` reads all columns, one batch per row group.
+Reads can decode on several threads. `BatchOptions`, `readRowGroupAsArrowWith` (`RowGroupOptions`) and `DynamicReaderOptions` take an `io: ?std.Io`. With a `std.Io.Threaded`, the columns of a row group, and the leaf columns of nested columns, are decoded as tasks on its threads; the allocator and the source must then allow concurrent use (`std.heap.smp_allocator`, a file). `BatchOptions.read_ahead = k` also decodes each row group whole and keeps k row groups decoding ahead of the batches; between batches the reader then holds the decoded entries of up to k + 1 row groups, and an error in a row group is returned by the first batch that takes rows from it.
+
+```zig
+// Up to 8 threads: 7 in the pool and the calling one.
+var threaded: std.Io.Threaded = .init(std.heap.smp_allocator, .{ .async_limit = .limited(7) });
+defer threaded.deinit();
+var batches = try parquet.ArrowBatchReader.init(std.heap.smp_allocator, reader.getSource(), reader.metadata, .{
+    .batch_rows = 65536,
+    .io = threaded.io(),
+    .read_ahead = 1,
+});
+```
+
+Reading all 3 columns of a 10-million-row file with 10 row groups in 65,536-row batches on an Apple M2 Max (bench/column-read) took 177 ms on the calling thread, 89 ms on 8 threads, and 45 ms on 8 threads with `read_ahead = 1`; the peak memory went from 8 MB to 9 MB and 72 MB.
+
+C callers have the same functions as `zp_reader_read_row_group` and `zp_reader_get_stream_with_options`. The second returns an `ArrowArrayStream` configured by a `zp_stream_options` struct: columns and row groups to read, rows per batch (0: one batch per row group), flags such as `ZP_STREAM_LARGE_OFFSETS`, and `threads` and `read_ahead`, which start a thread pool for the stream as above (WASM builds ignore them). With `threads` of 2 or more, a reader opened with `zp_reader_open_callbacks` calls `read_at` from several threads at once. `zp_reader_get_stream` reads all columns, one batch per row group, on the calling thread.
 
 ```c
 int cols[] = {0, 2};
@@ -358,6 +373,8 @@ zp_stream_options options = ZP_STREAM_OPTIONS_INIT;
 options.col_indices = cols;
 options.num_cols = 2;
 options.batch_rows = 65536;
+options.threads = 8;     /* optional: decode on up to 8 threads */
+options.read_ahead = 1;  /* optional: decode 1 row group ahead */
 
 struct ArrowArrayStream stream;
 if (zp_reader_get_stream_with_options(reader, &options, &stream) == ZP_OK) {

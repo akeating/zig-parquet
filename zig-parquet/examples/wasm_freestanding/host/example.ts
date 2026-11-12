@@ -315,14 +315,15 @@ async function main() {
     console.error(`Failed to open reader: error code ${-arrowReader}`);
     Deno.exit(1);
   }
-  // zp_stream_options (32 bytes on wasm32): size, flags, col_indices, num_cols,
-  // row_groups, num_row_groups, batch_rows.
+  // zp_stream_options (40 bytes on wasm32): size, flags, col_indices, num_cols,
+  // row_groups, num_row_groups, batch_rows, threads, read_ahead. WASM builds
+  // decode on the calling thread and ignore threads and read_ahead.
   const colsPtr = zp.zp_alloc(4);
   new DataView(wasmMemory.buffer).setInt32(colsPtr, 0, true);
-  const optionsPtr = zp.zp_alloc(32);
-  new Uint8Array(wasmMemory.buffer, optionsPtr, 32).fill(0);
-  const options = new DataView(wasmMemory.buffer, optionsPtr, 32);
-  options.setUint32(0, 32, true);
+  const optionsPtr = zp.zp_alloc(40);
+  new Uint8Array(wasmMemory.buffer, optionsPtr, 40).fill(0);
+  const options = new DataView(wasmMemory.buffer, optionsPtr, 40);
+  options.setUint32(0, 40, true);
   options.setUint32(8, colsPtr, true);
   options.setInt32(12, 1, true);
   options.setBigInt64(24, 2n, true);

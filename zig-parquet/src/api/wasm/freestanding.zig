@@ -1983,7 +1983,7 @@ export fn zp_reader_stream_init_with_options(reader_handle_id: i32, options: ?*c
     const slot = allocHandleSlot();
     if (slot < 0) return slot;
 
-    var batches = arrow_batch.ArrowBatchReader.init(reader.allocator, reader.source, reader.metadata, parsed.batchOptions()) catch |e| {
+    var batches = arrow_batch.ArrowBatchReader.init(reader.allocator, reader.source, reader.metadata, parsed.batchOptions(null)) catch |e| {
         if (e == error.InvalidArgument) {
             reader.err_ctx.setError(err.ZP_ERROR_INVALID_ARGUMENT, "column or row group index out of range");
         } else {

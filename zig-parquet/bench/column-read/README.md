@@ -1,6 +1,6 @@
 # Column read benchmark
 
-Measures reading every row group of a Parquet file through `readRowGroupAsArrow` (Arrow path, one row group at a time), `ArrowBatchReader` (batches path, 65,536 rows at a time) and `readRowsProjected` / `readAllRows` (row path), one top-level column at a time and all columns together. Reports wall time and allocator activity, and compares with PyArrow on the same file.
+Measures reading every row group of a Parquet file through `readRowGroupAsArrow` (Arrow path, one row group at a time), `ArrowBatchReader` (groups path, one batch per row group; batches path, 65,536 rows at a time) and `readRowsProjected` / `readAllRows` (row path), one top-level column at a time and all columns together. Reports wall time and allocator activity, and compares with PyArrow on the same file.
 
 ## Run
 
@@ -15,7 +15,8 @@ uv run python -I ../zig-parquet/bench/column-read/scripts/gen_bench.py /tmp/benc
 # 2. zig-parquet (builds ReleaseFast by default)
 cd ../zig-parquet/bench/column-read
 zig build run -- /tmp/bench_10m.parquet 5            # all cases, 5 measured runs
-zig build run -- /tmp/bench_10m.parquet 5 arrow:id   # one case: PATH:COLUMN, PATH is arrow, batches or rows, COLUMN a column name or all
+zig build run -- /tmp/bench_10m.parquet 5 arrow:id   # one case: PATH:COLUMN, PATH is arrow, groups, batches or rows, COLUMN a column name or all
+zig build run -- /tmp/bench_10m.parquet 5 threads=8 ahead=1   # decode on up to 8 threads, 1 row group ahead (groups and batches paths)
 zig build -Dcodecs=c-only run -- /tmp/bench_10m.parquet 5   # with the C codec libraries (rebuilds zig-out)
 
 # 3. PyArrow reference (single-threaded; read_row_group and iter_batches, each case in its own process)
@@ -73,6 +74,21 @@ Nested file (`bench_nested_2m.parquet`, 2M rows):
 | rows all | 333 | | 2,856 | 1,893 | 526.1 | | |
 
 The batches path reads and decodes pages as batches need them. Between batches it holds, per leaf column, one compressed page, the dictionary and at most one page of decoded entries; its peak is that plus one batch. Batches take rows from as many row groups as they need; a batch that crosses a row group end joins the pieces from both, which adds to the peak (nested file: 1,000,000-row row groups, so 1 batch in 31 crosses one). Reading all columns took 176 ms (flat) and 301 ms (nested) in batches, against 177 ms and 278 ms for whole row groups: entries past the end of a batch are copied, and there are more allocations.
+
+## Threads and read-ahead (2026-11-12, Apple M2 Max, 8 performance and 4 efficiency cores)
+
+All columns, median of 9 runs. `threads=8` decodes the columns of a row group, and the leaf columns of nested columns, as tasks of a `std.Io.Threaded` with 7 pool threads. `ahead=1` (`BatchOptions.read_ahead`) also decodes each row group whole as one task and keeps 1 row group decoding ahead of the batches. Other applications used about one core during the run.
+
+| Case | ms, 1 thread | ms, 8 threads | ms, 8 threads, ahead=1 | peak MB, 1 / 8 / 8 ahead=1 |
+|---|---|---|---|---|
+| flat arrow all | 174 | 76 | | 46.5 / 61.0 / |
+| flat groups all | 167 | 84 | 44 | 49.1 / 49.3 / 94.0 |
+| flat batches all | 177 | 89 | 45 | 8.2 / 9.3 / 71.9 |
+| nested arrow all | 284 | 119 | | 136.0 / 169.4 / |
+| nested groups all | 279 | 140 | 130 | 159.6 / 178.0 / 286.0 |
+| nested batches all | 306 | 153 | 143 | 21.0 / 23.2 / 248.8 |
+
+Without read-ahead, a row group's columns finish when its slowest column finishes, and the batch is assembled on the calling thread. With read-ahead, the next row group decodes during that time. The nested file has 2 row groups, so at most 2 overlap, and the columns of each batch are assembled on the calling thread after the row group is decoded. Reading 2 or 3 row groups ahead of the flat file took 44 to 55 ms, with peaks of 102 to 160 MB. PyArrow with `use_threads=True`, measured earlier on the same machine: `read_row_group` 111 ms (flat) and 80 ms (nested); `read_table` 69.5 ms and 43 ms.
 
 The row path writes a `Value` per entry and a `Row` per row. The values of a read are in one block of storage shared by its rows, and string values reference the decoded byte buffers.
 

@@ -152,6 +152,8 @@ int zp_reader_open_memory(const uint8_t* data, size_t len,
 /**
  * Open a reader using random-access callbacks.
  * The context and callbacks must remain valid until zp_reader_close().
+ * A stream with threads >= 2 (zp_stream_options) calls read_at from several
+ * threads at once.
  */
 int zp_reader_open_callbacks(void* ctx,
                              zp_read_at_fn read_at,
@@ -291,7 +293,9 @@ int zp_reader_get_stream(zp_reader_t handle,
  *
  * Set size to sizeof(zp_stream_options), so that later versions can add
  * fields: a library given a larger size accepts it only when the bytes it
- * does not know are zero. ZP_STREAM_OPTIONS_INIT gives the defaults.
+ * does not know are zero, and a library given a smaller size (from a caller
+ * built against an older header) treats the missing fields as zero.
+ * ZP_STREAM_OPTIONS_INIT gives the defaults.
  */
 typedef struct zp_stream_options {
     uint32_t size;          /* sizeof(zp_stream_options) */
@@ -301,9 +305,11 @@ typedef struct zp_stream_options {
     const int* row_groups;  /* row groups, in this order; NULL: all */
     int num_row_groups;     /* entries in row_groups */
     int64_t batch_rows;     /* rows per batch; 0: one batch per row group */
+    int threads;            /* decoding threads, including the caller's; 0, 1: one */
+    int read_ahead;         /* row groups decoded ahead; needs threads >= 2 */
 } zp_stream_options;
 
-#define ZP_STREAM_OPTIONS_INIT { sizeof(zp_stream_options), 0, NULL, 0, NULL, 0, 0 }
+#define ZP_STREAM_OPTIONS_INIT { sizeof(zp_stream_options), 0, NULL, 0, NULL, 0, 0, 0, 0 }
 
 /**
  * Like zp_reader_get_stream(), configured by options (NULL: the defaults).
@@ -321,6 +327,17 @@ typedef struct zp_stream_options {
  * ZP_ERROR_INVALID_DATA. With ZP_STREAM_LARGE_OFFSETS in flags they are
  * large_string ("U") or large_binary ("Z") with int64 offsets.
  *
+ * With threads >= 2, the stream decodes the columns of each batch, and the
+ * leaves of nested columns, on up to that many threads, including the one
+ * that calls get_next(); the stream starts the other threads and stops them
+ * on release(). A reader opened with zp_reader_open_callbacks() then calls
+ * read_at from several threads at once. With read_ahead k >= 1, the stream
+ * decodes each row group whole and keeps k row groups decoding ahead of the
+ * batches: it then holds the decoded entries of up to k + 1 row groups
+ * between batches, and an error in a row group is returned by the first
+ * batch that takes rows from it. WASM builds decode on the calling thread
+ * and ignore threads and read_ahead.
+ *
  * The stream copies what it needs from options.
  *
  * @param handle      Reader handle (must stay open while stream is active).
@@ -328,7 +345,8 @@ typedef struct zp_stream_options {
  * @param stream_out  Output: initialized ArrowArrayStream.
  * @return ZP_OK, or ZP_ERROR_INVALID_ARGUMENT for an invalid option (a
  *         column or row group index out of range, a negative batch_rows,
- *         unknown flags, or a size this version cannot read); the reader's
+ *         threads or read_ahead, read_ahead without threads >= 2, unknown
+ *         flags, or a size this version cannot read); the reader's
  *         error message says which.
  */
 int zp_reader_get_stream_with_options(zp_reader_t handle,

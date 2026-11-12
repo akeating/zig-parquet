@@ -650,7 +650,7 @@ test "C ABI: reader get_stream iterates row groups" {
 const StreamOptions = @import("../api/stream_options.zig").StreamOptions;
 
 /// Stream options with the given fields; the others keep their defaults.
-fn streamOptions(fields: struct { cols: ?[]const c_int = null, row_groups: ?[]const c_int = null, batch_rows: i64 = 0, flags: u32 = 0 }) StreamOptions {
+fn streamOptions(fields: struct { cols: ?[]const c_int = null, row_groups: ?[]const c_int = null, batch_rows: i64 = 0, flags: u32 = 0, threads: c_int = 0, read_ahead: c_int = 0 }) StreamOptions {
     return .{
         .size = @sizeOf(StreamOptions),
         .flags = fields.flags,
@@ -659,6 +659,8 @@ fn streamOptions(fields: struct { cols: ?[]const c_int = null, row_groups: ?[]co
         .row_groups = if (fields.row_groups) |r| r.ptr else null,
         .num_row_groups = if (fields.row_groups) |r| @intCast(r.len) else 0,
         .batch_rows = fields.batch_rows,
+        .threads = fields.threads,
+        .read_ahead = fields.read_ahead,
     };
 }
 
@@ -718,6 +720,8 @@ test "C ABI: stream with options rejects invalid options" {
         streamOptions(.{ .row_groups = &no_such_row_group }),
         streamOptions(.{ .batch_rows = -1 }),
         streamOptions(.{ .flags = 2 }),
+        streamOptions(.{ .threads = -1 }),
+        streamOptions(.{ .threads = 1, .read_ahead = 1 }),
         small,
     };
     for (cases) |options| {
@@ -821,24 +825,33 @@ test "C ABI: stream with options reads the selected row groups in the given orde
     try std.testing.expectEqual(c_err.ZP_OK, c_reader.zp_reader_open_memory(buf.ptr, buf.len, &handle));
     defer c_reader.zp_reader_close(handle);
 
-    // Row groups 2 then 0, in batches of 2: [5, 1], [2].
-    const options = streamOptions(.{ .row_groups = &.{ 2, 0 }, .batch_rows = 2 });
-    var stream: ArrowArrayStream = undefined;
-    try std.testing.expectEqual(c_err.ZP_OK, c_reader.zp_reader_get_stream_with_options(handle, &options, &stream));
-    defer stream.release.?(&stream);
+    // Row groups 2 then 0, in batches of 2: [5, 1], [2]. On the calling thread; on 4
+    // threads; on 4 threads with 1 and 2 row groups decoded ahead; and with the size of the
+    // first version of the options, which has no threads or read_ahead.
+    const first_size = @offsetOf(StreamOptions, "threads");
+    for ([_][2]c_int{ .{ 0, 0 }, .{ 4, 0 }, .{ 4, 1 }, .{ 4, 2 }, .{ -1, 0 } }) |config| {
+        var options = streamOptions(.{ .row_groups = &.{ 2, 0 }, .batch_rows = 2, .threads = @max(config[0], 0), .read_ahead = config[1] });
+        if (config[0] < 0) {
+            options.size = first_size;
+            options.threads = -1; // past the caller's size: not read
+        }
+        var stream: ArrowArrayStream = undefined;
+        try std.testing.expectEqual(c_err.ZP_OK, c_reader.zp_reader_get_stream_with_options(handle, &options, &stream));
+        defer stream.release.?(&stream);
 
-    const expected = [_][]const i32{ &.{ 5, 1 }, &.{2} };
-    for (expected) |ids| {
-        var batch: ArrowArray = undefined;
-        try std.testing.expectEqual(@as(c_int, 0), stream.get_next.?(&stream, &batch));
-        defer batch.doRelease();
-        try std.testing.expectEqual(@as(i64, @intCast(ids.len)), batch.length);
-        const values: [*]const i32 = @ptrCast(@alignCast(batch.children.?[0].buffers[1].?));
-        try std.testing.expectEqualSlices(i32, ids, values[0..ids.len]);
+        const expected = [_][]const i32{ &.{ 5, 1 }, &.{2} };
+        for (expected) |ids| {
+            var batch: ArrowArray = undefined;
+            try std.testing.expectEqual(@as(c_int, 0), stream.get_next.?(&stream, &batch));
+            defer batch.doRelease();
+            try std.testing.expectEqual(@as(i64, @intCast(ids.len)), batch.length);
+            const values: [*]const i32 = @ptrCast(@alignCast(batch.children.?[0].buffers[1].?));
+            try std.testing.expectEqualSlices(i32, ids, values[0..ids.len]);
+        }
+        var end: ArrowArray = undefined;
+        try std.testing.expectEqual(@as(c_int, 0), stream.get_next.?(&stream, &end));
+        try std.testing.expect(end.release == null);
     }
-    var end: ArrowArray = undefined;
-    try std.testing.expectEqual(@as(c_int, 0), stream.get_next.?(&stream, &end));
-    try std.testing.expect(end.release == null);
 }
 
 test "C ABI: stream get_last_error returns null when no error" {

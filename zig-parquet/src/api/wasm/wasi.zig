@@ -466,7 +466,7 @@ export fn zp_reader_get_stream_with_options(
     // The batch reader keeps its own copies of the index lists.
     defer parsed.deinit(handle.allocator);
 
-    var batches = arrow_batch.ArrowBatchReader.init(handle.allocator, handle.source, handle.metadata, parsed.batchOptions()) catch |e| {
+    var batches = arrow_batch.ArrowBatchReader.init(handle.allocator, handle.source, handle.metadata, parsed.batchOptions(null)) catch |e| {
         if (e == error.InvalidArgument) {
             handle.err_ctx.setError(err.ZP_ERROR_INVALID_ARGUMENT, "column or row group index out of range");
         } else {
