@@ -518,7 +518,7 @@ fn writeDataPageTypedWithEncoding(
 }
 
 /// Encode values with the specified encoding
-fn encodeValuesWithEncoding(
+pub fn encodeValuesWithEncoding(
     allocator: std.mem.Allocator,
     comptime T: type,
     values: []const T,
@@ -641,7 +641,7 @@ pub fn writeDataPageByteArrayWithEncoding(
 }
 
 /// Encode byte arrays with the specified encoding
-fn encodeByteArraysWithEncoding(
+pub fn encodeByteArraysWithEncoding(
     allocator: std.mem.Allocator,
     values: []const []const u8,
     encoding: format.Encoding,
@@ -654,7 +654,7 @@ fn encodeByteArraysWithEncoding(
 }
 
 /// Encode fixed-length byte arrays with the specified encoding
-fn encodeFixedByteArraysWithEncoding(
+pub fn encodeFixedByteArraysWithEncoding(
     allocator: std.mem.Allocator,
     values: []const []const u8,
     fixed_len: usize,

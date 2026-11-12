@@ -361,11 +361,13 @@ test "page index: intersecting filters narrow further than either alone" {
 // Filtered reads of nested columns
 // =============================================================================
 //
-// The dynamic writer writes one data page per nested column chunk and writes page indexes
-// only for flat numeric columns. `indexRowGroupsAsPages` turns a file written with several
-// row groups into a file with one row group in which each former row group's column chunk is
-// a data page, and writes an offset index and a column index for every column. The pages of
-// such a file start at rows, as the Parquet format requires of files with an offset index.
+// The reader tests below need pages of exactly 10 rows, and one needs an offset index that
+// disagrees with the pages; the writer sizes pages by bytes and writes correct indexes.
+// `indexRowGroupsAsPages` turns a file written with several row groups into a file with one
+// row group in which each former row group's column chunk is a data page, and writes an
+// offset index and a column index for every column. The pages of such a file start at rows,
+// as the Parquet format requires of files with an offset index. The tests after them read
+// files with nested pages and page indexes from the writer itself.
 
 const thrift = @import("../core/thrift/mod.zig");
 const leaf_decoder = @import("../core/leaf_decoder.zig");
@@ -772,6 +774,235 @@ test "page index: readRowsFiltered on a map column" {
         .{ .first = 44, .last = 47 },
     };
     try expectFilteredRows(allocator, &reader, &.{rangesFilter(2, &ranges)}, ranges);
+}
+
+const NestedSchema = enum { lists, record, map };
+
+const WriterPageOptions = struct {
+    /// Null writes one page per column chunk and no page index.
+    max_page_size: ?usize = null,
+    dictionary: bool = false,
+};
+
+/// Writes `num_rows` rows in one row group: column 0 is id (int32), column 1 a nested column
+/// of shape `schema`. `.lists` adds column 2 (a list of lists), as in `writeListFile`.
+fn writeNestedFile(allocator: std.mem.Allocator, schema: NestedSchema, num_rows: usize, options: WriterPageOptions) ![]u8 {
+    var writer = try parquet.createBufferDynamic(allocator);
+    defer writer.deinit();
+    writer.setUseDictionary(options.dictionary);
+    writer.setRowGroupSize(num_rows);
+    if (options.max_page_size) |m| {
+        writer.max_page_size = m;
+        writer.write_page_index = true;
+    }
+
+    try writer.addColumn("id", parquet.TypeInfo.int32, .{});
+    switch (schema) {
+        .lists => {
+            const element = try writer.allocSchemaNode(.{ .int32 = .{} });
+            const list = try writer.allocSchemaNode(.{ .list = element });
+            try writer.addColumnNested("values", try writer.allocSchemaNode(.{ .optional = list }), .{});
+            const inner = try writer.allocSchemaNode(.{ .list = element });
+            try writer.addColumnNested("matrix", try writer.allocSchemaNode(.{ .list = inner }), .{});
+        },
+        .record => {
+            const fields = try writer.allocSchemaFields(2);
+            fields[0] = .{ .name = "a", .node = try writer.allocSchemaNode(.{ .int64 = .{} }) };
+            const string = try writer.allocSchemaNode(.{ .byte_array = .{ .logical = .string } });
+            fields[1] = .{ .name = "b", .node = try writer.allocSchemaNode(.{ .optional = string }) };
+            const record = try writer.allocSchemaNode(.{ .struct_ = .{ .fields = fields } });
+            try writer.addColumnNested("s", try writer.allocSchemaNode(.{ .optional = record }), .{});
+        },
+        .map => {
+            const key_node = try writer.allocSchemaNode(.{ .byte_array = .{ .logical = .string } });
+            const val_node = try writer.allocSchemaNode(.{ .int32 = .{} });
+            try writer.addColumnNested("m", try writer.allocSchemaNode(.{ .map = .{ .key = key_node, .value = val_node } }), .{});
+        },
+    }
+    try writer.begin();
+
+    for (0..num_rows) |i| {
+        try writer.setInt32(0, @intCast(i));
+        var buf: [16]u8 = undefined;
+        switch (schema) {
+            .lists => {
+                if (i % 7 == 3) {
+                    try writer.setNull(1);
+                } else {
+                    try writer.beginList(1);
+                    for (0..i % 4) |j| try writer.appendNestedValue(1, .{ .int32_val = @intCast(i * 10 + j) });
+                    try writer.endList(1);
+                }
+                try writer.beginList(2);
+                for (0..i % 3) |k| {
+                    try writer.beginList(2);
+                    for (0..k) |m| try writer.appendNestedValue(2, .{ .int32_val = @intCast(i * 100 + k * 10 + m) });
+                    try writer.endList(2);
+                }
+                try writer.endList(2);
+            },
+            .record => {
+                if (i % 5 == 2) {
+                    try writer.setNull(1);
+                } else {
+                    try writer.beginStruct(1);
+                    try writer.setStructField(1, 0, .{ .int64_val = @intCast(i * 1000) });
+                    if (i % 3 == 0) {
+                        try writer.setStructField(1, 1, .null_val);
+                    } else {
+                        // Few distinct strings, so that the dictionary is used.
+                        try writer.setStructFieldBytes(1, 1, try std.fmt.bufPrint(&buf, "b{d:0>3}", .{i / 16}));
+                    }
+                    try writer.endStruct(1);
+                }
+            },
+            .map => {
+                try writer.beginMap(1);
+                for (0..i % 4) |j| {
+                    try writer.beginMapEntry(1);
+                    try writer.appendNestedBytes(1, try std.fmt.bufPrint(&buf, "k{d:0>3}_{d}", .{ i, j }));
+                    try writer.appendNestedValue(1, .{ .int32_val = @intCast(i * 10 + j) });
+                    try writer.endMapEntry(1);
+                }
+                try writer.endMap(1);
+            },
+        }
+        try writer.addRow();
+    }
+    try writer.close();
+    return writer.toOwnedSlice();
+}
+
+/// Checks that every leaf column of row group 0 has an offset index of two or more pages whose
+/// first rows start at 0 and increase, and a column index with one entry per page.
+fn expectWriterPages(allocator: std.mem.Allocator, reader: *parquet.DynamicReader) !void {
+    const rg = &reader.metadata.row_groups[0];
+    var pir = @import("../core/page_index_reader.zig").PageIndexReader.init(allocator, reader.getSource());
+    for (rg.columns) |*chunk| {
+        var oi = (try pir.readOffsetIndex(chunk)) orelse return error.TestExpectedOffsetIndex;
+        defer oi.deinit(allocator);
+        var ci = (try pir.readColumnIndex(chunk)) orelse return error.TestExpectedColumnIndex;
+        defer ci.deinit(allocator);
+        const pages = oi.page_locations;
+        try std.testing.expect(pages.len >= 2);
+        try std.testing.expectEqual(pages.len, ci.null_pages.len);
+        try std.testing.expectEqual(@as(i64, 0), pages[0].first_row_index);
+        for (pages[1..], pages[0 .. pages.len - 1]) |p, prev| {
+            try std.testing.expect(p.first_row_index > prev.first_row_index);
+            try std.testing.expectEqual(prev.offset + prev.compressed_page_size, p.offset);
+        }
+        try std.testing.expect(pages[pages.len - 1].first_row_index < rg.num_rows);
+    }
+}
+
+/// The rows of the pages of leaf `column` whose int32 [min, max] overlaps [lo, hi], from the
+/// file's page index.
+fn overlappingPageRows(allocator: std.mem.Allocator, reader: *parquet.DynamicReader, column: usize, lo: i32, hi: i32) ![]RowRange {
+    const rg = &reader.metadata.row_groups[0];
+    var pir = @import("../core/page_index_reader.zig").PageIndexReader.init(allocator, reader.getSource());
+    var oi = (try pir.readOffsetIndex(&rg.columns[column])).?;
+    defer oi.deinit(allocator);
+    var ci = (try pir.readColumnIndex(&rg.columns[column])).?;
+    defer ci.deinit(allocator);
+    var out: std.ArrayListUnmanaged(RowRange) = .empty;
+    errdefer out.deinit(allocator);
+    for (oi.page_locations, 0..) |p, i| {
+        if (ci.null_pages[i]) continue;
+        const mn = std.mem.readInt(i32, ci.min_values[i][0..4], .little);
+        const mx = std.mem.readInt(i32, ci.max_values[i][0..4], .little);
+        if (mn > hi or mx < lo) continue;
+        const end = if (i + 1 < oi.page_locations.len) oi.page_locations[i + 1].first_row_index else rg.num_rows;
+        try out.append(allocator, .{ .first = @intCast(p.first_row_index), .last = @intCast(end) });
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn expectRowsEqual(want: []const Row, got: []const Row) !void {
+    try std.testing.expectEqual(want.len, got.len);
+    for (want, got) |w, g| {
+        try std.testing.expectEqual(w.values.len, g.values.len);
+        for (w.values, g.values) |e, v| try expectValueEqual(e, v);
+    }
+}
+
+test "page index: writer splits nested columns into pages that start at rows" {
+    const allocator = std.testing.allocator;
+    const num_rows = 300;
+    for ([_]NestedSchema{ .lists, .record, .map }) |schema| {
+        const single = try writeNestedFile(allocator, schema, num_rows, .{});
+        defer allocator.free(single);
+        var single_reader = try parquet.openBufferDynamic(allocator, single, .{});
+        defer single_reader.deinit();
+        const want = try single_reader.readAllRows(0);
+        defer freeRows(allocator, want);
+        try std.testing.expectEqual(@as(usize, num_rows), want.len);
+
+        for ([_]bool{ false, true }) |dictionary| {
+            const paged = try writeNestedFile(allocator, schema, num_rows, .{ .max_page_size = 64, .dictionary = dictionary });
+            defer allocator.free(paged);
+            var reader = try parquet.openBufferDynamic(allocator, paged, .{});
+            defer reader.deinit();
+            try expectWriterPages(allocator, &reader);
+
+            const got = try reader.readAllRows(0);
+            defer freeRows(allocator, got);
+            try expectRowsEqual(want, got);
+
+            // Exact row ranges through each leaf column, inside pages and across them.
+            const ranges: []const RowRange = &.{
+                .{ .first = 0, .last = 1 },
+                .{ .first = 17, .last = 90 },
+                .{ .first = 151, .last = 152 },
+                .{ .first = 250, .last = 300 },
+            };
+            for (0..reader.metadata.row_groups[0].columns.len) |c| {
+                try expectFilteredRows(allocator, &reader, &.{rangesFilter(c, &ranges)}, ranges);
+            }
+        }
+    }
+}
+
+test "page index: nested files with pages for test_interop.py" {
+    const allocator = std.testing.allocator;
+    std.Io.Dir.cwd().createDirPath(io, "../test-files-arrow/interop") catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+    for ([_]NestedSchema{ .lists, .record, .map }) |schema| {
+        const bytes = try writeNestedFile(allocator, schema, 300, .{ .max_page_size = 64, .dictionary = true });
+        defer allocator.free(bytes);
+        var name_buf: [64]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "../test-files-arrow/interop/nested_pages_{s}.parquet", .{@tagName(schema)});
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = name, .data = bytes });
+    }
+}
+
+test "page index: readRowsFiltered keeps the writer's pages that a min/max filter selects" {
+    const allocator = std.testing.allocator;
+    const cases = [_]struct { schema: NestedSchema, column: usize, lo: i32, hi: i32 }{
+        // values.list.element: items i * 10 + j, rows 120..129.
+        .{ .schema = .lists, .column = 1, .lo = 1200, .hi = 1290 },
+        // matrix leaf: items i * 100 + k * 10 + m, row 200.
+        .{ .schema = .lists, .column = 2, .lo = 20020, .hi = 20021 },
+        // m.value: items i * 10 + j, rows 40..45.
+        .{ .schema = .map, .column = 2, .lo = 400, .hi = 453 },
+    };
+    for (cases) |case| {
+        for ([_]bool{ false, true }) |dictionary| {
+            const bytes = try writeNestedFile(allocator, case.schema, 300, .{ .max_page_size = 64, .dictionary = dictionary });
+            defer allocator.free(bytes);
+            var reader = try parquet.openBufferDynamic(allocator, bytes, .{});
+            defer reader.deinit();
+
+            const expected = try overlappingPageRows(allocator, &reader, case.column, case.lo, case.hi);
+            defer allocator.free(expected);
+            try std.testing.expect(expected.len > 0);
+            var kept: i64 = 0;
+            for (expected) |r| kept += @intCast(r.last - r.first);
+            try std.testing.expect(kept < 300);
+            try expectFilteredRows(allocator, &reader, &.{page_filter.betweenI32(case.column, case.lo, case.hi)}, expected);
+        }
+    }
 }
 
 test "page index: readRowsFiltered returns an error when a page's rows differ from the offset index" {

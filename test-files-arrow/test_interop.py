@@ -406,3 +406,41 @@ class TestNested:
         assert vals[0] == {"x": 10, "y": 11}
         assert vals[1] == {"x": 20, "y": 21}
         assert vals[3] == {"x": 30, "y": 31}
+
+
+# ── Nested columns in several pages, with page indexes ───────────────────────
+
+
+def _nested_pages_rows(schema):
+    """The rows that writeNestedFile in page_index_test.zig writes."""
+    rows = []
+    for i in range(300):
+        if schema == "lists":
+            values = None if i % 7 == 3 else [i * 10 + j for j in range(i % 4)]
+            matrix = [[i * 100 + k * 10 + m for m in range(k)] for k in range(i % 3)]
+            rows.append({"id": i, "values": values, "matrix": matrix})
+        elif schema == "record":
+            if i % 5 == 2:
+                s = None
+            else:
+                s = {"a": i * 1000, "b": None if i % 3 == 0 else f"b{i // 16:03d}"}
+            rows.append({"id": i, "s": s})
+        else:
+            rows.append({"id": i, "m": [(f"k{i:03d}_{j}", i * 10 + j) for j in range(i % 4)]})
+    return rows
+
+
+@pytest.mark.parametrize("schema", ["lists", "record", "map"])
+class TestNestedPages:
+    def test_values(self, schema):
+        table = pq.read_table(interop_path(f"nested_pages_{schema}.parquet"))
+        assert table.to_pylist() == _nested_pages_rows(schema)
+
+    def test_page_indexes(self, schema):
+        md = pq.ParquetFile(interop_path(f"nested_pages_{schema}.parquet")).metadata
+        assert md.num_row_groups == 1
+        rg = md.row_group(0)
+        for c in range(rg.num_columns):
+            col = rg.column(c)
+            assert col.has_offset_index, col.path_in_schema
+            assert col.has_column_index, col.path_in_schema
