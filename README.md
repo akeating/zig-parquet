@@ -474,14 +474,14 @@ writer.setMaxPageSize(1_048_576);      // 1MB page size limit
 
 ### Build Sizes
 
-Pure Zig, all five compression codecs, no C compiler required. Measured with `ReleaseSmall`.
+Pure Zig, all five compression codecs, no C compiler required. Measured with `ReleaseSmall` and Zig 0.17.1.
 
 | Target | Size |
 |--------|------|
-| Static library (macOS arm64) | 1,365 KB |
-| WASM (brotli-compressed) | 199 KB |
+| Static library (macOS arm64) | 1,296 KB |
+| WASM (brotli-compressed) | 203 KB |
 
-The 1,365 KB figure includes all five Zig codecs. Per-codec cost (on top of a 992 KB codec-less baseline) ranges from 89 KB for lz4 to 254 KB for brotli — use `-Dcodecs=` to pick a subset. See [COMPRESSION.md](COMPRESSION.md) for the full breakdown.
+The 1,296 KB figure includes all five Zig codecs. Per-codec cost on top of a 1,010 KB codec-less baseline ranges from 3 KB for lz4 to 170 KB for brotli; use `-Dcodecs=` to pick a subset. See [COMPRESSION.md](COMPRESSION.md) for the full breakdown.
 
 ## Spec Coverage
 

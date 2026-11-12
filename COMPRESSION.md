@@ -14,43 +14,45 @@ zig-parquet supports all major Parquet compression codecs. Codecs are individual
 
 ## Build Sizes
 
-Static library (`libparquet.a`) sizes with `ReleaseSmall`, measured on macOS arm64.
+Static library (`libparquet.a`) sizes with `ReleaseSmall`, measured on macOS arm64 with Zig 0.17.1 on 2026-11-12. 1 KB is 1,024 bytes.
 
 | `-Dcodecs=` | ReleaseSmall | Delta vs none | C/C++ required |
 |-------------|-------------|---------------|----------------|
-| `none` | 992 KB | -- | No |
-| `lz4` | 1,081 KB | +89 KB | No |
-| `snappy` | 1,082 KB | +90 KB | No |
-| `gzip` | 1,114 KB | +122 KB | No |
-| `zstd` | 1,160 KB | +168 KB | No |
-| `brotli` | 1,246 KB | +254 KB | No |
-| `zig-only` | 1,365 KB | +373 KB | No |
-| `c-snappy` | 1,124 KB | +132 KB | C++ |
-| `c-lz4` | 1,143 KB | +151 KB | C |
-| `c-gzip` | 1,145 KB | +153 KB | C |
-| `c-zstd` | 1,569 KB | +577 KB | C |
-| `c-brotli` | 1,881 KB | +889 KB | C |
-| `all` (default) | 2,829 KB | +1,837 KB | C, C++ |
+| `none` | 1,010 KB | -- | No |
+| `lz4` | 1,013 KB | +3 KB | No |
+| `snappy` | 1,015 KB | +5 KB | No |
+| `gzip` | 1,045 KB | +35 KB | No |
+| `zstd` | 1,088 KB | +78 KB | No |
+| `brotli` | 1,180 KB | +170 KB | No |
+| `zig-only` | 1,296 KB | +286 KB | No |
+| `c-snappy` | 1,057 KB | +47 KB | C++ |
+| `c-lz4` | 1,074 KB | +64 KB | C |
+| `c-gzip` | 1,077 KB | +67 KB | C |
+| `c-zstd` | 1,499 KB | +489 KB | C |
+| `c-brotli` | 1,812 KB | +802 KB | C |
+| `all` (default) | 2,758 KB | +1,748 KB | C, C++ |
 
 ### WASM (wasm32-wasi, ReleaseSmall)
 
-| `-Dcodecs=` | Raw `.wasm` | Brotli compressed | Delta vs none |
-|-------------|------------|-------------------|---------------|
-| `none` | 664 KB | 125 KB | -- |
-| `lz4` | 673 KB | 127 KB | +2 KB |
-| `snappy` | 673 KB | 127 KB | +2 KB |
-| `gzip` | 695 KB | 134 KB | +9 KB |
-| `zstd` | 760 KB | 152 KB | +27 KB |
-| `brotli` | 833 KB | 167 KB | +42 KB |
-| `zig-only` | 948 KB | 199 KB | +74 KB |
-| `c-snappy` | 710 KB | 139 KB | +14 KB |
-| `c-lz4` | 712 KB | 135 KB | +10 KB |
-| `c-gzip` | 720 KB | 143 KB | +18 KB |
-| `c-zstd` | 1,070 KB | 204 KB | +79 KB |
-| `c-brotli` | 1,384 KB | 336 KB | +211 KB |
-| `all` (default) | 1,418 KB | 298 KB | +173 KB |
+Brotli sizes use `brotli -q 11`.
 
-The `wasm32-freestanding` target hardcodes all codecs to disabled and produces a 664 KB / 125 KB (brotli) binary.
+| `-Dcodecs=` | Raw `.wasm` | Brotli compressed | Delta vs none (brotli) |
+|-------------|------------|-------------------|---------------|
+| `none` | 592 KB | 129 KB | -- |
+| `lz4` | 594 KB | 130 KB | +1 KB |
+| `snappy` | 597 KB | 131 KB | +2 KB |
+| `gzip` | 616 KB | 137 KB | +8 KB |
+| `zstd` | 677 KB | 154 KB | +25 KB |
+| `brotli` | 754 KB | 169 KB | +40 KB |
+| `zig-only` | 866 KB | 203 KB | +74 KB |
+| `c-snappy` | 628 KB | 142 KB | +13 KB |
+| `c-lz4` | 631 KB | 139 KB | +10 KB |
+| `c-gzip` | 639 KB | 147 KB | +18 KB |
+| `c-zstd` | 984 KB | 207 KB | +78 KB |
+| `c-brotli` | 1,301 KB | 340 KB | +212 KB |
+| `all` (default) | 1,326 KB | 302 KB | +173 KB |
+
+The `wasm32-freestanding` target disables all codecs and produces a 594 KB binary, 129 KB brotli-compressed.
 
 ## Build Options
 
