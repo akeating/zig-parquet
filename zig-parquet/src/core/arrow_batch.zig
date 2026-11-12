@@ -957,16 +957,24 @@ pub const ArrowBatchReader = struct {
         piece_rows: []usize,
         /// Piece `p` of leaf `k` is `pieces[k * piece_rows.len + p]`.
         pieces: []leaf_decoder.Leaf,
+        /// The arrays of the pieces that are whole batches, assembled by the task; their
+        /// leaves in `pieces` were moved out.
+        batches: []?[]ArrowArray,
         /// Pieces before this one have been taken by batches.
         next_piece: usize = 0,
 
         fn deinit(self: *Decoded) void {
             const n = self.piece_rows.len;
-            if (n > 0) {
-                for (0..self.pieces.len / n) |k| {
-                    for (self.pieces[k * n + self.next_piece .. (k + 1) * n]) |*l| l.deinit(self.allocator);
+            const leaves = if (n > 0) self.pieces.len / n else 0;
+            for (self.next_piece..n) |p| {
+                if (self.batches[p]) |arrays| {
+                    for (arrays) |*arr| arr.doRelease();
+                    self.allocator.free(arrays);
+                } else {
+                    for (0..leaves) |k| self.pieces[k * n + p].deinit(self.allocator);
                 }
             }
+            self.allocator.free(self.batches);
             self.allocator.free(self.pieces);
             self.allocator.free(self.piece_rows);
         }
@@ -1057,6 +1065,21 @@ pub const ArrowBatchReader = struct {
     /// The next batch, or null after the last row group.
     pub fn next(self: *ArrowBatchReader) !?ReadResult {
         const allocator = self.allocator;
+        if (self.read_ahead > 0) {
+            // A batch the row group's task assembled.
+            if (!try self.advanceCurrent()) return null;
+            const c = &self.current.?;
+            if (c.batches[c.next_piece]) |arrays| {
+                c.batches[c.next_piece] = null;
+                c.next_piece += 1;
+                errdefer {
+                    for (arrays) |*arr| arr.doRelease();
+                    allocator.free(arrays);
+                }
+                const sch = try self.schema();
+                return .{ .arrays = arrays, .schema = sch, .allocator = allocator };
+            }
+        }
         // Decoded rows of each leaf, one piece per row group the batch takes rows from.
         const parts = try allocator.alloc(std.ArrayList(leaf_decoder.Leaf), self.leaf_info.len);
         for (parts) |*p| p.* = .empty;
@@ -1071,26 +1094,37 @@ pub const ArrowBatchReader = struct {
         const rows = if (self.read_ahead > 0) try self.takeDecoded(parts) else try self.decodePieces(parts);
         if (rows == 0) return null;
 
-        const arrays = try allocator.alloc(ArrowArray, self.columns.len);
-        errdefer allocator.free(arrays);
-        const built = try allocator.alloc(bool, self.columns.len);
-        defer allocator.free(built);
-        @memset(built, false);
-        errdefer for (arrays, built) |*arr, b| if (b) arr.doRelease();
-        // The first leaf of each column in `parts`.
-        const first_leaf = try allocator.alloc(usize, self.columns.len);
-        defer allocator.free(first_leaf);
-        var k: usize = 0;
-        for (self.columns, first_leaf) |c, *f| {
-            f.* = k;
-            k += self.tree[c].physical_count;
+        const assembly: Assembly = .{
+            .allocator = allocator,
+            .schema = self.metadata.schema,
+            .tree = self.tree,
+            .columns = self.columns,
+            .leaf_info = self.leaf_info,
+            .io = self.io,
+        };
+        const arrays = try assembly.arrays(parts, rows);
+        errdefer {
+            for (arrays) |*arr| arr.doRelease();
+            allocator.free(arrays);
         }
-        const assemble: AssembleTask = .{ .reader = self, .parts = parts, .first_leaf = first_leaf, .arrays = arrays, .built = built };
-        try parallel.forEach(self.io, allocator, self.columns.len, &assemble, AssembleTask.run);
-        for (arrays) |arr| if (arr.length != rows) return error.InvalidPageData;
-        var sch = try self.schema();
-        errdefer sch.doRelease();
+        const sch = try self.schema();
         return .{ .arrays = arrays, .schema = sch, .allocator = allocator };
+    }
+
+    /// With `read_ahead`: makes `current` a decoded row group with pieces not yet taken,
+    /// waiting for its task. Returns false after the last row group.
+    fn advanceCurrent(self: *ArrowBatchReader) !bool {
+        while (true) {
+            if (self.current) |*c| {
+                if (c.next_piece < c.piece_rows.len) return true;
+                c.deinit();
+                self.current = null;
+            }
+            try self.startDecoding();
+            if (self.pending.items.len == 0) return false;
+            var future = self.pending.orderedRemove(0);
+            self.current = try future.await(self.io.?);
+        }
     }
 
     /// Decodes the rows of the next batch from the open row group's cursors, opening row
@@ -1128,15 +1162,12 @@ pub const ArrowBatchReader = struct {
             if (cur == null or cur.?.next_piece == cur.?.piece_rows.len) {
                 // Without batch_rows, a batch is one row group.
                 if (self.batch_rows == null and rows > 0) break;
-                if (self.current) |*c| c.deinit();
-                self.current = null;
-                try self.startDecoding();
-                if (self.pending.items.len == 0) break;
-                var future = self.pending.orderedRemove(0);
-                self.current = try future.await(self.io.?);
+                if (!try self.advanceCurrent()) break;
                 continue;
             }
             const c = cur.?;
+            // Assembled pieces are whole batches, which `next` takes before calling this.
+            if (c.batches[c.next_piece] != null) return error.InvalidPageData;
             for (parts) |*p| try p.ensureUnusedCapacity(allocator, 1);
             const n = c.piece_rows.len;
             for (parts, 0..) |*p, k| p.appendAssumeCapacity(c.pieces[k * n + c.next_piece]);
@@ -1158,9 +1189,12 @@ pub const ArrowBatchReader = struct {
                 .source = self.source,
                 .schema = self.metadata.schema,
                 .rg = rg,
+                .tree = self.tree,
+                .columns = self.columns,
                 .leaf_info = self.leaf_info,
                 .batch_rows = self.batch_rows,
                 .fill = self.next_fill,
+                .last = self.next_rg + 1 == self.row_groups.len,
                 .large_offsets = self.large_offsets,
                 .io = io,
             };
@@ -1176,15 +1210,20 @@ pub const ArrowBatchReader = struct {
     }
 
     /// Decodes the selected columns of a row group and cuts each leaf into the pieces the
-    /// batches take: a batch holding `fill` rows takes the first piece.
+    /// batches take: a batch holding `fill` rows takes the first piece. Assembles the pieces
+    /// that are whole batches: those that start a batch and fill it, or end the last row
+    /// group (`last`).
     const RowGroupJob = struct {
         allocator: Allocator,
         source: SeekableReader,
         schema: []const format.SchemaElement,
         rg: *const format.RowGroup,
+        tree: []const Node,
+        columns: []const usize,
         leaf_info: []const LeafInfo,
         batch_rows: ?usize,
         fill: usize,
+        last: bool,
         large_offsets: bool,
         io: std.Io,
 
@@ -1208,16 +1247,61 @@ pub const ArrowBatchReader = struct {
             }
 
             const np = piece_rows.items.len;
-            const pieces = try allocator.alloc(leaf_decoder.Leaf, job.leaf_info.len * np);
+            const num_leaves = job.leaf_info.len;
+            const pieces = try allocator.alloc(leaf_decoder.Leaf, num_leaves * np);
             errdefer allocator.free(pieces);
-            const done = try allocator.alloc(bool, job.leaf_info.len);
+            const done = try allocator.alloc(bool, num_leaves);
             defer allocator.free(done);
             @memset(done, false);
-            errdefer for (done, 0..) |d, k| if (d) for (pieces[k * np ..][0..np]) |*l| l.deinit(allocator);
+            const batches = try allocator.alloc(?[]ArrowArray, np);
+            errdefer allocator.free(batches);
+            @memset(batches, null);
+            // Pieces whose leaves were moved out to be assembled.
+            const moved = try allocator.alloc(bool, np);
+            defer allocator.free(moved);
+            @memset(moved, false);
+            errdefer for (done, 0..) |d, k| if (d) for (0..np) |p| if (!moved[p]) pieces[k * np + p].deinit(allocator);
+            errdefer for (batches) |b| if (b) |arrays| {
+                for (arrays) |*arr| arr.doRelease();
+                allocator.free(arrays);
+            };
 
             const task: LeafPiecesTask = .{ .job = &job, .piece_rows = piece_rows.items, .pieces = pieces, .done = done };
-            try parallel.forEach(job.io, allocator, job.leaf_info.len, &task, LeafPiecesTask.run);
-            return .{ .allocator = allocator, .piece_rows = try piece_rows.toOwnedSlice(allocator), .pieces = pieces };
+            try parallel.forEach(job.io, allocator, num_leaves, &task, LeafPiecesTask.run);
+
+            // One list of one piece per leaf, for `Assembly.arrays`.
+            const parts = try allocator.alloc(std.ArrayList(leaf_decoder.Leaf), num_leaves);
+            for (parts) |*part| part.* = .empty;
+            defer {
+                for (parts) |*part| {
+                    for (part.items) |*l| l.deinit(allocator);
+                    part.deinit(allocator);
+                }
+                allocator.free(parts);
+            }
+            for (parts) |*part| try part.ensureTotalCapacity(allocator, 1);
+            const assembly: Assembly = .{
+                .allocator = allocator,
+                .schema = job.schema,
+                .tree = job.tree,
+                .columns = job.columns,
+                .leaf_info = job.leaf_info,
+                .io = job.io,
+            };
+            var batch_fill = job.fill;
+            for (piece_rows.items, 0..) |n, p| {
+                const whole = if (job.batch_rows) |b| batch_fill == 0 and (n == b or (job.last and p == np - 1)) else true;
+                batch_fill = if (job.batch_rows) |b| (batch_fill + n) % b else 0;
+                if (!whole) continue;
+                moved[p] = true;
+                for (parts, 0..) |*part, k| part.appendAssumeCapacity(pieces[k * np + p]);
+                batches[p] = try assembly.arrays(parts, n);
+                for (parts) |*part| {
+                    for (part.items) |*l| l.deinit(allocator);
+                    part.clearRetainingCapacity();
+                }
+            }
+            return .{ .allocator = allocator, .piece_rows = try piece_rows.toOwnedSlice(allocator), .pieces = pieces, .batches = batches };
         }
     };
 
@@ -1288,28 +1372,62 @@ pub const ArrowBatchReader = struct {
         }
     };
 
+    /// What assembling the arrays of a batch needs: the selected columns and their leaves.
+    const Assembly = struct {
+        allocator: Allocator,
+        schema: []const format.SchemaElement,
+        tree: []const Node,
+        columns: []const usize,
+        leaf_info: []const LeafInfo,
+        io: ?std.Io,
+
+        /// Assembles the arrays of a batch of `rows` rows from `parts`, the pieces of each
+        /// leaf, with the columns as tasks of `io`. Pieces moved out of `parts` are removed
+        /// from it.
+        fn arrays(self: *const Assembly, parts: []std.ArrayList(leaf_decoder.Leaf), rows: usize) ReaderError![]ArrowArray {
+            const allocator = self.allocator;
+            const out = try allocator.alloc(ArrowArray, self.columns.len);
+            errdefer allocator.free(out);
+            const built = try allocator.alloc(bool, self.columns.len);
+            defer allocator.free(built);
+            @memset(built, false);
+            errdefer for (out, built) |*arr, b| if (b) arr.doRelease();
+            // The first leaf of each column in `parts`.
+            const first_leaf = try allocator.alloc(usize, self.columns.len);
+            defer allocator.free(first_leaf);
+            var k: usize = 0;
+            for (self.columns, first_leaf) |c, *f| {
+                f.* = k;
+                k += self.tree[c].physical_count;
+            }
+            const task: AssembleTask = .{ .assembly = self, .parts = parts, .first_leaf = first_leaf, .arrays = out, .built = built };
+            parallel.forEach(self.io, allocator, self.columns.len, &task, AssembleTask.run) catch |e| return asErrorOf(ReaderError, e);
+            for (out) |arr| if (arr.length != rows) return error.InvalidPageData;
+            return out;
+        }
+    };
+
     /// Assembles output column `i` of a batch into `arrays[i]`.
     const AssembleTask = struct {
-        reader: *ArrowBatchReader,
+        assembly: *const Assembly,
         parts: []std.ArrayList(leaf_decoder.Leaf),
         first_leaf: []const usize,
         arrays: []ArrowArray,
         built: []bool,
 
         fn run(self: *const AssembleTask, i: usize) ReaderError!void {
-            const r = self.reader;
-            const node = &r.tree[r.columns[i]];
+            const a = self.assembly;
+            const node = &a.tree[a.columns[i]];
             const k = self.first_leaf[i];
             const count = node.physical_count;
-            self.arrays[i] = try r.assembleColumn(node, self.parts[k..][0..count], r.leaf_info[k..][0..count]);
+            self.arrays[i] = try assembleColumn(a.allocator, a.schema, node, self.parts[k..][0..count], a.leaf_info[k..][0..count]);
             self.built[i] = true;
         }
     };
 
     /// Joins each leaf's pieces and assembles the column's array. Pieces moved out of
     /// `parts` are removed from it.
-    fn assembleColumn(self: *ArrowBatchReader, node: *const Node, parts: []std.ArrayList(leaf_decoder.Leaf), info: []const LeafInfo) ReaderError!ArrowArray {
-        const allocator = self.allocator;
+    fn assembleColumn(allocator: Allocator, schema_elems: []const format.SchemaElement, node: *const Node, parts: []std.ArrayList(leaf_decoder.Leaf), info: []const LeafInfo) ReaderError!ArrowArray {
         const leaves = try allocator.alloc(NestedLeaf, parts.len);
         var joined: usize = 0;
         defer {
@@ -1329,8 +1447,8 @@ pub const ArrowBatchReader = struct {
             l.max_rep = levels.max_rep;
             joined = k + 1;
         }
-        if (node.kind == .leaf) return leafToArrow(allocator, leaves[0].leaf.buffers.takeAll(), self.metadata.schema[node.schema_idx]);
-        return assembleNode(allocator, self.metadata.schema, node, leaves, node.physical_start);
+        if (node.kind == .leaf) return leafToArrow(allocator, leaves[0].leaf.buffers.takeAll(), schema_elems[node.schema_idx]);
+        return assembleNode(allocator, schema_elems, node, leaves, node.physical_start);
     }
 
     fn openRowGroup(self: *ArrowBatchReader, rg_index: usize) !void {

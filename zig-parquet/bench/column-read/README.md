@@ -93,13 +93,13 @@ All columns, median of 9 runs; the nested rows were measured after the level cha
 | Case | ms, 1 thread | ms, 8 threads | ms, 8 threads, ahead=1 | peak MB, 1 / 8 / 8 ahead=1 |
 |---|---|---|---|---|
 | flat arrow all | 174 | 76 | | 46.5 / 61.0 / |
-| flat groups all | 167 | 84 | 44 | 49.1 / 49.3 / 94.0 |
-| flat batches all | 177 | 89 | 45 | 8.2 / 9.3 / 71.9 |
+| flat groups all | 167 | 84 | 40 | 49.1 / 49.3 / 108.2 |
+| flat batches all | 177 | 89 | 36 | 8.2 / 9.3 / 75.6 |
 | nested arrow all | 166 | 64 | | 92.8 / 137.6 / |
-| nested groups all | 166 | 65 | 57 | — / 108.2 / 173.2 |
-| nested batches all | 176 | 72 | 64 | 13.9 / 15.5 / 160.5 |
+| nested groups all | 166 | 65 | 51 | — / 108.2 / 208.2 |
+| nested batches all | 176 | 72 | 55 | 13.9 / 15.5 / 154.2 |
 
-Without read-ahead, a row group's columns finish when its slowest column finishes, and the batch is assembled on the calling thread. With read-ahead, the next row group decodes during that time. The nested file has 2 row groups, so at most 2 overlap, and the columns of each batch are assembled on the calling thread after the row group is decoded. Reading 2 or 3 row groups ahead of the flat file took 44 to 55 ms, with peaks of 102 to 160 MB. PyArrow with `use_threads=True`, measured earlier on the same machine: `read_row_group` 111 ms (flat) and 80 ms (nested); `read_table` 69.5 ms and 43 ms.
+Without read-ahead, a row group's columns finish when its slowest column finishes, and the batch is assembled on the calling thread. With read-ahead, the next row group decodes during that time, and the task that decodes a row group also assembles the batches that lie inside it; only batches that take rows from two row groups are assembled on the calling thread. The ahead=1 column was measured after that change (before: flat 44 and 45 ms, nested 57 and 64 ms). The nested file has 2 row groups, so at most 2 overlap; its groups case took 35 to 51 ms between runs. Reading 2 or 3 row groups ahead of the flat file took 44 to 55 ms, with peaks of 102 to 160 MB. PyArrow with `use_threads=True`, measured earlier on the same machine: `read_row_group` 111 ms (flat) and 80 ms (nested); `read_table` 69.5 ms and 43 ms.
 
 The row path writes a `Value` per entry and a `Row` per row. The values of a read are in one block of storage shared by its rows, and string values reference the decoded byte buffers.
 
