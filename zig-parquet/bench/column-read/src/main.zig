@@ -4,8 +4,10 @@
 //! together, and reports wall time plus allocator activity. Paths: `arrow` reads each row
 //! group whole, `batches` reads 65,536-row batches, `rows` reads through the row API.
 //!
-//! Usage: zig build run -- FILE.parquet [RUNS]
+//! Usage: zig build run -- FILE.parquet [RUNS] [PATH:COLUMN] [threads=N]
 //!   RUNS: measured runs per case after one warm-up run (default 5).
+//!   threads=N: decode columns as tasks of a `std.Io.Threaded` with N - 1 pool threads, so
+//!   up to N threads including the calling one (default 1: no `Io`, one thread).
 //!   Time: median and minimum over the measured runs. The file is read through the OS page
 //!   cache, which the warm-up run fills, so times exclude disk reads.
 //!   Allocations: counted on the last run (they are the same on every run).
@@ -13,9 +15,11 @@
 const std = @import("std");
 const parquet = @import("parquet");
 
-/// Allocator wrapper that counts calls and tracks live and peak bytes. Single-threaded.
+/// Allocator wrapper that counts calls and tracks live and peak bytes. A spin lock guards the
+/// counts, so it can be used from several threads.
 const CountingAllocator = struct {
     backing: std.mem.Allocator,
+    lock: std.atomic.Mutex = .unlocked,
     allocs: usize = 0,
     resizes: usize = 0,
     frees: usize = 0,
@@ -33,6 +37,10 @@ const CountingAllocator = struct {
         self.frees = 0;
         self.bytes_allocated = 0;
         self.peak = self.live;
+    }
+
+    fn acquire(self: *CountingAllocator) void {
+        while (!self.lock.tryLock()) std.atomic.spinLoopHint();
     }
 
     fn grew(self: *CountingAllocator, old_len: usize, new_len: usize) void {
@@ -55,6 +63,8 @@ const CountingAllocator = struct {
     fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
         const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
         const ptr = self.backing.rawAlloc(len, alignment, ret_addr) orelse return null;
+        self.acquire();
+        defer self.lock.unlock();
         self.allocs += 1;
         self.grew(0, len);
         return ptr;
@@ -63,6 +73,8 @@ const CountingAllocator = struct {
     fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
         const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
         if (!self.backing.rawResize(memory, alignment, new_len, ret_addr)) return false;
+        self.acquire();
+        defer self.lock.unlock();
         self.resizes += 1;
         self.grew(memory.len, new_len);
         return true;
@@ -71,6 +83,8 @@ const CountingAllocator = struct {
     fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
         const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
         const ptr = self.backing.rawRemap(memory, alignment, new_len, ret_addr) orelse return null;
+        self.acquire();
+        defer self.lock.unlock();
         self.resizes += 1;
         self.grew(memory.len, new_len);
         return ptr;
@@ -79,6 +93,8 @@ const CountingAllocator = struct {
     fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
         const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
         self.backing.rawFree(memory, alignment, ret_addr);
+        self.acquire();
+        defer self.lock.unlock();
         self.frees += 1;
         self.live -= memory.len;
     }
@@ -103,28 +119,45 @@ pub fn main(init: std.process.Init) !void {
         return error.InvalidArguments;
     }
     const path = args[1];
-    const runs: usize = if (args.len > 2) try std.fmt.parseInt(usize, args[2], 10) else 5;
+    // Positional arguments after FILE: RUNS, PATH:COLUMN; `threads=N` anywhere.
+    var positional: [2]?[]const u8 = .{ null, null };
+    var num_positional: usize = 0;
+    var threads: usize = 1;
+    for (args[2..]) |arg| {
+        if (std.mem.startsWith(u8, arg, "threads=")) {
+            threads = try std.fmt.parseInt(usize, arg["threads=".len..], 10);
+            if (threads == 0) return error.InvalidArguments;
+        } else if (num_positional < positional.len) {
+            positional[num_positional] = arg;
+            num_positional += 1;
+        } else return error.InvalidArguments;
+    }
+    const runs: usize = if (positional[0]) |r| try std.fmt.parseInt(usize, r, 10) else 5;
+
+    var threaded: std.Io.Threaded = .init(std.heap.smp_allocator, .{ .async_limit = .limited(threads - 1) });
+    defer threaded.deinit();
+    const decode_io: ?std.Io = if (threads > 1) threaded.io() else null;
 
     var counting: CountingAllocator = .{ .backing = std.heap.smp_allocator };
     const allocator = counting.allocator();
 
     const file = try std.Io.Dir.cwd().openFile(io, path, .{});
     defer file.close(io);
-    var reader = try parquet.openFileDynamic(allocator, file, io, .{});
+    var reader = try parquet.openFileDynamic(allocator, file, io, .{ .io = decode_io });
     defer reader.deinit();
 
     const num_rgs = reader.getNumRowGroups();
     // readRowGroupAsArrow and readRowsProjected take top-level column indices.
     const col_names = try topLevelNames(init.arena.allocator(), reader.metadata.schema);
     const num_cols = col_names.len;
-    std.debug.print("file: {s}\nrows: {d}, row groups: {d}, top-level columns: {d}, measured runs: {d}\n\n", .{
-        path, reader.getTotalNumRows(), num_rgs, num_cols, runs,
+    std.debug.print("file: {s}\nrows: {d}, row groups: {d}, top-level columns: {d}, measured runs: {d}, threads: {d}\n\n", .{
+        path, reader.getTotalNumRows(), num_rgs, num_cols, runs, threads,
     });
 
     var cases: std.ArrayList(Case) = .empty;
     defer cases.deinit(init.gpa);
     // Optional CASE argument "path:column" (e.g. "arrow:id", "batches:all") runs only that case.
-    const filter: ?[]const u8 = if (args.len > 3) args[3] else null;
+    const filter: ?[]const u8 = positional[1];
     for ([_]Path{ .arrow, .batches, .rows }) |p| {
         for (0..num_cols + 1) |c| {
             const column: ?usize = if (c < num_cols) c else null;
@@ -156,8 +189,8 @@ pub fn main(init: std.process.Init) !void {
             const live_before = counting.live;
             const start = std.Io.Clock.awake.now(io);
             check = switch (case.path) {
-                .arrow => try readArrow(allocator, &reader, num_rgs, case.column),
-                .batches => try readBatches(allocator, &reader, case.column),
+                .arrow => try readArrow(allocator, &reader, num_rgs, case.column, decode_io),
+                .batches => try readBatches(allocator, &reader, case.column, decode_io),
                 .rows => try readRows(allocator, &reader, num_rgs, case.column),
             };
             const elapsed = start.durationTo(std.Io.Clock.awake.now(io));
@@ -215,11 +248,11 @@ fn bytesToMb(bytes: usize) f64 {
 
 /// Reads all row groups through readRowGroupAsArrow. Returns a checksum of the array lengths
 /// and null counts so the work cannot be skipped.
-fn readArrow(allocator: std.mem.Allocator, reader: *parquet.DynamicReader, num_rgs: usize, column: ?usize) !u64 {
+fn readArrow(allocator: std.mem.Allocator, reader: *parquet.DynamicReader, num_rgs: usize, column: ?usize, io: ?std.Io) !u64 {
     var check: u64 = 0;
     for (0..num_rgs) |rg| {
         const cols: ?[]const usize = if (column) |c| &.{c} else null;
-        var result = try parquet.readRowGroupAsArrow(allocator, reader.getSource(), reader.metadata, rg, cols);
+        var result = try parquet.readRowGroupAsArrowWith(allocator, reader.getSource(), reader.metadata, rg, .{ .columns = cols, .io = io });
         defer result.deinit();
         for (result.arrays) |arr| {
             check +%= @as(u64, @intCast(arr.length)) *% 31 +% @as(u64, @intCast(arr.null_count));
@@ -231,10 +264,10 @@ fn readArrow(allocator: std.mem.Allocator, reader: *parquet.DynamicReader, num_r
 /// Reads the file through ArrowBatchReader, `batch_rows` rows per batch. Returns the same
 /// checksum as readArrow when every row group's rows fit in one batch; otherwise a checksum
 /// of the batches.
-fn readBatches(allocator: std.mem.Allocator, reader: *parquet.DynamicReader, column: ?usize) !u64 {
+fn readBatches(allocator: std.mem.Allocator, reader: *parquet.DynamicReader, column: ?usize, io: ?std.Io) !u64 {
     var check: u64 = 0;
     const cols: ?[]const usize = if (column) |c| &.{c} else null;
-    var batches = try parquet.ArrowBatchReader.init(allocator, reader.getSource(), reader.metadata, .{ .columns = cols, .batch_rows = batch_rows });
+    var batches = try parquet.ArrowBatchReader.init(allocator, reader.getSource(), reader.metadata, .{ .columns = cols, .batch_rows = batch_rows, .io = io });
     defer batches.deinit();
     while (try batches.next()) |result_const| {
         var result = result_const;

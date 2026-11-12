@@ -100,8 +100,14 @@ pub const GeoError = error{
     InvalidEdgeInterpolationAlgorithm,
 };
 
+/// Errors of reads that decode columns as tasks of a `std.Io` (see `parallel.zig`).
+pub const TaskError = error{
+    /// The calling task was canceled while the read waited for its decoding tasks.
+    Canceled,
+};
+
 /// Composed error set for reader operations.
-pub const ReaderError = TransportError || FormatError || DecodingError || CompressionError || ChecksumError || ResourceError || GeoError;
+pub const ReaderError = TransportError || FormatError || DecodingError || CompressionError || ChecksumError || ResourceError || GeoError || TaskError;
 
 /// Composed error set for writer operations.
 pub const WriterError = ResourceError || CallerError || CompressionError || error{

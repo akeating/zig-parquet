@@ -90,6 +90,8 @@ pub const exportProjectedSchemaAsArrow = arrow_batch.exportProjectedSchemaAsArro
 pub const importSchemaFromArrow = arrow_batch.importSchemaFromArrow;
 pub const freeImportedColumnDefs = arrow_batch.freeImportedColumnDefs;
 pub const readRowGroupAsArrow = arrow_batch.readRowGroupAsArrow;
+pub const readRowGroupAsArrowWith = arrow_batch.readRowGroupAsArrowWith;
+pub const RowGroupOptions = arrow_batch.RowGroupOptions;
 pub const ArrowBatchReader = arrow_batch.ArrowBatchReader;
 pub const BatchOptions = arrow_batch.BatchOptions;
 pub const writeRowGroupFromArrow = arrow_batch.writeRowGroupFromArrow;
@@ -688,6 +690,7 @@ test {
     _ = internals.reader.seekable_reader;
     _ = @import("core/writer.zig");
     _ = @import("core/row_ranges.zig");
+    _ = @import("core/parallel.zig");
     _ = @import("core/page_index_reader.zig");
     _ = @import("core/page_filter.zig");
     _ = @import("core/page_range_reader.zig");

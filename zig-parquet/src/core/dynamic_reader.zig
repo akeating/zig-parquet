@@ -37,6 +37,7 @@ const row_ranges_mod = @import("row_ranges.zig");
 const page_filter_mod = @import("page_filter.zig");
 const page_index_reader_mod = @import("page_index_reader.zig");
 const page_range_reader_mod = @import("page_range_reader.zig");
+const parallel = @import("parallel.zig");
 
 pub const Value = value_mod.Value;
 pub const Row = value_mod.Row;
@@ -50,6 +51,12 @@ pub const ColumnFilter = page_filter_mod.ColumnFilter;
 pub const DynamicReaderOptions = struct {
     /// Checksum validation options
     checksum: ChecksumOptions = .{},
+    /// Decodes the columns of a row read (`readAllRows`, `readRowsProjected`,
+    /// `readRowsFiltered`, `rowIterator`) as tasks of this `Io`, so an `Io` whose `async`
+    /// uses threads (`std.Io.Threaded`) decodes them in parallel; see `parallel.zig`. Then
+    /// the reader's allocator and source must allow concurrent use. Null decodes them one
+    /// after another on the calling thread.
+    io: ?std.Io = null,
 };
 
 /// Error type for dynamic reader operations.
@@ -68,6 +75,8 @@ pub const DynamicReader = struct {
     metadata: format.FileMetaData,
     footer_data: []u8,
     checksum_options: ChecksumOptions,
+    /// `DynamicReaderOptions.io`.
+    decode_io: ?std.Io = null,
     _backend_cleanup: ?BackendCleanup = null,
     /// Storage of the read in progress (see `value_mod.RowStorage`): rows'
     /// `values` arrays and nested values are allocated in its arena, it owns
@@ -93,6 +102,7 @@ pub const DynamicReader = struct {
             .metadata = info.metadata,
             .footer_data = info.footer_data,
             .checksum_options = options.checksum,
+            .decode_io = options.io,
         };
     }
 
@@ -519,18 +529,27 @@ pub const DynamicReader = struct {
         const num_out = output_indices.len;
         const all_values = try self.rowAllocator().alloc(Value, try std.math.mul(usize, num_rows, num_out));
 
-        for (output_indices, 0..) |top_idx, out_idx| {
-            const column_out = all_values[out_idx..];
-            if (tree) |columns| {
-                const node = &columns[top_idx];
-                if (node.kind == .leaf)
-                    try self.readLeafIntoRows(node.physical_start, src, column_out, num_out, num_rows)
-                else
-                    try self.readNodeIntoRows(node, src, column_out, num_out, num_rows);
-            } else {
-                try self.readLeafIntoRows(top_idx, src, column_out, num_out, num_rows);
-            }
-        }
+        // The columns are decoded as parallel tasks when there is a `decode_io`. The row
+        // storage and its arena are not thread-safe, so handing byte buffers to the storage
+        // and assembling nested columns (which allocates in the arena) wait until the tasks
+        // finish. Without a `decode_io`, each column is completed in its turn, as before.
+        const slots = try self.allocator.alloc(ColumnSlot, num_out);
+        defer self.allocator.free(slots);
+        @memset(slots, .{});
+        defer for (slots) |*slot| slot.release(self.allocator);
+        const columns: RowColumnTask = .{
+            .reader = self,
+            .src = src,
+            .tree = tree,
+            .output_indices = output_indices,
+            .values = all_values,
+            .num_out = num_out,
+            .num_rows = num_rows,
+            .slots = slots,
+            .in_task = self.decode_io == null,
+        };
+        try parallel.forEach(self.decode_io, self.allocator, num_out, &columns, RowColumnTask.run);
+        for (slots, 0..) |*slot, out_idx| try self.finishColumn(slot, all_values[out_idx..], num_out, num_rows);
 
         const rows = try self.allocator.alloc(Row, num_rows);
         for (rows, 0..) |*row, r| {
@@ -542,9 +561,12 @@ pub const DynamicReader = struct {
 
     const RowLeaf = struct {
         leaf: leaf_decoder.Leaf,
-        /// The decoded values buffer. For byte arrays it is owned by the row storage and
-        /// `leaf.buffers.values` is empty; otherwise it is `leaf.buffers.values`.
+        /// The decoded values buffer. Once `adoptBytes` hands a byte-array buffer to the row
+        /// storage, the storage owns it and `leaf.buffers.values` is empty; until then, and
+        /// for other types, it is `leaf.buffers.values`.
         values: leaf_decoder.Buffer,
+        /// A byte-array or fixed-length byte-array leaf, whose rows' values reference `values`.
+        bytes: bool,
         element: format.SchemaElement,
         max_def: u32,
         max_rep: u32,
@@ -574,22 +596,133 @@ pub const DynamicReader = struct {
             .large_offsets = true,
         };
 
-        var leaf = if (src.filter) |filter|
+        const leaf = if (src.filter) |filter|
             try self.decodeFilteredLeaf(chunk, meta, info, options, filter, &filter.offset_indexes[leaf_idx].?)
         else blk: {
             const page_data = try self.readColumnChunkData(chunk);
             defer self.allocator.free(page_data);
             break :blk try leaf_decoder.decodeLeaf(self.allocator, page_data, meta, info, options);
         };
-        const values = leaf.buffers.values;
-        if (physical == .byte_array or physical == .fixed_len_byte_array) {
-            self.storage.?.adopt(values) catch |e| {
-                leaf.deinit(self.allocator);
-                return e;
-            };
-            leaf.buffers.values = &.{};
+        return .{
+            .leaf = leaf,
+            .values = leaf.buffers.values,
+            .bytes = physical == .byte_array or physical == .fixed_len_byte_array,
+            .element = info.element,
+            .max_def = info.max_def_level,
+            .max_rep = info.max_rep_level,
+        };
+    }
+
+    /// Hands a byte-array leaf's values buffer, which the rows' byte values reference, to the
+    /// row storage. Not thread-safe.
+    fn adoptBytes(self: *Self, rl: *RowLeaf) !void {
+        if (!rl.bytes or rl.leaf.buffers.values.len == 0) return;
+        try self.storage.?.adopt(rl.values);
+        rl.leaf.buffers.values = &.{};
+    }
+
+    fn ErrorSetOf(comptime f: anytype) type {
+        return @typeInfo(@typeInfo(@TypeOf(f)).@"fn".return_type.?).error_union.error_set;
+    }
+
+    const RowColumnError = ErrorSetOf(decodeRowLeaf) || ErrorSetOf(leaf_decoder.writeValues) ||
+        ErrorSetOf(nested_rows.nodeValues) || std.mem.Allocator.Error;
+
+    /// What a column task leaves for `finishColumn`.
+    const ColumnSlot = struct {
+        /// A flat byte-array column's values buffer, which its rows' values reference.
+        bytes: ?RowLeaf = null,
+        /// A nested column whose leaves are decoded and whose values are not yet assembled.
+        node: ?*const schema_tree.Node = null,
+        leaves: ?[]RowLeaf = null,
+
+        fn release(self: *ColumnSlot, allocator: std.mem.Allocator) void {
+            if (self.bytes) |*rl| rl.leaf.deinit(allocator);
+            if (self.leaves) |leaves| {
+                for (leaves) |*rl| rl.leaf.deinit(allocator);
+                allocator.free(leaves);
+            }
+            self.* = .{};
         }
-        return .{ .leaf = leaf, .values = values, .element = info.element, .max_def = info.max_def_level, .max_rep = info.max_rep_level };
+    };
+
+    /// Decodes output column `i` of a row read and writes its values to every `num_out`-th
+    /// entry of `values[i..]`. A flat column is written in the task. A nested column is
+    /// assembled in the task when `in_task` is set, otherwise by `finishColumn`.
+    const RowColumnTask = struct {
+        reader: *Self,
+        src: RowSource,
+        tree: ?[]const schema_tree.Node,
+        output_indices: []const usize,
+        values: []Value,
+        num_out: usize,
+        num_rows: usize,
+        slots: []ColumnSlot,
+        in_task: bool,
+
+        fn run(self: *const RowColumnTask, i: usize) RowColumnError!void {
+            const r = self.reader;
+            const top_idx = self.output_indices[i];
+            const out = self.values[i..];
+            const slot = &self.slots[i];
+            const node: ?*const schema_tree.Node = if (self.tree) |t| &t[top_idx] else null;
+            if (node == null or node.?.kind == .leaf) {
+                const leaf_idx = if (node) |n| n.physical_start else top_idx;
+                // A byte-array leaf, which the written values reference, goes to the slot;
+                // from there `ColumnSlot.release` or `finishColumn` frees it.
+                slot.bytes = try self.writeLeaf(leaf_idx, out) orelse return;
+            } else {
+                slot.node = node.?;
+                slot.leaves = try self.decodeNodeLeaves(node.?);
+            }
+            if (self.in_task) try r.finishColumn(slot, out, self.num_out, self.num_rows);
+        }
+
+        /// Decodes leaf `leaf_idx` and writes its values to every `num_out`-th entry of
+        /// `out`. Returns the leaf when its values reference its values buffer (byte
+        /// arrays); otherwise frees it and returns null.
+        fn writeLeaf(self: *const RowColumnTask, leaf_idx: usize, out: []Value) RowColumnError!?RowLeaf {
+            const r = self.reader;
+            var rl = try r.decodeRowLeaf(leaf_idx, self.src, false);
+            errdefer rl.leaf.deinit(r.allocator);
+            const view = rl.view(self.num_rows);
+            try leaf_decoder.writeValues(&view, rl.element, out, self.num_out);
+            for (view.length..self.num_rows) |row| out[row * self.num_out] = .{ .null_val = {} };
+            if (rl.bytes) return rl;
+            rl.leaf.deinit(r.allocator);
+            return null;
+        }
+
+        /// Decodes the leaves of nested column `node`, with levels.
+        fn decodeNodeLeaves(self: *const RowColumnTask, node: *const schema_tree.Node) RowColumnError![]RowLeaf {
+            const r = self.reader;
+            const leaves = try r.allocator.alloc(RowLeaf, node.physical_count);
+            var decoded: usize = 0;
+            errdefer {
+                for (leaves[0..decoded]) |*rl| rl.leaf.deinit(r.allocator);
+                r.allocator.free(leaves);
+            }
+            for (leaves, 0..) |*rl, k| {
+                rl.* = try r.decodeRowLeaf(node.physical_start + k, self.src, true);
+                decoded = k + 1;
+            }
+            return leaves;
+        }
+    };
+
+    /// Completes a column after its task: hands its byte buffers to the row storage and
+    /// assembles a nested column's values into every `stride`-th entry of `out`. Not
+    /// thread-safe.
+    fn finishColumn(self: *Self, slot: *ColumnSlot, out: []Value, stride: usize, num_rows: usize) !void {
+        if (slot.bytes) |*rl| {
+            try self.adoptBytes(rl);
+            rl.leaf.deinit(self.allocator);
+            slot.bytes = null;
+        }
+        const leaves = slot.leaves orelse return;
+        for (leaves) |*rl| try self.adoptBytes(rl);
+        try self.assembleNodeIntoRows(slot.node.?, leaves, out, stride, num_rows);
+        slot.release(self.allocator);
     }
 
     /// Reads the pages of a leaf column chunk that hold rows `filter` keeps (see
@@ -632,32 +765,13 @@ pub const DynamicReader = struct {
         return kept;
     }
 
-    /// Decodes a top-level primitive column and writes its values to `out[r * stride]` for
-    /// `r < num_rows`; rows past the column's entries get null.
-    fn readLeafIntoRows(self: *Self, leaf_idx: usize, src: RowSource, out: []Value, stride: usize, num_rows: usize) !void {
-        var rl = try self.decodeRowLeaf(leaf_idx, src, false);
-        defer rl.leaf.deinit(self.allocator);
-        const view = rl.view(num_rows);
-        try leaf_decoder.writeValues(&view, rl.element, out, stride);
-        for (view.length..num_rows) |r| out[r * stride] = .{ .null_val = {} };
-    }
-
-    /// Reads the leaves of nested top-level column `node`, assembles its values in the row
-    /// storage (see `nested_rows`) and writes them to `out[r * stride]` for `r < num_rows`;
+    /// Assembles the values of nested top-level column `node` from its decoded `leaves` in the
+    /// row storage (see `nested_rows`) and writes them to `out[r * stride]` for `r < num_rows`;
     /// rows past the column's values get null.
-    fn readNodeIntoRows(self: *Self, node: *const schema_tree.Node, src: RowSource, out: []Value, stride: usize, num_rows: usize) !void {
-        const n = node.physical_count;
-        const row_leaves = try self.allocator.alloc(RowLeaf, n);
-        var decoded: usize = 0;
-        defer {
-            for (row_leaves[0..decoded]) |*rl| rl.leaf.deinit(self.allocator);
-            self.allocator.free(row_leaves);
-        }
-        const leaves = try self.allocator.alloc(nested_rows.Leaf, n);
+    fn assembleNodeIntoRows(self: *Self, node: *const schema_tree.Node, row_leaves: []RowLeaf, out: []Value, stride: usize, num_rows: usize) !void {
+        const leaves = try self.allocator.alloc(nested_rows.Leaf, row_leaves.len);
         defer self.allocator.free(leaves);
-        for (row_leaves, leaves, 0..) |*rl, *l, k| {
-            rl.* = try self.decodeRowLeaf(node.physical_start + k, src, true);
-            decoded = k + 1;
+        for (row_leaves, leaves) |*rl, *l| {
             l.* = .{
                 .buffers = rl.view(std.math.maxInt(usize)),
                 .def_levels = rl.leaf.def_levels,

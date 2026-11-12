@@ -42,6 +42,7 @@ const SchemaNode = schema_mod.SchemaNode;
 const SeekableReader = parquet_reader.SeekableReader;
 const Optional = types.Optional;
 const ReaderError = types.ReaderError;
+const parallel = @import("parallel.zig");
 
 pub const BatchError = error{
     OutOfMemory,
@@ -780,6 +781,27 @@ pub fn readRowGroupAsArrow(
     rg_index: usize,
     col_indices: ?[]const usize,
 ) !ReadResult {
+    return readRowGroupAsArrowWith(allocator, source, metadata, rg_index, .{ .columns = col_indices });
+}
+
+pub const RowGroupOptions = struct {
+    /// Top-level columns to read, in this order; null reads all.
+    columns: ?[]const usize = null,
+    /// Decodes the columns, and the leaves of nested columns, as tasks of this `Io`, so an
+    /// `Io` whose `async` uses threads (`std.Io.Threaded`) decodes them in parallel; see
+    /// `parallel`. Then `allocator` and the source must allow concurrent use. Null decodes
+    /// them one after another on the calling thread.
+    io: ?std.Io = null,
+};
+
+/// `readRowGroupAsArrow` with options.
+pub fn readRowGroupAsArrowWith(
+    allocator: Allocator,
+    source: SeekableReader,
+    metadata: format.FileMetaData,
+    rg_index: usize,
+    options: RowGroupOptions,
+) !ReadResult {
     if (rg_index >= metadata.row_groups.len) return error.InvalidArgument;
     const rg = &metadata.row_groups[rg_index];
 
@@ -787,25 +809,29 @@ pub fn readRowGroupAsArrow(
     defer arena.deinit();
     const columns = try buildSchemaTree(arena.allocator(), metadata.schema);
 
+    const col_indices = options.columns;
     const num_cols = if (col_indices) |ci| ci.len else columns.len;
+    if (col_indices) |ci| for (ci) |c| if (c >= columns.len) return error.InvalidArgument;
 
-    var arrays = try allocator.alloc(ArrowArray, num_cols);
-    var init_count: usize = 0;
-    errdefer {
-        for (arrays[0..init_count]) |*a| a.doRelease();
-        allocator.free(arrays);
-    }
+    const arrays = try allocator.alloc(ArrowArray, num_cols);
+    errdefer allocator.free(arrays);
+    const built = try allocator.alloc(bool, num_cols);
+    defer allocator.free(built);
+    @memset(built, false);
+    errdefer for (arrays, built) |*a, b| if (b) a.doRelease();
 
-    for (0..num_cols) |i| {
-        const col_idx = if (col_indices) |ci| ci[i] else i;
-        if (col_idx >= columns.len) return error.InvalidArgument;
-        const column = &columns[col_idx];
-        arrays[i] = if (column.kind == .leaf)
-            try readColumnAsArrow(allocator, source, metadata, rg, column.physical_start)
-        else
-            try readNestedColumn(allocator, source, metadata, rg, column);
-        init_count = i + 1;
-    }
+    const task: ColumnTask = .{
+        .allocator = allocator,
+        .source = source,
+        .metadata = metadata,
+        .rg = rg,
+        .columns = columns,
+        .col_indices = col_indices,
+        .arrays = arrays,
+        .built = built,
+        .io = options.io,
+    };
+    try parallel.forEach(options.io, allocator, num_cols, &task, ColumnTask.run);
 
     var schema = try treeSchema(allocator, metadata.schema, columns, col_indices, false);
     errdefer schema.doRelease();
@@ -816,6 +842,28 @@ pub fn readRowGroupAsArrow(
         .allocator = allocator,
     };
 }
+
+/// Reads output column `i` of `readRowGroupAsArrowWith` into `arrays[i]`.
+const ColumnTask = struct {
+    allocator: Allocator,
+    source: SeekableReader,
+    metadata: format.FileMetaData,
+    rg: *const format.RowGroup,
+    columns: []const Node,
+    col_indices: ?[]const usize,
+    arrays: []ArrowArray,
+    built: []bool,
+    io: ?std.Io,
+
+    fn run(self: *const ColumnTask, i: usize) ReaderError!void {
+        const column = &self.columns[if (self.col_indices) |ci| ci[i] else i];
+        self.arrays[i] = if (column.kind == .leaf)
+            try readColumnAsArrow(self.allocator, self.source, self.metadata, self.rg, column.physical_start)
+        else
+            try readNestedColumn(self.allocator, self.source, self.metadata, self.rg, column, self.io);
+        self.built[i] = true;
+    }
+};
 
 pub const BatchOptions = struct {
     /// Top-level columns to read, in this order; null reads all.
@@ -829,6 +877,11 @@ pub const BatchOptions = struct {
     /// i64 offsets). With i32 offsets, a batch whose column holds more than 2^31 - 1 bytes
     /// of byte-array data returns `error.IntegerOverflow`.
     large_offsets: bool = false,
+    /// Decodes each batch's leaf columns, and assembles its columns, as tasks of this `Io`,
+    /// so an `Io` whose `async` uses threads (`std.Io.Threaded`) does them in parallel; see
+    /// `parallel`. Then the allocator and the source must allow concurrent use. Null does
+    /// them one after another on the calling thread.
+    io: ?std.Io = null,
 };
 
 /// Reads a file's columns as Arrow arrays, `batch_rows` rows at a time. A batch takes rows
@@ -851,6 +904,7 @@ pub const ArrowBatchReader = struct {
     row_groups: []const usize,
     batch_rows: ?usize,
     large_offsets: bool,
+    io: ?std.Io,
     /// Levels of the selected columns' leaves, in column order.
     leaf_info: []const LeafInfo,
     /// Position in `row_groups` of the next row group to open.
@@ -859,6 +913,8 @@ pub const ArrowBatchReader = struct {
     rows_left: usize = 0,
     /// One entry per selected column while a row group is open.
     open: []BatchColumn = &.{},
+    /// The cursors of `open`'s leaves, in column order.
+    cursors: []*leaf_decoder.ColumnCursor = &.{},
 
     const BatchLeaf = struct {
         cursor: leaf_decoder.ColumnCursor,
@@ -919,6 +975,7 @@ pub const ArrowBatchReader = struct {
             .row_groups = row_groups,
             .batch_rows = options.batch_rows,
             .large_offsets = options.large_offsets,
+            .io = options.io,
             .leaf_info = leaf_info,
         };
     }
@@ -960,41 +1017,70 @@ pub const ArrowBatchReader = struct {
                 continue;
             }
             const n = if (self.batch_rows) |b| @min(b - rows, self.rows_left) else self.rows_left;
-            var k: usize = 0;
-            for (self.open) |*col| {
-                for (col.leaves) |*l| {
-                    var piece = try l.cursor.next(n);
-                    parts[k].append(allocator, piece) catch |e| {
-                        piece.deinit(allocator);
-                        return e;
-                    };
-                    k += 1;
-                }
-            }
+            const pieces: PieceTask = .{ .allocator = allocator, .cursors = self.cursors, .parts = parts, .rows = n };
+            try parallel.forEach(self.io, allocator, self.cursors.len, &pieces, PieceTask.run);
             self.rows_left -= n;
             rows += n;
         }
         if (rows == 0) return null;
 
-        var arrays = try allocator.alloc(ArrowArray, self.columns.len);
-        var init_count: usize = 0;
-        errdefer {
-            for (arrays[0..init_count]) |*arr| arr.doRelease();
-            allocator.free(arrays);
-        }
+        const arrays = try allocator.alloc(ArrowArray, self.columns.len);
+        errdefer allocator.free(arrays);
+        const built = try allocator.alloc(bool, self.columns.len);
+        defer allocator.free(built);
+        @memset(built, false);
+        errdefer for (arrays, built) |*arr, b| if (b) arr.doRelease();
+        // The first leaf of each column in `parts`.
+        const first_leaf = try allocator.alloc(usize, self.columns.len);
+        defer allocator.free(first_leaf);
         var k: usize = 0;
-        for (self.columns, 0..) |c, i| {
-            const node = &self.tree[c];
-            const count = node.physical_count;
-            arrays[i] = try self.assembleColumn(node, parts[k..][0..count], self.leaf_info[k..][0..count]);
-            init_count = i + 1;
-            k += count;
-            if (arrays[i].length != rows) return error.InvalidPageData;
+        for (self.columns, first_leaf) |c, *f| {
+            f.* = k;
+            k += self.tree[c].physical_count;
         }
+        const assemble: AssembleTask = .{ .reader = self, .parts = parts, .first_leaf = first_leaf, .arrays = arrays, .built = built };
+        try parallel.forEach(self.io, allocator, self.columns.len, &assemble, AssembleTask.run);
+        for (arrays) |arr| if (arr.length != rows) return error.InvalidPageData;
         var sch = try self.schema();
         errdefer sch.doRelease();
         return .{ .arrays = arrays, .schema = sch, .allocator = allocator };
     }
+
+    const CursorError = @typeInfo(@typeInfo(@TypeOf(leaf_decoder.ColumnCursor.next)).@"fn".return_type.?).error_union.error_set;
+
+    /// Decodes the next `rows` rows of leaf `k` and appends them to `parts[k]`.
+    const PieceTask = struct {
+        allocator: Allocator,
+        cursors: []const *leaf_decoder.ColumnCursor,
+        parts: []std.ArrayList(leaf_decoder.Leaf),
+        rows: usize,
+
+        fn run(self: *const PieceTask, k: usize) (CursorError || Allocator.Error)!void {
+            var piece = try self.cursors[k].next(self.rows);
+            self.parts[k].append(self.allocator, piece) catch |e| {
+                piece.deinit(self.allocator);
+                return e;
+            };
+        }
+    };
+
+    /// Assembles output column `i` of a batch into `arrays[i]`.
+    const AssembleTask = struct {
+        reader: *ArrowBatchReader,
+        parts: []std.ArrayList(leaf_decoder.Leaf),
+        first_leaf: []const usize,
+        arrays: []ArrowArray,
+        built: []bool,
+
+        fn run(self: *const AssembleTask, i: usize) ReaderError!void {
+            const r = self.reader;
+            const node = &r.tree[r.columns[i]];
+            const k = self.first_leaf[i];
+            const count = node.physical_count;
+            self.arrays[i] = try r.assembleColumn(node, self.parts[k..][0..count], r.leaf_info[k..][0..count]);
+            self.built[i] = true;
+        }
+    };
 
     /// Joins each leaf's pieces and assembles the column's array. Pieces moved out of
     /// `parts` are removed from it.
@@ -1059,14 +1145,23 @@ pub const ArrowBatchReader = struct {
             col.* = .{ .node = node, .leaves = leaves };
             opened += 1;
         }
+        const cursors = try allocator.alloc(*leaf_decoder.ColumnCursor, self.leaf_info.len);
+        var k: usize = 0;
+        for (open) |*col| for (col.leaves) |*l| {
+            cursors[k] = &l.cursor;
+            k += 1;
+        };
         self.open = open;
+        self.cursors = cursors;
         self.rows_left = num_rows;
     }
 
     fn closeRowGroup(self: *ArrowBatchReader) void {
         for (self.open) |*col| freeColumn(self.allocator, col);
         if (self.open.len > 0) self.allocator.free(self.open);
+        if (self.cursors.len > 0) self.allocator.free(self.cursors);
         self.open = &.{};
+        self.cursors = &.{};
         self.rows_left = 0;
     }
 
@@ -1097,31 +1192,58 @@ fn readNestedColumn(
     metadata: format.FileMetaData,
     rg: *const format.RowGroup,
     node: *const Node,
+    io: ?std.Io,
 ) ReaderError!ArrowArray {
     if (node.physical_count == 0) return error.InvalidSchema;
+    if (node.physical_start + node.physical_count > rg.columns.len) return error.InvalidArgument;
     const leaves = try allocator.alloc(NestedLeaf, node.physical_count);
-    var decoded: usize = 0;
+    const decoded = try allocator.alloc(bool, node.physical_count);
+    @memset(decoded, false);
     defer {
-        for (leaves[0..decoded]) |*l| l.leaf.deinit(allocator);
+        for (leaves, decoded) |*l, d| if (d) l.leaf.deinit(allocator);
         allocator.free(leaves);
+        allocator.free(decoded);
     }
-    for (leaves, 0..) |*l, k| {
-        const col_idx = node.physical_start + k;
-        if (col_idx >= rg.columns.len) return error.InvalidArgument;
-        const chunk = &rg.columns[col_idx];
+    const task: NestedLeafTask = .{
+        .allocator = allocator,
+        .source = source,
+        .metadata = metadata,
+        .rg = rg,
+        .first = node.physical_start,
+        .leaves = leaves,
+        .decoded = decoded,
+    };
+    parallel.forEach(io, allocator, leaves.len, &task, NestedLeafTask.run) catch |e| return asErrorOf(ReaderError, e);
+    return assembleNode(allocator, metadata.schema, node, leaves, node.physical_start);
+}
+
+/// Decodes leaf `first + k` of a nested column, with levels, into `leaves[k]`.
+const NestedLeafTask = struct {
+    allocator: Allocator,
+    source: SeekableReader,
+    metadata: format.FileMetaData,
+    rg: *const format.RowGroup,
+    first: usize,
+    leaves: []NestedLeaf,
+    decoded: []bool,
+
+    fn run(self: *const NestedLeafTask, k: usize) ReaderError!void {
+        const allocator = self.allocator;
+        const col_idx = self.first + k;
+        const chunk = &self.rg.columns[col_idx];
         const meta = chunk.meta_data orelse return error.InvalidArgument;
-        const page_data = try parquet_reader.readColumnChunkData(allocator, source, chunk);
+        const page_data = try parquet_reader.readColumnChunkData(allocator, self.source, chunk);
         defer allocator.free(page_data);
-        const info = format.getColumnInfo(metadata.schema, col_idx) orelse return error.InvalidArgument;
+        const info = format.getColumnInfo(self.metadata.schema, col_idx) orelse return error.InvalidArgument;
+        const l = &self.leaves[k];
         l.leaf = leaf_decoder.decodeLeaf(allocator, page_data, meta, info, .{ .keep_levels = true }) catch |e|
             return asErrorOf(ReaderError, e);
         l.entries = l.leaf.buffers.length;
         l.max_def = info.max_def_level;
         l.max_rep = info.max_rep_level;
-        decoded = k + 1;
+        self.decoded[k] = true;
     }
-    return assembleNode(allocator, metadata.schema, node, leaves, node.physical_start);
-}
+};
 
 /// Assembles `node` from its decoded leaves; `leaves[k]` is leaf column `base + k`.
 /// Shapes are computed from the node's first leaf before the children take their buffers.
@@ -5362,17 +5484,7 @@ test "Arrow arrays match PyArrow on the test files with nested columns" {
     };
     const reference = try std.json.parseFromSliceLeaky(std.json.Value, arena, json_text, .{});
 
-    var totals: NestedTotals = .{};
-    var it = reference.object.iterator();
-    while (it.next()) |entry| {
-        const columns = entry.value_ptr.*.object;
-        if (columns.get("error") != null) {
-            totals.pyarrow_errors += 1;
-            continue;
-        }
-        totals.files += 1;
-        try compareFileWithReference(entry.key_ptr.*, columns, &totals, null, false);
-    }
+    const totals = try compareAllFiles(reference.object, null, false, null);
     std.debug.print("\nPyArrow comparison: {d} files ({d} more unreadable by PyArrow), {d} columns: {d} equal, {d} differ, {d} read errors\n", .{
         totals.files, totals.pyarrow_errors, totals.columns, totals.equal, totals.differ, totals.read_errors,
     });
@@ -5392,16 +5504,32 @@ test "Arrow batches match PyArrow on the test files with nested columns" {
     // 7 rows per batch cuts inside pages; 1000 cuts mostly at or near page ends. The second
     // pass reads byte arrays with i64 offsets.
     for ([_]usize{ 7, 1000 }, [_]bool{ false, true }) |batch_rows, large| {
-        var totals: NestedTotals = .{};
-        var it = reference.object.iterator();
-        while (it.next()) |entry| {
-            const columns = entry.value_ptr.*.object;
-            if (columns.get("error") != null) continue;
-            totals.files += 1;
-            try compareFileWithReference(entry.key_ptr.*, columns, &totals, batch_rows, large);
-        }
+        const totals = try compareAllFiles(reference.object, batch_rows, large, null);
         std.debug.print("\nPyArrow comparison, {d} rows per batch{s}: {d} files, {d} columns: {d} equal, {d} differ, {d} read errors\n", .{
             batch_rows, if (large) ", i64 offsets" else "", totals.files, totals.columns, totals.equal, totals.differ, totals.read_errors,
+        });
+        try std.testing.expectEqual(@as(usize, 0), totals.differ);
+        try std.testing.expectEqual(@as(usize, 0), totals.read_errors);
+    }
+}
+
+test "Arrow arrays and batches match PyArrow when leaves are decoded on 4 threads" {
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const json_text = try std.Io.Dir.cwd().readFileAlloc(io, "../test-files-arrow/nested_reference.json", arena, .limited(1 << 30));
+    const reference = try std.json.parseFromSliceLeaky(std.json.Value, arena, json_text, .{});
+
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{ .async_limit = .limited(3) });
+    defer threaded.deinit();
+
+    // Whole row groups, then batches of 7 rows.
+    for ([_]?usize{ null, 7 }) |batch_rows| {
+        const totals = try compareAllFiles(reference.object, batch_rows, false, threaded.io());
+        std.debug.print("\nPyArrow comparison, 4 threads, {s}: {d} files, {d} columns: {d} equal, {d} differ, {d} read errors\n", .{
+            if (batch_rows == null) "row groups" else "7 rows per batch", totals.files, totals.columns, totals.equal, totals.differ, totals.read_errors,
         });
         try std.testing.expectEqual(@as(usize, 0), totals.differ);
         try std.testing.expectEqual(@as(usize, 0), totals.read_errors);
@@ -5575,9 +5703,10 @@ fn canonColumn(
     batch_rows: ?usize,
     large: bool,
     max_rows: usize,
+    decode_io: ?std.Io,
 ) !void {
     if (batch_rows == null) {
-        var result = try readRowGroupAsArrow(allocator, source, md, rg, &.{c});
+        var result = try readRowGroupAsArrowWith(allocator, source, md, rg, .{ .columns = &.{c}, .io = decode_io });
         defer result.deinit();
         const arr = &result.arrays[0];
         const rows = @min(@as(usize, @intCast(arr.length)), max_rows);
@@ -5587,7 +5716,7 @@ fn canonColumn(
         }
         return;
     }
-    var batches = try ArrowBatchReader.init(allocator, source, md, .{ .columns = &.{c}, .row_groups = &.{rg}, .batch_rows = batch_rows.?, .large_offsets = large });
+    var batches = try ArrowBatchReader.init(allocator, source, md, .{ .columns = &.{c}, .row_groups = &.{rg}, .batch_rows = batch_rows.?, .large_offsets = large, .io = decode_io });
     defer batches.deinit();
     var written: usize = 0;
     while (written < max_rows) {
@@ -5604,11 +5733,64 @@ fn canonColumn(
     }
 }
 
-fn compareFileWithReference(path: []const u8, reference: std.json.ObjectMap, totals: *NestedTotals, batch_rows: ?usize, large: bool) !void {
+/// Compares every file of `reference` with PyArrow's reading of it (`compareFileWithReference`).
+/// The files are compared as tasks of `std.testing.io`, so several at a time; leaks fail the
+/// comparison of the file that leaked.
+const test_util = @import("test_util.zig");
+
+fn compareAllFiles(reference: std.json.ObjectMap, batch_rows: ?usize, large: bool, decode_io: ?std.Io) !NestedTotals {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
+    const FileJob = struct {
+        path: []const u8,
+        columns: std.json.ObjectMap,
+        totals: NestedTotals = .{},
+        err: ?anyerror = null,
+
+        /// Uses an allocator of its own, so that jobs on different threads do not wait on
+        /// one allocator's lock; it fails the job when memory leaks. The allocator records
+        /// no stack traces: on macOS, capturing one per allocation made the 7-row batch pass
+        /// take about 90 s for each of the largest files.
+        fn run(job: *@This(), rows: ?usize, large_offsets: bool, dio: ?std.Io) void {
+            var gpa: test_util.LeakCheckAllocator = .init;
+            compareFileWithReference(gpa.allocator(), job.path, job.columns, &job.totals, rows, large_offsets, dio) catch |e| {
+                job.err = e;
+            };
+            if (gpa.deinit() == .leak and job.err == null) job.err = error.MemoryLeak;
+        }
+    };
+
+    var totals: NestedTotals = .{};
+    var jobs: std.ArrayList(FileJob) = .empty;
+    defer jobs.deinit(allocator);
+    var it = reference.iterator();
+    while (it.next()) |entry| {
+        const columns = entry.value_ptr.*.object;
+        if (columns.get("error") != null) {
+            totals.pyarrow_errors += 1;
+            continue;
+        }
+        try jobs.append(allocator, .{ .path = entry.key_ptr.*, .columns = columns });
+    }
+    var group: std.Io.Group = .init;
+    for (jobs.items) |*job| group.async(io, FileJob.run, .{ job, batch_rows, large, decode_io });
+    try group.await(io);
+
+    totals.files = jobs.items.len;
+    for (jobs.items) |job| {
+        if (job.err) |e| return e;
+        totals.columns += job.totals.columns;
+        totals.equal += job.totals.equal;
+        totals.differ += job.totals.differ;
+        totals.read_errors += job.totals.read_errors;
+    }
+    return totals;
+}
+
+fn compareFileWithReference(allocator: Allocator, path: []const u8, reference: std.json.ObjectMap, totals: *NestedTotals, batch_rows: ?usize, large: bool, decode_io: ?std.Io) !void {
+    const io = std.testing.io;
     // The reader uses an arena (footer parsing leaks on some malformed files); the Arrow read
-    // uses the testing allocator.
+    // uses `allocator`.
     var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -5637,7 +5819,7 @@ fn compareFileWithReference(path: []const u8, reference: std.json.ObjectMap, tot
 
             var out: std.Io.Writer.Allocating = .init(allocator);
             defer out.deinit();
-            canonColumn(allocator, &out.writer, reader.getSource(), md, node, rg, c, batch_rows, large, 2000) catch |err| {
+            canonColumn(allocator, &out.writer, reader.getSource(), md, node, rg, c, batch_rows, large, 2000, decode_io) catch |err| {
                 totals.read_errors += 1;
                 std.debug.print("READ ERROR {s} {s} ({s}): {s}\n", .{ path, key, md.schema[node.schema_idx].name, @errorName(err) });
                 continue;

@@ -11,6 +11,11 @@ pub inline fn repeatString(comptime n: usize, comptime str: []const u8) []const 
 }
 
 /// A `SeekableReader` over `data` that records the offset and length of each `readAt`.
+/// A thread-safe allocator for tests that reports leaks (`deinit` returns `.leak`) but records
+/// no stack traces. Capturing a stack trace on every allocation takes most of the run time of
+/// tests that allocate many times, such as batch reads of a few rows.
+pub const LeakCheckAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
+
 pub const RecordingSource = struct {
     data: []const u8,
     allocator: std.mem.Allocator,
