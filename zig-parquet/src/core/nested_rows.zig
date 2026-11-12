@@ -19,8 +19,8 @@ const Node = schema_tree.Node;
 pub const Leaf = struct {
     /// Buffers with the values in place; byte payloads must live as long as the row values.
     buffers: leaf_decoder.Buffers,
-    def_levels: ?[]const u32,
-    rep_levels: ?[]const u32,
+    def_levels: ?[]const leaf_decoder.Level,
+    rep_levels: ?[]const leaf_decoder.Level,
     element: format.SchemaElement,
     max_def: u32,
     max_rep: u32,

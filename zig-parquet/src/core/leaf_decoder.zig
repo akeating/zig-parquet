@@ -102,7 +102,7 @@ pub const Buffers = struct {
 
     /// Copies the entries `i` with `levels[i] >= min_level`, in order and at most `limit` of
     /// them, into new buffers with offsets of the same width.
-    pub fn select(self: *const Buffers, allocator: Allocator, levels: []const u32, min_level: u32, limit: usize) !Buffers {
+    pub fn select(self: *const Buffers, allocator: Allocator, levels: []const Level, min_level: u32, limit: usize) !Buffers {
         var count: usize = 0;
         var bytes: usize = 0;
         for (levels, 0..) |lv, i| {
@@ -142,7 +142,7 @@ pub const Buffers = struct {
 
     /// `select` for fixed-width entries. `comptime_width` is the width when known at compile
     /// time (4 or 8), else 0.
-    fn selectFixed(self: *const Buffers, comptime comptime_width: usize, b: *Builder, levels: []const u32, min_level: u32, count: usize) void {
+    fn selectFixed(self: *const Buffers, comptime comptime_width: usize, b: *Builder, levels: []const Level, min_level: u32, count: usize) void {
         const w = if (comptime_width != 0) comptime_width else self.layout.fixed;
         var taken: usize = 0;
         for (levels, 0..) |lv, i| {
@@ -160,7 +160,7 @@ pub const Buffers = struct {
 
     /// Like `select`, but when every entry is selected, moves the buffers out of `self`
     /// (leaving it empty) instead of copying them.
-    pub fn take(self: *Buffers, allocator: Allocator, levels: []const u32, min_level: u32, limit: usize) !Buffers {
+    pub fn take(self: *Buffers, allocator: Allocator, levels: []const Level, min_level: u32, limit: usize) !Buffers {
         var all = levels.len == self.length and self.length <= limit;
         if (all) {
             for (levels) |lv| {
@@ -237,15 +237,19 @@ pub const Options = struct {
     slot_level: u32 = 0,
 };
 
+/// A definition or repetition level, or a presence flag derived from one (0 or 1). Levels
+/// are at most 255 (`format.ColumnInfo.max_def_level` and `max_rep_level` are `u8`).
+pub const Level = u8;
+
 /// A decoded leaf column chunk.
 pub const Leaf = struct {
     buffers: Buffers,
     /// Definition level of each entry. Null when not requested or when the column's maximum
     /// definition level is 0.
-    def_levels: ?[]u32,
+    def_levels: ?[]Level,
     /// Repetition level of each entry. Null when not requested or when the column's maximum
     /// repetition level is 0.
-    rep_levels: ?[]u32,
+    rep_levels: ?[]Level,
 
     pub fn deinit(self: *Leaf, allocator: Allocator) void {
         self.buffers.deinit(allocator);
@@ -286,10 +290,10 @@ pub fn concatLeaves(allocator: Allocator, pieces: []const Leaf) !Leaf {
     return .{ .buffers = buffers, .def_levels = def_levels, .rep_levels = rep_levels };
 }
 
-fn concatLevels(allocator: Allocator, pieces: []const Leaf, comptime which: enum { def, rep }) ![]u32 {
+fn concatLevels(allocator: Allocator, pieces: []const Leaf, comptime which: enum { def, rep }) ![]Level {
     var total: usize = 0;
     for (pieces) |*p| total += (if (which == .def) p.def_levels else p.rep_levels).?.len;
-    const out = try allocator.alloc(u32, total);
+    const out = try allocator.alloc(Level, total);
     var at: usize = 0;
     for (pieces) |*p| {
         const levels = (if (which == .def) p.def_levels else p.rep_levels).?;
@@ -593,13 +597,30 @@ pub const ColumnCursor = struct {
         if (!repeated) return self.take(rows, rows);
         if (!self.dec.keep_levels) return error.InvalidArgument;
         // Entry index of the start of row `rows`.
+        const i = nthZero(self.dec.out_rep.items[self.start..], rows) orelse
+            unreachable; // row_starts counts the zeros in out_rep from `start`
+        return self.take(i, rows);
+    }
+
+    /// The index of zero number `n` (from 0) in `levels`, or null when there are fewer.
+    /// Counts the zeros of 32 levels at a time up to the block that holds it.
+    fn nthZero(levels: []const Level, n: usize) ?usize {
+        const block = 32;
+        const V = @Vector(block, Level);
         var seen: usize = 0;
-        for (self.dec.out_rep.items[self.start..], 0..) |lv, i| {
+        var i: usize = 0;
+        while (i + block <= levels.len) : (i += block) {
+            const v: V = levels[i..][0..block].*;
+            const zeros: usize = @popCount(@as(u32, @bitCast(v == @as(V, @splat(0)))));
+            if (seen + zeros > n) break;
+            seen += zeros;
+        }
+        for (levels[i..], i..) |lv, j| {
             if (lv != 0) continue;
-            if (seen == rows) return self.take(i, rows);
+            if (seen == n) return j;
             seen += 1;
         }
-        unreachable; // row_starts counts the zeros in out_rep from `start`
+        return null;
     }
 
     /// Returns the next `n` pending entries, which hold `rows` rows.
@@ -652,9 +673,9 @@ pub const ColumnCursor = struct {
             return e;
         };
         errdefer buffers.deinit(allocator);
-        const def_levels = if (keep_def) try allocator.dupe(u32, dec.out_def.items[self.start..end]) else null;
+        const def_levels = if (keep_def) try allocator.dupe(Level, dec.out_def.items[self.start..end]) else null;
         errdefer if (def_levels) |l| allocator.free(l);
-        const rep_levels = if (keep_rep) try allocator.dupe(u32, dec.out_rep.items[self.start..end]) else null;
+        const rep_levels = if (keep_rep) try allocator.dupe(Level, dec.out_rep.items[self.start..end]) else null;
         errdefer if (rep_levels) |l| allocator.free(l);
 
         if (slot_end * 2 > self.builder.length or (keep_def and end * 2 > dec.out_def.items.len)) {
@@ -679,22 +700,22 @@ pub const ColumnCursor = struct {
         return self.builder.length - self.start;
     }
 
-    fn countAtLeast(levels: []const u32, min: u32) usize {
+    fn countAtLeast(levels: []const Level, min: u32) usize {
         var count: usize = 0;
         for (levels) |lv| count += @intFromBool(lv >= min);
         return count;
     }
 
     /// A list with `list.items[from..]`, or an empty list when `keep` is false.
-    fn levelsFrom(allocator: Allocator, list: *const std.ArrayList(u32), from: usize, keep: bool) !std.ArrayList(u32) {
-        var out: std.ArrayList(u32) = .empty;
+    fn levelsFrom(allocator: Allocator, list: *const std.ArrayList(Level), from: usize, keep: bool) !std.ArrayList(Level) {
+        var out: std.ArrayList(Level) = .empty;
         if (keep) try out.appendSlice(allocator, list.items[from..]);
         return out;
     }
 
-    fn dropFront(list: *std.ArrayList(u32), n: usize) void {
+    fn dropFront(list: *std.ArrayList(Level), n: usize) void {
         const rest = list.items.len - n;
-        std.mem.copyForwards(u32, list.items[0..rest], list.items[n..]);
+        std.mem.copyForwards(Level, list.items[0..rest], list.items[n..]);
         list.shrinkRetainingCapacity(rest);
     }
 
@@ -1022,14 +1043,14 @@ const ChunkDecoder = struct {
     /// `Options.slot_level`; 0 when the column has no definition levels.
     slot_level: u32 = 0,
     /// Definition levels of the current page.
-    levels: std.ArrayList(u32) = .empty,
+    levels: std.ArrayList(Level) = .empty,
     /// Repetition levels of the current page.
-    rep: std.ArrayList(u32) = .empty,
+    rep: std.ArrayList(Level) = .empty,
     /// Presence of each entry of the current page (1 when the definition level is the
     /// maximum), when the maximum definition level is above 1.
-    mask: std.ArrayList(u32) = .empty,
-    out_def: std.ArrayList(u32) = .empty,
-    out_rep: std.ArrayList(u32) = .empty,
+    mask: std.ArrayList(Level) = .empty,
+    out_def: std.ArrayList(Level) = .empty,
+    out_rep: std.ArrayList(Level) = .empty,
     /// Whether the page decoded last starts at a row: its first repetition level is 0, or
     /// the column has no repetition.
     page_starts_row: bool = true,
@@ -1115,13 +1136,13 @@ const ChunkDecoder = struct {
 
         var data: []const u8 = decompressed;
         // Repetition levels come before definition levels.
-        var rep: ?[]const u32 = null;
+        var rep: ?[]const Level = null;
         if (self.info.max_rep_level > 0) {
             const out = try self.levelsOut(&self.out_rep, &self.rep, n);
             data = try decodeV1Levels(data, dph.repetition_level_encoding, self.rep_bits, out);
             rep = out;
         }
-        var def: ?[]const u32 = null;
+        var def: ?[]const Level = null;
         if (self.info.max_def_level > 0) {
             const out = try self.levelsOut(&self.out_def, &self.levels, n);
             data = try decodeV1Levels(data, dph.definition_level_encoding, self.def_bits, out);
@@ -1132,7 +1153,7 @@ const ChunkDecoder = struct {
 
     /// Decodes V1 levels at the start of `data` into `out` and returns the data after them.
     /// BIT_PACKED levels have no length prefix; RLE levels have a 4-byte little-endian length.
-    fn decodeV1Levels(data: []const u8, encoding: format.Encoding, bit_width: u5, out: []u32) ![]const u8 {
+    fn decodeV1Levels(data: []const u8, encoding: format.Encoding, bit_width: u5, out: []Level) ![]const u8 {
         if (encoding == .bit_packed) {
             const len = rle.bitPackedSize(out.len, bit_width);
             try rle.decodeBitPackedLevelsInto(try safe.slice(data, 0, len), bit_width, out);
@@ -1168,13 +1189,13 @@ const ChunkDecoder = struct {
 
         // V2 levels are RLE without a length prefix. An empty level section means all levels
         // are 0 (repetition) or the maximum (definition).
-        var rep: ?[]const u32 = null;
+        var rep: ?[]const Level = null;
         if (self.info.max_rep_level > 0) {
             const out = try self.levelsOut(&self.out_rep, &self.rep, n);
             if (rep_data.len > 0) try rle.decodeInto(rep_data, self.rep_bits, out) else @memset(out, 0);
             rep = out;
         }
-        var def: ?[]const u32 = null;
+        var def: ?[]const Level = null;
         if (self.info.max_def_level > 0) {
             const out = try self.levelsOut(&self.out_def, &self.levels, n);
             if (def_data.len > 0) try rle.decodeInto(def_data, self.def_bits, out) else @memset(out, self.info.max_def_level);
@@ -1190,8 +1211,8 @@ const ChunkDecoder = struct {
         b: *Builder,
         data: []const u8,
         n: usize,
-        def: ?[]const u32,
-        rep: ?[]const u32,
+        def: ?[]const Level,
+        rep: ?[]const Level,
         encoding: format.Encoding,
     ) !void {
         if (self.keep_levels) {
@@ -1202,7 +1223,7 @@ const ChunkDecoder = struct {
         if (rep) |r| {
             for (r) |lv| self.row_starts += @intFromBool(lv == 0);
         } else self.row_starts += n;
-        var present: ?[]const u32 = null;
+        var present: ?[]const Level = null;
         var non_null = n;
         var slots = n;
         if (def) |d| {
@@ -1233,7 +1254,7 @@ const ChunkDecoder = struct {
 
     /// Where a page's `n` levels are decoded. When levels are kept, that is the unused
     /// capacity of `kept`, so `keepLevels` adds them without copying; otherwise `scratch`.
-    fn levelsOut(self: *ChunkDecoder, kept: *std.ArrayList(u32), scratch: *std.ArrayList(u32), n: usize) ![]u32 {
+    fn levelsOut(self: *ChunkDecoder, kept: *std.ArrayList(Level), scratch: *std.ArrayList(Level), n: usize) ![]Level {
         if (!self.keep_levels) return resizeList(self.allocator, scratch, n);
         try kept.ensureUnusedCapacity(self.allocator, n);
         return kept.unusedCapacitySlice()[0..n];
@@ -1241,7 +1262,7 @@ const ChunkDecoder = struct {
 
     /// Adds a page's levels to `list`; levels decoded into its unused capacity by
     /// `levelsOut` are not copied.
-    fn keepLevels(self: *ChunkDecoder, list: *std.ArrayList(u32), levels: []const u32) !void {
+    fn keepLevels(self: *ChunkDecoder, list: *std.ArrayList(Level), levels: []const Level) !void {
         if (list.capacity > list.items.len and levels.ptr == list.items.ptr + list.items.len) {
             list.items.len += levels.len;
         } else {
@@ -1249,12 +1270,12 @@ const ChunkDecoder = struct {
         }
     }
 
-    fn resizeList(allocator: Allocator, list: *std.ArrayList(u32), n: usize) ![]u32 {
+    fn resizeList(allocator: Allocator, list: *std.ArrayList(Level), n: usize) ![]Level {
         try list.resize(allocator, n);
         return list.items;
     }
 
-    fn countPresent(levels: []const u32) usize {
+    fn countPresent(levels: []const Level) usize {
         var count: usize = 0;
         for (levels) |lv| count += @intFromBool(lv != 0);
         return count;
@@ -1267,7 +1288,7 @@ const ChunkDecoder = struct {
         b: *Builder,
         data: []const u8,
         n: usize,
-        levels: ?[]const u32,
+        levels: ?[]const Level,
         non_null: usize,
         encoding: format.Encoding,
     ) !void {
@@ -1349,7 +1370,7 @@ const ChunkDecoder = struct {
     }
 
     /// Appends entries decoded by a DELTA_LENGTH_BYTE_ARRAY or DELTA_BYTE_ARRAY decoder.
-    fn appendByteValues(self: *ChunkDecoder, b: *Builder, levels: ?[]const u32, n: usize, non_null: usize, values: []const []const u8) !void {
+    fn appendByteValues(self: *ChunkDecoder, b: *Builder, levels: ?[]const Level, n: usize, non_null: usize, values: []const []const u8) !void {
         if (values.len < non_null) return error.EndOfData;
         switch (b.kind) {
             .bytes => try appendBytesList(b, levels, n, values),
@@ -1418,7 +1439,7 @@ const ChunkDecoder = struct {
         return out;
     }
 
-    fn appendDeltaInts(self: *ChunkDecoder, comptime T: type, b: *Builder, data: []const u8, levels: ?[]const u32, n: usize, non_null: usize) !void {
+    fn appendDeltaInts(self: *ChunkDecoder, comptime T: type, b: *Builder, data: []const u8, levels: ?[]const Level, n: usize, non_null: usize) !void {
         const decoded = (if (T == i32)
             delta_binary_packed.decodeInt32(self.allocator, data)
         else
@@ -1439,7 +1460,7 @@ fn mapEncodingError(e: anyerror) error{ OutOfMemory, InvalidPageData } {
 
 /// Appends `n` fixed-width entries. `dense` holds the non-null entries back to back.
 /// `levels` is null when all entries are present.
-fn appendFixedDense(b: *Builder, w: usize, levels: ?[]const u32, n: usize, dense: []const u8) !void {
+fn appendFixedDense(b: *Builder, w: usize, levels: ?[]const Level, n: usize, dense: []const u8) !void {
     const lv = levels orelse {
         b.values.appendSliceAssumeCapacity(dense[0 .. n * w]);
         b.validRun(n);
@@ -1451,7 +1472,7 @@ fn appendFixedDense(b: *Builder, w: usize, levels: ?[]const u32, n: usize, dense
     }
 }
 
-fn scatterFixed(comptime w: usize, b: *Builder, levels: []const u32, dense: []const u8) void {
+fn scatterFixed(comptime w: usize, b: *Builder, levels: []const Level, dense: []const u8) void {
     var k: usize = 0;
     for (levels) |lv| {
         const present = lv != 0;
@@ -1466,7 +1487,7 @@ fn scatterFixed(comptime w: usize, b: *Builder, levels: []const u32, dense: []co
     }
 }
 
-fn scatterFixedRuntime(w: usize, b: *Builder, levels: []const u32, dense: []const u8) void {
+fn scatterFixedRuntime(w: usize, b: *Builder, levels: []const Level, dense: []const u8) void {
     var k: usize = 0;
     for (levels) |lv| {
         const present = lv != 0;
@@ -1482,7 +1503,7 @@ fn scatterFixedRuntime(w: usize, b: *Builder, levels: []const u32, dense: []cons
 }
 
 /// Appends `n` fixed-width entries looked up in a dictionary of `count` entries.
-fn appendFixedDict(b: *Builder, dict: []const u8, count: usize, levels: ?[]const u32, n: usize, indices: []const u32) !void {
+fn appendFixedDict(b: *Builder, dict: []const u8, count: usize, levels: ?[]const Level, n: usize, indices: []const u32) !void {
     const w = b.kind.fixed;
     switch (w) {
         inline 4, 8 => |cw| try lookupFixed(cw, b, dict, count, levels, n, indices),
@@ -1490,7 +1511,7 @@ fn appendFixedDict(b: *Builder, dict: []const u8, count: usize, levels: ?[]const
     }
 }
 
-fn lookupFixed(comptime w: usize, b: *Builder, dict: []const u8, count: usize, levels: ?[]const u32, n: usize, indices: []const u32) !void {
+fn lookupFixed(comptime w: usize, b: *Builder, dict: []const u8, count: usize, levels: ?[]const Level, n: usize, indices: []const u32) !void {
     if (levels) |lvs| {
         var k: usize = 0;
         for (lvs) |lv| {
@@ -1515,7 +1536,7 @@ fn lookupFixed(comptime w: usize, b: *Builder, dict: []const u8, count: usize, l
     }
 }
 
-fn lookupFixedRuntime(w: usize, b: *Builder, dict: []const u8, count: usize, levels: ?[]const u32, n: usize, indices: []const u32) !void {
+fn lookupFixedRuntime(w: usize, b: *Builder, dict: []const u8, count: usize, levels: ?[]const Level, n: usize, indices: []const u32) !void {
     var k: usize = 0;
     for (0..n) |i| {
         const present = if (levels) |lvs| lvs[i] != 0 else true;
@@ -1534,7 +1555,7 @@ fn lookupFixedRuntime(w: usize, b: *Builder, dict: []const u8, count: usize, lev
 
 /// Appends `n` PLAIN byte-array entries: each non-null entry is a 4-byte little-endian length
 /// followed by that many bytes.
-fn appendBytesPlain(b: *Builder, levels: ?[]const u32, n: usize, data: []const u8) !void {
+fn appendBytesPlain(b: *Builder, levels: ?[]const Level, n: usize, data: []const u8) !void {
     // The entries' bytes cannot exceed the page's value section.
     try b.values.ensureUnusedCapacity(b.allocator, std.math.add(usize, data.len, copy_block) catch return error.OutOfMemory);
     var out = b.values.items.len;
@@ -1563,7 +1584,7 @@ fn appendBytesPlain(b: *Builder, levels: ?[]const u32, n: usize, data: []const u
 }
 
 /// Appends `n` byte-array entries looked up in a dictionary.
-fn appendBytesDict(b: *Builder, dict: BytesDict, levels: ?[]const u32, n: usize, indices: []const u32) !void {
+fn appendBytesDict(b: *Builder, dict: BytesDict, levels: ?[]const Level, n: usize, indices: []const u32) !void {
     const count = dict.count();
     var total: usize = 0;
     for (indices) |idx| {
@@ -1604,7 +1625,7 @@ fn pushOffsetAt(b: *Builder, end: usize) !void {
 }
 
 /// Appends `n` byte-array entries from decoded values (non-null entries in order).
-fn appendBytesList(b: *Builder, levels: ?[]const u32, n: usize, values: []const []const u8) !void {
+fn appendBytesList(b: *Builder, levels: ?[]const Level, n: usize, values: []const []const u8) !void {
     var k: usize = 0;
     for (0..n) |i| {
         const present = if (levels) |lvs| lvs[i] != 0 else true;
@@ -1634,7 +1655,7 @@ const ListBits = struct {
 };
 
 /// Appends `n` boolean entries. The source must hold one bit per non-null entry.
-fn appendBits(b: *Builder, levels: ?[]const u32, n: usize, src: anytype) void {
+fn appendBits(b: *Builder, levels: ?[]const Level, n: usize, src: anytype) void {
     var k: usize = 0;
     for (0..n) |i| {
         const present = if (levels) |lvs| lvs[i] != 0 else true;
@@ -1699,3 +1720,30 @@ pub const ValueReader = struct {
         };
     }
 };
+
+test "ColumnCursor.nthZero finds the same zero as a scan" {
+    var prng = std.Random.DefaultPrng.init(7);
+    const random = prng.random();
+    var levels: [200]Level = undefined;
+    for (0..500) |_| {
+        const len = random.uintAtMost(usize, levels.len);
+        // Mostly non-zero, so runs of blocks without a zero occur.
+        const zero_odds = random.uintAtMost(u32, 40) + 1;
+        for (levels[0..len]) |*lv| lv.* = if (random.uintLessThan(u32, zero_odds) == 0) 0 else 1;
+        var zeros: usize = 0;
+        for (levels[0..len]) |lv| zeros += @intFromBool(lv == 0);
+        for (0..zeros + 2) |n| {
+            var want: ?usize = null;
+            var seen: usize = 0;
+            for (levels[0..len], 0..) |lv, i| {
+                if (lv != 0) continue;
+                if (seen == n) {
+                    want = i;
+                    break;
+                }
+                seen += 1;
+            }
+            try std.testing.expectEqual(want, ColumnCursor.nthZero(levels[0..len], n));
+        }
+    }
+}

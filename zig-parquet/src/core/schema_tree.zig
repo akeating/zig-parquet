@@ -10,6 +10,7 @@ const leaf_decoder = @import("leaf_decoder.zig");
 
 const Allocator = std.mem.Allocator;
 const Buffer = leaf_decoder.Buffer;
+const Level = leaf_decoder.Level;
 
 pub const TreeError = error{ OutOfMemory, InvalidSchema };
 pub const ShapeError = error{ OutOfMemory, InvalidPageData, IntegerOverflow };
@@ -255,8 +256,8 @@ pub const LevelShape = struct {
 
 pub fn levelShape(
     allocator: Allocator,
-    def: ?[]const u32,
-    rep: ?[]const u32,
+    def: ?[]const Level,
+    rep: ?[]const Level,
     entries: usize,
     info: LevelInfo,
     is_list: bool,
@@ -287,8 +288,8 @@ fn shapeOf(
     comptime has_rep: bool,
     comptime is_list: bool,
     allocator: Allocator,
-    def: []const u32,
-    rep: []const u32,
+    def: []const Level,
+    rep: []const Level,
     entries: usize,
     info: LevelInfo,
 ) ShapeError!LevelShape {
@@ -346,8 +347,8 @@ fn shapeOf(
 
 fn levelShapeReference(
     allocator: Allocator,
-    def: ?[]const u32,
-    rep: ?[]const u32,
+    def: ?[]const Level,
+    rep: ?[]const Level,
     entries: usize,
     info: LevelInfo,
     is_list: bool,
@@ -404,24 +405,24 @@ test "levelShape equals the reference on random levels" {
     const allocator = std.testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x5eed);
     const random = prng.random();
-    var def: [300]u32 = undefined;
-    var rep: [300]u32 = undefined;
+    var def: [300]Level = undefined;
+    var rep: [300]Level = undefined;
     for (0..2000) |_| {
         const n = random.uintAtMost(usize, def.len);
         const max_def = random.uintAtMost(u32, 4);
         const max_rep = random.uintAtMost(u32, 2);
         for (def[0..n], rep[0..n], 0..) |*d, *r, i| {
-            d.* = random.uintAtMost(u32, max_def);
+            d.* = @intCast(random.uintAtMost(u32, max_def));
             // Mostly well-formed: the first entry starts a row.
-            r.* = if (i == 0 and random.boolean()) 0 else random.uintAtMost(u32, max_rep);
+            r.* = if (i == 0 and random.boolean()) 0 else @intCast(random.uintAtMost(u32, max_rep));
         }
         const info: LevelInfo = .{
             .def_level = random.uintAtMost(u32, max_def + 1),
             .rep_level = random.uintAtMost(u32, max_rep),
             .ancestor_def_level = random.uintAtMost(u32, max_def),
         };
-        const d: ?[]const u32 = if (max_def > 0) def[0..n] else null;
-        const r: ?[]const u32 = if (max_rep > 0) rep[0..n] else null;
+        const d: ?[]const Level = if (max_def > 0) def[0..n] else null;
+        const r: ?[]const Level = if (max_rep > 0) rep[0..n] else null;
         for ([_]bool{ false, true }) |is_list| {
             const want = levelShapeReference(allocator, d, r, n, info, is_list);
             const got = levelShape(allocator, d, r, n, info, is_list);

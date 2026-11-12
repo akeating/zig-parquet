@@ -23,9 +23,12 @@ pub fn decode(allocator: std.mem.Allocator, data: []const u8, bit_width: u5, num
     return result;
 }
 
-/// Decode RLE/bit-packed hybrid encoded data into `result`, filling all of it.
-/// Entries the data does not cover are set to 0.
-pub fn decodeInto(data: []const u8, bit_width: u5, result: []u32) !void {
+/// Decode RLE/bit-packed hybrid encoded data into `result` (a slice of `u32`, or of `u8`
+/// for levels), filling all of it. Entries the data does not cover are set to 0. A bit
+/// width wider than the element type returns `error.InvalidBitWidth`.
+pub fn decodeInto(data: []const u8, bit_width: u5, result: anytype) !void {
+    const T = @typeInfo(@TypeOf(result)).pointer.child;
+    if (bit_width > @bitSizeOf(T)) return error.InvalidBitWidth;
     const num_values = result.len;
     if (bit_width == 0) {
         // All values are 0
@@ -48,7 +51,7 @@ pub fn decodeInto(data: []const u8, bit_width: u5, result: []u32) !void {
             const num_packed_values = std.math.mul(usize, num_groups, 8) catch return error.EndOfData;
 
             const values_to_read = @min(num_packed_values, num_values - out_idx);
-            const out_slice = safe.sliceMutOf(u32, result, out_idx, values_to_read) catch return error.EndOfData;
+            const out_slice = safe.sliceMutOf(T, result, out_idx, values_to_read) catch return error.EndOfData;
             try decodeBitPacked(safe.slice(data, pos, data.len - pos) catch return error.EndOfData, bit_width, out_slice);
             out_idx += values_to_read;
 
@@ -75,8 +78,8 @@ pub fn decodeInto(data: []const u8, bit_width: u5, result: []u32) !void {
             value &= mask;
             pos += value_bytes;
 
-            // Fill with repeated value
-            @memset(result[out_idx..][0..values_to_write], value);
+            // Fill with repeated value; it has at most bit_width bits, which fit in T.
+            @memset(result[out_idx..][0..values_to_write], @as(T, @intCast(value)));
             out_idx += values_to_write;
         }
     }
@@ -117,8 +120,9 @@ pub fn decodeBitPackedLevels(allocator: std.mem.Allocator, data: []const u8, bit
     return result;
 }
 
-/// Decode pure bit-packed levels into `result`, filling all of it.
-pub fn decodeBitPackedLevelsInto(data: []const u8, bit_width: u5, result: []u32) !void {
+/// Decode pure bit-packed levels into `result` (`u32` or `u8` elements), filling all of it.
+pub fn decodeBitPackedLevelsInto(data: []const u8, bit_width: u5, result: anytype) !void {
+    if (bit_width > @bitSizeOf(@typeInfo(@TypeOf(result)).pointer.child)) return error.InvalidBitWidth;
     try decodeBitPacked(data, bit_width, result);
 }
 
@@ -156,7 +160,8 @@ fn readVarInt(data: []const u8) !VarIntResult {
 
 /// Unpacks `output.len` values of `bit_width` bits, LSB first. Values past the end of `data`
 /// are 0, and bytes missing from a value at the end of `data` count as 0.
-fn decodeBitPacked(data: []const u8, bit_width: u5, output: []u32) !void {
+/// `output` is a slice of `u32` or `u8`, and `bit_width` at most its element's bits.
+fn decodeBitPacked(data: []const u8, bit_width: u5, output: anytype) !void {
     if (bit_width == 0) {
         @memset(output, 0);
         return;

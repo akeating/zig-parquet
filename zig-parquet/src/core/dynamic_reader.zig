@@ -814,7 +814,7 @@ fn keptEntryRanges(
     allocator: std.mem.Allocator,
     selected: []const page_range_reader_mod.SelectedPage,
     ranges: RowRanges,
-    rep_levels: ?[]const u32,
+    rep_levels: ?[]const leaf_decoder.Level,
     num_entries: usize,
 ) ![]leaf_decoder.EntryRange {
     // The entry at which each decoded row starts, then `num_entries`.
@@ -878,13 +878,13 @@ fn selectLeafEntries(allocator: std.mem.Allocator, leaf: *const leaf_decoder.Lea
 }
 
 /// The levels of the entries in `ranges`.
-fn selectLevels(allocator: std.mem.Allocator, levels: []const u32, ranges: []const leaf_decoder.EntryRange) ![]u32 {
+fn selectLevels(allocator: std.mem.Allocator, levels: []const leaf_decoder.Level, ranges: []const leaf_decoder.EntryRange) ![]leaf_decoder.Level {
     var count: usize = 0;
     for (ranges) |r| {
         if (r.start > r.end or r.end > levels.len) return error.InvalidPageData;
         count += r.end - r.start;
     }
-    const out = try allocator.alloc(u32, count);
+    const out = try allocator.alloc(leaf_decoder.Level, count);
     var at: usize = 0;
     for (ranges) |r| {
         @memcpy(out[at..][0 .. r.end - r.start], levels[r.start..r.end]);

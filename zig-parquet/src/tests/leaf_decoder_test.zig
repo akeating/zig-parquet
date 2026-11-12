@@ -220,8 +220,8 @@ fn expectCursorMatches(
             const pad: u8 = ~((@as(u8, 1) << @intCast(b.length % 8)) - 1);
             try std.testing.expectEqual(pad, b.validity[b.length / 8] & pad);
         }
-        if (full.def_levels) |d| try std.testing.expectEqualSlices(u32, d[level_at..][0..batch_entries], batch.def_levels.?);
-        if (full.rep_levels) |r| try std.testing.expectEqualSlices(u32, r[level_at..][0..batch_entries], batch.rep_levels.?);
+        if (full.def_levels) |d| try std.testing.expectEqualSlices(leaf_decoder.Level, d[level_at..][0..batch_entries], batch.def_levels.?);
+        if (full.rep_levels) |r| try std.testing.expectEqualSlices(leaf_decoder.Level, r[level_at..][0..batch_entries], batch.rep_levels.?);
         at += b.length;
         level_at += batch_entries;
     }
@@ -254,8 +254,8 @@ fn expectSlotsMatch(
             .bytes => try std.testing.expectEqualSlices(u8, want.bytesAt(i), b.bytesAt(i)),
         }
     }
-    try std.testing.expectEqualSlices(u32, full.def_levels.?, slotted.def_levels.?);
-    if (full.rep_levels) |r| try std.testing.expectEqualSlices(u32, r, slotted.rep_levels.?);
+    try std.testing.expectEqualSlices(leaf_decoder.Level, full.def_levels.?, slotted.def_levels.?);
+    if (full.rep_levels) |r| try std.testing.expectEqualSlices(leaf_decoder.Level, r, slotted.rep_levels.?);
     if (full.def_levels.?.len <= 7000) try expectCursorMatches(allocator, page_data, meta, info, &slotted, 7, slot_level);
 }
 
@@ -288,7 +288,7 @@ fn expectSamePages(allocator: std.mem.Allocator, page_data: []const u8, source: 
     try std.testing.expect(src.done());
 }
 
-fn countZeros(levels: []const u32) usize {
+fn countZeros(levels: []const leaf_decoder.Level) usize {
     var n: usize = 0;
     for (levels) |lv| n += @intFromBool(lv == 0);
     return n;
