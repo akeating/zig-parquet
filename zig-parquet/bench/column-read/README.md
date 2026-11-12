@@ -84,7 +84,7 @@ Nested file after the level changes (2026-11-12): the buffers of a list or map l
 | batches all | 176 | 7,411 | 503 | 13.9 |
 | rows all | 323 | 2,726 | 1,551 | 505.1 |
 
-The batches path reads and decodes pages as batches need them. Between batches it holds, per leaf column, one compressed page, the dictionary and at most one page of decoded entries; its peak is that plus one batch. Batches take rows from as many row groups as they need; a batch that crosses a row group end joins the pieces from both, which adds to the peak (nested file: 1,000,000-row row groups, so 1 batch in 31 crosses one). Reading all columns took 176 ms (flat) and 301 ms (nested) in batches, against 177 ms and 278 ms for whole row groups: entries past the end of a batch are copied, and there are more allocations.
+The batches path reads and decodes pages as batches need them. Between batches it holds, per leaf column, one compressed page, the dictionary and at most one page of decoded entries (since 2026-11-12 also buffers with room for the next batch's entries); its peak is that plus one batch. Batches take rows from as many row groups as they need; a batch that crosses a row group end joins the pieces from both, which adds to the peak (nested file: 1,000,000-row row groups, so 1 batch in 31 crosses one). Reading all columns took 176 ms (flat) and 301 ms (nested) in batches, against 177 ms and 278 ms for whole row groups: entries past the end of a batch are copied, and there are more allocations.
 
 ## Threads and read-ahead (2026-11-12, Apple M2 Max, 8 performance and 4 efficiency cores)
 

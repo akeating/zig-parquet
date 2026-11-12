@@ -24,8 +24,11 @@ zig build run-04_in_memory_buffer
 
 # 5. Low-level column-based API
 zig build run-05_column_api
+
+# 6. Decoding columns on several threads: Arrow batches with read-ahead, and rows
+zig build run-06_threaded_read -Doptimize=ReleaseFast
 ```
 
 ## Structure
 
-All examples in this directory share a single `build.zig` and `build.zig.zon` file. To add a new simple example, just drop a `.zig` file into the `src/` directory and it will automatically be picked up by the build script.
+All examples in this directory share a single `build.zig` and `build.zig.zon` file. To add a new simple example, put a `.zig` file in `src/` and add its name to the `examples` list in `build.zig`.

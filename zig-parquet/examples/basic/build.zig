@@ -17,6 +17,7 @@ pub fn build(b: *std.Build) void {
         "03_nested_types",
         "04_in_memory_buffer",
         "05_column_api",
+        "06_threaded_read",
     };
 
     for (examples) |example_name| {

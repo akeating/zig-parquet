@@ -319,8 +319,9 @@ typedef struct zp_stream_options {
  * each batch has batch_rows rows, taken from as many row groups as
  * needed; only the last batch can have fewer. Pages are read and decoded
  * as batches need them; between batches the stream holds, per leaf
- * column, one compressed page, the dictionary, and at most one page of
- * decoded entries. Columns not selected are not read or decoded.
+ * column, one compressed page, the dictionary, at most one page of
+ * decoded entries, and buffers with room for the next batch's entries.
+ * Columns not selected are not read or decoded.
  *
  * Byte-array columns are string ("u") or binary ("z") with int32 offsets;
  * a batch whose column holds more than 2^31 - 1 bytes then fails with

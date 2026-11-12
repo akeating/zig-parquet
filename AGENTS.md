@@ -66,6 +66,8 @@ make clean                             # Remove .zig-cache and zig-out everywher
 
 The build runner prints a step's stderr under a `run test stderr` heading followed by `failed command: <command line>`, also when the step passed. Several tests print summary lines (for example `PyArrow comparison: …`), so that block appears on passing runs. Use the exit status or `zig build test --summary all` (`Build Summary: N/N steps succeeded`) to tell whether tests passed.
 
+Tests that read every file of `test-files-arrow` and `test-files-wild` run one task per file on `std.testing.io`, each with its own `test_util.LeakCheckAllocator` (a `DebugAllocator` that detects leaks without recording stack traces). With `std.testing.allocator`, which records a stack trace per allocation, the 7-row batch comparison took 70 to 96 s for each of five wild files; follow the same pattern in new tests of that kind. To get a leak's stack trace, rerun the failing file with `std.testing.allocator`.
+
 ## Zig 0.17 — Key API Patterns
 
 Always search the codebase for existing patterns before writing new code.

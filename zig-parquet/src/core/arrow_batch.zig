@@ -895,8 +895,8 @@ pub const BatchOptions = struct {
 /// With `read_ahead` 0, pages of the selected columns are read from the source and decoded
 /// as batches need them; a page's entries past the end of a batch are kept for the next one.
 /// Memory held between calls, per leaf column: one compressed page plus up to 1 KiB after it
-/// (the start of the next page header), the dictionary, and at most one page of decoded
-/// entries.
+/// (the start of the next page header), the dictionary, at most one page of decoded entries,
+/// and buffers with room for the next batch's entries.
 ///
 /// With `read_ahead` k above 0, the selected columns of a row group are decoded whole, as
 /// one task of `io` per row group, and k row groups are decoded ahead of the one the batches

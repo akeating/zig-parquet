@@ -12,6 +12,7 @@ The examples are grouped into sub-projects by complexity.
   - Handling nested lists and structs
   - Reading/writing to in-memory buffers instead of files
   - Low-level column-based API
+  - Decoding columns on several threads (Arrow batches with read-ahead, and rows)
 
 - **[`gen-power-grid/`](gen-power-grid/)** - A showcase of time-series data compression. Generates 1 minute of synthetic 3-phase power grid monitoring data (15,000 samples at 250 Hz) to demonstrate the `.delta_binary_packed` integer encoding.
 

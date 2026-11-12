@@ -20,8 +20,7 @@ Possible development directions, roughly ordered by likely impact. No timeline c
 
 - **Bloom filters** — Write Bloom filter pages; read and apply for row group skipping. Useful for high-cardinality string columns (e.g., UUIDs, URLs). Plugs into the existing `ColumnFilter` / `RowRanges` contract used by page-index filtering — a bloom producer just returns `empty()` or `full(num_rows)` depending on the probe result, and intersects with other filters automatically.
 - **Predicate expression parser** — Page-level predicate pushdown already works via `readRowsFiltered(rg, &filters)`; what's missing is a parser that turns a SQL-like expression (`col0 BETWEEN 10 AND 20 AND col1 = "foo"`) into a list of `ColumnFilter`s. The I/O path doesn't change.
-- **Brotli LZ77 encoder** — Upgrade the pure Zig Brotli compressor from quality-0 uncompressed meta-blocks to a quality-1 LZ77 pass with hash-chain matching. Closes the compression ratio gap vs. the C quality-11 backend on Parquet data. Self-contained within `zig_brotli.zig`.
+- **Brotli LZ77 encoder** — Upgrade the pure Zig Brotli compressor from quality-0 uncompressed meta-blocks to a quality-1 LZ77 pass with hash-chain matching. Closes the compression ratio gap vs. the C quality-11 backend on Parquet data. Self-contained within `zig-parquet/src/core/compress/brotli.zig`.
 - **DATA_PAGE_V2 write** — Optional; some engines prefer V2 for its split decompression model.
 - **VARIANT type** — Semi-structured data (Parquet spec addition). Currently reads as its underlying physical type.
 - **Column encryption** — Parquet Modular Encryption. Complex spec with limited ecosystem support outside Java.
-- **Parallel column decoding** — Decode multiple columns concurrently within a row group. Zig's async model could make this natural.
