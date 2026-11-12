@@ -895,7 +895,7 @@ pub const BatchOptions = struct {
 /// take rows from. Memory held between calls: the decoded entries of up to k + 1 row groups.
 /// An error in a row group is returned by the first batch that takes rows from it.
 ///
-/// After `next` returns an error, the reader's position is undefined; call `deinit`.
+/// After `next` returns an error, later calls return `error.InvalidState`; call `deinit`.
 pub const ArrowBatchReader = struct {
     allocator: Allocator,
     source: SeekableReader,
@@ -926,6 +926,8 @@ pub const ArrowBatchReader = struct {
     current: ?Decoded = null,
     /// With `read_ahead`: rows a batch holds when row group `next_rg` starts.
     next_fill: usize = 0,
+    /// Set when `next` returns an error; later calls return `error.InvalidState`.
+    failed: bool = false,
 
     const BatchLeaf = struct {
         cursor: leaf_decoder.ColumnCursor,
@@ -1056,6 +1058,9 @@ pub const ArrowBatchReader = struct {
 
     /// The next batch, or null after the last row group.
     pub fn next(self: *ArrowBatchReader) !?ReadResult {
+        // After an error the cursors and decoded row groups are in an undefined state.
+        if (self.failed) return error.InvalidState;
+        errdefer self.failed = true;
         const allocator = self.allocator;
         if (self.read_ahead > 0) {
             // A batch the row group's task assembled.
@@ -1196,7 +1201,9 @@ pub const ArrowBatchReader = struct {
             // later row groups does not matter then.
             if (self.batch_rows) |b| {
                 const n = safe.castTo(usize, rg.num_rows) catch 0;
-                self.next_fill = (self.next_fill + n % b) % b;
+                // (next_fill + n) % b, without overflow when b is near maxInt(usize).
+                const add = n % b;
+                self.next_fill = if (add >= b - self.next_fill) add - (b - self.next_fill) else self.next_fill + add;
             }
         }
     }
@@ -1226,6 +1233,14 @@ pub const ArrowBatchReader = struct {
         fn decode(job: RowGroupJob) !Decoded {
             const allocator = job.allocator;
             const num_rows = safe.castTo(usize, job.rg.num_rows) catch return error.InvalidRowCount;
+            // Each row has at least one entry in every leaf, so a row count above a chunk's
+            // value count is wrong; the pieces below are sized from it before any decoding.
+            for (job.leaf_info) |info| {
+                if (info.col_idx >= job.rg.columns.len) return error.InvalidArgument;
+                const meta = job.rg.columns[info.col_idx].meta_data orelse return error.InvalidArgument;
+                const values = safe.castTo(usize, meta.num_values) catch return error.InvalidRowCount;
+                if (num_rows > values) return error.InvalidRowCount;
+            }
 
             var piece_rows: std.ArrayList(usize) = .empty;
             defer piece_rows.deinit(allocator);
@@ -1338,7 +1353,7 @@ pub const ArrowBatchReader = struct {
         const col_info = format.getColumnInfo(schema_elems, info.col_idx) orelse return error.InvalidArgument;
         const range = try parquet_reader.columnChunkRange(chunk);
         const pages = leaf_decoder.PageReader.fromSource(allocator, source, range.start, range.size);
-        const reserve = @min(batch_rows orelse std.math.maxInt(usize), safe.castTo(usize, meta.num_values) catch 0);
+        const reserve = @min(batch_rows orelse std.math.maxInt(usize), leaf_decoder.reservedEntries(meta.num_values));
         return leaf_decoder.ColumnCursor.init(allocator, pages, meta, col_info, .{
             .keep_levels = info.nested,
             .large_offsets = large_offsets,

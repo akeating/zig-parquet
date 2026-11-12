@@ -486,6 +486,9 @@ pub const PageReader = struct {
         const source = self.source orelse return error.EndOfData;
         const more = std.math.cast(usize, @min(extra, self.end - (at + n))) orelse return error.OutOfMemory;
         const len = std.math.add(usize, n, more) catch return error.OutOfMemory;
+        // The window is refilled below; until then it must not point into the buffer, which
+        // may be freed or overwritten, in case the allocation or the read fails.
+        self.window = &.{};
         if (self.buf.len < len) {
             self.allocator.free(self.buf);
             self.buf = &.{};
@@ -784,7 +787,7 @@ fn fixedLength(element: format.SchemaElement) !usize {
     return safe.cast(tl) catch return error.InvalidTypeLength;
 }
 
-fn reservedEntries(num_values: i64) usize {
+pub fn reservedEntries(num_values: i64) usize {
     const n = safe.cast(num_values) catch return 0;
     return @min(n, max_reserved_entries);
 }

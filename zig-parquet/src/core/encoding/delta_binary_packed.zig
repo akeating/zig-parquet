@@ -401,3 +401,13 @@ test "delta binary packed: 63-bit mini-block values spanning 9 bytes" {
     defer allocator.free(values);
     try std.testing.expectEqualSlices(i64, &.{ 0, 1, 1 + (@as(i64, 1) << 62) + 5 }, values);
 }
+
+test "delta binary packed rejects an overlong varint and more values than allowed" {
+    const allocator = std.testing.allocator;
+    // block_size as a varint of 11 bytes.
+    const overlong = [_]u8{ 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01 };
+    try std.testing.expectError(error.VarintOverflow, decodeInt32(allocator, &overlong, test_max_values));
+    // block_size 128, 4 mini-blocks, 1000 values, first value 0: more than the 10 allowed.
+    const many = [_]u8{ 0x80, 0x01, 0x04, 0xe8, 0x07, 0x00 };
+    try std.testing.expectError(error.InvalidValueCount, decodeInt32(allocator, &many, 10));
+}

@@ -191,3 +191,8 @@ test "PlainDecoder i32" {
     try std.testing.expectEqual(@as(?i32, 2147483647), decoder.next());
     try std.testing.expectEqual(@as(?i32, null), decoder.next());
 }
+
+test "decodeByteArray with a length prefix of 0xffffffff is an error" {
+    const data = [_]u8{ 0xff, 0xff, 0xff, 0xff, 'a', 'b' };
+    try std.testing.expectError(error.EndOfData, decodeByteArray(&data));
+}

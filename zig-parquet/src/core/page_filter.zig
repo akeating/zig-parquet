@@ -105,6 +105,14 @@ fn evaluateTyped(
     {
         return error.InvalidPageIndex;
     }
+    // Page start rows must not decrease and must lie in the row group, so the kept ranges
+    // are ordered, do not overlap and hold at most `rg_num_rows` rows.
+    var prev_first: u64 = 0;
+    for (oi.page_locations) |loc| {
+        const first = std.math.cast(u64, loc.first_row_index) orelse return error.InvalidPageIndex;
+        if (first < prev_first or first > rg_num_rows) return error.InvalidPageIndex;
+        prev_first = first;
+    }
 
     // Build per-page ranges where pages passing the predicate contribute
     // [first_row_index, next_first_row_index); the last page ends at rg_num_rows.

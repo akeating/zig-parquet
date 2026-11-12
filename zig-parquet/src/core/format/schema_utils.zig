@@ -54,7 +54,7 @@ pub fn getColumnInfo(schema: []const SchemaElement, column_index: usize) ?Column
     // The root usually has no repetition type and just contains the top-level fields
     if (schema[0].num_children) |num_children| {
         // Root is a group, traverse its children
-        _ = traverseChildren(&state, 1, safe.castTo(usize, num_children) catch return null, 0, 0);
+        _ = traverseChildren(&state, 1, safe.castTo(usize, num_children) catch return null, 0, 0, 0);
     } else {
         // Schema has only one element which is the leaf
         if (column_index == 0) {
@@ -104,6 +104,9 @@ const TraversalState = struct {
     result: ?ColumnInfo = null,
 };
 
+/// Groups nested deeper than this end the traversal (see `schema_tree.max_schema_depth`).
+const max_traversal_depth = 128;
+
 /// Traverse children of a group node, accumulating levels
 fn traverseChildren(
     state: *TraversalState,
@@ -111,7 +114,10 @@ fn traverseChildren(
     num_children: usize,
     current_def_level: u8,
     current_rep_level: u8,
+    depth: usize,
 ) usize {
+    // Deeper schemas, and levels that do not fit in a u8, end the traversal without a result.
+    if (depth > max_traversal_depth) return state.schema.len;
     var idx = start_idx;
     var children_processed: usize = 0;
 
@@ -121,8 +127,8 @@ fn traverseChildren(
         const elem = state.schema[idx];
 
         // Add level contribution from this element
-        const def_level = current_def_level + levelContribution(elem.repetition_type, true);
-        const rep_level = current_rep_level + levelContribution(elem.repetition_type, false);
+        const def_level = std.math.add(u8, current_def_level, levelContribution(elem.repetition_type, true)) catch return state.schema.len;
+        const rep_level = std.math.add(u8, current_rep_level, levelContribution(elem.repetition_type, false)) catch return state.schema.len;
 
         if (isLeaf(elem)) {
             // This is a leaf column
@@ -138,7 +144,7 @@ fn traverseChildren(
             idx += 1;
         } else if (elem.num_children) |nc| {
             // This is a group, recurse into its children
-            idx = traverseChildren(state, idx + 1, safe.castTo(usize, nc) catch 0, def_level, rep_level);
+            idx = traverseChildren(state, idx + 1, safe.castTo(usize, nc) catch 0, def_level, rep_level, depth + 1);
         } else {
             idx += 1;
         }

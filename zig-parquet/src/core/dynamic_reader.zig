@@ -507,10 +507,14 @@ pub const DynamicReader = struct {
 
         const rg = &self.metadata.row_groups[row_group_index];
         const num_leaf_columns = rg.columns.len;
+        const rg_rows = try safeRowCount(rg.num_rows);
         const num_rows = if (filter) |f|
             safe.castTo(usize, f.ranges.rowCount()) catch return error.InvalidRowCount
         else
-            try safeRowCount(rg.num_rows);
+            rg_rows;
+        // Ranges that overlap (from a damaged page index) can count more rows than the row
+        // group holds; the rows are allocated from this count.
+        if (num_rows > rg_rows) return error.InvalidPageIndex;
 
         if (num_rows == 0 or num_leaf_columns == 0) {
             return try self.allocator.alloc(Row, 0);

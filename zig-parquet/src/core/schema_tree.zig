@@ -61,11 +61,16 @@ pub const Node = struct {
     children: []Node,
 };
 
+/// Schemas nested deeper than this are rejected, as by `schema.zig`.
+pub const max_schema_depth = 128;
+
 /// Builds the top-level nodes of `schema`. Nodes are allocated with `allocator` and not freed
 /// individually; use an arena.
 pub fn buildSchemaTree(allocator: Allocator, schema: []const format.SchemaElement) TreeError![]Node {
     if (schema.len == 0) return error.InvalidSchema;
     const nc = safe.castTo(usize, schema[0].num_children orelse return error.InvalidSchema) catch return error.InvalidSchema;
+    // Each child is at least one element.
+    if (nc > schema.len - 1) return error.InvalidSchema;
     var builder = TreeBuilder{ .allocator = allocator, .schema = schema };
     const columns = try allocator.alloc(Node, nc);
     for (columns) |*column| column.* = try builder.node(.{});
@@ -79,10 +84,16 @@ const TreeBuilder = struct {
     schema: []const format.SchemaElement,
     next_idx: usize = 1,
     next_physical: usize = 0,
+    /// Nodes being built, from the root's children down.
+    depth: usize = 0,
 
     /// The node at `next_idx`, under a parent with levels `info`.
     fn node(self: *TreeBuilder, info: LevelInfo) TreeError!Node {
         if (self.next_idx >= self.schema.len) return error.InvalidSchema;
+        // The builder recurses once per level, so the depth is bounded to bound the stack.
+        if (self.depth >= max_schema_depth) return error.InvalidSchema;
+        self.depth += 1;
+        defer self.depth -= 1;
         const idx = self.next_idx;
         if (self.schema[idx].repetition_type == .repeated) {
             // A repeated field outside a LIST or MAP annotation is a list of required elements.
@@ -113,6 +124,10 @@ const TreeBuilder = struct {
         if (optional) info.def_level += 1;
 
         if (elem.num_children == null) {
+            // A leaf has a physical type; `format.getColumnInfo`, which the decoders use,
+            // counts only such elements as leaf columns, so an element without one would put
+            // the tree's leaves and the decoders' leaves out of step.
+            if (elem.type_ == null) return error.InvalidSchema;
             self.next_idx += 1;
             self.next_physical += 1;
             return .{
@@ -127,7 +142,7 @@ const TreeBuilder = struct {
         }
 
         const nc = safe.castTo(usize, elem.num_children.?) catch return error.InvalidSchema;
-        if (nc == 0) return error.InvalidSchema;
+        if (nc == 0 or nc > self.schema.len - idx - 1) return error.InvalidSchema;
         if (elem.converted_type) |ct| {
             if (ct == format.ConvertedType.LIST) return self.list(idx, info, optional);
             if (ct == format.ConvertedType.MAP or ct == format.ConvertedType.MAP_KEY_VALUE) return self.map(idx, info, optional);
@@ -444,4 +459,23 @@ test "levelShape equals the reference on random levels" {
             }
         }
     }
+}
+
+test "buildSchemaTree rejects a leaf without a physical type and counts past the schema" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // A childless element without a type: format.getColumnInfo would not count it as a leaf.
+    const typeless = [_]format.SchemaElement{
+        .{ .name = "root", .num_children = 2 },
+        .{ .name = "a", .repetition_type = .required },
+        .{ .name = "b", .type_ = .int64, .repetition_type = .required },
+    };
+    try std.testing.expectError(error.InvalidSchema, buildSchemaTree(a, &typeless));
+    // More children than elements follow.
+    const too_many = [_]format.SchemaElement{
+        .{ .name = "root", .num_children = 1000 },
+        .{ .name = "b", .type_ = .int64, .repetition_type = .required },
+    };
+    try std.testing.expectError(error.InvalidSchema, buildSchemaTree(a, &too_many));
 }

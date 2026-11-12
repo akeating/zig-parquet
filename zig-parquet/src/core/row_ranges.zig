@@ -113,7 +113,9 @@ pub const RowRanges = struct {
 
     pub fn rowCount(self: Self) u64 {
         var total: u64 = 0;
-        for (self.ranges) |r| total += r.count();
+        // Saturating: ranges from a damaged index can overlap; their count is then bounded
+        // by the row group's rows where it is used.
+        for (self.ranges) |r| total +|= r.count();
         return total;
     }
 

@@ -44,7 +44,12 @@ const backing_allocator = if (builtin.single_threaded) std.heap.page_allocator e
 
 /// Lazily-initialized blocking I/O backend for file operations.
 var c_io_threaded: ?std.Io.Threaded = null;
+/// Guards the initialization of `c_io_threaded`: separate handles may be opened from
+/// several threads at once.
+var c_io_lock: std.atomic.Mutex = .unlocked;
 fn cIo() std.Io {
+    while (!c_io_lock.tryLock()) std.atomic.spinLoopHint();
+    defer c_io_lock.unlock();
     if (c_io_threaded == null) {
         c_io_threaded = .init(backing_allocator, .{});
     }
@@ -189,16 +194,11 @@ pub const ReaderHandle = struct {
         errdefer allocator.destroy(fr);
 
         const file = std.Io.Dir.cwd().openFile(io, std.mem.span(path), .{}) catch return error.InputOutput;
-        fr.* = FileReader.init(file, io) catch |e| {
-            file.close(io);
-            return e;
-        };
+        errdefer file.close(io);
+        fr.* = try FileReader.init(file, io);
 
-        const info = parquet_reader.parseFooter(allocator, fr.reader()) catch |e| {
-            file.close(io);
-            allocator.destroy(fr);
-            return e;
-        };
+        // `fr` is destroyed by the errdefer above; destroying it here as well freed it twice.
+        const info = try parquet_reader.parseFooter(allocator, fr.reader());
 
         const handle = try allocator.create(ReaderHandle);
         handle.* = .{

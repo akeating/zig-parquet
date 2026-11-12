@@ -73,6 +73,19 @@ pub const PageLocation = struct {
     }
 };
 
+/// The known fields (1-7) read so far from a page index struct. A field that appears twice
+/// is an error: the parsers would otherwise replace, and leak, the first value.
+const SeenFields = struct {
+    bits: u8 = 0,
+
+    fn add(self: *SeenFields, field_id: i16) error{InvalidPageIndex}!void {
+        if (field_id < 1 or field_id > 7) return;
+        const bit = @as(u8, 1) << @intCast(field_id); // 1 <= field_id <= 7
+        if (self.bits & bit != 0) return error.InvalidPageIndex;
+        self.bits |= bit;
+    }
+};
+
 /// Per-column-chunk offset index: `page_locations` is ordered by `offset`.
 pub const OffsetIndex = struct {
     page_locations: []PageLocation = &.{},
@@ -91,11 +104,13 @@ pub const OffsetIndex = struct {
     pub fn parse(allocator: std.mem.Allocator, reader: *thrift.CompactReader) !Self {
         var oi = Self{};
         errdefer oi.deinit(allocator);
+        var seen: SeenFields = .{};
 
         const saved = reader.last_field_id;
         reader.resetFieldTracking();
 
         while (try reader.readFieldHeader()) |field| {
+            try seen.add(field.field_id);
             switch (field.field_id) {
                 1 => {
                     const list_header = try reader.readListHeader();
@@ -174,11 +189,13 @@ pub const ColumnIndex = struct {
     pub fn parse(allocator: std.mem.Allocator, reader: *thrift.CompactReader) !Self {
         var ci = Self{};
         errdefer ci.deinit(allocator);
+        var seen: SeenFields = .{};
 
         const saved = reader.last_field_id;
         reader.resetFieldTracking();
 
         while (try reader.readFieldHeader()) |field| {
+            try seen.add(field.field_id);
             switch (field.field_id) {
                 1 => ci.null_pages = try readBoolList(allocator, reader),
                 2 => ci.min_values = try readBinaryList(allocator, reader),
@@ -408,4 +425,17 @@ test "ColumnIndex accepts alternate bool encoding (0x00)" {
     defer parsed.deinit(testing.allocator);
 
     try testing.expectEqualSlices(bool, &[_]bool{ true, false, false }, parsed.null_pages);
+}
+
+test "OffsetIndex with a repeated field is an error" {
+    const allocator = std.testing.allocator;
+    var w = thrift.CompactWriter.init(allocator);
+    defer w.deinit();
+    for (0..2) |_| {
+        try w.writeFieldHeader(1, .list);
+        try w.writeListHeader(.struct_, 0);
+    }
+    try w.writeStructEnd();
+    var r = thrift.CompactReader.init(w.getWritten());
+    try std.testing.expectError(error.InvalidPageIndex, OffsetIndex.parse(allocator, &r));
 }
