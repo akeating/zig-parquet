@@ -9,7 +9,7 @@ test "zp_stream_options has the layout of StreamOptions" {
     const C = c.zp_stream_options;
     const Z = stream_options.StreamOptions;
     try std.testing.expectEqual(@sizeOf(Z), @sizeOf(C));
-    inline for (.{ "size", "flags", "col_indices", "num_cols", "row_groups", "num_row_groups", "batch_rows", "threads", "read_ahead" }) |field| {
+    inline for (.{ "size", "flags", "col_indices", "num_cols", "row_groups", "num_row_groups", "batch_rows", "threads", "read_ahead", "max_page_size" }) |field| {
         try std.testing.expectEqual(@offsetOf(Z, field), @offsetOf(C, field));
         try std.testing.expectEqual(@sizeOf(@FieldType(Z, field)), @sizeOf(@FieldType(C, field)));
     }

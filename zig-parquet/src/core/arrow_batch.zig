@@ -787,6 +787,10 @@ pub const RowGroupOptions = struct {
     /// `parallel`. Then `allocator` and the source must allow concurrent use. Null decodes
     /// them one after another on the calling thread.
     io: ?std.Io = null,
+    /// Largest decompressed page (default 128 MiB) and dictionary (64 MiB) accepted; larger
+    /// ones return `error.AllocationLimitExceeded`. Their sizes come from the file and are
+    /// allocated before the data is decoded.
+    limits: parquet_reader.AllocationLimits = .{},
 };
 
 /// Reads the columns of row group `rg_index` as Arrow arrays: one ArrowArray per top-level
@@ -827,6 +831,7 @@ pub fn readColumns(
         .arrays = arrays,
         .built = built,
         .io = options.io,
+        .limits = options.limits,
     };
     try parallel.forEach(options.io, allocator, num_cols, &task, ColumnTask.run);
 
@@ -851,13 +856,14 @@ const ColumnTask = struct {
     arrays: []ArrowArray,
     built: []bool,
     io: ?std.Io,
+    limits: parquet_reader.AllocationLimits,
 
     fn run(self: *const ColumnTask, i: usize) ReaderError!void {
         const column = &self.columns[if (self.col_indices) |ci| ci[i] else i];
         self.arrays[i] = if (column.kind == .leaf)
-            try readColumnAsArrow(self.allocator, self.source, self.metadata, self.rg, column.physical_start)
+            try readColumnAsArrow(self.allocator, self.source, self.metadata, self.rg, column.physical_start, self.limits)
         else
-            try readNestedColumn(self.allocator, self.source, self.metadata, self.rg, column, self.io);
+            try readNestedColumn(self.allocator, self.source, self.metadata, self.rg, column, self.io, self.limits);
         self.built[i] = true;
     }
 };
@@ -884,6 +890,10 @@ pub const BatchOptions = struct {
     /// take, while the caller consumes earlier batches; see `ArrowBatchReader`. 0 decodes
     /// pages as batches need them.
     read_ahead: usize = 0,
+    /// Largest decompressed page (default 128 MiB) and dictionary (64 MiB) accepted; larger
+    /// ones return `error.AllocationLimitExceeded`. Their sizes come from the file and are
+    /// allocated before the data is decoded.
+    limits: parquet_reader.AllocationLimits = .{},
 };
 
 /// Reads a file's columns as Arrow arrays, `batch_rows` rows at a time. A batch takes rows
@@ -926,6 +936,7 @@ pub const ArrowBatchReader = struct {
 
     /// With `read_ahead`: row groups being decoded, in `row_groups` order.
     read_ahead: usize,
+    limits: parquet_reader.AllocationLimits,
     pending: std.ArrayList(std.Io.Future(ReaderError!Decoded)) = .empty,
     /// With `read_ahead`: the decoded row group the batches take rows from.
     current: ?Decoded = null,
@@ -1041,6 +1052,7 @@ pub const ArrowBatchReader = struct {
             .large_offsets = options.large_offsets,
             .io = options.io,
             .read_ahead = options.read_ahead,
+            .limits = options.limits,
             .leaf_info = leaf_info,
         };
     }
@@ -1198,6 +1210,7 @@ pub const ArrowBatchReader = struct {
                 .fill = self.next_fill,
                 .last = self.next_rg + 1 == self.row_groups.len,
                 .large_offsets = self.large_offsets,
+                .limits = self.limits,
                 .io = io,
             };
             self.pending.appendAssumeCapacity(io.async(RowGroupJob.run, .{job}));
@@ -1229,6 +1242,7 @@ pub const ArrowBatchReader = struct {
         fill: usize,
         last: bool,
         large_offsets: bool,
+        limits: parquet_reader.AllocationLimits,
         io: std.Io,
 
         fn run(job: RowGroupJob) ReaderError!Decoded {
@@ -1328,7 +1342,7 @@ pub const ArrowBatchReader = struct {
             const job = self.job;
             const allocator = job.allocator;
             const info = job.leaf_info[k];
-            var cursor = openCursor(allocator, job.source, job.schema, job.rg, info, job.large_offsets, job.batch_rows) catch |e|
+            var cursor = openCursor(allocator, job.source, job.schema, job.rg, info, job.large_offsets, job.batch_rows, job.limits) catch |e|
                 return asErrorOf(ReaderError, e);
             defer cursor.deinit();
             const out = self.pieces[k * self.piece_rows.len ..][0..self.piece_rows.len];
@@ -1351,6 +1365,7 @@ pub const ArrowBatchReader = struct {
         info: LeafInfo,
         large_offsets: bool,
         batch_rows: ?usize,
+        limits: parquet_reader.AllocationLimits,
     ) !leaf_decoder.ColumnCursor {
         if (info.col_idx >= rg.columns.len) return error.InvalidArgument;
         const chunk = &rg.columns[info.col_idx];
@@ -1363,6 +1378,7 @@ pub const ArrowBatchReader = struct {
             .keep_levels = info.nested,
             .large_offsets = large_offsets,
             .slot_level = if (info.nested) info.slot_level else 0,
+            .limits = limits,
         }, reserve);
     }
 
@@ -1485,7 +1501,7 @@ pub const ArrowBatchReader = struct {
                 allocator.free(leaves);
             }
             for (leaves, self.leaf_info[first_leaf..][0..leaves.len], 0..) |*l, info, k| {
-                const cursor = try openCursor(allocator, self.source, self.metadata.schema, rg, info, self.large_offsets, self.batch_rows);
+                const cursor = try openCursor(allocator, self.source, self.metadata.schema, rg, info, self.large_offsets, self.batch_rows, self.limits);
                 l.* = .{ .cursor = cursor };
                 leaf_count = k + 1;
             }
@@ -1543,6 +1559,7 @@ fn readNestedColumn(
     rg: *const format.RowGroup,
     node: *const Node,
     io: ?std.Io,
+    limits: parquet_reader.AllocationLimits,
 ) ReaderError!ArrowArray {
     if (node.physical_count == 0) return error.InvalidSchema;
     if (node.physical_start + node.physical_count > rg.columns.len) return error.InvalidArgument;
@@ -1564,6 +1581,7 @@ fn readNestedColumn(
         .slot_levels = slot_levels,
         .leaves = leaves,
         .decoded = decoded,
+        .limits = limits,
     };
     parallel.forEach(io, allocator, leaves.len, &task, NestedLeafTask.run) catch |e| return asErrorOf(ReaderError, e);
     return assembleNode(allocator, metadata.schema, node, leaves, node.physical_start);
@@ -1579,6 +1597,7 @@ const NestedLeafTask = struct {
     slot_levels: []const u32,
     leaves: []NestedLeaf,
     decoded: []bool,
+    limits: parquet_reader.AllocationLimits,
 
     fn run(self: *const NestedLeafTask, k: usize) ReaderError!void {
         const allocator = self.allocator;
@@ -1589,7 +1608,7 @@ const NestedLeafTask = struct {
         defer allocator.free(page_data);
         const info = format.getColumnInfo(self.metadata.schema, col_idx) orelse return error.InvalidArgument;
         const l = &self.leaves[k];
-        l.leaf = leaf_decoder.decodeLeaf(allocator, page_data, meta, info, .{ .keep_levels = true, .slot_level = self.slot_levels[k] }) catch |e|
+        l.leaf = leaf_decoder.decodeLeaf(allocator, page_data, meta, info, .{ .keep_levels = true, .slot_level = self.slot_levels[k], .limits = self.limits }) catch |e|
             return asErrorOf(ReaderError, e);
         l.entries = levelCount(&l.leaf);
         l.max_def = info.max_def_level;
@@ -1880,6 +1899,7 @@ fn readColumnAsArrow(
     metadata: format.FileMetaData,
     rg: *const format.RowGroup,
     col_idx: usize,
+    limits: parquet_reader.AllocationLimits,
 ) ReaderError!ArrowArray {
     if (col_idx >= rg.columns.len) return error.InvalidArgument;
     const chunk = &rg.columns[col_idx];
@@ -1888,7 +1908,7 @@ fn readColumnAsArrow(
     defer allocator.free(page_data);
     const column_info = format.getColumnInfo(metadata.schema, col_idx) orelse return error.InvalidArgument;
 
-    const leaf = leaf_decoder.decodeLeaf(allocator, page_data, meta, column_info, .{}) catch |e|
+    const leaf = leaf_decoder.decodeLeaf(allocator, page_data, meta, column_info, .{ .limits = limits }) catch |e|
         return asErrorOf(ReaderError, e);
     return leafToArrow(allocator, leaf.buffers, column_info.element);
 }

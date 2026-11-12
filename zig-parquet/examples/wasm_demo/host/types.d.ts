@@ -240,7 +240,7 @@ export interface ParquetWasiExports {
     handle: HandlePtr,
     stream_out_ptr: number,
   ): StatusCode;
-  /** options_ptr: a zp_stream_options struct (40 bytes on wasm32; 32 bytes, without threads and read_ahead, is accepted), or 0 for the defaults. */
+  /** options_ptr: a zp_stream_options struct (48 bytes on wasm32; the 32- and 40-byte layouts of earlier versions are accepted), or 0 for the defaults. */
   zp_reader_get_stream_with_options(
     handle: HandlePtr,
     options_ptr: number,

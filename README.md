@@ -124,6 +124,8 @@ Buffer layout:
 
 The reader loads a column chunk's compressed bytes whole, then decompresses and decodes one page at a time directly into the Arrow buffers.
 
+A page's decompressed size and a dictionary's size come from the file and are allocated before the data is decoded, so reads refuse pages over 128 MiB and dictionaries over 64 MiB with `error.AllocationLimitExceeded`. Files with larger pages can be read by raising the limits: `.limits = .{ .max_page_size = 1 << 30 }` in the options of `readColumns`, `columnBatches` or `openFileDynamic`, or `max_page_size` in `zp_stream_options`.
+
 #### Reading in Batches
 
 To read in batches of a fixed number of rows instead of whole row groups, use `reader.columnBatches`, which returns an `ArrowBatchReader`:
@@ -182,6 +184,7 @@ options.num_cols = 2;
 options.batch_rows = 65536;
 options.threads = 8;     /* optional: decode on up to 8 threads */
 options.read_ahead = 1;  /* optional: decode 1 row group ahead */
+options.max_page_size = 0; /* optional: largest decompressed page in bytes; 0: 128 MiB */
 
 struct ArrowArrayStream stream;
 if (zp_reader_get_stream_with_options(reader, &options, &stream) == ZP_OK) {

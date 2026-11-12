@@ -308,9 +308,10 @@ typedef struct zp_stream_options {
     int64_t batch_rows;     /* rows per batch; 0: one batch per row group */
     int threads;            /* decoding threads, including the caller's; 0, 1: one */
     int read_ahead;         /* row groups decoded ahead; needs threads >= 2 */
+    int64_t max_page_size;  /* largest decompressed page in bytes; 0: 128 MiB */
 } zp_stream_options;
 
-#define ZP_STREAM_OPTIONS_INIT { sizeof(zp_stream_options), 0, NULL, 0, NULL, 0, 0, 0, 0 }
+#define ZP_STREAM_OPTIONS_INIT { sizeof(zp_stream_options), 0, NULL, 0, NULL, 0, 0, 0, 0, 0 }
 
 /**
  * Like zp_reader_get_stream(), configured by options (NULL: the defaults).

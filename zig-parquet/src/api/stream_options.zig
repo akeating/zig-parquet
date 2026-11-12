@@ -9,6 +9,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const arrow_batch = @import("../core/arrow_batch.zig");
+const parquet_reader = @import("../core/parquet_reader.zig");
 const safe = @import("../core/safe.zig");
 
 const Allocator = std.mem.Allocator;
@@ -35,6 +36,9 @@ pub const StreamOptions = extern struct {
     threads: c_int,
     /// Row groups decoded ahead of the batches; needs `threads` of 2 or more.
     read_ahead: c_int,
+    /// Largest decompressed page accepted, in bytes; 0: the default (128 MiB). Larger pages
+    /// return ZP_ERROR_INVALID_DATA (AllocationLimitExceeded).
+    max_page_size: i64,
 };
 
 /// The size of the first version of `zp_stream_options`, which ended with `batch_rows`.
@@ -75,6 +79,7 @@ pub const Parsed = struct {
     large_offsets: bool = false,
     threads: usize = 1,
     read_ahead: usize = 0,
+    max_page_size: ?usize = null,
 
     pub fn deinit(self: *Parsed, allocator: Allocator) void {
         if (self.columns) |c| allocator.free(c);
@@ -92,6 +97,7 @@ pub const Parsed = struct {
             .large_offsets = self.large_offsets,
             .io = io,
             .read_ahead = if (io == null) 0 else self.read_ahead,
+            .limits = .{ .max_page_size = self.max_page_size orelse (parquet_reader.AllocationLimits{}).max_page_size },
         };
     }
 };
@@ -130,6 +136,10 @@ pub fn parse(allocator: Allocator, options: ?*const StreamOptions, message: *[]c
         message.* = "zp_stream_options.threads and read_ahead must not be negative";
         return error.InvalidArgument;
     }
+    if (o.max_page_size < 0) {
+        message.* = "zp_stream_options.max_page_size must not be negative";
+        return error.InvalidArgument;
+    }
     if (o.read_ahead > 0 and o.threads < 2) {
         message.* = "zp_stream_options.read_ahead needs threads of 2 or more";
         return error.InvalidArgument;
@@ -140,6 +150,7 @@ pub fn parse(allocator: Allocator, options: ?*const StreamOptions, message: *[]c
         .large_offsets = o.flags & ZP_STREAM_LARGE_OFFSETS != 0,
         .threads = @max(1, safe.castTo(usize, o.threads) catch unreachable), // checked non-negative above
         .read_ahead = safe.castTo(usize, o.read_ahead) catch unreachable, // checked non-negative above
+        .max_page_size = if (o.max_page_size == 0) null else safe.castTo(usize, o.max_page_size) catch std.math.maxInt(usize),
     };
     errdefer parsed.deinit(allocator);
     if (o.col_indices) |ci| parsed.columns = try indexList(allocator, ci, o.num_cols, "zp_stream_options.col_indices", message);
@@ -175,7 +186,7 @@ test "parse checks size, flags, batch_rows and indices" {
 
     const cols = [_]c_int{ 2, 0 };
     const rgs = [_]c_int{1};
-    var o: StreamOptions = .{ .size = @sizeOf(StreamOptions), .flags = ZP_STREAM_LARGE_OFFSETS, .col_indices = &cols, .num_cols = 2, .row_groups = &rgs, .num_row_groups = 1, .batch_rows = 100, .threads = 4, .read_ahead = 1 };
+    var o: StreamOptions = .{ .size = @sizeOf(StreamOptions), .flags = ZP_STREAM_LARGE_OFFSETS, .col_indices = &cols, .num_cols = 2, .row_groups = &rgs, .num_row_groups = 1, .batch_rows = 100, .threads = 4, .read_ahead = 1, .max_page_size = 256 << 20 };
     parsed = try parse(allocator, &o, &msg);
     defer parsed.deinit(allocator);
     try std.testing.expectEqualSlices(usize, &.{ 2, 0 }, parsed.columns.?);
@@ -184,6 +195,8 @@ test "parse checks size, flags, batch_rows and indices" {
     try std.testing.expect(parsed.large_offsets);
     try std.testing.expectEqual(@as(usize, 4), parsed.threads);
     try std.testing.expectEqual(@as(usize, 1), parsed.read_ahead);
+    try std.testing.expectEqual(@as(?usize, 256 << 20), parsed.max_page_size);
+    try std.testing.expectEqual(@as(usize, 256 << 20), parsed.batchOptions(null).limits.max_page_size);
 
     var bad = o;
     bad.size = 8;
@@ -193,6 +206,9 @@ test "parse checks size, flags, batch_rows and indices" {
     try std.testing.expectError(error.InvalidArgument, parse(allocator, &bad, &msg));
     bad = o;
     bad.batch_rows = -1;
+    try std.testing.expectError(error.InvalidArgument, parse(allocator, &bad, &msg));
+    bad = o;
+    bad.max_page_size = -1;
     try std.testing.expectError(error.InvalidArgument, parse(allocator, &bad, &msg));
     bad = o;
     bad.threads = -1;

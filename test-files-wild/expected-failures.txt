@@ -24,8 +24,8 @@ parquet-testing/data/nation.dict-malformed.parquet EndOfData
 # Malformed: REQUIRED column with RLE-encoded nulls (PyArrow also fails)
 parquet-testing/data/fixed_length_byte_array.parquet EndOfData
 
-# A 3 KB file whose first page decompresses to about 2 GiB: above the reader's 128 MiB page
-# limit (parquet_reader.AllocationLimits.max_page_size)
+# A 3 KB file whose first page decompresses to about 2 GiB: above the reader's default 128 MiB
+# page limit (AllocationLimits.max_page_size, which a reader's options can raise)
 parquet-testing/data/large_string_map.brotli.parquet AllocationLimitExceeded
 
 # Intentionally corrupt CRC32 checksums

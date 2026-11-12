@@ -92,6 +92,8 @@ pub const freeImportedColumnDefs = arrow_batch.freeImportedColumnDefs;
 pub const RowGroupOptions = arrow_batch.RowGroupOptions;
 pub const ArrowBatchReader = arrow_batch.ArrowBatchReader;
 pub const BatchOptions = arrow_batch.BatchOptions;
+/// Largest decompressed page and dictionary a read accepts (`limits` in the read options).
+pub const AllocationLimits = @import("core/parquet_reader.zig").AllocationLimits;
 pub const writeRowGroupFromArrow = arrow_batch.writeRowGroupFromArrow;
 
 // Writer (core type)

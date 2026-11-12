@@ -247,6 +247,10 @@ pub const Options = struct {
     /// level of its innermost list or map: the entries below it are empty or null lists and
     /// maps, which have no element. Needs `keep_levels`. 0 gives every entry a slot.
     slot_level: u32 = 0,
+    /// Largest decompressed page and dictionary accepted; larger ones return
+    /// `error.AllocationLimitExceeded`. Their sizes come from the page headers and are
+    /// allocated before the data is decoded.
+    limits: parquet_reader.AllocationLimits = .{},
 };
 
 /// A definition or repetition level, or a presence flag derived from one (0 or 1). Levels
@@ -599,6 +603,7 @@ pub const ColumnCursor = struct {
             .rep_bits = format.computeBitWidth(info.max_rep_level),
             .keep_levels = options.keep_levels,
             .slot_level = if (info.max_def_level > 0) options.slot_level else 0,
+            .limits = options.limits,
         };
         errdefer dec.deinit();
         if (dec.slot_level > 0 and !options.keep_levels) return error.InvalidArgument;
@@ -617,7 +622,7 @@ pub const ColumnCursor = struct {
                 try checkCrc(options.checksum, header, body);
                 const uncompressed = safe.cast(header.uncompressed_page_size) catch return error.InvalidPageSize;
                 const count = safe.cast(dph.num_values) catch return error.InvalidPageSize;
-                try dec.dict_set.initFromPage(body, count, physical, info.element.type_length, meta.codec, uncompressed);
+                try dec.dict_set.initFromPageWithLimits(body, count, physical, info.element.type_length, meta.codec, uncompressed, options.limits);
                 try dec.buildDictView();
             } else {
                 first = header;
@@ -1096,6 +1101,7 @@ const ChunkDecoder = struct {
     keep_levels: bool,
     /// `Options.slot_level`; 0 when the column has no definition levels.
     slot_level: u32 = 0,
+    limits: parquet_reader.AllocationLimits = .{},
     /// Definition levels of the current page.
     levels: std.ArrayList(Level) = .empty,
     /// Repetition levels of the current page.
@@ -1185,7 +1191,7 @@ const ChunkDecoder = struct {
 
         const decompressed = if (self.codec != .uncompressed) blk: {
             const size = safe.cast(header.uncompressed_page_size) catch return error.InvalidPageSize;
-            try parquet_reader.AllocationLimits.default.checkPageSize(size);
+            try self.limits.checkPageSize(size);
             break :blk compress.decompress(self.allocator, body, self.codec, size) catch return error.DecompressionError;
         } else body;
         defer if (self.codec != .uncompressed) self.allocator.free(decompressed);
@@ -1236,7 +1242,7 @@ const ChunkDecoder = struct {
         var allocated = false;
         const data = if (v2.is_compressed and self.codec != .uncompressed) blk: {
             const total = safe.cast(header.uncompressed_page_size) catch return error.InvalidPageSize;
-            try parquet_reader.AllocationLimits.default.checkPageSize(total);
+            try self.limits.checkPageSize(total);
             if (total < levels_len) return error.EndOfData;
             const size = total - levels_len;
             if (size == 0 or values_raw.len == 0) break :blk values_raw;

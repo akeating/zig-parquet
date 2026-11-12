@@ -638,7 +638,7 @@ test "C ABI: reader get_stream iterates row groups" {
 const StreamOptions = @import("../api/stream_options.zig").StreamOptions;
 
 /// Stream options with the given fields; the others keep their defaults.
-fn streamOptions(fields: struct { cols: ?[]const c_int = null, row_groups: ?[]const c_int = null, batch_rows: i64 = 0, flags: u32 = 0, threads: c_int = 0, read_ahead: c_int = 0 }) StreamOptions {
+fn streamOptions(fields: struct { cols: ?[]const c_int = null, row_groups: ?[]const c_int = null, batch_rows: i64 = 0, flags: u32 = 0, threads: c_int = 0, read_ahead: c_int = 0, max_page_size: i64 = 0 }) StreamOptions {
     return .{
         .size = @sizeOf(StreamOptions),
         .flags = fields.flags,
@@ -649,6 +649,7 @@ fn streamOptions(fields: struct { cols: ?[]const c_int = null, row_groups: ?[]co
         .batch_rows = fields.batch_rows,
         .threads = fields.threads,
         .read_ahead = fields.read_ahead,
+        .max_page_size = fields.max_page_size,
     };
 }
 
@@ -2095,4 +2096,41 @@ test "C ABI: a stream outlives zp_reader_close until it is released" {
     try std.testing.expectEqual(@as(i64, 5), batch.length);
     batch.doRelease();
     stream.release.?(&stream);
+}
+
+test "page size limit: readColumns and the C stream refuse pages above max_page_size" {
+    if (!build_options.supports_zstd) return;
+    const allocator = std.testing.allocator;
+
+    // 1000 int64 values in one zstd PLAIN page of 8,000 uncompressed bytes (no dictionary,
+    // whose page has its own limit).
+    var writer = try parquet.createBufferDynamic(allocator);
+    defer writer.deinit();
+    writer.use_dictionary = false;
+    try writer.addColumn("x", parquet.TypeInfo.int64, .{});
+    writer.setCompression(.zstd);
+    try writer.begin();
+    for (0..1000) |i| {
+        try writer.setInt64(0, @intCast(i));
+        try writer.addRow();
+    }
+    try writer.close();
+    const buf = try writer.toOwnedSlice();
+    defer allocator.free(buf);
+
+    var reader = try parquet.openBufferDynamic(allocator, buf, .{});
+    defer reader.deinit();
+    try std.testing.expectError(error.AllocationLimitExceeded, reader.readColumns(0, .{ .limits = .{ .max_page_size = 4096 } }));
+    var result = try reader.readColumns(0, .{});
+    result.deinit();
+
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(c_err.ZP_OK, c_reader.zp_reader_open_memory(buf.ptr, buf.len, &handle));
+    defer c_reader.zp_reader_close(handle);
+    const options = streamOptions(.{ .max_page_size = 4096 });
+    var stream: ArrowArrayStream = undefined;
+    try std.testing.expectEqual(c_err.ZP_OK, c_reader.zp_reader_get_stream_with_options(handle, &options, &stream));
+    defer stream.release.?(&stream);
+    var batch: ArrowArray = undefined;
+    try std.testing.expect(stream.get_next.?(&stream, &batch) != 0);
 }

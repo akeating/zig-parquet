@@ -58,6 +58,9 @@ pub const DynamicReaderOptions = struct {
     /// the reader's allocator and source must allow concurrent use. Null decodes them one
     /// after another on the calling thread.
     io: ?std.Io = null,
+    /// Largest decompressed page (default 128 MiB) and dictionary (64 MiB) accepted by row
+    /// reads; larger ones return `error.AllocationLimitExceeded`.
+    limits: parquet_reader.AllocationLimits = .{},
 };
 
 /// Error type for dynamic reader operations.
@@ -78,6 +81,8 @@ pub const DynamicReader = struct {
     footer_arena: std.heap.ArenaAllocator,
     checksum_options: ChecksumOptions,
     /// `DynamicReaderOptions.io`.
+    /// `DynamicReaderOptions.limits`.
+    limits: parquet_reader.AllocationLimits = .{},
     decode_io: ?std.Io = null,
     _backend_cleanup: ?BackendCleanup = null,
     /// Storage of the read in progress (see `value_mod.RowStorage`): rows'
@@ -105,6 +110,7 @@ pub const DynamicReader = struct {
             .footer_arena = info.arena,
             .checksum_options = options.checksum,
             .decode_io = options.io,
+            .limits = options.limits,
         };
     }
 
@@ -569,6 +575,7 @@ pub const DynamicReader = struct {
             .keep_levels = keep_levels,
             .checksum = self.checksum_options,
             .large_offsets = true,
+            .limits = self.limits,
         };
 
         const leaf = if (src.filter) |filter|
