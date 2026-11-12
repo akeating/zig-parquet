@@ -210,10 +210,12 @@ std.math.sub(usize, a, b) catch return error.Underflow;
 2. **Checked arithmetic** — `std.math.add`/`mul` with error handling
 3. **Validate schema constraints** — precision, scale, type lengths
 4. **Clear errors** — `ValueTooLarge`, `TooManyRows`, `InvalidSchema`
+5. **Read caller Arrow buffers through `align(1)` pointers** — the Arrow C Data Interface recommends aligned buffers but does not require them. `@alignCast` on such a buffer panics in safe builds and is undefined behaviour in `ReleaseFast`; it panicked on the Linux CI runner for an `[8]u8` test buffer read as `i32`.
 
 ### Auditing
 ```bash
 rg "@intCast" src/ --type zig -c    # Should be 0 outside tests
 rg "catch unreachable" src/ --type zig  # Each should have an invariant comment
 rg "\[.*\.\.\]\[0\.\." src/ --type zig  # Check for unchecked slicing
+rg "@alignCast\(.*buffers" src/core --type zig  # Should only appear in tests (caller buffers use align(1))
 ```

@@ -2420,7 +2420,7 @@ const ArrowValueError = error{ InvalidSchema, IntegerOverflow, UnsupportedType, 
 
 fn arrowToValue(allocator: Allocator, arr: ArrowArray, sch: ArrowSchema, idx: usize) ArrowValueError!Value {
     const fmt = std.mem.sliceTo(sch.format, 0);
-    const validity: ?[*]const u8 = if (arr.buffers[0]) |b| @ptrCast(@alignCast(b)) else null;
+    const validity: ?[*]const u8 = if (arr.buffers[0]) |b| @ptrCast(b) else null;
     const n = safe.castTo(usize, arr.length) catch return error.InvalidSchema;
 
     if (validity) |v| {
@@ -2445,66 +2445,66 @@ fn arrowLeafToValue(allocator: Allocator, arr: ArrowArray, fmt: []const u8, idx:
     if (fmt.len == 1) {
         switch (fmt[0]) {
             'b' => {
-                const data: [*]const u8 = @ptrCast(@alignCast(arr.buffers[1].?));
+                const data: [*]const u8 = @ptrCast(arr.buffers[1].?);
                 const n = safe.castTo(usize, arr.length) catch return error.InvalidSchema;
                 return .{ .bool_val = arrow.getBit(data[0 .. (n + 7) / 8], idx) };
             },
             'c' => {
-                const data: [*]const i8 = @ptrCast(@alignCast(arr.buffers[1].?));
+                const data: [*]const i8 = @ptrCast(arr.buffers[1].?);
                 return .{ .int32_val = safe.castTo(i32, data[idx]) catch unreachable }; // i8 always fits in i32
             },
             'C' => {
-                const data: [*]const u8 = @ptrCast(@alignCast(arr.buffers[1].?));
+                const data: [*]const u8 = @ptrCast(arr.buffers[1].?);
                 return .{ .int32_val = safe.castTo(i32, data[idx]) catch unreachable }; // u8 always fits in i32
             },
             's' => {
-                const data: [*]const i16 = @ptrCast(@alignCast(arr.buffers[1].?));
+                const data: [*]align(1) const i16 = @ptrCast(arr.buffers[1].?);
                 return .{ .int32_val = safe.castTo(i32, data[idx]) catch unreachable }; // i16 always fits in i32
             },
             'S' => {
-                const data: [*]const u16 = @ptrCast(@alignCast(arr.buffers[1].?));
+                const data: [*]align(1) const u16 = @ptrCast(arr.buffers[1].?);
                 return .{ .int32_val = safe.castTo(i32, data[idx]) catch unreachable }; // u16 always fits in i32
             },
             'i' => {
-                const data: [*]const i32 = @ptrCast(@alignCast(arr.buffers[1].?));
+                const data: [*]align(1) const i32 = @ptrCast(arr.buffers[1].?);
                 return .{ .int32_val = data[idx] };
             },
             'I' => {
-                const data: [*]const u32 = @ptrCast(@alignCast(arr.buffers[1].?));
+                const data: [*]align(1) const u32 = @ptrCast(arr.buffers[1].?);
                 return .{ .int64_val = safe.castTo(i64, data[idx]) catch unreachable }; // u32 always fits in i64
             },
             'l' => {
-                const data: [*]const i64 = @ptrCast(@alignCast(arr.buffers[1].?));
+                const data: [*]align(1) const i64 = @ptrCast(arr.buffers[1].?);
                 return .{ .int64_val = data[idx] };
             },
             'L' => {
-                const data: [*]const u64 = @ptrCast(@alignCast(arr.buffers[1].?));
+                const data: [*]align(1) const u64 = @ptrCast(arr.buffers[1].?);
                 return .{ .int64_val = try safe.castTo(i64, data[idx]) };
             },
             'f' => {
-                const data: [*]const f32 = @ptrCast(@alignCast(arr.buffers[1].?));
+                const data: [*]align(1) const f32 = @ptrCast(arr.buffers[1].?);
                 return .{ .float_val = data[idx] };
             },
             'g' => {
-                const data: [*]const f64 = @ptrCast(@alignCast(arr.buffers[1].?));
+                const data: [*]align(1) const f64 = @ptrCast(arr.buffers[1].?);
                 return .{ .double_val = data[idx] };
             },
             'u', 'z' => {
-                const offsets: [*]const i32 = @ptrCast(@alignCast(arr.buffers[1].?));
-                const data: [*]const u8 = if (arr.buffers[2]) |b| @ptrCast(@alignCast(b)) else @as([*]const u8, &[_]u8{});
+                const offsets: [*]align(1) const i32 = @ptrCast(arr.buffers[1].?);
+                const data: [*]const u8 = if (arr.buffers[2]) |b| @ptrCast(b) else @as([*]const u8, &[_]u8{});
                 const s: usize = try safe.cast(offsets[idx]);
                 const e: usize = try safe.cast(offsets[idx + 1]);
                 return .{ .bytes_val = data[s..e] };
             },
             'U', 'Z' => {
-                const offsets: [*]const i64 = @ptrCast(@alignCast(arr.buffers[1].?));
-                const data: [*]const u8 = if (arr.buffers[2]) |b| @ptrCast(@alignCast(b)) else @as([*]const u8, &[_]u8{});
+                const offsets: [*]align(1) const i64 = @ptrCast(arr.buffers[1].?);
+                const data: [*]const u8 = if (arr.buffers[2]) |b| @ptrCast(b) else @as([*]const u8, &[_]u8{});
                 const s: usize = try safe.cast(offsets[idx]);
                 const e: usize = try safe.cast(offsets[idx + 1]);
                 return .{ .bytes_val = data[s..e] };
             },
             'e' => {
-                const data: [*]const u8 = @ptrCast(@alignCast(arr.buffers[1].?));
+                const data: [*]const u8 = @ptrCast(arr.buffers[1].?);
                 return .{ .fixed_bytes_val = data[idx * 2 ..][0..2] };
             },
             else => return error.UnsupportedType,
@@ -2513,27 +2513,27 @@ fn arrowLeafToValue(allocator: Allocator, arr: ArrowArray, fmt: []const u8, idx:
 
     // Multi-char: temporal types → int32/int64 values
     if (std.mem.eql(u8, fmt, "tdD")) {
-        const data: [*]const i32 = @ptrCast(@alignCast(arr.buffers[1].?));
+        const data: [*]align(1) const i32 = @ptrCast(arr.buffers[1].?);
         return .{ .int32_val = data[idx] };
     }
     if (std.mem.eql(u8, fmt, "tdm")) {
-        const data: [*]const i64 = @ptrCast(@alignCast(arr.buffers[1].?));
+        const data: [*]align(1) const i64 = @ptrCast(arr.buffers[1].?);
         return .{ .int32_val = safe.castTo(i32, @divTrunc(data[idx], 86_400_000)) catch return error.IntegerOverflow };
     }
     if (std.mem.eql(u8, fmt, "ttm")) {
-        const data: [*]const i32 = @ptrCast(@alignCast(arr.buffers[1].?));
+        const data: [*]align(1) const i32 = @ptrCast(arr.buffers[1].?);
         return .{ .int32_val = data[idx] };
     }
     if (std.mem.eql(u8, fmt, "tts")) {
-        const data: [*]const i32 = @ptrCast(@alignCast(arr.buffers[1].?));
+        const data: [*]align(1) const i32 = @ptrCast(arr.buffers[1].?);
         return .{ .int32_val = std.math.mul(i32, data[idx], 1000) catch return error.IntegerOverflow };
     }
     if (std.mem.eql(u8, fmt, "ttu") or std.mem.eql(u8, fmt, "ttn")) {
-        const data: [*]const i64 = @ptrCast(@alignCast(arr.buffers[1].?));
+        const data: [*]align(1) const i64 = @ptrCast(arr.buffers[1].?);
         return .{ .int64_val = data[idx] };
     }
     if (fmt.len >= 4 and std.mem.eql(u8, fmt[0..2], "ts")) {
-        const data: [*]const i64 = @ptrCast(@alignCast(arr.buffers[1].?));
+        const data: [*]align(1) const i64 = @ptrCast(arr.buffers[1].?);
         if (fmt[2] == 's') {
             return .{ .int64_val = std.math.mul(i64, data[idx], 1000) catch return error.IntegerOverflow };
         }
@@ -2541,7 +2541,7 @@ fn arrowLeafToValue(allocator: Allocator, arr: ArrowArray, fmt: []const u8, idx:
     }
     if (fmt.len >= 2 and fmt[0] == 'w' and fmt[1] == ':') {
         const type_len = std.fmt.parseInt(usize, fmt[2..], 10) catch return error.InvalidSchema;
-        const data: [*]const u8 = @ptrCast(@alignCast(arr.buffers[1].?));
+        const data: [*]const u8 = @ptrCast(arr.buffers[1].?);
         return .{ .fixed_bytes_val = data[idx * type_len ..][0..type_len] };
     }
     if (fmt.len >= 4 and fmt[0] == 'd' and fmt[1] == ':') {
@@ -2564,7 +2564,7 @@ fn arrowLeafToValue(allocator: Allocator, arr: ArrowArray, fmt: []const u8, idx:
 }
 
 fn arrowListToValue(allocator: Allocator, arr: ArrowArray, sch: ArrowSchema, idx: usize) ArrowValueError!Value {
-    const offsets: [*]const i32 = @ptrCast(@alignCast(arr.buffers[1].?));
+    const offsets: [*]align(1) const i32 = @ptrCast(arr.buffers[1].?);
     const child_arr_ptr: [*]*ArrowArray = arr.children orelse return error.InvalidSchema;
     const child_sch_ptr: [*]*ArrowSchema = sch.children orelse return error.InvalidSchema;
     const child_arr = child_arr_ptr[0];
@@ -2598,7 +2598,7 @@ fn arrowStructToValue(allocator: Allocator, arr: ArrowArray, sch: ArrowSchema, i
 }
 
 fn arrowMapToValue(allocator: Allocator, arr: ArrowArray, sch: ArrowSchema, idx: usize) ArrowValueError!Value {
-    const offsets: [*]const i32 = @ptrCast(@alignCast(arr.buffers[1].?));
+    const offsets: [*]align(1) const i32 = @ptrCast(arr.buffers[1].?);
     const entries_arr_ptr: [*]*ArrowArray = arr.children orelse return error.InvalidSchema;
     const entries_sch_ptr: [*]*ArrowSchema = sch.children orelse return error.InvalidSchema;
     const entries_arr = entries_arr_ptr[0];
@@ -2717,10 +2717,10 @@ fn writeListColumnTyped(
     child_arr: ArrowArray,
     n: usize,
 ) WriterError!void {
-    const offsets: [*]const i32 = @ptrCast(@alignCast(parent_arr.buffers[1].?));
-    const parent_validity: ?[*]const u8 = if (parent_arr.buffers[0]) |b| @ptrCast(@alignCast(b)) else null;
-    const child_data: [*]const T = @ptrCast(@alignCast(child_arr.buffers[1].?));
-    const child_validity: ?[*]const u8 = if (child_arr.buffers[0]) |b| @ptrCast(@alignCast(b)) else null;
+    const offsets: [*]align(1) const i32 = @ptrCast(parent_arr.buffers[1].?);
+    const parent_validity: ?[*]const u8 = if (parent_arr.buffers[0]) |b| @ptrCast(b) else null;
+    const child_data: [*]align(1) const T = @ptrCast(child_arr.buffers[1].?);
+    const child_validity: ?[*]const u8 = if (child_arr.buffers[0]) |b| @ptrCast(b) else null;
     const child_len = safe.castTo(usize, child_arr.length) catch return error.IntegerOverflow;
 
     var lists = allocator.alloc(Optional([]const Optional(T)), n) catch return error.OutOfMemory;
@@ -2765,10 +2765,10 @@ fn writeListColumnBool(
     child_arr: ArrowArray,
     n: usize,
 ) WriterError!void {
-    const offsets: [*]const i32 = @ptrCast(@alignCast(parent_arr.buffers[1].?));
-    const parent_validity: ?[*]const u8 = if (parent_arr.buffers[0]) |b| @ptrCast(@alignCast(b)) else null;
-    const child_data_bits: [*]const u8 = @ptrCast(@alignCast(child_arr.buffers[1].?));
-    const child_validity: ?[*]const u8 = if (child_arr.buffers[0]) |b| @ptrCast(@alignCast(b)) else null;
+    const offsets: [*]align(1) const i32 = @ptrCast(parent_arr.buffers[1].?);
+    const parent_validity: ?[*]const u8 = if (parent_arr.buffers[0]) |b| @ptrCast(b) else null;
+    const child_data_bits: [*]const u8 = @ptrCast(child_arr.buffers[1].?);
+    const child_validity: ?[*]const u8 = if (child_arr.buffers[0]) |b| @ptrCast(b) else null;
     const child_len = safe.castTo(usize, child_arr.length) catch return error.IntegerOverflow;
 
     var lists = allocator.alloc(Optional([]const Optional(bool)), n) catch return error.OutOfMemory;
@@ -2814,11 +2814,11 @@ fn writeListColumnByteArray(
     n: usize,
     large: bool,
 ) WriterError!void {
-    const offsets: [*]const i32 = @ptrCast(@alignCast(parent_arr.buffers[1].?));
-    const parent_validity: ?[*]const u8 = if (parent_arr.buffers[0]) |b| @ptrCast(@alignCast(b)) else null;
+    const offsets: [*]align(1) const i32 = @ptrCast(parent_arr.buffers[1].?);
+    const parent_validity: ?[*]const u8 = if (parent_arr.buffers[0]) |b| @ptrCast(b) else null;
 
-    const child_data: [*]const u8 = if (child_arr.buffers[2]) |b| @ptrCast(@alignCast(b)) else @as([*]const u8, &[_]u8{});
-    const child_validity: ?[*]const u8 = if (child_arr.buffers[0]) |b| @ptrCast(@alignCast(b)) else null;
+    const child_data: [*]const u8 = if (child_arr.buffers[2]) |b| @ptrCast(b) else @as([*]const u8, &[_]u8{});
+    const child_validity: ?[*]const u8 = if (child_arr.buffers[0]) |b| @ptrCast(b) else null;
     const child_len = safe.castTo(usize, child_arr.length) catch return error.IntegerOverflow;
 
     var lists = allocator.alloc(Optional([]const Optional([]const u8)), n) catch return error.OutOfMemory;
@@ -2846,12 +2846,12 @@ fn writeListColumnByteArray(
                     elems[j] = .null_value;
                 } else {
                     if (large) {
-                        const child_offsets_64: [*]const i64 = @ptrCast(@alignCast(child_arr.buffers[1].?));
+                        const child_offsets_64: [*]align(1) const i64 = @ptrCast(child_arr.buffers[1].?);
                         const s = safe.castTo(usize, child_offsets_64[idx]) catch return error.IntegerOverflow;
                         const e = safe.castTo(usize, child_offsets_64[idx + 1]) catch return error.IntegerOverflow;
                         elems[j] = .{ .value = child_data[s..e] };
                     } else {
-                        const child_offsets_32: [*]const i32 = @ptrCast(@alignCast(child_arr.buffers[1].?));
+                        const child_offsets_32: [*]align(1) const i32 = @ptrCast(child_arr.buffers[1].?);
                         const s = safe.castTo(usize, child_offsets_32[idx]) catch return error.IntegerOverflow;
                         const e = safe.castTo(usize, child_offsets_32[idx + 1]) catch return error.IntegerOverflow;
                         elems[j] = .{ .value = child_data[s..e] };
@@ -2875,10 +2875,10 @@ fn writeListColumnWidened(
     child_arr: ArrowArray,
     n: usize,
 ) WriterError!void {
-    const offsets: [*]const i32 = @ptrCast(@alignCast(parent_arr.buffers[1].?));
-    const parent_validity: ?[*]const u8 = if (parent_arr.buffers[0]) |b| @ptrCast(@alignCast(b)) else null;
-    const child_data: [*]const Src = @ptrCast(@alignCast(child_arr.buffers[1].?));
-    const child_validity: ?[*]const u8 = if (child_arr.buffers[0]) |b| @ptrCast(@alignCast(b)) else null;
+    const offsets: [*]align(1) const i32 = @ptrCast(parent_arr.buffers[1].?);
+    const parent_validity: ?[*]const u8 = if (parent_arr.buffers[0]) |b| @ptrCast(b) else null;
+    const child_data: [*]align(1) const Src = @ptrCast(child_arr.buffers[1].?);
+    const child_validity: ?[*]const u8 = if (child_arr.buffers[0]) |b| @ptrCast(b) else null;
     const child_len = safe.castTo(usize, child_arr.length) catch return error.IntegerOverflow;
 
     var lists = allocator.alloc(Optional([]const Optional(Dst)), n) catch return error.OutOfMemory;
@@ -2924,10 +2924,10 @@ fn writeListColumnFixedByteArray(
     n: usize,
     type_len: usize,
 ) WriterError!void {
-    const offsets: [*]const i32 = @ptrCast(@alignCast(parent_arr.buffers[1].?));
-    const parent_validity: ?[*]const u8 = if (parent_arr.buffers[0]) |b| @ptrCast(@alignCast(b)) else null;
-    const child_data: [*]const u8 = @ptrCast(@alignCast(child_arr.buffers[1].?));
-    const child_validity: ?[*]const u8 = if (child_arr.buffers[0]) |b| @ptrCast(@alignCast(b)) else null;
+    const offsets: [*]align(1) const i32 = @ptrCast(parent_arr.buffers[1].?);
+    const parent_validity: ?[*]const u8 = if (parent_arr.buffers[0]) |b| @ptrCast(b) else null;
+    const child_data: [*]const u8 = @ptrCast(child_arr.buffers[1].?);
+    const child_validity: ?[*]const u8 = if (child_arr.buffers[0]) |b| @ptrCast(b) else null;
     const child_len = safe.castTo(usize, child_arr.length) catch return error.IntegerOverflow;
 
     var lists = allocator.alloc(Optional([]const Optional([]const u8)), n) catch return error.OutOfMemory;
@@ -2972,10 +2972,10 @@ fn writeListColumnDate64(
     child_arr: ArrowArray,
     n: usize,
 ) WriterError!void {
-    const offsets: [*]const i32 = @ptrCast(@alignCast(parent_arr.buffers[1].?));
-    const parent_validity: ?[*]const u8 = if (parent_arr.buffers[0]) |b| @ptrCast(@alignCast(b)) else null;
-    const child_data: [*]const i64 = @ptrCast(@alignCast(child_arr.buffers[1].?));
-    const child_validity: ?[*]const u8 = if (child_arr.buffers[0]) |b| @ptrCast(@alignCast(b)) else null;
+    const offsets: [*]align(1) const i32 = @ptrCast(parent_arr.buffers[1].?);
+    const parent_validity: ?[*]const u8 = if (parent_arr.buffers[0]) |b| @ptrCast(b) else null;
+    const child_data: [*]align(1) const i64 = @ptrCast(child_arr.buffers[1].?);
+    const child_validity: ?[*]const u8 = if (child_arr.buffers[0]) |b| @ptrCast(b) else null;
     const child_len = safe.castTo(usize, child_arr.length) catch return error.IntegerOverflow;
 
     const millis_per_day: i64 = 86_400_000;
@@ -3022,10 +3022,10 @@ fn writeListColumnTime32Seconds(
     child_arr: ArrowArray,
     n: usize,
 ) WriterError!void {
-    const offsets: [*]const i32 = @ptrCast(@alignCast(parent_arr.buffers[1].?));
-    const parent_validity: ?[*]const u8 = if (parent_arr.buffers[0]) |b| @ptrCast(@alignCast(b)) else null;
-    const child_data: [*]const i32 = @ptrCast(@alignCast(child_arr.buffers[1].?));
-    const child_validity: ?[*]const u8 = if (child_arr.buffers[0]) |b| @ptrCast(@alignCast(b)) else null;
+    const offsets: [*]align(1) const i32 = @ptrCast(parent_arr.buffers[1].?);
+    const parent_validity: ?[*]const u8 = if (parent_arr.buffers[0]) |b| @ptrCast(b) else null;
+    const child_data: [*]align(1) const i32 = @ptrCast(child_arr.buffers[1].?);
+    const child_validity: ?[*]const u8 = if (child_arr.buffers[0]) |b| @ptrCast(b) else null;
     const child_len = safe.castTo(usize, child_arr.length) catch return error.IntegerOverflow;
 
     var lists = allocator.alloc(Optional([]const Optional(i32)), n) catch return error.OutOfMemory;
@@ -3070,10 +3070,10 @@ fn writeListColumnTimestampSeconds(
     child_arr: ArrowArray,
     n: usize,
 ) WriterError!void {
-    const offsets: [*]const i32 = @ptrCast(@alignCast(parent_arr.buffers[1].?));
-    const parent_validity: ?[*]const u8 = if (parent_arr.buffers[0]) |b| @ptrCast(@alignCast(b)) else null;
-    const child_data: [*]const i64 = @ptrCast(@alignCast(child_arr.buffers[1].?));
-    const child_validity: ?[*]const u8 = if (child_arr.buffers[0]) |b| @ptrCast(@alignCast(b)) else null;
+    const offsets: [*]align(1) const i32 = @ptrCast(parent_arr.buffers[1].?);
+    const parent_validity: ?[*]const u8 = if (parent_arr.buffers[0]) |b| @ptrCast(b) else null;
+    const child_data: [*]align(1) const i64 = @ptrCast(child_arr.buffers[1].?);
+    const child_validity: ?[*]const u8 = if (child_arr.buffers[0]) |b| @ptrCast(b) else null;
     const child_len = safe.castTo(usize, child_arr.length) catch return error.IntegerOverflow;
 
     var lists = allocator.alloc(Optional([]const Optional(i64)), n) catch return error.OutOfMemory;
@@ -3145,7 +3145,7 @@ fn writeStructFromArrow(
     const sch_children: [*]*ArrowSchema = sch.children orelse return error.TypeMismatch;
 
     // Compute parent nulls from struct validity
-    const parent_validity: ?[*]const u8 = if (arr.buffers[0]) |b| @ptrCast(@alignCast(b)) else null;
+    const parent_validity: ?[*]const u8 = if (arr.buffers[0]) |b| @ptrCast(b) else null;
     var parent_nulls = allocator.alloc(bool, n) catch return error.OutOfMemory;
     defer allocator.free(parent_nulls);
     for (0..n) |i| {
@@ -3244,8 +3244,8 @@ fn writeStructFieldTyped(
     n: usize,
     parent_nulls: []const bool,
 ) WriterError!void {
-    const data: [*]const T = @ptrCast(@alignCast(child_arr.buffers[1].?));
-    const validity: ?[*]const u8 = if (child_arr.buffers[0]) |b| @ptrCast(@alignCast(b)) else null;
+    const data: [*]align(1) const T = @ptrCast(child_arr.buffers[1].?);
+    const validity: ?[*]const u8 = if (child_arr.buffers[0]) |b| @ptrCast(b) else null;
 
     var values = allocator.alloc(?T, n) catch return error.OutOfMemory;
     defer allocator.free(values);
@@ -3271,14 +3271,14 @@ fn writeStructFieldByteArray(
     parent_nulls: []const bool,
     large: bool,
 ) WriterError!void {
-    const str_data: [*]const u8 = if (child_arr.buffers[2]) |b| @ptrCast(@alignCast(b)) else @as([*]const u8, &[_]u8{});
-    const validity: ?[*]const u8 = if (child_arr.buffers[0]) |b| @ptrCast(@alignCast(b)) else null;
+    const str_data: [*]const u8 = if (child_arr.buffers[2]) |b| @ptrCast(b) else @as([*]const u8, &[_]u8{});
+    const validity: ?[*]const u8 = if (child_arr.buffers[0]) |b| @ptrCast(b) else null;
 
     var values = allocator.alloc(?[]const u8, n) catch return error.OutOfMemory;
     defer allocator.free(values);
 
     if (large) {
-        const str_offsets: [*]const i64 = @ptrCast(@alignCast(child_arr.buffers[1].?));
+        const str_offsets: [*]align(1) const i64 = @ptrCast(child_arr.buffers[1].?);
         for (0..n) |i| {
             if (validity != null and !arrow.getBit(validity.?[0 .. (n + 7) / 8], i)) {
                 values[i] = null;
@@ -3289,7 +3289,7 @@ fn writeStructFieldByteArray(
             }
         }
     } else {
-        const str_offsets: [*]const i32 = @ptrCast(@alignCast(child_arr.buffers[1].?));
+        const str_offsets: [*]align(1) const i32 = @ptrCast(child_arr.buffers[1].?);
         for (0..n) |i| {
             if (validity != null and !arrow.getBit(validity.?[0 .. (n + 7) / 8], i)) {
                 values[i] = null;
@@ -3313,8 +3313,8 @@ fn writeStructFieldBool(
     n: usize,
     parent_nulls: []const bool,
 ) WriterError!void {
-    const data_bits: [*]const u8 = @ptrCast(@alignCast(child_arr.buffers[1].?));
-    const validity: ?[*]const u8 = if (child_arr.buffers[0]) |b| @ptrCast(@alignCast(b)) else null;
+    const data_bits: [*]const u8 = @ptrCast(child_arr.buffers[1].?);
+    const validity: ?[*]const u8 = if (child_arr.buffers[0]) |b| @ptrCast(b) else null;
 
     var values = allocator.alloc(?bool, n) catch return error.OutOfMemory;
     defer allocator.free(values);
@@ -3341,8 +3341,8 @@ fn writeStructFieldWidened(
     n: usize,
     parent_nulls: []const bool,
 ) WriterError!void {
-    const data: [*]const Src = @ptrCast(@alignCast(child_arr.buffers[1].?));
-    const validity: ?[*]const u8 = if (child_arr.buffers[0]) |b| @ptrCast(@alignCast(b)) else null;
+    const data: [*]align(1) const Src = @ptrCast(child_arr.buffers[1].?);
+    const validity: ?[*]const u8 = if (child_arr.buffers[0]) |b| @ptrCast(b) else null;
 
     var values = allocator.alloc(?Dst, n) catch return error.OutOfMemory;
     defer allocator.free(values);
@@ -3368,8 +3368,8 @@ fn writeStructFieldFixedByteArray(
     parent_nulls: []const bool,
     type_len: usize,
 ) WriterError!void {
-    const data: [*]const u8 = @ptrCast(@alignCast(child_arr.buffers[1].?));
-    const validity: ?[*]const u8 = if (child_arr.buffers[0]) |b| @ptrCast(@alignCast(b)) else null;
+    const data: [*]const u8 = @ptrCast(child_arr.buffers[1].?);
+    const validity: ?[*]const u8 = if (child_arr.buffers[0]) |b| @ptrCast(b) else null;
 
     var values = allocator.alloc(?[]const u8, n) catch return error.OutOfMemory;
     defer allocator.free(values);
@@ -3394,8 +3394,8 @@ fn writeStructFieldDate64(
     n: usize,
     parent_nulls: []const bool,
 ) WriterError!void {
-    const data: [*]const i64 = @ptrCast(@alignCast(child_arr.buffers[1].?));
-    const validity: ?[*]const u8 = if (child_arr.buffers[0]) |b| @ptrCast(@alignCast(b)) else null;
+    const data: [*]align(1) const i64 = @ptrCast(child_arr.buffers[1].?);
+    const validity: ?[*]const u8 = if (child_arr.buffers[0]) |b| @ptrCast(b) else null;
 
     var values = allocator.alloc(?i32, n) catch return error.OutOfMemory;
     defer allocator.free(values);
@@ -3422,8 +3422,8 @@ fn writeStructFieldTime32Seconds(
     n: usize,
     parent_nulls: []const bool,
 ) WriterError!void {
-    const data: [*]const i32 = @ptrCast(@alignCast(child_arr.buffers[1].?));
-    const validity: ?[*]const u8 = if (child_arr.buffers[0]) |b| @ptrCast(@alignCast(b)) else null;
+    const data: [*]align(1) const i32 = @ptrCast(child_arr.buffers[1].?);
+    const validity: ?[*]const u8 = if (child_arr.buffers[0]) |b| @ptrCast(b) else null;
 
     var values = allocator.alloc(?i32, n) catch return error.OutOfMemory;
     defer allocator.free(values);
@@ -3448,8 +3448,8 @@ fn writeStructFieldTimestampSeconds(
     n: usize,
     parent_nulls: []const bool,
 ) WriterError!void {
-    const data: [*]const i64 = @ptrCast(@alignCast(child_arr.buffers[1].?));
-    const validity: ?[*]const u8 = if (child_arr.buffers[0]) |b| @ptrCast(@alignCast(b)) else null;
+    const data: [*]align(1) const i64 = @ptrCast(child_arr.buffers[1].?);
+    const validity: ?[*]const u8 = if (child_arr.buffers[0]) |b| @ptrCast(b) else null;
 
     var values = allocator.alloc(?i64, n) catch return error.OutOfMemory;
     defer allocator.free(values);
@@ -3657,8 +3657,8 @@ fn writeMapColumnTyped(
     val_arr: ArrowArray,
 ) WriterError!void {
     const n = safe.castTo(usize, parent_arr.length) catch return error.IntegerOverflow;
-    const offsets: [*]const i32 = @ptrCast(@alignCast(parent_arr.buffers[1].?));
-    const parent_validity: ?[*]const u8 = if (parent_arr.buffers[0]) |b| @ptrCast(@alignCast(b)) else null;
+    const offsets: [*]align(1) const i32 = @ptrCast(parent_arr.buffers[1].?);
+    const parent_validity: ?[*]const u8 = if (parent_arr.buffers[0]) |b| @ptrCast(b) else null;
 
     var maps = allocator.alloc(Optional([]const MapEntry(K, V)), n) catch return error.OutOfMemory;
     defer {
@@ -3700,10 +3700,10 @@ fn writeMapColumnBool(
     val_arr: ArrowArray,
 ) WriterError!void {
     const n = safe.castTo(usize, parent_arr.length) catch return error.IntegerOverflow;
-    const offsets: [*]const i32 = @ptrCast(@alignCast(parent_arr.buffers[1].?));
-    const parent_validity: ?[*]const u8 = if (parent_arr.buffers[0]) |b| @ptrCast(@alignCast(b)) else null;
-    const val_bits: [*]const u8 = @ptrCast(@alignCast(val_arr.buffers[1].?));
-    const val_validity: ?[*]const u8 = if (val_arr.buffers[0]) |b| @ptrCast(@alignCast(b)) else null;
+    const offsets: [*]align(1) const i32 = @ptrCast(parent_arr.buffers[1].?);
+    const parent_validity: ?[*]const u8 = if (parent_arr.buffers[0]) |b| @ptrCast(b) else null;
+    const val_bits: [*]const u8 = @ptrCast(val_arr.buffers[1].?);
+    const val_validity: ?[*]const u8 = if (val_arr.buffers[0]) |b| @ptrCast(b) else null;
     const val_len = safe.castTo(usize, val_arr.length) catch return error.IntegerOverflow;
 
     var maps = allocator.alloc(Optional([]const MapEntry(K, bool)), n) catch return error.OutOfMemory;
@@ -3743,19 +3743,19 @@ fn writeMapColumnBool(
 
 fn readArrowValue(comptime T: type, arr: ArrowArray, idx: usize) error{IntegerOverflow}!T {
     if (T == []const u8) {
-        const str_offsets: [*]const i32 = @ptrCast(@alignCast(arr.buffers[1].?));
-        const str_data: [*]const u8 = if (arr.buffers[2]) |b| @ptrCast(@alignCast(b)) else @as([*]const u8, &[_]u8{});
+        const str_offsets: [*]align(1) const i32 = @ptrCast(arr.buffers[1].?);
+        const str_data: [*]const u8 = if (arr.buffers[2]) |b| @ptrCast(b) else @as([*]const u8, &[_]u8{});
         const s: usize = try safe.cast(str_offsets[idx]);
         const e: usize = try safe.cast(str_offsets[idx + 1]);
         return str_data[s..e];
     } else {
-        const data: [*]const T = @ptrCast(@alignCast(arr.buffers[1].?));
+        const data: [*]align(1) const T = @ptrCast(arr.buffers[1].?);
         return data[idx];
     }
 }
 
 fn readArrowNullableValue(comptime T: type, arr: ArrowArray, idx: usize) error{IntegerOverflow}!Optional(T) {
-    const validity: ?[*]const u8 = if (arr.buffers[0]) |b| @ptrCast(@alignCast(b)) else null;
+    const validity: ?[*]const u8 = if (arr.buffers[0]) |b| @ptrCast(b) else null;
     const len = safe.castTo(usize, arr.length) catch return .null_value;
     if (validity) |v| {
         if (!arrow.getBit(v[0 .. (len + 7) / 8], idx)) return .null_value;
@@ -3771,10 +3771,10 @@ fn writeTypedColumn(
     arr: ArrowArray,
     n: usize,
 ) WriterError!void {
-    const validity: ?[*]const u8 = if (arr.buffers[0]) |b| @ptrCast(@alignCast(b)) else null;
+    const validity: ?[*]const u8 = if (arr.buffers[0]) |b| @ptrCast(b) else null;
 
     if (T == bool) {
-        const data_bits: [*]const u8 = @ptrCast(@alignCast(arr.buffers[1].?));
+        const data_bits: [*]const u8 = @ptrCast(arr.buffers[1].?);
         var optionals = allocator.alloc(Optional(bool), n) catch return error.OutOfMemory;
         defer allocator.free(optionals);
         for (0..n) |i| {
@@ -3788,7 +3788,7 @@ fn writeTypedColumn(
         }
         try writer.writeColumnOptional(bool, col_idx, optionals);
     } else {
-        const data: [*]const T = @ptrCast(@alignCast(arr.buffers[1].?));
+        const data: [*]align(1) const T = @ptrCast(arr.buffers[1].?);
         var optionals = allocator.alloc(Optional(T), n) catch return error.OutOfMemory;
         defer allocator.free(optionals);
         for (0..n) |i| {
@@ -3812,8 +3812,8 @@ fn writeWidenedColumn(
     arr: ArrowArray,
     n: usize,
 ) WriterError!void {
-    const validity: ?[*]const u8 = if (arr.buffers[0]) |b| @ptrCast(@alignCast(b)) else null;
-    const data: [*]const Src = @ptrCast(@alignCast(arr.buffers[1].?));
+    const validity: ?[*]const u8 = if (arr.buffers[0]) |b| @ptrCast(b) else null;
+    const data: [*]align(1) const Src = @ptrCast(arr.buffers[1].?);
     var optionals = allocator.alloc(Optional(Dst), n) catch return error.OutOfMemory;
     defer allocator.free(optionals);
     for (0..n) |i| {
@@ -3834,14 +3834,14 @@ fn writeByteArrayColumn(
     n: usize,
     large: bool,
 ) WriterError!void {
-    const validity: ?[*]const u8 = if (arr.buffers[0]) |b| @ptrCast(@alignCast(b)) else null;
-    const data: [*]const u8 = if (arr.buffers[2]) |b| @ptrCast(@alignCast(b)) else @as([*]const u8, &[_]u8{});
+    const validity: ?[*]const u8 = if (arr.buffers[0]) |b| @ptrCast(b) else null;
+    const data: [*]const u8 = if (arr.buffers[2]) |b| @ptrCast(b) else @as([*]const u8, &[_]u8{});
 
     var optionals = allocator.alloc(Optional([]const u8), n) catch return error.OutOfMemory;
     defer allocator.free(optionals);
 
     if (large) {
-        const offsets: [*]const i64 = @ptrCast(@alignCast(arr.buffers[1].?));
+        const offsets: [*]align(1) const i64 = @ptrCast(arr.buffers[1].?);
         for (0..n) |i| {
             if (validity != null and !arrow.getBit(validity.?[0 .. (n + 7) / 8], i)) {
                 optionals[i] = .null_value;
@@ -3852,7 +3852,7 @@ fn writeByteArrayColumn(
             }
         }
     } else {
-        const offsets: [*]const i32 = @ptrCast(@alignCast(arr.buffers[1].?));
+        const offsets: [*]align(1) const i32 = @ptrCast(arr.buffers[1].?);
         for (0..n) |i| {
             if (validity != null and !arrow.getBit(validity.?[0 .. (n + 7) / 8], i)) {
                 optionals[i] = .null_value;
@@ -3874,8 +3874,8 @@ fn writeDate64Column(
     arr: ArrowArray,
     n: usize,
 ) WriterError!void {
-    const validity: ?[*]const u8 = if (arr.buffers[0]) |b| @ptrCast(@alignCast(b)) else null;
-    const data: [*]const i64 = @ptrCast(@alignCast(arr.buffers[1].?));
+    const validity: ?[*]const u8 = if (arr.buffers[0]) |b| @ptrCast(b) else null;
+    const data: [*]align(1) const i64 = @ptrCast(arr.buffers[1].?);
 
     var optionals = allocator.alloc(Optional(i32), n) catch return error.OutOfMemory;
     defer allocator.free(optionals);
@@ -3900,8 +3900,8 @@ fn writeTime32SecondsColumn(
     arr: ArrowArray,
     n: usize,
 ) WriterError!void {
-    const validity: ?[*]const u8 = if (arr.buffers[0]) |b| @ptrCast(@alignCast(b)) else null;
-    const data: [*]const i32 = @ptrCast(@alignCast(arr.buffers[1].?));
+    const validity: ?[*]const u8 = if (arr.buffers[0]) |b| @ptrCast(b) else null;
+    const data: [*]align(1) const i32 = @ptrCast(arr.buffers[1].?);
 
     var optionals = allocator.alloc(Optional(i32), n) catch return error.OutOfMemory;
     defer allocator.free(optionals);
@@ -3924,8 +3924,8 @@ fn writeTimestampSecondsColumn(
     arr: ArrowArray,
     n: usize,
 ) WriterError!void {
-    const validity: ?[*]const u8 = if (arr.buffers[0]) |b| @ptrCast(@alignCast(b)) else null;
-    const data: [*]const i64 = @ptrCast(@alignCast(arr.buffers[1].?));
+    const validity: ?[*]const u8 = if (arr.buffers[0]) |b| @ptrCast(b) else null;
+    const data: [*]align(1) const i64 = @ptrCast(arr.buffers[1].?);
 
     var optionals = allocator.alloc(Optional(i64), n) catch return error.OutOfMemory;
     defer allocator.free(optionals);
@@ -3949,8 +3949,8 @@ fn writeFixedByteArrayColumn(
     n: usize,
     type_len: usize,
 ) WriterError!void {
-    const validity: ?[*]const u8 = if (arr.buffers[0]) |b| @ptrCast(@alignCast(b)) else null;
-    const data: [*]const u8 = @ptrCast(@alignCast(arr.buffers[1].?));
+    const validity: ?[*]const u8 = if (arr.buffers[0]) |b| @ptrCast(b) else null;
+    const data: [*]const u8 = @ptrCast(arr.buffers[1].?);
 
     var optionals = allocator.alloc(Optional([]const u8), n) catch return error.OutOfMemory;
     defer allocator.free(optionals);
@@ -6619,4 +6619,63 @@ test "validateArrow rejects offsets and lengths outside the array" {
 
     // A fixed-size binary width of -1.
     try std.testing.expectError(error.InvalidSchema, ArrowFormatInfo.parse("w:-1"));
+}
+
+test "Arrow write: buffers at addresses not aligned to the element size" {
+    const allocator = std.testing.allocator;
+
+    // The Arrow C Data Interface recommends aligned buffers but does not require them. Each
+    // buffer here starts one byte past an 8-byte boundary.
+    var ints: [1 + 3 * 8]u8 align(8) = @splat(0);
+    for ([_]i64{ 100, -200, 300 }, 0..) |v, i| std.mem.writeInt(i64, ints[1 + i * 8 ..][0..8], v, native_endian);
+    var str_offsets: [1 + 4 * 4]u8 align(8) = @splat(0);
+    for ([_]i32{ 0, 2, 2, 5 }, 0..) |v, i| std.mem.writeInt(i32, str_offsets[1 + i * 4 ..][0..4], v, native_endian);
+    var list_offsets: [1 + 4 * 4]u8 align(8) = @splat(0);
+    for ([_]i32{ 0, 2, 2, 3 }, 0..) |v, i| std.mem.writeInt(i32, list_offsets[1 + i * 4 ..][0..4], v, native_endian);
+    var elems: [1 + 3 * 4]u8 align(8) = @splat(0);
+    for ([_]i32{ 7, 8, -9 }, 0..) |v, i| std.mem.writeInt(i32, elems[1 + i * 4 ..][0..4], v, native_endian);
+    var chars = "abcde".*;
+
+    var int_buffers = [_]?*anyopaque{ null, @ptrCast(&ints[1]) };
+    const int_arr = ArrowArray{ .length = 3, .null_count = 0, .offset = 0, .n_buffers = 2, .n_children = 0, .buffers = &int_buffers, .children = null, .dictionary = null, .release = null, .private_data = null };
+    var str_buffers = [_]?*anyopaque{ null, @ptrCast(&str_offsets[1]), @ptrCast(&chars) };
+    const str_arr = ArrowArray{ .length = 3, .null_count = 0, .offset = 0, .n_buffers = 3, .n_children = 0, .buffers = &str_buffers, .children = null, .dictionary = null, .release = null, .private_data = null };
+    var elem_buffers = [_]?*anyopaque{ null, @ptrCast(&elems[1]) };
+    var elem_arr = ArrowArray{ .length = 3, .null_count = 0, .offset = 0, .n_buffers = 2, .n_children = 0, .buffers = &elem_buffers, .children = null, .dictionary = null, .release = null, .private_data = null };
+    var list_buffers = [_]?*anyopaque{ null, @ptrCast(&list_offsets[1]) };
+    var list_children = [_]*ArrowArray{&elem_arr};
+    const list_arr = ArrowArray{ .length = 3, .null_count = 0, .offset = 0, .n_buffers = 2, .n_children = 1, .buffers = &list_buffers, .children = &list_children, .dictionary = null, .release = null, .private_data = null };
+
+    var int_sch = testLeafSchema("l", "n");
+    var str_sch = testLeafSchema("u", "s");
+    var elem_sch = testLeafSchema("i", "element");
+    var list_sch_children = [_]*ArrowSchema{&elem_sch};
+    var list_sch = ArrowSchema{ .format = "+l", .name = "items", .metadata = null, .flags = arrow.ARROW_FLAG_NULLABLE, .n_children = 1, .children = &list_sch_children, .dictionary = null, .release = null, .private_data = null };
+    var root_children = [_]*ArrowSchema{ &int_sch, &str_sch, &list_sch };
+    const root = ArrowSchema{ .format = "+s", .name = "", .metadata = null, .flags = 0, .n_children = 3, .children = &root_children, .dictionary = null, .release = null, .private_data = null };
+
+    const col_defs = try importSchemaFromArrow(allocator, &root);
+    defer freeImportedColumnDefs(allocator, col_defs);
+    var writer = try api_writer_mod.writeToBuffer(allocator, col_defs);
+    try writeRowGroupFromArrow(&writer, allocator, &.{ int_arr, str_arr, list_arr }, &.{ int_sch, str_sch, list_sch });
+    try writer.close();
+    const buf = try writer.toOwnedSlice();
+    defer allocator.free(buf);
+    writer.deinit();
+
+    var dr = try api_reader_mod.openBufferDynamic(allocator, buf, .{});
+    defer dr.deinit();
+    var result = try readColumns(allocator, dr.getSource(), dr.metadata, 0, .{});
+    defer result.deinit();
+
+    const read_ints: [*]const i64 = @ptrCast(@alignCast(result.arrays[0].buffers[1].?));
+    try std.testing.expectEqualSlices(i64, &.{ 100, -200, 300 }, read_ints[0..3]);
+    const read_str_offsets: [*]const i32 = @ptrCast(@alignCast(result.arrays[1].buffers[1].?));
+    try std.testing.expectEqualSlices(i32, &.{ 0, 2, 2, 5 }, read_str_offsets[0..4]);
+    const read_chars: [*]const u8 = @ptrCast(result.arrays[1].buffers[2].?);
+    try std.testing.expectEqualStrings("abcde", read_chars[0..5]);
+    const read_list_offsets: [*]const i32 = @ptrCast(@alignCast(result.arrays[2].buffers[1].?));
+    try std.testing.expectEqualSlices(i32, &.{ 0, 2, 2, 3 }, read_list_offsets[0..4]);
+    const read_elems: [*]const i32 = @ptrCast(@alignCast(result.arrays[2].children.?[0].buffers[1].?));
+    try std.testing.expectEqualSlices(i32, &.{ 7, 8, -9 }, read_elems[0..3]);
 }
