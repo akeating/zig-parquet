@@ -705,7 +705,7 @@ pub fn writeColumnChunkFixedByteArrayOptionalWithEncoding(
 ) ColumnWriteError!ColumnChunkResult {
     if (fixed_len == 0) return error.InvalidFixedLength;
     const values_per_page = if (max_page_size) |mps| @max(1, mps / fixed_len) else values.len;
-    return writeFlatChunk([]const u8, allocator, output, path_in_schema, values, .fixed_len_byte_array, fixed_len, is_optional, start_offset, codec, value_encoding, values_per_page, write_page_checksum, page_index_builder);
+    return writeFlatChunk([]const u8, allocator, output, path_in_schema, values, .fixed_len_byte_array, fixed_len, is_optional, start_offset, codec, value_encoding, .{ .values = values_per_page }, write_page_checksum, page_index_builder);
 }
 
 // =============================================================================
@@ -960,12 +960,14 @@ pub fn writeColumnChunkOptionalWithEncoding(
     // PLAIN encodes a boolean in one bit.
     const value_bits: usize = if (T == bool) 1 else @bitSizeOf(T);
     const values_per_page = if (max_page_size) |mps| @max(1, (mps *| 8) / value_bits) else values.len;
-    return writeFlatChunk(T, allocator, output, path_in_schema, values, comptime typeToPhysicalType(T), 0, is_optional, start_offset, codec, value_encoding, values_per_page, write_page_checksum, page_index_builder);
+    return writeFlatChunk(T, allocator, output, path_in_schema, values, comptime typeToPhysicalType(T), 0, is_optional, start_offset, codec, value_encoding, .{ .values = values_per_page }, write_page_checksum, page_index_builder);
 }
 
 /// Write a byte array column chunk with Optional values and a specific encoding.
-/// With `max_page_size`, a data page holds `max_page_size / 100` values (at least one); without
-/// it, the chunk is one page.
+/// With `max_page_size`, a page ends before the first value at which its values reach
+/// `max_page_size` bytes in PLAIN form (4 length bytes and the bytes of each non-null value),
+/// as `column_write_values` cuts the pages of nested columns; without it, the chunk is one
+/// page.
 /// is_optional: true if column is optional in schema (writes def levels), false for required columns.
 /// page_index_builder (optional) receives one entry per data page.
 pub fn writeColumnChunkByteArrayOptionalWithEncoding(
@@ -981,10 +983,8 @@ pub fn writeColumnChunkByteArrayOptionalWithEncoding(
     write_page_checksum: bool,
     page_index_builder: ?*page_index_writer.PageIndexBuilder,
 ) ColumnWriteError!ColumnChunkResult {
-    // Pages are sized for an average value of 100 bytes.
-    const avg_value_size = 100;
-    const values_per_page = if (max_page_size) |mps| @max(1, mps / avg_value_size) else values.len;
-    return writeFlatChunk([]const u8, allocator, output, path_in_schema, values, .byte_array, 0, is_optional, start_offset, codec, value_encoding, values_per_page, write_page_checksum, page_index_builder);
+    const limit: PageLimit = if (max_page_size) |mps| .{ .plain_bytes = mps } else .{ .values = values.len };
+    return writeFlatChunk([]const u8, allocator, output, path_in_schema, values, .byte_array, 0, is_optional, start_offset, codec, value_encoding, limit, write_page_checksum, page_index_builder);
 }
 
 /// Statistics of a flat column's values, including the null count.
@@ -1011,8 +1011,37 @@ fn mapPageWriteError(e: page_writer.PageWriteError) ColumnWriteError {
     };
 }
 
-/// Writes a flat column chunk as data pages of at most `values_per_page` values (one row per
-/// value) and records each page in `page_index_builder`. `fixed_len` is the value length of a
+/// Where `writeFlatChunk` ends a data page.
+const PageLimit = union(enum) {
+    /// At most this many values.
+    values: usize,
+    /// Before the first value at which the page's byte-array values reach this many bytes
+    /// in PLAIN form; a page holds at least one value.
+    plain_bytes: usize,
+
+    /// The end of the page that starts at `start`.
+    fn pageEnd(self: PageLimit, comptime T: type, values: []const Optional(T), start: usize) usize {
+        switch (self) {
+            .values => |n| return start + @min(@max(n, 1), values.len - start),
+            .plain_bytes => |limit| {
+                if (T != []const u8) unreachable; // only byte-array columns use this limit
+                var bytes: usize = 0;
+                var end = start;
+                while (end < values.len) : (end += 1) {
+                    if (end > start and bytes >= limit) break;
+                    switch (values[end]) {
+                        .value => |v| bytes +|= 4 + v.len,
+                        .null_value => {},
+                    }
+                }
+                return end;
+            },
+        }
+    }
+};
+
+/// Writes a flat column chunk as data pages ended by `limit` (one row per value) and records
+/// each page in `page_index_builder`. `fixed_len` is the value length of a
 /// FIXED_LEN_BYTE_ARRAY column and 0 for every other type.
 fn writeFlatChunk(
     comptime T: type,
@@ -1026,7 +1055,7 @@ fn writeFlatChunk(
     start_offset: i64,
     codec: format.CompressionCodec,
     value_encoding: format.Encoding,
-    values_per_page: usize,
+    limit: PageLimit,
     write_page_checksum: bool,
     page_index_builder: ?*page_index_writer.PageIndexBuilder,
 ) ColumnWriteError!ColumnChunkResult {
@@ -1039,7 +1068,7 @@ fn writeFlatChunk(
     var offset: usize = 0;
 
     while (offset < values.len) {
-        const chunk_end = offset + @min(@max(values_per_page, 1), values.len - offset);
+        const chunk_end = limit.pageEnd(T, values, offset);
         const chunk = values[offset..chunk_end];
 
         var page_result = (if (T == []const u8 and physical_type == .fixed_len_byte_array)
@@ -1464,3 +1493,33 @@ test "compressed column tracks uncompressed vs compressed sizes separately" {
     try std.testing.expect(result.metadata.total_uncompressed_size != result.metadata.total_compressed_size);
 }
 
+
+test "byte array pages end once their values reach max_page_size bytes in PLAIN form" {
+    const allocator = std.testing.allocator;
+
+    // 40 values of 6 bytes (10 in PLAIN form), then 10 of 96 bytes (100), then nulls (0).
+    var long_value: [96]u8 = undefined;
+    @memset(&long_value, 'x');
+    var values: [60]Optional([]const u8) = undefined;
+    for (values[0..40]) |*v| v.* = .{ .value = "abcdef" };
+    for (values[40..50]) |*v| v.* = .{ .value = &long_value };
+    for (values[50..60]) |*v| v.* = .null_value;
+
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    var pib = page_index_writer.PageIndexBuilder.init(allocator, .byte_array, true);
+    defer pib.deinit();
+    var result = try writeColumnChunkByteArrayOptionalWithEncoding(allocator, &aw.writer, &.{"s"}, &values, true, 4, .uncompressed, .plain, 200, false, &pib);
+    defer result.deinit(allocator);
+
+    // A page takes values until they reach 200 bytes: 20 short values twice, 2 long values
+    // five times, then the nulls, which add no bytes.
+    const want = [_]i64{ 20, 20, 2, 2, 2, 2, 2, 10 };
+    try std.testing.expectEqual(want.len, pib.entries.items.len);
+    var first_row: i64 = 0;
+    for (pib.entries.items, want) |entry, rows| {
+        try std.testing.expectEqual(first_row, entry.first_row_index);
+        try std.testing.expectEqual(rows, entry.num_rows);
+        first_row += rows;
+    }
+}
