@@ -655,9 +655,26 @@ pub fn decompress(allocator: std.mem.Allocator, compressed: []const u8, uncompre
     var in: std.Io.Reader = .fixed(compressed);
     var zstd_stream: std.compress.zstd.Decompress = .init(&in, &.{}, .{});
 
-    _ = zstd_stream.reader.streamRemaining(&out.writer) catch return error.DecompressionError;
+    _ = try streamAtMost(&zstd_stream.reader, &out.writer, uncompressed_size);
 
     return out.toOwnedSlice() catch return error.OutOfMemory;
+}
+
+/// Streams `r` into `w` until the end of the stream, or until more than `max` bytes would be
+/// written: then `error.DecompressionError`. A page's output is bounded by its declared
+/// uncompressed size, so a damaged or hostile stream cannot grow it without limit.
+fn streamAtMost(r: *std.Io.Reader, w: *std.Io.Writer, max: usize) Error!usize {
+    var total: usize = 0;
+    while (true) {
+        // One byte past `max` tells a stream that is too long from one that ends at `max`.
+        const room = (max - total) +| 1;
+        const n = r.stream(w, .limited(room)) catch |e| switch (e) {
+            error.EndOfStream => return total,
+            else => return error.DecompressionError,
+        };
+        total += n;
+        if (total > max) return error.DecompressionError;
+    }
 }
 
 // =========================================================================

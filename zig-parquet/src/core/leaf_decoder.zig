@@ -1367,13 +1367,13 @@ const ChunkDecoder = struct {
             },
             .delta_length_byte_array => {
                 if (self.physical != .byte_array) return error.UnsupportedEncoding;
-                var result = delta_length_byte_array.decode(self.allocator, data) catch |e| return mapEncodingError(e);
+                var result = delta_length_byte_array.decode(self.allocator, data, non_null) catch |e| return mapEncodingError(e);
                 defer result.deinit();
                 try self.appendByteValues(b, lv, n, non_null, result.values);
             },
             .delta_byte_array => {
                 if (self.physical != .byte_array and self.physical != .fixed_len_byte_array) return error.UnsupportedEncoding;
-                var result = delta_byte_array.decode(self.allocator, data) catch |e| return mapEncodingError(e);
+                var result = delta_byte_array.decode(self.allocator, data, non_null) catch |e| return mapEncodingError(e);
                 defer result.deinit();
                 try self.appendByteValues(b, lv, n, non_null, result.values);
             },
@@ -1461,9 +1461,9 @@ const ChunkDecoder = struct {
 
     fn appendDeltaInts(self: *ChunkDecoder, comptime T: type, b: *Builder, data: []const u8, levels: ?[]const Level, n: usize, non_null: usize) !void {
         const decoded = (if (T == i32)
-            delta_binary_packed.decodeInt32(self.allocator, data)
+            delta_binary_packed.decodeInt32(self.allocator, data, non_null)
         else
-            delta_binary_packed.decodeInt64(self.allocator, data)) catch |e| return mapEncodingError(e);
+            delta_binary_packed.decodeInt64(self.allocator, data, non_null)) catch |e| return mapEncodingError(e);
         defer self.allocator.free(decoded);
         if (decoded.len < non_null) return error.EndOfData;
         try appendFixedDense(b, @sizeOf(T), levels, n, std.mem.sliceAsBytes(decoded[0..non_null]));

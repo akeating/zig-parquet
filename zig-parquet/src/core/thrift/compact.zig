@@ -142,7 +142,7 @@ pub const CompactReader = struct {
 
         if (delta != 0) {
             // Delta encoded
-            field_id = self.last_field_id + delta;
+            field_id = std.math.add(i16, self.last_field_id, delta) catch return error.InvalidFieldId;
         } else {
             // Full field ID follows
             field_id = try self.readI16();
@@ -170,6 +170,9 @@ pub const CompactReader = struct {
         } else {
             size = size_nibble;
         }
+        // Every element takes at least one byte, so a list cannot hold more elements than
+        // there are bytes left. Callers allocate `size` elements before reading them.
+        if (size > self.data.len - self.pos) return error.ListTooLong;
 
         return .{ .element_type = element_type, .size = size };
     }
@@ -179,8 +182,38 @@ pub const CompactReader = struct {
         self.last_field_id = 0;
     }
 
+    /// Structs, lists, sets and maps nested deeper than this are an error when skipped, so a
+    /// malformed value cannot exhaust the stack.
+    pub const max_skip_depth = 64;
+
+    pub const SkipError = error{
+        EndOfData,
+        IntegerOverflow,
+        InvalidFieldId,
+        InvalidFieldType,
+        InvalidListType,
+        LengthTooLong,
+        ListTooLong,
+        NestingTooDeep,
+        VarIntTooLong,
+    };
+
     /// Skip a value of the given type
-    pub fn skip(self: *Self, t: Type) !void {
+    pub fn skip(self: *Self, t: Type) SkipError!void {
+        return self.skipNested(t, 0);
+    }
+
+    /// Skip an element of a list, set or map: there a boolean is a byte of its own.
+    fn skipElement(self: *Self, t: Type, depth: usize) SkipError!void {
+        if (t == .bool_true or t == .bool_false) {
+            _ = try self.readByte();
+            return;
+        }
+        return self.skipNested(t, depth);
+    }
+
+    fn skipNested(self: *Self, t: Type, depth: usize) SkipError!void {
+        if (depth > max_skip_depth) return error.NestingTooDeep;
         switch (t) {
             .stop => {},
             .bool_true, .bool_false => {},
@@ -195,27 +228,28 @@ pub const CompactReader = struct {
             .list, .set => {
                 const header = try self.readListHeader();
                 for (0..header.size) |_| {
-                    try self.skip(header.element_type);
+                    try self.skipElement(header.element_type, depth + 1);
                 }
             },
             .map => {
                 const size = try self.readVarInt();
                 if (size == 0) return;
-                if (size > std.math.maxInt(usize)) return error.ListTooLong;
                 const types = try self.readByte();
+                // Each entry takes at least two bytes.
+                if (size > self.data.len - self.pos) return error.ListTooLong;
                 // Mask to 4 bits: (0-15) always fits in u4
-                const key_type: Type = @enumFromInt(@as(u4, @truncate((types >> 4) & 0x0F)));
-                const val_type: Type = @enumFromInt(@as(u4, @truncate(types & 0x0F)));
+                const key_type = std.enums.fromInt(Type, @as(u4, @truncate((types >> 4) & 0x0F))) orelse return error.InvalidFieldType;
+                const val_type = std.enums.fromInt(Type, @as(u4, @truncate(types & 0x0F))) orelse return error.InvalidFieldType;
                 for (0..safe.castTo(usize, size) catch return error.IntegerOverflow) |_| {
-                    try self.skip(key_type);
-                    try self.skip(val_type);
+                    try self.skipElement(key_type, depth + 1);
+                    try self.skipElement(val_type, depth + 1);
                 }
             },
             .struct_ => {
                 const saved_field_id = self.last_field_id;
                 self.resetFieldTracking();
                 while (try self.readFieldHeader()) |field| {
-                    try self.skip(field.field_type);
+                    try self.skipNested(field.field_type, depth + 1);
                 }
                 self.last_field_id = saved_field_id;
             },

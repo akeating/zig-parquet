@@ -24,25 +24,34 @@ pub const Statistics = struct {
         self.* = .{};
     }
 
+    /// On error, frees what it allocated. A field that appears twice replaces the first value,
+    /// which is freed.
     pub fn parse(allocator: std.mem.Allocator, reader: *thrift.CompactReader) !Self {
         var stats = Self{};
+        errdefer stats.deinit(allocator);
         const saved_field_id = reader.last_field_id;
         reader.resetFieldTracking();
 
         while (try reader.readFieldHeader()) |field| {
             switch (field.field_id) {
-                1 => stats.max = try allocator.dupe(u8, try reader.readBinary()),
-                2 => stats.min = try allocator.dupe(u8, try reader.readBinary()),
+                1 => try setBytes(allocator, &stats.max, try reader.readBinary()),
+                2 => try setBytes(allocator, &stats.min, try reader.readBinary()),
                 3 => stats.null_count = try reader.readI64(),
                 4 => stats.distinct_count = try reader.readI64(),
-                5 => stats.max_value = try allocator.dupe(u8, try reader.readBinary()),
-                6 => stats.min_value = try allocator.dupe(u8, try reader.readBinary()),
+                5 => try setBytes(allocator, &stats.max_value, try reader.readBinary()),
+                6 => try setBytes(allocator, &stats.min_value, try reader.readBinary()),
                 else => try reader.skip(field.field_type),
             }
         }
 
         reader.last_field_id = saved_field_id;
         return stats;
+    }
+
+    fn setBytes(allocator: std.mem.Allocator, slot: *?[]const u8, bytes: []const u8) !void {
+        const copy = try allocator.dupe(u8, bytes);
+        if (slot.*) |old| allocator.free(old);
+        slot.* = copy;
     }
 
     /// Serialize to Thrift Compact Protocol
@@ -270,16 +279,17 @@ pub const GeospatialStatistics = struct {
         reader.resetFieldTracking();
 
         var stats = Self{};
+        errdefer stats.deinit(allocator);
 
         while (try reader.readFieldHeader()) |field| {
             switch (field.field_id) {
                 1 => stats.bbox = try BoundingBox.parse(reader),
                 2 => {
                     const list_header = try reader.readListHeader();
-                    var types = try allocator.alloc(i32, list_header.size);
-                    for (0..list_header.size) |i| {
-                        types[i] = try reader.readI32();
-                    }
+                    const types = try allocator.alloc(i32, list_header.size);
+                    errdefer allocator.free(types);
+                    for (types) |*t| t.* = try reader.readI32();
+                    if (stats.geospatial_types) |prev| allocator.free(prev);
                     stats.geospatial_types = types;
                 },
                 else => try reader.skip(field.field_type),

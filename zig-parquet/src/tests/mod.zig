@@ -39,4 +39,5 @@ test {
     _ = @import("leaf_decoder_test.zig");
     _ = @import("parallel_read_test.zig");
     _ = @import("writer_page_index_test.zig");
+    _ = @import("corrupt_read_test.zig");
 }

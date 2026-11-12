@@ -22,9 +22,10 @@ pub const Error = error{
 
 /// Decode DELTA_LENGTH_BYTE_ARRAY encoded byte arrays
 /// Returns a slice of slices pointing into the decoded data buffer
-pub fn decode(allocator: std.mem.Allocator, data: []const u8) Error!DecodeResult {
+/// Returns `error.InvalidValueCount` when the data declares more than `max_values` values.
+pub fn decode(allocator: std.mem.Allocator, data: []const u8, max_values: usize) Error!DecodeResult {
     // First, decode the lengths using DELTA_BINARY_PACKED
-    var lengths_decoder = delta_binary_packed.Decoder(i32).init(data);
+    var lengths_decoder = delta_binary_packed.Decoder(i32).init(data, max_values);
     const lengths = try lengths_decoder.decode(allocator);
     errdefer allocator.free(lengths);
     
@@ -126,7 +127,7 @@ test "delta length byte array decode" {
         'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i',
     };
     
-    var result = try decode(allocator, &simple_data);
+    var result = try decode(allocator, &simple_data, 1 << 20);
     defer result.deinit();
     
     try std.testing.expectEqual(@as(usize, 3), result.values.len);
@@ -150,7 +151,7 @@ test "delta length byte array decode with empty strings" {
         // No raw bytes needed
     };
 
-    var result = try decode(allocator, &data);
+    var result = try decode(allocator, &data, 1 << 20);
     defer result.deinit();
 
     try std.testing.expectEqual(@as(usize, 3), result.values.len);
@@ -169,7 +170,7 @@ test "delta length byte array empty" {
         0x00, // first_value = 0
     };
     
-    var result = try decode(allocator, &data);
+    var result = try decode(allocator, &data, 1 << 20);
     defer result.deinit();
     
     try std.testing.expectEqual(@as(usize, 0), result.values.len);

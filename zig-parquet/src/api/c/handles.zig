@@ -217,6 +217,7 @@ pub const ReaderHandle = struct {
         // Free schema element names
         for (self.metadata.schema) |elem| {
             if (elem.name.len > 0) allocator.free(elem.name);
+            if (elem.logical_type) |lt| lt.deinit(allocator);
         }
         allocator.free(self.metadata.schema);
 

@@ -1282,6 +1282,11 @@ pub fn decompress(allocator: std.mem.Allocator, compressed: []const u8, uncompre
             continue;
         }
 
+        // A meta-block produces exactly `meta_block_len` bytes. Output past the page's
+        // declared uncompressed size is an error, so a damaged or hostile stream cannot grow
+        // it without limit.
+        if (meta_block_len > uncompressed_size -| output.items.len) return error.DecompressionError;
+
         // ISUNCOMPRESSED bit is only present when ISLAST=0
         var is_uncompressed = false;
         if (!is_last) {

@@ -54,6 +54,8 @@ pub const DecodingError = error{
     IntegerOverflow,
     LengthTooLong,
     ListTooLong,
+    InvalidFieldId,
+    NestingTooDeep,
     InvalidEncoding,
     InvalidBitWidth,
     InvalidBitPackedLength,

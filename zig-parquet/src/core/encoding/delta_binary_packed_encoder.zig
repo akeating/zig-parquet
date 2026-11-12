@@ -251,7 +251,7 @@ test "delta binary packed encode single value" {
 
     // Decode and verify
     const decoder = @import("delta_binary_packed.zig");
-    const decoded = try decoder.decodeInt32(allocator, encoded);
+    const decoded = try decoder.decodeInt32(allocator, encoded, 1 << 20);
     defer allocator.free(decoded);
 
     try std.testing.expectEqual(@as(usize, 1), decoded.len);
@@ -267,7 +267,7 @@ test "delta binary packed encode simple sequence" {
 
     // Decode and verify
     const decoder = @import("delta_binary_packed.zig");
-    const decoded = try decoder.decodeInt32(allocator, encoded);
+    const decoded = try decoder.decodeInt32(allocator, encoded, 1 << 20);
     defer allocator.free(decoded);
 
     try std.testing.expectEqual(@as(usize, 5), decoded.len);
@@ -283,7 +283,7 @@ test "delta binary packed encode with negative deltas" {
 
     // Decode and verify
     const decoder = @import("delta_binary_packed.zig");
-    const decoded = try decoder.decodeInt32(allocator, encoded);
+    const decoded = try decoder.decodeInt32(allocator, encoded, 1 << 20);
     defer allocator.free(decoded);
 
     try std.testing.expectEqualSlices(i32, &values, decoded);
@@ -298,7 +298,7 @@ test "delta binary packed encode i64" {
 
     // Decode and verify
     const decoder = @import("delta_binary_packed.zig");
-    const decoded = try decoder.decodeInt64(allocator, encoded);
+    const decoded = try decoder.decodeInt64(allocator, encoded, 1 << 20);
     defer allocator.free(decoded);
 
     try std.testing.expectEqualSlices(i64, &values, decoded);
@@ -318,7 +318,7 @@ test "delta binary packed encode large sequence" {
 
     // Decode and verify
     const decoder = @import("delta_binary_packed.zig");
-    const decoded = try decoder.decodeInt32(allocator, encoded);
+    const decoded = try decoder.decodeInt32(allocator, encoded, 1 << 20);
     defer allocator.free(decoded);
 
     try std.testing.expectEqualSlices(i32, &values, decoded);
@@ -333,7 +333,7 @@ test "delta binary packed encode mixed deltas" {
 
     // Decode and verify
     const decoder = @import("delta_binary_packed.zig");
-    const decoded = try decoder.decodeInt32(allocator, encoded);
+    const decoded = try decoder.decodeInt32(allocator, encoded, 1 << 20);
     defer allocator.free(decoded);
 
     try std.testing.expectEqualSlices(i32, &values, decoded);

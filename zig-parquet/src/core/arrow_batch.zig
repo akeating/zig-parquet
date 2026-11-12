@@ -65,6 +65,8 @@ pub const BatchError = error{
     IntegerOverflow,
     InvalidListType,
     ListTooLong,
+    InvalidFieldId,
+    NestingTooDeep,
     InvalidPhysicalType,
     InvalidRepetitionType,
     InvalidEncoding,

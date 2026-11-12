@@ -63,7 +63,7 @@ pub fn decompress(allocator: std.mem.Allocator, compressed: []const u8, uncompre
     const written = snappyDecode(compressed, dst) catch return error.DecompressionError;
 
     if (written < uncompressed_size) {
-        return allocator.realloc(dst, written) catch dst[0..written];
+        return allocator.realloc(dst, written) catch return error.OutOfMemory;
     }
 
     return dst;

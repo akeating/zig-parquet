@@ -61,8 +61,10 @@ pub const ByteArrayResult = struct {
 };
 
 pub fn decodeByteArray(data: []const u8) !ByteArrayResult {
-    const len = try decodeU32(data);
-    if (data.len < 4 + len) return error.EndOfData;
+    const len: usize = try decodeU32(data);
+    // decodeU32 checked data.len >= 4. Comparing with the bytes after the prefix, since
+    // 4 + len overflows u32 for a length prefix of 0xfffffffc or more.
+    if (data.len - 4 < len) return error.EndOfData;
     return .{
         .value = data[4..][0..len],
         .bytes_read = 4 + len,

@@ -30,7 +30,8 @@ pub const Error = error{
 } || delta_binary_packed.Error;
 
 /// Decode DELTA_BYTE_ARRAY encoded strings
-pub fn decode(allocator: std.mem.Allocator, data: []const u8) Error!DecodeResult {
+/// Returns `error.InvalidValueCount` when the data declares more than `max_values` values.
+pub fn decode(allocator: std.mem.Allocator, data: []const u8, max_values: usize) Error!DecodeResult {
     if (data.len == 0) {
         return .{
             .values = &[_][]const u8{},
@@ -39,13 +40,12 @@ pub fn decode(allocator: std.mem.Allocator, data: []const u8) Error!DecodeResult
     }
     
     // Decode prefix lengths
-    var prefix_decoder = delta_binary_packed.Decoder(i32).init(data);
+    var prefix_decoder = delta_binary_packed.Decoder(i32).init(data, max_values);
     const prefix_lengths = try prefix_decoder.decode(allocator);
-    errdefer allocator.free(prefix_lengths);
+    defer allocator.free(prefix_lengths);
     
     const num_values = prefix_lengths.len;
     if (num_values == 0) {
-        allocator.free(prefix_lengths);
         return .{
             .values = allocator.alloc([]const u8, 0) catch return error.OutOfMemory,
             .allocator = allocator,
@@ -53,9 +53,9 @@ pub fn decode(allocator: std.mem.Allocator, data: []const u8) Error!DecodeResult
     }
     
     // Decode suffix lengths from remaining data
-    var suffix_decoder = delta_binary_packed.Decoder(i32).init(data[prefix_decoder.pos..]);
+    var suffix_decoder = delta_binary_packed.Decoder(i32).init(data[prefix_decoder.pos..], max_values);
     const suffix_lengths = try suffix_decoder.decode(allocator);
-    errdefer allocator.free(suffix_lengths);
+    defer allocator.free(suffix_lengths);
     
     if (suffix_lengths.len != num_values) {
         return error.InsufficientData;
@@ -124,8 +124,6 @@ pub fn decode(allocator: std.mem.Allocator, data: []const u8) Error!DecodeResult
         suffix_offset += suffix_length;
     }
     
-    allocator.free(prefix_lengths);
-    allocator.free(suffix_lengths);
     
     // Cast to const slices
     const const_result = allocator.alloc([]const u8, num_values) catch return error.OutOfMemory;
@@ -192,7 +190,7 @@ test "delta byte array decode simple" {
         'a', 'b', 'c',
     };
     
-    var result = try decode(allocator, &data);
+    var result = try decode(allocator, &data, 1 << 20);
     defer result.deinit();
     
     try std.testing.expectEqual(@as(usize, 3), result.values.len);
@@ -224,7 +222,7 @@ test "delta byte array decode with empty strings" {
         // No suffix bytes needed
     };
 
-    var result = try decode(allocator, &data);
+    var result = try decode(allocator, &data, 1 << 20);
     defer result.deinit();
 
     try std.testing.expectEqual(@as(usize, 3), result.values.len);
@@ -244,7 +242,7 @@ test "delta byte array decode empty" {
         0x00, // first = 0
     };
     
-    var result = try decode(allocator, &data);
+    var result = try decode(allocator, &data, 1 << 20);
     defer result.deinit();
     
     try std.testing.expectEqual(@as(usize, 0), result.values.len);

@@ -26,6 +26,7 @@ pub const DataPageHeader = struct {
 
     pub fn parse(allocator: std.mem.Allocator, reader: *thrift.CompactReader) !Self {
         var header = Self{};
+        errdefer header.deinit(allocator);
         const saved_field_id = reader.last_field_id;
         reader.resetFieldTracking();
 
@@ -35,7 +36,11 @@ pub const DataPageHeader = struct {
                 2 => header.encoding = try Encoding.fromInt(try reader.readI32()),
                 3 => header.definition_level_encoding = try Encoding.fromInt(try reader.readI32()),
                 4 => header.repetition_level_encoding = try Encoding.fromInt(try reader.readI32()),
-                5 => header.statistics = try Statistics.parse(allocator, reader),
+                5 => {
+                    const stats = try Statistics.parse(allocator, reader);
+                    if (header.statistics) |*prev| prev.deinit(allocator);
+                    header.statistics = stats;
+                },
                 else => try reader.skip(field.field_type),
             }
         }
@@ -92,6 +97,7 @@ pub const DataPageHeaderV2 = struct {
 
     pub fn parse(allocator: std.mem.Allocator, reader: *thrift.CompactReader) !Self {
         var header = Self{};
+        errdefer header.deinit(allocator);
         const saved_field_id = reader.last_field_id;
         reader.resetFieldTracking();
 
@@ -104,7 +110,11 @@ pub const DataPageHeaderV2 = struct {
                 5 => header.definition_levels_byte_length = try reader.readI32(),
                 6 => header.repetition_levels_byte_length = try reader.readI32(),
                 7 => header.is_compressed = field.field_type == .bool_true,
-                8 => header.statistics = try Statistics.parse(allocator, reader),
+                8 => {
+                    const stats = try Statistics.parse(allocator, reader);
+                    if (header.statistics) |*prev| prev.deinit(allocator);
+                    header.statistics = stats;
+                },
                 else => try reader.skip(field.field_type),
             }
         }
@@ -180,6 +190,7 @@ pub const PageHeader = struct {
 
     pub fn parse(allocator: std.mem.Allocator, reader: *thrift.CompactReader) !Self {
         var header = Self{};
+        errdefer header.deinit(allocator);
         const saved_field_id = reader.last_field_id;
         reader.resetFieldTracking();
 
@@ -189,9 +200,17 @@ pub const PageHeader = struct {
                 2 => header.uncompressed_page_size = try reader.readI32(),
                 3 => header.compressed_page_size = try reader.readI32(),
                 4 => header.crc = try reader.readI32(),
-                5 => header.data_page_header = try DataPageHeader.parse(allocator, reader),
+                5 => {
+                    const h = try DataPageHeader.parse(allocator, reader);
+                    if (header.data_page_header) |*prev| prev.deinit(allocator);
+                    header.data_page_header = h;
+                },
                 7 => header.dictionary_page_header = try DictionaryPageHeader.parse(allocator, reader),
-                8 => header.data_page_header_v2 = try DataPageHeaderV2.parse(allocator, reader),
+                8 => {
+                    const h = try DataPageHeaderV2.parse(allocator, reader);
+                    if (header.data_page_header_v2) |*prev| prev.deinit(allocator);
+                    header.data_page_header_v2 = h;
+                },
                 else => try reader.skip(field.field_type),
             }
         }

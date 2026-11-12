@@ -32,15 +32,17 @@ pub const Error = error{
     OutOfMemory,
 };
 
-/// Decode DELTA_BINARY_PACKED encoded i32 values
-pub fn decodeInt32(allocator: std.mem.Allocator, data: []const u8) Error![]i32 {
-    var decoder = Decoder(i32).init(data);
+/// Decode DELTA_BINARY_PACKED encoded i32 values. The values are allocated before they are
+/// decoded, so a header that declares more than `max_values` values (the count the caller
+/// expects, such as a page's non-null values) returns `error.InvalidValueCount`.
+pub fn decodeInt32(allocator: std.mem.Allocator, data: []const u8, max_values: usize) Error![]i32 {
+    var decoder = Decoder(i32).init(data, max_values);
     return decoder.decode(allocator);
 }
 
-/// Decode DELTA_BINARY_PACKED encoded i64 values
-pub fn decodeInt64(allocator: std.mem.Allocator, data: []const u8) Error![]i64 {
-    var decoder = Decoder(i64).init(data);
+/// Decode DELTA_BINARY_PACKED encoded i64 values; see `decodeInt32`.
+pub fn decodeInt64(allocator: std.mem.Allocator, data: []const u8, max_values: usize) Error![]i64 {
+    var decoder = Decoder(i64).init(data, max_values);
     return decoder.decode(allocator);
 }
 
@@ -57,8 +59,12 @@ pub fn Decoder(comptime T: type) type {
         num_mini_blocks: usize,
         total_values: usize,
         first_value: T,
+        /// Largest value count the header may declare.
+        max_values: usize,
 
-        pub fn init(data: []const u8) Self {
+        /// A decoder that returns `error.InvalidValueCount` when the header declares more than
+        /// `max_values` values.
+        pub fn init(data: []const u8, max_values: usize) Self {
             return .{
                 .data = data,
                 .pos = 0,
@@ -66,6 +72,7 @@ pub fn Decoder(comptime T: type) type {
                 .num_mini_blocks = 0,
                 .total_values = 0,
                 .first_value = 0,
+                .max_values = max_values,
             };
         }
 
@@ -100,7 +107,7 @@ pub fn Decoder(comptime T: type) type {
                 const min_delta = std.math.cast(T, min_delta_raw) orelse return error.InvalidValueCount;
 
                 // Read bit widths for each mini-block
-                if (self.pos + self.num_mini_blocks > self.data.len) {
+                if (self.num_mini_blocks > self.data.len - self.pos) {
                     return error.InsufficientData;
                 }
             const bit_widths = safe.slice(self.data, self.pos, self.num_mini_blocks) catch return error.InsufficientData;
@@ -121,9 +128,11 @@ pub fn Decoder(comptime T: type) type {
                             values_decoded += 1;
                         }
                     } else {
-                        // Bit-packed values
-                        const mini_block_bytes = (mini_block_size * bit_width + 7) / 8;
-                        if (self.pos + mini_block_bytes > self.data.len) {
+                        // Bit-packed values. A delta of an i64 column takes at most 64 bits.
+                        if (bit_width > 64) return error.InvalidHeader;
+                        const mini_block_bits = std.math.mul(usize, mini_block_size, bit_width) catch return error.InsufficientData;
+                        const mini_block_bytes = mini_block_bits / 8 + @intFromBool(mini_block_bits % 8 != 0);
+                        if (mini_block_bytes > self.data.len - self.pos) {
                             return error.InsufficientData;
                         }
                         const packed_data = safe.slice(self.data, self.pos, mini_block_bytes) catch return error.InsufficientData;
@@ -155,8 +164,11 @@ pub fn Decoder(comptime T: type) type {
             if (self.block_size == 0 or self.block_size % 128 != 0) {
                 return error.InvalidBlockSize;
             }
-            if (self.num_mini_blocks == 0) {
+            if (self.num_mini_blocks == 0 or self.num_mini_blocks > self.block_size) {
                 return error.InvalidMiniBlockCount;
+            }
+            if (self.total_values > self.max_values) {
+                return error.InvalidValueCount;
             }
             const mini_block_size = self.block_size / self.num_mini_blocks;
             if (mini_block_size % 32 != 0) {
@@ -164,22 +176,26 @@ pub fn Decoder(comptime T: type) type {
             }
         }
 
+        /// A ULEB128 varint of at most 10 bytes. Bits past the 64th are an error.
         fn readUnsignedVarint(self: *Self) Error!u64 {
             var result: u64 = 0;
-            var shift: u6 = 0;
+            var shift: u32 = 0;
 
             while (self.pos < self.data.len) {
                 const b = self.data[self.pos];
                 self.pos += 1;
 
-                result |= @as(u64, b & 0x7F) << shift;
+                const bits: u64 = b & 0x7F;
+                const s: u6 = @intCast(shift); // shift <= 63, checked below before it grows past
+                if (shift == 63 and bits > 1) return error.VarintOverflow;
+                result |= bits << s;
 
                 if (b & 0x80 == 0) {
                     return result;
                 }
 
                 shift += 7;
-                if (shift >= 64) {
+                if (shift > 63) {
                     return error.VarintOverflow;
                 }
             }
@@ -188,11 +204,9 @@ pub fn Decoder(comptime T: type) type {
         }
 
         fn readSignedVarint(self: *Self) Error!i64 {
-            // Zigzag decode
-            const unsigned = try self.readUnsignedVarint();
-            // Zigzag: (n >> 1) ^ -(n & 1)
-            const n: i64 = @bitCast(unsigned);
-            return (n >> 1) ^ (-(n & 1));
+            // Zigzag: (n >> 1) ^ -(n & 1), with a logical shift.
+            const n = try self.readUnsignedVarint();
+            return @bitCast((n >> 1) ^ (0 -% (n & 1)));
         }
 
         fn unpackMiniBlock(
@@ -249,6 +263,9 @@ pub fn Decoder(comptime T: type) type {
 // Tests
 // =============================================================================
 
+/// The value count the tests allow; more than any test's data holds.
+const test_max_values = 1 << 20;
+
 test "delta binary packed decode simple sequence" {
     const allocator = std.testing.allocator;
 
@@ -264,7 +281,7 @@ test "delta binary packed decode simple sequence" {
         0x00, 0x00, 0x00, 0x00, // bit_widths all 0
     };
 
-    const result = try decodeInt32(allocator, &data);
+    const result = try decodeInt32(allocator, &data, test_max_values);
     defer allocator.free(result);
 
     try std.testing.expectEqual(@as(usize, 5), result.len);
@@ -286,7 +303,7 @@ test "delta binary packed decode single value" {
         0x54, // first_value = 42 (zigzag: 42 -> 84 = 0x54)
     };
 
-    const result = try decodeInt32(allocator, &data);
+    const result = try decodeInt32(allocator, &data, test_max_values);
     defer allocator.free(result);
 
     try std.testing.expectEqual(@as(usize, 1), result.len);
@@ -303,7 +320,7 @@ test "delta binary packed decode empty" {
         0x00, // first_value = 0
     };
 
-    const result = try decodeInt32(allocator, &data);
+    const result = try decodeInt32(allocator, &data, test_max_values);
     defer allocator.free(result);
 
     try std.testing.expectEqual(@as(usize, 0), result.len);
@@ -322,7 +339,7 @@ test "delta binary packed decode negative values" {
         0x00, 0x00, 0x00, 0x00, // bit_widths all 0
     };
 
-    const result = try decodeInt32(allocator, &data);
+    const result = try decodeInt32(allocator, &data, test_max_values);
     defer allocator.free(result);
 
     try std.testing.expectEqual(@as(usize, 3), result.len);
@@ -347,7 +364,7 @@ test "delta binary packed i64" {
         0x00, 0x00, 0x00, 0x00, // bit_widths all 0
     };
 
-    const result = try decodeInt64(allocator, &data);
+    const result = try decodeInt64(allocator, &data, test_max_values);
     defer allocator.free(result);
 
     try std.testing.expectEqual(@as(usize, 3), result.len);
@@ -380,7 +397,7 @@ test "delta binary packed: 63-bit mini-block values spanning 9 bytes" {
             }
         }
     }
-    const values = try decodeInt64(allocator, &data);
+    const values = try decodeInt64(allocator, &data, test_max_values);
     defer allocator.free(values);
     try std.testing.expectEqualSlices(i64, &.{ 0, 1, 1 + (@as(i64, 1) << 62) + 5 }, values);
 }

@@ -33,6 +33,8 @@ const thrift_errors = error{
     IntegerOverflow,
     LengthTooLong,
     ListTooLong,
+    InvalidFieldId,
+    NestingTooDeep,
     InvalidFieldType,
     InvalidListType,
     InvalidBoundaryOrder,

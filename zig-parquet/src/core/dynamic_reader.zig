@@ -113,6 +113,7 @@ pub const DynamicReader = struct {
             if (elem.name.len > 0) {
                 self.allocator.free(elem.name);
             }
+            if (elem.logical_type) |lt| lt.deinit(self.allocator);
         }
         self.allocator.free(self.metadata.schema);
 

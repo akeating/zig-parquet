@@ -88,6 +88,16 @@ pub const IntType = struct {
 /// Logical type union - field 10 in SchemaElement
 /// Per Parquet spec, this is a Thrift union with specific field IDs
 pub const LogicalType = union(enum) {
+    /// Frees the CRS string of a GEOMETRY or GEOGRAPHY type read from a file (`parse`
+    /// allocates it). Types built in code with a CRS they own must not be freed this way.
+    pub fn deinit(self: LogicalType, allocator: std.mem.Allocator) void {
+        switch (self) {
+            .geometry => |g| if (g.crs) |c| allocator.free(c),
+            .geography => |g| if (g.crs) |c| allocator.free(c),
+            else => {},
+        }
+    }
+
     string, // Field 1: UTF8 string (empty struct)
     enum_, // Field 4: Enum (empty struct)
     decimal: DecimalType, // Field 5: Decimal with precision/scale
@@ -112,73 +122,87 @@ pub const LogicalType = union(enum) {
         reader.resetFieldTracking();
 
         var result: ?Self = null;
+        errdefer if (result) |r| r.deinit(allocator);
 
         while (try reader.readFieldHeader()) |field| {
             switch (field.field_id) {
                 1 => {
                     // STRING - empty struct
                     try reader.skip(.struct_);
+                    if (result) |prev| prev.deinit(allocator);
                     result = .string;
                 },
                 4 => {
                     // ENUM - empty struct
                     try reader.skip(.struct_);
+                    if (result) |prev| prev.deinit(allocator);
                     result = .enum_;
                 },
                 5 => {
                     // DECIMAL - DecimalType struct
                     const decimal_type = try parseDecimalType(reader);
+                    if (result) |prev| prev.deinit(allocator);
                     result = .{ .decimal = decimal_type };
                 },
                 6 => {
                     // DATE - empty struct
                     try reader.skip(.struct_);
+                    if (result) |prev| prev.deinit(allocator);
                     result = .date;
                 },
                 7 => {
                     // TIME - TimeType struct
                     const time_type = try parseTimeType(reader);
+                    if (result) |prev| prev.deinit(allocator);
                     result = .{ .time = time_type };
                 },
                 8 => {
                     // TIMESTAMP - TimestampType struct
                     const ts_type = try parseTimestampType(reader);
+                    if (result) |prev| prev.deinit(allocator);
                     result = .{ .timestamp = ts_type };
                 },
                 // Field 9 is reserved for Interval
                 10 => {
                     // INT - IntType struct
                     const int_type = try parseIntType(reader);
+                    if (result) |prev| prev.deinit(allocator);
                     result = .{ .int = int_type };
                 },
                 12 => {
                     // JSON - empty struct
                     try reader.skip(.struct_);
+                    if (result) |prev| prev.deinit(allocator);
                     result = .json;
                 },
                 13 => {
                     // BSON - empty struct
                     try reader.skip(.struct_);
+                    if (result) |prev| prev.deinit(allocator);
                     result = .bson;
                 },
                 14 => {
                     // UUID - empty struct
                     try reader.skip(.struct_);
+                    if (result) |prev| prev.deinit(allocator);
                     result = .uuid;
                 },
                 15 => {
                     // FLOAT16 - empty struct
                     try reader.skip(.struct_);
+                    if (result) |prev| prev.deinit(allocator);
                     result = .float16;
                 },
                 17 => {
                     // GEOMETRY - GeometryType struct
                     const geo_type = try parseGeometryType(allocator, reader);
+                    if (result) |prev| prev.deinit(allocator);
                     result = .{ .geometry = geo_type };
                 },
                 18 => {
                     // GEOGRAPHY - GeographyType struct
                     const geo_type = try parseGeographyType(allocator, reader);
+                    if (result) |prev| prev.deinit(allocator);
                     result = .{ .geography = geo_type };
                 },
                 else => try reader.skip(field.field_type),
@@ -471,10 +495,15 @@ fn parseGeometryType(allocator: std.mem.Allocator, reader: *thrift.CompactReader
     reader.resetFieldTracking();
 
     var g = GeometryType{};
+    errdefer if (g.crs) |c| allocator.free(c);
 
     while (try reader.readFieldHeader()) |field| {
         switch (field.field_id) {
-            1 => g.crs = try allocator.dupe(u8, try reader.readString()),
+            1 => {
+                const crs = try allocator.dupe(u8, try reader.readString());
+                if (g.crs) |prev| allocator.free(prev);
+                g.crs = crs;
+            },
             else => try reader.skip(field.field_type),
         }
     }
@@ -488,10 +517,15 @@ fn parseGeographyType(allocator: std.mem.Allocator, reader: *thrift.CompactReade
     reader.resetFieldTracking();
 
     var g = GeographyType{};
+    errdefer if (g.crs) |c| allocator.free(c);
 
     while (try reader.readFieldHeader()) |field| {
         switch (field.field_id) {
-            1 => g.crs = try allocator.dupe(u8, try reader.readString()),
+            1 => {
+                const crs = try allocator.dupe(u8, try reader.readString());
+                if (g.crs) |prev| allocator.free(prev);
+                g.crs = crs;
+            },
             2 => g.algorithm = try EdgeInterpolationAlgorithm.fromInt(try reader.readI32()),
             else => try reader.skip(field.field_type),
         }

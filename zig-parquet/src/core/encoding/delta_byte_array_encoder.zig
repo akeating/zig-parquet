@@ -119,7 +119,7 @@ test "delta byte array encode single value" {
 
     // Decode and verify
     const decoder = @import("delta_byte_array.zig");
-    var result = try decoder.decode(allocator, encoded);
+    var result = try decoder.decode(allocator, encoded, 1 << 20);
     defer result.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), result.values.len);
@@ -135,7 +135,7 @@ test "delta byte array encode with common prefixes" {
 
     // Decode and verify
     const decoder = @import("delta_byte_array.zig");
-    var result = try decoder.decode(allocator, encoded);
+    var result = try decoder.decode(allocator, encoded, 1 << 20);
     defer result.deinit();
 
     try std.testing.expectEqual(@as(usize, 3), result.values.len);
@@ -153,7 +153,7 @@ test "delta byte array encode no common prefix" {
 
     // Decode and verify
     const decoder = @import("delta_byte_array.zig");
-    var result = try decoder.decode(allocator, encoded);
+    var result = try decoder.decode(allocator, encoded, 1 << 20);
     defer result.deinit();
 
     try std.testing.expectEqual(@as(usize, 3), result.values.len);
@@ -175,7 +175,7 @@ test "delta byte array encode sorted strings" {
 
     // Decode and verify
     const decoder = @import("delta_byte_array.zig");
-    var result = try decoder.decode(allocator, encoded);
+    var result = try decoder.decode(allocator, encoded, 1 << 20);
     defer result.deinit();
 
     try std.testing.expectEqual(@as(usize, 3), result.values.len);

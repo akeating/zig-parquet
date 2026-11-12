@@ -83,7 +83,7 @@ test "delta length byte array encode single value" {
 
     // Decode and verify
     const decoder = @import("delta_length_byte_array.zig");
-    var result = try decoder.decode(allocator, encoded);
+    var result = try decoder.decode(allocator, encoded, 1 << 20);
     defer result.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), result.values.len);
@@ -99,7 +99,7 @@ test "delta length byte array encode multiple values" {
 
     // Decode and verify
     const decoder = @import("delta_length_byte_array.zig");
-    var result = try decoder.decode(allocator, encoded);
+    var result = try decoder.decode(allocator, encoded, 1 << 20);
     defer result.deinit();
 
     try std.testing.expectEqual(@as(usize, 3), result.values.len);
@@ -117,7 +117,7 @@ test "delta length byte array encode with empty strings" {
 
     // Decode and verify
     const decoder = @import("delta_length_byte_array.zig");
-    var result = try decoder.decode(allocator, encoded);
+    var result = try decoder.decode(allocator, encoded, 1 << 20);
     defer result.deinit();
 
     try std.testing.expectEqual(@as(usize, 5), result.values.len);
@@ -137,7 +137,7 @@ test "delta length byte array encode uniform lengths" {
 
     // Decode and verify
     const decoder = @import("delta_length_byte_array.zig");
-    var result = try decoder.decode(allocator, encoded);
+    var result = try decoder.decode(allocator, encoded, 1 << 20);
     defer result.deinit();
 
     try std.testing.expectEqual(@as(usize, 4), result.values.len);
