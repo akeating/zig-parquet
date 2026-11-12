@@ -1,6 +1,12 @@
 # API Design
 
-Status: draft
+Status: implemented. This document records the plan for the `core/`, `io/` and `api/` layout. The layout, the transport adapters and the C and WASM APIs follow it; the sections below describe the plan as written, with the file mapping and the concurrency model updated. Later changes replaced parts of it:
+
+- The typed `Reader`, `RowReader` and `RowWriter` were removed; `DynamicReader` and `DynamicWriter` are the row APIs, and the column-based `Writer` remains. Their files (`core/reader.zig`, `core/row_reader.zig`, `core/row_writer.zig`, `core/struct_utils.zig`, `core/list_decoder.zig`, `core/map_decoder.zig`) are deleted.
+- Leaf columns are decoded by `core/leaf_decoder.zig` into Arrow-layout buffers, for the Arrow and the row APIs; `core/column_decoder.zig` is deleted.
+- The writer's nested columns go through `core/column_write_values.zig`; `core/column_write_list.zig`, `core/column_write_struct.zig` and `core/column_write_map.zig` are deleted.
+- Every codec has a pure-Zig implementation, used by default; the C/C++ libraries are optional. The `codecs` build option (`all`, `zig-only`, `c-only`, `none`, or a list) replaces the planned `no_compression` flag. The "All Codecs Are C/C++" and "Compile-Time Codec Control" sections describe the state before that.
+- Reads can decode columns on several threads, opt-in through a `std.Io` (see Concurrency Model).
 
 This document describes how `zig-parquet` should structure its internals so the same Parquet implementation can cleanly support the Zig API, a future C-facing ABI, `wasm32-wasi`, and `wasm32-freestanding`.
 
@@ -522,9 +528,7 @@ The mapping layer lives in `src/api/c/` and translates at the ABI boundary. The 
 
 Single-threaded access per handle. The library does not synchronize internally. If callers need to share a reader or writer across threads, they must provide their own synchronization.
 
-Callback functions must not be invoked concurrently by the library for a given handle. Callers can rely on callbacks being invoked sequentially.
-
-This is the simplest correct model and avoids pulling threading concerns into the core. If parallel column decoding is added later, it should be opt-in and internal to the engine, not visible in the transport contract.
+The library invokes a handle's callbacks one at a time, except when the caller opts into parallel decoding: a C stream with `zp_stream_options.threads` of 2 or more, or a Zig read given a `std.Io` (`RowGroupOptions.io`, `BatchOptions.io`, `DynamicReaderOptions.io`). The columns are then decoded on several threads, and a reader opened with `zp_reader_open_callbacks` calls `read_at` from several threads at once; the source and, in Zig, the allocator must allow concurrent use. The threads are internal to the read: a handle is still used from one thread at a time.
 
 ## Module Organization
 
@@ -564,19 +568,19 @@ Tests that import internal modules directly (e.g., `@import("../reader/row_reade
 | `reader/seekable_reader.zig` | `core/seekable_reader.zig` | Interface, used by core |
 | `writer/write_target.zig` | `core/write_target.zig` | Interface, used by core |
 | `reader/parquet_reader.zig` | `core/parquet_reader.zig` | |
-| `reader/row_reader.zig` | `core/row_reader.zig` | |
+| `reader/row_reader.zig` | `core/row_reader.zig` | Deleted later; `DynamicReader` replaces it |
 | `reader/dynamic_reader.zig` | `core/dynamic_reader.zig` | |
-| `reader/column_decoder.zig` | `core/column_decoder.zig` | |
-| `reader/list_decoder.zig` | `core/list_decoder.zig` | |
-| `reader/map_decoder.zig` | `core/map_decoder.zig` | |
+| `reader/column_decoder.zig` | `core/column_decoder.zig` | Deleted later; `core/leaf_decoder.zig` replaces it |
+| `reader/list_decoder.zig` | `core/list_decoder.zig` | Deleted later; `core/leaf_decoder.zig` replaces it |
+| `reader/map_decoder.zig` | `core/map_decoder.zig` | Deleted later; `core/leaf_decoder.zig` replaces it |
 | `writer/column_writer.zig` | `core/column_writer.zig` | |
 | `writer/page_writer.zig` | `core/page_writer.zig` | |
-| `writer/row_writer.zig` | `core/row_writer.zig` | |
+| `writer/row_writer.zig` | `core/row_writer.zig` | Deleted later; `DynamicWriter` replaces it |
 | `writer/column_def.zig` | `core/column_def.zig` | |
 | `writer/statistics.zig` | `core/statistics.zig` | |
-| `writer/column_write_list.zig` | `core/column_write_list.zig` | |
-| `writer/column_write_struct.zig` | `core/column_write_struct.zig` | |
-| `writer/column_write_map.zig` | `core/column_write_map.zig` | |
+| `writer/column_write_list.zig` | `core/column_write_list.zig` | Deleted later; `core/column_write_values.zig` replaces it |
+| `writer/column_write_struct.zig` | `core/column_write_struct.zig` | Deleted later; `core/column_write_values.zig` replaces it |
+| `writer/column_write_map.zig` | `core/column_write_map.zig` | Deleted later; `core/column_write_values.zig` replaces it |
 | `writer/list_encoder.zig` | `core/list_encoder.zig` | |
 | `writer/map_encoder.zig` | `core/map_encoder.zig` | |
 | `safe.zig` | `core/safe.zig` | Shared utility |
@@ -586,15 +590,15 @@ Tests that import internal modules directly (e.g., `@import("../reader/row_reade
 | `schema.zig` | `core/schema.zig` | Shared utility |
 | `value.zig` | `core/value.zig` | Shared utility |
 | `nested.zig` | `core/nested.zig` | Shared utility |
-| `struct_utils.zig` | `core/struct_utils.zig` | Comptime struct helpers |
+| `struct_utils.zig` | `core/struct_utils.zig` | Deleted later, with `RowWriter` and `RowReader` |
 | `encoding/` | `core/encoding/` | |
 | `compress/` | `core/compress/` | |
 | `thrift/` | `core/thrift/` | |
 | `geo/` | `core/geo/` | |
 | `arrow.zig` | `core/arrow.zig` | Arrow C Data Interface types |
 | New file | `core/arrow_batch.zig` | Parquet ↔ Arrow batch API (readRowGroupAsArrow, writeRowGroupFromArrow) |
-| `reader.zig` (top-level) | Split: core methods → `core/`, convenience constructors → `api/zig/reader.zig` |
-| `writer.zig` (top-level) | Split: core methods → `core/`, convenience constructors → `api/zig/writer.zig` |
+| `reader.zig` (top-level) | Split: core methods → `core/`, convenience constructors → `api/zig/reader.zig` | The typed `Reader` was deleted later |
+| `writer.zig` (top-level) | Split: core methods → `core/`, convenience constructors → `api/zig/writer.zig` | |
 | New file | `io/file_reader.zig` | `FileReader` adapter (extracted from seekable_reader.zig) |
 | New file | `io/buffer_reader.zig` | `BufferReader` adapter (extracted from seekable_reader.zig) |
 | New file | `io/callback_reader.zig` | `CallbackReader` adapter (new) |
