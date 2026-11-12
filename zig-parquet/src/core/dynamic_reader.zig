@@ -36,7 +36,7 @@ const schema_tree = @import("schema_tree.zig");
 const row_ranges_mod = @import("row_ranges.zig");
 const page_filter_mod = @import("page_filter.zig");
 const page_index_reader_mod = @import("page_index_reader.zig");
-const page_range_reader_mod = @import("page_range_reader.zig");
+const page_selection = @import("page_selection.zig");
 const parallel = @import("parallel.zig");
 
 pub const Value = value_mod.Value;
@@ -356,7 +356,7 @@ pub const DynamicReader = struct {
     ///   - Pages whose row ranges don't intersect the final (intersected)
     ///     `RowRanges` are never read or decompressed. The pages that are read
     ///     are read from the source as they are decoded, one range of adjacent
-    ///     pages (at most `page_range_reader.max_span_bytes`) per read.
+    ///     pages (at most `page_selection.max_span_bytes`) per read.
     ///   - Nested columns (lists, structs, maps) are returned as by `readAllRows`.
     ///     The page index counts rows, so the data pages of a column with
     ///     repetition must start at a row (repetition level 0), as the Parquet
@@ -726,7 +726,7 @@ pub const DynamicReader = struct {
     }
 
     /// Reads the pages of a leaf column chunk that hold rows `filter` keeps (see
-    /// `page_range_reader`) from the source as they are decoded, and returns the
+    /// `page_selection`) from the source as they are decoded, and returns the
     /// entries of the kept rows.
     fn decodeFilteredLeaf(
         self: *Self,
@@ -743,7 +743,7 @@ pub const DynamicReader = struct {
         // The rows of a column with repetition start at entries with repetition level 0.
         if (repeated) opts.keep_levels = true;
 
-        var pages = try page_range_reader_mod.selectPages(allocator, chunk, offset_index, filter.ranges, filter.rg_num_rows);
+        var pages = try page_selection.selectPages(allocator, chunk, offset_index, filter.ranges, filter.rg_num_rows);
         defer pages.deinit(allocator);
 
         const page_rows = try allocator.alloc(usize, pages.selected.len);
@@ -812,7 +812,7 @@ pub const DynamicReader = struct {
 /// entry is a row. The entry ranges are in ascending order, with adjacent ones merged.
 fn keptEntryRanges(
     allocator: std.mem.Allocator,
-    selected: []const page_range_reader_mod.SelectedPage,
+    selected: []const page_selection.SelectedPage,
     ranges: RowRanges,
     rep_levels: ?[]const leaf_decoder.Level,
     num_entries: usize,

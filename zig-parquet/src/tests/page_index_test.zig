@@ -1007,7 +1007,7 @@ test "page index: readRowsFiltered keeps the writer's pages that a min/max filte
 
 test "page index: readRowsFiltered reads each range of adjacent selected pages with one read" {
     const allocator = std.testing.allocator;
-    const page_range_reader = @import("../core/page_range_reader.zig");
+    const page_selection = @import("../core/page_selection.zig");
     const parquet_reader = @import("../core/parquet_reader.zig");
     const RecordingSource = @import("../core/test_util.zig").RecordingSource;
 
@@ -1029,7 +1029,7 @@ test "page index: readRowsFiltered reads each range of adjacent selected pages w
         // The pages each leaf column reads, in column order.
         var wanted = try page_filter.RowRanges.fromUnsorted(allocator, ranges);
         defer wanted.deinit(allocator);
-        var expected: std.ArrayList(page_range_reader.Span) = .empty;
+        var expected: std.ArrayList(page_selection.Span) = .empty;
         defer expected.deinit(allocator);
         var pir = @import("../core/page_index_reader.zig").PageIndexReader.init(allocator, reader.getSource());
         var selected_pages: usize = 0;
@@ -1037,7 +1037,7 @@ test "page index: readRowsFiltered reads each range of adjacent selected pages w
         for (rg.columns) |*chunk| {
             var oi = (try pir.readOffsetIndex(chunk)).?;
             defer oi.deinit(allocator);
-            var selection = try page_range_reader.selectPages(allocator, chunk, &oi, wanted, @intCast(rg.num_rows));
+            var selection = try page_selection.selectPages(allocator, chunk, &oi, wanted, @intCast(rg.num_rows));
             defer selection.deinit(allocator);
             selected_pages += selection.selected.len;
             all_pages += oi.page_locations.len;
@@ -1054,7 +1054,7 @@ test "page index: readRowsFiltered reads each range of adjacent selected pages w
 
         // The reads of column chunk bytes are the selected ranges, in order; the other
         // reads are of the page indexes.
-        var chunk_reads: std.ArrayList(page_range_reader.Span) = .empty;
+        var chunk_reads: std.ArrayList(page_selection.Span) = .empty;
         defer chunk_reads.deinit(allocator);
         for (source.reads.items) |r| {
             for (rg.columns) |*chunk| {
