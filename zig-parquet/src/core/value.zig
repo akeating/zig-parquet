@@ -6,31 +6,6 @@
 
 const std = @import("std");
 
-/// Thread-local override for byte payload allocations. When set (typically by
-/// `DynamicReader.readRowsInternal`), all `bytes_val` / `fixed_bytes_val`
-/// payloads produced via `dupeBytes` go into this allocator instead of the
-/// per-value allocator. `DynamicReader` sets it to the arena of the read's
-/// `RowStorage`, which rows hold a reference to in `Row.storage`. Save/restore
-/// the prior value at each entry point — the pattern is:
-///
-///     const prev = value_mod.bytes_arena_allocator;
-///     value_mod.bytes_arena_allocator = arena.allocator();
-///     defer value_mod.bytes_arena_allocator = prev;
-///
-/// This replaces the per-value `allocator.dupe(u8, ...)` hot path (~440k
-/// allocations on covid.snappy.parquet) with one arena's worth of contiguous
-/// allocations, avoiding the N*stack-trace overhead of DebugAllocator.
-pub threadlocal var bytes_arena_allocator: ?std.mem.Allocator = null;
-
-/// Duplicate a byte slice, routing through `bytes_arena_allocator` if set,
-/// else through the provided `fallback` allocator. Every producer of
-/// `Value.bytes_val` and `Value.fixed_bytes_val` should call this helper
-/// instead of `allocator.dupe(u8, ...)` to participate in the arena scheme.
-pub fn dupeBytes(fallback: std.mem.Allocator, bytes: []const u8) std.mem.Allocator.Error![]u8 {
-    const alloc = bytes_arena_allocator orelse fallback;
-    return alloc.dupe(u8, bytes);
-}
-
 /// A dynamic value that can represent any Parquet data.
 ///
 /// Unlike the typed `Optional(T)` approach which requires knowing types at
@@ -224,50 +199,32 @@ pub const Value = union(enum) {
         }
     }
 
-    pub const DeinitOptions = struct {
-        /// When true, skip freeing `bytes_val` / `fixed_bytes_val` payloads.
-        /// Set by producers that routed byte allocations through an arena
-        /// (see `bytes_arena_allocator`); those slices are sub-slices of
-        /// arena chunks and cannot be freed individually.
-        skip_bytes: bool = false,
-    };
-
-    /// Free all memory owned by this value recursively.
-    ///
-    /// If `bytes_arena_allocator` is currently set (i.e. we're inside a
-    /// decode context), byte payloads are automatically skipped — they
-    /// live in the arena and are freed en masse by the producer. Outside
-    /// a decode context this behaves as the classic owned-everything free.
-    ///
-    /// For explicit control use `deinitWithOptions`.
+    /// Frees this value's memory recursively with `allocator`: byte payloads, list items,
+    /// map entries, struct fields and field names. Every one of them must have been
+    /// allocated with `allocator`. Values of rows read by `DynamicReader` are freed with
+    /// their rows (`Row.deinit`), not with this function.
     pub fn deinit(self: Value, allocator: std.mem.Allocator) void {
-        self.deinitWithOptions(allocator, .{ .skip_bytes = bytes_arena_allocator != null });
-    }
-
-    /// Like `deinit` but with explicit byte-payload freeing control: pass
-    /// `.{ .skip_bytes = true }` for values whose byte payloads live in an arena.
-    pub fn deinitWithOptions(self: Value, allocator: std.mem.Allocator, opts: DeinitOptions) void {
         switch (self) {
             .null_val, .bool_val, .int32_val, .int64_val, .float_val, .double_val => {},
-            .bytes_val => |v| if (!opts.skip_bytes) allocator.free(v),
-            .fixed_bytes_val => |v| if (!opts.skip_bytes) allocator.free(v),
+            .bytes_val => |v| allocator.free(v),
+            .fixed_bytes_val => |v| allocator.free(v),
             .list_val => |items| {
                 for (items) |item| {
-                    item.deinitWithOptions(allocator, opts);
+                    item.deinit(allocator);
                 }
                 allocator.free(items);
             },
             .map_val => |entries| {
                 for (entries) |entry| {
-                    entry.key.deinitWithOptions(allocator, opts);
-                    entry.value.deinitWithOptions(allocator, opts);
+                    entry.key.deinit(allocator);
+                    entry.value.deinit(allocator);
                 }
                 allocator.free(entries);
             },
             .struct_val => |fields| {
                 for (fields) |field| {
                     allocator.free(field.name);
-                    field.value.deinitWithOptions(allocator, opts);
+                    field.value.deinit(allocator);
                 }
                 allocator.free(fields);
             },
@@ -276,8 +233,8 @@ pub const Value = union(enum) {
 };
 
 /// Memory shared by the rows of one read: their `values` arrays, nested list,
-/// map and struct arrays, struct field names and byte payloads, allocated in
-/// `arena`, plus decoded byte buffers that byte payloads point into (`buffers`).
+/// map and struct arrays and struct field names, allocated in `arena`, plus
+/// decoded byte buffers that byte payloads point into (`buffers`).
 /// Each row holds a reference; everything is freed when the last reference is
 /// released.
 pub const RowStorage = struct {

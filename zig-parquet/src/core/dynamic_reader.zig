@@ -70,9 +70,10 @@ pub const DynamicReader = struct {
     checksum_options: ChecksumOptions,
     _backend_cleanup: ?BackendCleanup = null,
     /// Storage of the read in progress (see `value_mod.RowStorage`): rows'
-    /// `values` arrays, nested values and byte payloads are allocated in its
-    /// arena, and each row built holds a reference to it. Set by
-    /// `beginStorage` for the duration of one read call.
+    /// `values` arrays and nested values are allocated in its arena, it owns
+    /// the decoded byte buffers that byte payloads reference, and each row
+    /// built holds a reference to it. Set by `beginStorage` for the duration
+    /// of one read call.
     storage: ?*value_mod.RowStorage = null,
 
     const Self = @This();
@@ -438,27 +439,20 @@ pub const DynamicReader = struct {
 
     const StorageScope = struct {
         storage: *value_mod.RowStorage,
-        prev_alloc: ?std.mem.Allocator,
         prev_storage: ?*value_mod.RowStorage,
     };
 
-    /// Creates row storage for one read and routes `value_mod.dupeBytes` to its arena.
+    /// Creates row storage for one read and makes it the reader's `storage`.
     fn beginStorage(self: *Self) !StorageScope {
         const storage = try value_mod.RowStorage.create(self.allocator);
-        const scope: StorageScope = .{
-            .storage = storage,
-            .prev_alloc = value_mod.bytes_arena_allocator,
-            .prev_storage = self.storage,
-        };
-        value_mod.bytes_arena_allocator = storage.arena.allocator();
+        const scope: StorageScope = .{ .storage = storage, .prev_storage = self.storage };
         self.storage = storage;
         return scope;
     }
 
-    /// Restores the previous routing and drops the read's reference; the storage stays alive
-    /// while rows hold references to it.
+    /// Restores the previous `storage` and drops the read's reference; the storage stays
+    /// alive while rows hold references to it.
     fn endStorage(self: *Self, scope: StorageScope) void {
-        value_mod.bytes_arena_allocator = scope.prev_alloc;
         self.storage = scope.prev_storage;
         scope.storage.release();
     }

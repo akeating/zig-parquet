@@ -511,8 +511,8 @@ fn assembleRecursive(
             ctx.positions[idx] += 1;
             const v = col.values[pos];
             return switch (v) {
-                .bytes_val => |b| .{ .bytes_val = try value_mod.dupeBytes(ctx.allocator, b) },
-                .fixed_bytes_val => |b| .{ .fixed_bytes_val = try value_mod.dupeBytes(ctx.allocator, b) },
+                .bytes_val => |b| .{ .bytes_val = try ctx.allocator.dupe(u8, b) },
+                .fixed_bytes_val => |b| .{ .fixed_bytes_val = try ctx.allocator.dupe(u8, b) },
                 else => v,
             };
         },
