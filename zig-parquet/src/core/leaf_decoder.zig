@@ -658,9 +658,12 @@ pub const ColumnCursor = struct {
             var tail = try self.builder.splitOff(slots);
             errdefer tail.deinit();
             // The next call likely returns as many entries and bytes as this one: room for
-            // them now saves growing the buffers, and copying them, page by page.
-            try tail.reserve(slots);
-            if (tail.kind == .bytes) try tail.values.ensureUnusedCapacity(allocator, self.builder.values.items.len);
+            // them now saves growing the buffers, and copying them, page by page. A chunk
+            // whose pages are all decoded has no next call.
+            if (self.hasPages()) {
+                try tail.reserve(slots);
+                if (tail.kind == .bytes) try tail.values.ensureUnusedCapacity(allocator, self.builder.values.items.len);
+            }
             var tail_def = try levelsFrom(allocator, &dec.out_def, n, keep_def);
             errdefer tail_def.deinit(allocator);
             var tail_rep = try levelsFrom(allocator, &dec.out_rep, n, keep_rep);
