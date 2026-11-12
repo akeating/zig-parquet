@@ -181,8 +181,10 @@ pub fn build(b: *std.Build) void {
     });
     test_mod.addImport("c_libparquet", c_header.createModule());
 
+    const test_filters = b.option([]const []const u8, "test-filter", "Run only the tests whose name contains this text") orelse &.{};
     const lib_unit_tests = b.addTest(.{
         .root_module = test_mod,
+        .filters = test_filters,
     });
 
     configureCodecs(lib_unit_tests.root_module, deps, b);

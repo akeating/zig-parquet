@@ -50,6 +50,7 @@ make test CODECS=zig-only              # Pure Zig codecs only (no C deps)
 make test CODECS=c-only                # C/C++ codecs only
 make test CODECS=none                  # Non-compression tests only
 make test CODECS=c-zstd,zstd           # Cross-implementation (both zstd codecs)
+make test-lib FILTER="page index"      # Only library tests whose name contains the text
 make lib CODECS=c-brotli OPT=ReleaseSmall  # Size-measured release build
 make example NAME=basic                # Build an example (NAME is required)
 make example NAME=wasm_demo OPT=ReleaseSmall

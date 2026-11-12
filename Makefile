@@ -21,7 +21,7 @@ help:
 	@echo "  make lib               Build library (honors CODECS, OPT)"
 	@echo "  make cli               Build pqi CLI (honors OPT)"
 	@echo "  make test              Library + CLI tests (honors CODECS, OPT)"
-	@echo "  make test-lib          Library tests only (honors CODECS, OPT)"
+	@echo "  make test-lib          Library tests only (honors CODECS, OPT, FILTER)"
 	@echo "  make test-cli          CLI tests only (honors OPT)"
 	@echo "  make example NAME=...  Build an example (honors OPT)"
 	@echo "  make examples          Build every example (honors OPT)"
@@ -62,7 +62,7 @@ test: test-lib test-cli
 
 .PHONY: test-lib
 test-lib:
-	cd $(LIB_DIR) && zig build test $(CODEC_FLAG) $(OPT_FLAG)
+	cd $(LIB_DIR) && zig build test $(CODEC_FLAG) $(OPT_FLAG) $(if $(FILTER),-Dtest-filter="$(FILTER)")
 
 .PHONY: test-cli
 test-cli:
