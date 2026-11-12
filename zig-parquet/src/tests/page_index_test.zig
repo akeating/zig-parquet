@@ -1005,6 +1005,74 @@ test "page index: readRowsFiltered keeps the writer's pages that a min/max filte
     }
 }
 
+test "page index: readRowsFiltered reads each range of adjacent selected pages with one read" {
+    const allocator = std.testing.allocator;
+    const page_range_reader = @import("../core/page_range_reader.zig");
+    const parquet_reader = @import("../core/parquet_reader.zig");
+    const RecordingSource = @import("../core/test_util.zig").RecordingSource;
+
+    // Ranges inside a page, across pages, and ending at the last row.
+    const ranges: []const RowRange = &.{
+        .{ .first = 17, .last = 90 },
+        .{ .first = 151, .last = 152 },
+        .{ .first = 250, .last = 300 },
+    };
+    for ([_]bool{ false, true }) |dictionary| {
+        const bytes = try writeNestedFile(allocator, .lists, 300, .{ .max_page_size = 64, .dictionary = dictionary });
+        defer allocator.free(bytes);
+        var source = RecordingSource{ .data = bytes, .allocator = allocator };
+        defer source.deinit();
+        var reader = try parquet.DynamicReader.initFromSeekable(allocator, source.reader(), .{});
+        defer reader.deinit();
+        const rg = &reader.metadata.row_groups[0];
+
+        // The pages each leaf column reads, in column order.
+        var wanted = try page_filter.RowRanges.fromUnsorted(allocator, ranges);
+        defer wanted.deinit(allocator);
+        var expected: std.ArrayList(page_range_reader.Span) = .empty;
+        defer expected.deinit(allocator);
+        var pir = @import("../core/page_index_reader.zig").PageIndexReader.init(allocator, reader.getSource());
+        var selected_pages: usize = 0;
+        var all_pages: usize = 0;
+        for (rg.columns) |*chunk| {
+            var oi = (try pir.readOffsetIndex(chunk)).?;
+            defer oi.deinit(allocator);
+            var selection = try page_range_reader.selectPages(allocator, chunk, &oi, wanted, @intCast(rg.num_rows));
+            defer selection.deinit(allocator);
+            selected_pages += selection.selected.len;
+            all_pages += oi.page_locations.len;
+            try expected.appendSlice(allocator, selection.spans);
+        }
+        try std.testing.expect(selected_pages < all_pages);
+        // Each kept run of adjacent pages is one range, so there are fewer ranges than pages.
+        try std.testing.expect(expected.items.len < selected_pages);
+
+        source.reads.clearRetainingCapacity();
+        const rows = try reader.readRowsFiltered(0, &.{rangesFilter(1, &ranges)});
+        freeRows(allocator, rows);
+        try std.testing.expectEqual(@as(usize, 124), rows.len);
+
+        // The reads of column chunk bytes are the selected ranges, in order; the other
+        // reads are of the page indexes.
+        var chunk_reads: std.ArrayList(page_range_reader.Span) = .empty;
+        defer chunk_reads.deinit(allocator);
+        for (source.reads.items) |r| {
+            for (rg.columns) |*chunk| {
+                const range = try parquet_reader.columnChunkRange(chunk);
+                if (r.offset >= range.start and r.offset < range.start + range.size) {
+                    try chunk_reads.append(allocator, .{ .start = r.offset, .size = r.len });
+                    break;
+                }
+            }
+        }
+        try std.testing.expectEqual(expected.items.len, chunk_reads.items.len);
+        for (expected.items, chunk_reads.items) |want, got| {
+            try std.testing.expectEqual(want.start, got.start);
+            try std.testing.expectEqual(want.size, got.size);
+        }
+    }
+}
+
 test "page index: readRowsFiltered returns an error when a page's rows differ from the offset index" {
     const allocator = std.testing.allocator;
     // The offset index puts the second page at row 11; it holds rows 10..20.
@@ -1061,7 +1129,7 @@ test "page index: decodeSelectedPages checks that pages start at rows" {
     leaf.deinit(allocator);
     try std.testing.expectError(error.PageRowCountMismatch, leaf_decoder.decodeSelectedPages(allocator, leaf_decoder.PageReader.fromMemory(allocator, p0), meta, info, options, &.{3}));
     try std.testing.expectError(error.PageNotAtRowStart, leaf_decoder.decodeSelectedPages(allocator, leaf_decoder.PageReader.fromMemory(allocator, p1), meta, info, options, &.{1}));
-    // Page 1, read after page 0 to check where page 0's last row ends, does not start at a row.
+    // Page 1, selected after page 0, does not start at a row.
     try std.testing.expectError(error.PageNotAtRowStart, leaf_decoder.decodeSelectedPages(allocator, leaf_decoder.PageReader.fromMemory(allocator, both), meta, info, options, &.{ 2, 1 }));
     // More data pages than expected.
     try std.testing.expectError(error.PageRowCountMismatch, leaf_decoder.decodeSelectedPages(allocator, leaf_decoder.PageReader.fromMemory(allocator, both), meta, info, options, &.{2}));

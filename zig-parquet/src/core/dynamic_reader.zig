@@ -56,12 +56,10 @@ pub const DynamicReaderOptions = struct {
 /// Composed from categorized error sets — no more `SchemaParseError` coalescing.
 pub const DynamicReaderError = errors_mod.DynamicReaderError;
 
-
 /// Safely cast i64 row count to usize, validating non-negative.
 fn safeRowCount(count: i64) error{InvalidRowCount}!usize {
     return safe.cast(count) catch return error.InvalidRowCount;
 }
-
 
 /// Schema-agnostic Parquet reader
 pub const DynamicReader = struct {
@@ -345,17 +343,18 @@ pub const DynamicReader = struct {
     ///     map keeps a row when the page holding the row might contain a
     ///     matching element of that row.
     ///   - Pages whose row ranges don't intersect the final (intersected)
-    ///     `RowRanges` are never read or decompressed. For a column with
-    ///     repetition (inside a list or map), when a run of kept rows ends at
-    ///     the end of a page, the next page is also read and decoded, to check
-    ///     that the run's last row does not continue in it.
+    ///     `RowRanges` are never read or decompressed. The pages that are read
+    ///     are read from the source as they are decoded, one range of adjacent
+    ///     pages (at most `page_range_reader.max_span_bytes`) per read.
     ///   - Nested columns (lists, structs, maps) are returned as by `readAllRows`.
     ///     The page index counts rows, so the data pages of a column with
     ///     repetition must start at a row (repetition level 0), as the Parquet
     ///     format requires of files with an offset index. A page read that does
     ///     not start at a row returns `error.PageNotAtRowStart`, and a page whose
     ///     row count differs from the offset index returns
-    ///     `error.PageRowCountMismatch`.
+    ///     `error.PageRowCountMismatch`. Pages that are not read are not checked:
+    ///     when the page after a kept row continues that row, the row is
+    ///     returned without the entries in that page.
     ///
     /// The returned rows are in row-group order, restricted to the final
     /// `RowRanges`. A stats-level predicate pushdown may still leave rows that
@@ -413,11 +412,8 @@ pub const DynamicReader = struct {
             return try self.allocator.alloc(Row, 0);
         }
 
-        var probe_ranges = try extendRanges(self.allocator, final_ranges, num_rows);
-        defer probe_ranges.deinit(self.allocator);
         const filter: FilteredRead = .{
             .ranges = final_ranges,
-            .probe_ranges = probe_ranges,
             .offset_indexes = offset_indexes,
             .rg_num_rows = num_rows,
         };
@@ -428,10 +424,6 @@ pub const DynamicReader = struct {
     const FilteredRead = struct {
         /// Rows kept, as row-group row indices.
         ranges: RowRanges,
-        /// `ranges` with each range extended by one row. A column with repetition reads the
-        /// pages that hold these rows: the extra row selects the page after a page whose last
-        /// row is kept, and the first entry of that page shows whether the row continues in it.
-        probe_ranges: RowRanges,
         /// Offset index of each leaf column; none is null.
         offset_indexes: []const ?format.OffsetIndex,
         rg_num_rows: u64,
@@ -607,7 +599,8 @@ pub const DynamicReader = struct {
     }
 
     /// Reads the pages of a leaf column chunk that hold rows `filter` keeps (see
-    /// `page_range_reader`), decodes them, and returns the entries of the kept rows.
+    /// `page_range_reader`) from the source as they are decoded, and returns the
+    /// entries of the kept rows.
     fn decodeFilteredLeaf(
         self: *Self,
         chunk: *const format.ColumnChunk,
@@ -623,8 +616,7 @@ pub const DynamicReader = struct {
         // The rows of a column with repetition start at entries with repetition level 0.
         if (repeated) opts.keep_levels = true;
 
-        const wanted = if (repeated) filter.probe_ranges else filter.ranges;
-        var pages = try page_range_reader_mod.readSelectedPages(allocator, self.getSource(), chunk, offset_index, wanted, filter.rg_num_rows);
+        var pages = try page_range_reader_mod.selectPages(allocator, chunk, offset_index, filter.ranges, filter.rg_num_rows);
         defer pages.deinit(allocator);
 
         const page_rows = try allocator.alloc(usize, pages.selected.len);
@@ -633,7 +625,8 @@ pub const DynamicReader = struct {
             n.* = safe.castTo(usize, sp.end_row_index - sp.first_row_index) catch return error.IntegerOverflow;
         }
 
-        var leaf = try leaf_decoder.decodeSelectedPages(allocator, leaf_decoder.PageReader.fromMemory(allocator, pages.data), meta, info, opts, page_rows);
+        const reader = leaf_decoder.PageReader.fromSpans(allocator, self.getSource(), pages.spans);
+        var leaf = try leaf_decoder.decodeSelectedPages(allocator, reader, meta, info, opts, page_rows);
         errdefer leaf.deinit(allocator);
 
         const ranges = try keptEntryRanges(allocator, pages.selected, filter.ranges, leaf.rep_levels, leaf.buffers.length);
@@ -705,14 +698,6 @@ pub const DynamicReader = struct {
         };
     }
 };
-
-/// `ranges` with each range extended by one row, up to `num_rows`.
-fn extendRanges(allocator: std.mem.Allocator, ranges: RowRanges, num_rows: u64) !RowRanges {
-    const extended = try allocator.alloc(row_ranges_mod.RowRange, ranges.ranges.len);
-    defer allocator.free(extended);
-    for (ranges.ranges, extended) |r, *e| e.* = .{ .first = r.first, .last = @min(r.last +| 1, num_rows) };
-    return RowRanges.fromUnsorted(allocator, extended);
-}
 
 /// The entries of the rows in `ranges`, in a leaf decoded from the `selected` pages. Entries
 /// with repetition level 0 start rows; without `rep_levels` (a column without repetition) each

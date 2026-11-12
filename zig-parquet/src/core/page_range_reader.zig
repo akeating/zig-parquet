@@ -1,35 +1,31 @@
-//! Reads only the pages of a column chunk whose row ranges intersect a
-//! caller-supplied `RowRanges`.
+//! Selects the pages of a column chunk whose row ranges intersect a caller-supplied
+//! `RowRanges`, from the chunk's offset index, and gives the byte range of each.
 //!
-//! The result is a byte buffer laid out as `[dict_page?][data_page_k0][data_page_k1]...`,
-//! which `leaf_decoder.PageReader.fromMemory` reads like a whole column chunk. Pages that
-//! are not selected are not read from the source and not decompressed.
+//! `leaf_decoder.PageReader.fromSpans` reads the selected pages from the source as they are
+//! decoded, one range of adjacent pages (at most `max_span_bytes`) per read. Pages that are
+//! not selected are not read from the source and not decompressed.
 //!
-//! The dictionary page (if any) is always included, since every data page in
-//! the chunk may reference it.
-//!
-//! Contiguous runs of selected pages are read with a single `readAt` each, which
-//! reduces the number of requests to remote sources.
+//! The dictionary page (if any) is always selected, since every data page in the chunk may
+//! reference it.
 
 const std = @import("std");
 const safe = @import("safe.zig");
 const format = @import("format.zig");
-const seekable_reader = @import("seekable_reader.zig");
+const leaf_decoder = @import("leaf_decoder.zig");
 const row_ranges = @import("row_ranges.zig");
 
-pub const SeekableReader = seekable_reader.SeekableReader;
 pub const RowRanges = row_ranges.RowRanges;
 pub const RowRange = row_ranges.RowRange;
+pub const Span = leaf_decoder.PageReader.Span;
 
 pub const Error = error{
-    InputOutput,
     OutOfMemory,
     InvalidPageIndex,
     InvalidArgument,
     IntegerOverflow,
 };
 
-/// Describes one selected data page within the returned buffer.
+/// One selected data page.
 pub const SelectedPage = struct {
     /// Index into the `OffsetIndex.page_locations` slice.
     page_index: usize,
@@ -38,73 +34,76 @@ pub const SelectedPage = struct {
     /// Exclusive upper bound of this page's rows within the row group.
     /// Equals `rg_num_rows` for the final page.
     end_row_index: u64,
-    /// Offset within `PageRangeResult.data` where this page (header+body)
-    /// begins. Dict page — if present — occupies `[0, data[0].buffer_offset)`.
-    buffer_offset: usize,
-    /// Number of bytes in `PageRangeResult.data` belonging to this page.
-    buffer_length: usize,
 };
 
-pub const PageRangeResult = struct {
-    /// `[dict_page?][selected data pages concatenated in chunk order]`.
-    /// Drop-in replacement for `readColumnChunkData`'s output for a filtered read.
-    data: []u8,
-    /// True when `data[0..selected[0].buffer_offset]` is a dictionary page.
-    has_dictionary: bool,
+pub const PageSelection = struct {
+    /// Byte ranges to read, in chunk order: the dictionary page, when the chunk has one, and
+    /// the selected data pages. Pages that are adjacent in the file share a range while the
+    /// range stays within `max_span_bytes`, so a run of kept pages is read with one read.
+    spans: []Span,
     /// Selected data pages, in chunk order (ascending `page_index`).
     selected: []SelectedPage,
 
-    pub fn deinit(self: *PageRangeResult, allocator: std.mem.Allocator) void {
-        if (self.data.len > 0) allocator.free(self.data);
-        if (self.selected.len > 0) allocator.free(self.selected);
-        self.* = .{ .data = &.{}, .has_dictionary = false, .selected = &.{} };
+    pub fn deinit(self: *PageSelection, allocator: std.mem.Allocator) void {
+        allocator.free(self.spans);
+        allocator.free(self.selected);
+        self.* = .{ .spans = &.{}, .selected = &.{} };
     }
 };
 
-pub fn readSelectedPages(
+/// Adjacent pages are joined into one range of at most this many bytes. A range is read
+/// whole, so this bounds the compressed bytes held per column while a filtered read decodes
+/// it; a single page larger than this is one range by itself.
+pub const max_span_bytes: u64 = 8 << 20;
+
+/// Selects the data pages of `chunk` that hold rows in `wanted`, and the dictionary page when
+/// at least one data page is selected. No data is read.
+pub fn selectPages(
     allocator: std.mem.Allocator,
-    source: SeekableReader,
     chunk: *const format.ColumnChunk,
     offset_index: *const format.OffsetIndex,
     wanted: RowRanges,
     rg_num_rows: u64,
-) Error!PageRangeResult {
+) Error!PageSelection {
     const meta = chunk.meta_data orelse return error.InvalidArgument;
-    if (offset_index.page_locations.len == 0) {
-        return .{ .data = &.{}, .has_dictionary = false, .selected = &.{} };
-    }
+    const locations = offset_index.page_locations;
+    if (locations.len == 0) return .{ .spans = &.{}, .selected = &.{} };
 
-    // Identify which data pages intersect `wanted`.
-    var selected_raw = try std.ArrayList(SelectedPage).initCapacity(allocator, offset_index.page_locations.len);
-    errdefer selected_raw.deinit(allocator);
+    var selected: std.ArrayList(SelectedPage) = .empty;
+    errdefer selected.deinit(allocator);
+    var page_spans: std.ArrayList(Span) = .empty;
+    defer page_spans.deinit(allocator);
 
-    const n_pages = offset_index.page_locations.len;
     // Pages cover rows `first_row_index[0]..rg_num_rows`; rows before the first page would
     // be in no page.
-    if (offset_index.page_locations[0].first_row_index != 0) return error.InvalidPageIndex;
-    for (offset_index.page_locations, 0..) |loc, i| {
+    if (locations[0].first_row_index != 0) return error.InvalidPageIndex;
+    for (locations, 0..) |loc, i| {
         if (loc.offset < 0 or loc.compressed_page_size < 0 or loc.first_row_index < 0) {
             return error.InvalidPageIndex;
         }
-        const first: u64 = @intCast(loc.first_row_index);
-        const end: u64 = if (i + 1 < n_pages) blk: {
-            const next = offset_index.page_locations[i + 1].first_row_index;
+        const first: u64 = @intCast(loc.first_row_index); // checked >= 0 above
+        const end: u64 = if (i + 1 < locations.len) blk: {
+            const next = locations[i + 1].first_row_index;
             if (next < 0) return error.InvalidPageIndex;
-            break :blk @intCast(next);
+            break :blk @intCast(next); // checked >= 0 above
         } else rg_num_rows;
         if (end < first) return error.InvalidPageIndex;
         if (end == first) continue; // empty page — shouldn't happen but skip safely
 
         if (!rangeIntersects(wanted, first, end)) continue;
 
-        const len = safe.castTo(usize, @as(u64, @intCast(loc.compressed_page_size))) catch return error.IntegerOverflow;
-        try selected_raw.append(allocator, .{
-            .page_index = i,
-            .first_row_index = first,
-            .end_row_index = end,
-            .buffer_offset = 0, // filled in below
-            .buffer_length = len,
+        // A page holds at least its header.
+        if (loc.compressed_page_size == 0) return error.InvalidPageIndex;
+        _ = std.math.add(i64, loc.offset, loc.compressed_page_size) catch return error.IntegerOverflow;
+        try selected.append(allocator, .{ .page_index = i, .first_row_index = first, .end_row_index = end });
+        try page_spans.append(allocator, .{
+            .start = @intCast(loc.offset), // checked >= 0 above
+            .size = @intCast(loc.compressed_page_size), // checked > 0 above
         });
+    }
+    if (selected.items.len == 0) {
+        selected.deinit(allocator);
+        return .{ .spans = &.{}, .selected = &.{} };
     }
 
     // The dictionary page, when there is one, is the chunk's first page and precedes the
@@ -113,81 +112,36 @@ pub fn readSelectedPages(
     // at the dictionary page instead, so bytes from `data_page_offset` to the first data page
     // are read as well. A `dictionary_page_offset` of 0 means no dictionary (0 is before the
     // PAR1 magic bytes).
-    var dict_info: ?struct { offset: u64, length: usize } = null;
-    const chunk_first_data = offset_index.page_locations[0].offset;
+    var dictionary: ?Span = null;
+    const chunk_first_data = locations[0].offset;
     const declared_dict: ?i64 = if (meta.dictionary_page_offset) |d| (if (d > 0) d else null) else null;
     if (declared_dict) |d| {
         if (chunk_first_data <= d) return error.InvalidPageIndex;
     }
     const dict_off = declared_dict orelse meta.data_page_offset;
     if (dict_off >= 0 and dict_off < chunk_first_data) {
-        const dict_len = safe.castTo(usize, chunk_first_data - dict_off) catch return error.IntegerOverflow;
-        dict_info = .{ .offset = @intCast(dict_off), .length = dict_len }; // dict_off >= 0 is checked above
+        dictionary = .{
+            .start = @intCast(dict_off), // checked >= 0 above
+            .size = @intCast(chunk_first_data - dict_off), // dict_off < chunk_first_data
+        };
     }
 
-    // Total output buffer size.
-    var total: usize = 0;
-    if (dict_info) |d| total = d.length;
-    for (selected_raw.items) |*sp| total = std.math.add(usize, total, sp.buffer_length) catch return error.IntegerOverflow;
-
-    if (total == 0) {
-        selected_raw.deinit(allocator);
-        return .{ .data = &.{}, .has_dictionary = false, .selected = &.{} };
-    }
-
-    const buffer = try allocator.alloc(u8, total);
-    errdefer allocator.free(buffer);
-
-    // Read dict page (if any) — single readAt.
-    var cursor: usize = 0;
-    if (dict_info) |d| {
-        const got = source.readAt(d.offset, buffer[0..d.length]) catch return error.InputOutput;
-        if (got != d.length) return error.InputOutput;
-        cursor = d.length;
-    }
-
-    // Coalesce contiguous runs of selected data pages into one readAt each.
-    var i: usize = 0;
-    while (i < selected_raw.items.len) {
-        const run_start = i;
-        var run_len: usize = selected_raw.items[i].buffer_length;
-        var expected_next_offset: i64 = try pageEnd(offset_index.page_locations[selected_raw.items[i].page_index]);
-        var j = i + 1;
-        while (j < selected_raw.items.len) : (j += 1) {
-            const next_loc = offset_index.page_locations[selected_raw.items[j].page_index];
-            if (next_loc.offset != expected_next_offset) break;
-            run_len += selected_raw.items[j].buffer_length;
-            expected_next_offset = try pageEnd(next_loc);
+    var spans: std.ArrayList(Span) = .empty;
+    errdefer spans.deinit(allocator);
+    if (dictionary) |d| try spans.append(allocator, d);
+    for (page_spans.items) |span| {
+        if (spans.items.len > 0) {
+            const last = &spans.items[spans.items.len - 1];
+            if (last.start + last.size == span.start and last.size + span.size <= max_span_bytes) {
+                last.size += span.size;
+                continue;
+            }
         }
-
-        // Single readAt covering the run.
-        const run_first_loc = offset_index.page_locations[selected_raw.items[run_start].page_index];
-        if (run_first_loc.offset < 0) return error.InvalidPageIndex;
-        const run_off: u64 = @intCast(run_first_loc.offset);
-        const got = source.readAt(run_off, buffer[cursor .. cursor + run_len]) catch return error.InputOutput;
-        if (got != run_len) return error.InputOutput;
-
-        // Assign buffer offsets for each page in the run.
-        var sub_cursor = cursor;
-        for (selected_raw.items[run_start..j]) |*sp| {
-            sp.buffer_offset = sub_cursor;
-            sub_cursor += sp.buffer_length;
-        }
-        cursor = sub_cursor;
-
-        i = j;
+        try spans.append(allocator, span);
     }
-
-    return .{
-        .data = buffer,
-        .has_dictionary = dict_info != null,
-        .selected = try selected_raw.toOwnedSlice(allocator),
-    };
-}
-
-/// Offset of the byte after the page at `loc`.
-fn pageEnd(loc: format.PageLocation) error{IntegerOverflow}!i64 {
-    return std.math.add(i64, loc.offset, loc.compressed_page_size) catch error.IntegerOverflow;
+    const owned_spans = try spans.toOwnedSlice(allocator);
+    errdefer allocator.free(owned_spans);
+    return .{ .spans = owned_spans, .selected = try selected.toOwnedSlice(allocator) };
 }
 
 fn rangeIntersects(wanted: RowRanges, first: u64, end: u64) bool {
@@ -205,48 +159,17 @@ fn rangeIntersects(wanted: RowRanges, first: u64, end: u64) bool {
 
 const testing = std.testing;
 
-/// Counting in-memory source — also verifies we only issue `readAt` for wanted
-/// byte ranges, not the whole chunk.
-const Source = struct {
-    data: []const u8,
-    reads: std.ArrayListUnmanaged(Record) = .empty,
-    allocator: std.mem.Allocator,
+fn expectSpans(expected: []const Span, actual: []const Span) !void {
+    try testing.expectEqual(expected.len, actual.len);
+    for (expected, actual) |e, a| {
+        try testing.expectEqual(e.start, a.start);
+        try testing.expectEqual(e.size, a.size);
+    }
+}
 
-    const Record = struct { offset: u64, length: usize };
-
-    fn readAt(ctx: *anyopaque, offset: u64, buf: []u8) SeekableReader.Error!usize {
-        const self: *Source = @ptrCast(@alignCast(ctx));
-        self.reads.append(self.allocator, .{ .offset = offset, .length = buf.len }) catch return error.InputOutput;
-        if (offset >= self.data.len) return 0;
-        const end = @min(offset + buf.len, self.data.len);
-        const n = end - offset;
-        @memcpy(buf[0..n], self.data[offset..end]);
-        return n;
-    }
-    fn sizeFn(ctx: *anyopaque) u64 {
-        const self: *Source = @ptrCast(@alignCast(ctx));
-        return self.data.len;
-    }
-    const vtable: SeekableReader.VTable = .{ .readAt = readAt, .size = sizeFn };
-    fn reader(self: *Source) SeekableReader {
-        return .{ .ptr = self, .vtable = &vtable };
-    }
-    fn deinit(self: *Source) void {
-        self.reads.deinit(self.allocator);
-    }
-};
-
-test "readSelectedPages: skips pages outside wanted range" {
-    // Layout: 4 data pages at offsets 0, 100, 200, 300; each 100 bytes long.
+test "selectPages: skips pages outside wanted range" {
+    // 4 data pages at offsets 0, 100, 200, 300; each 100 bytes long.
     // first_row_index: 0, 25, 50, 75.
-    const file_len: usize = 400;
-    const file = try testing.allocator.alloc(u8, file_len);
-    defer testing.allocator.free(file);
-    for (file, 0..) |*b, idx| b.* = @intCast(idx % 251);
-
-    var src = Source{ .data = file, .allocator = testing.allocator };
-    defer src.deinit();
-
     var locs = [_]format.PageLocation{
         .{ .offset = 0, .compressed_page_size = 100, .first_row_index = 0 },
         .{ .offset = 100, .compressed_page_size = 100, .first_row_index = 25 },
@@ -262,22 +185,14 @@ test "readSelectedPages: skips pages outside wanted range" {
     var wanted = try RowRanges.fromSingle(testing.allocator, 30, 65);
     defer wanted.deinit(testing.allocator);
 
-    var result = try readSelectedPages(testing.allocator, src.reader(), &chunk, &oi, wanted, 100);
+    var result = try selectPages(testing.allocator, &chunk, &oi, wanted, 100);
     defer result.deinit(testing.allocator);
 
-    try testing.expect(!result.has_dictionary);
     try testing.expectEqual(@as(usize, 2), result.selected.len);
     try testing.expectEqual(@as(usize, 1), result.selected[0].page_index);
     try testing.expectEqual(@as(usize, 2), result.selected[1].page_index);
-
-    // Pages 1 and 2 are contiguous (offsets 100 and 200) so they coalesce into
-    // one readAt.
-    try testing.expectEqual(@as(usize, 1), src.reads.items.len);
-    try testing.expectEqual(@as(u64, 100), src.reads.items[0].offset);
-    try testing.expectEqual(@as(usize, 200), src.reads.items[0].length);
-
-    // Output buffer should contain page 1 bytes then page 2 bytes.
-    try testing.expectEqualSlices(u8, file[100..300], result.data);
+    // No dictionary. Pages 1 and 2 are adjacent, so they are one range.
+    try expectSpans(&.{.{ .start = 100, .size = 200 }}, result.spans);
 
     // The selected pages hold rows 25..50 and 50..75.
     try testing.expectEqual(@as(u64, 25), result.selected[0].first_row_index);
@@ -286,16 +201,8 @@ test "readSelectedPages: skips pages outside wanted range" {
     try testing.expectEqual(@as(u64, 75), result.selected[1].end_row_index);
 }
 
-test "readSelectedPages: non-contiguous pages use separate reads" {
-    const file_len: usize = 400;
-    const file = try testing.allocator.alloc(u8, file_len);
-    defer testing.allocator.free(file);
-    @memset(file, 0);
-
-    var src = Source{ .data = file, .allocator = testing.allocator };
-    defer src.deinit();
-
-    // Pages 0, 1, 2, 3 but with a gap between 1 and 2 (offsets 0, 100, 250, 350).
+test "selectPages: non-contiguous pages" {
+    // Pages 0, 1, 2, 3 with a gap between 1 and 2 (offsets 0, 100, 250, 350).
     var locs = [_]format.PageLocation{
         .{ .offset = 0, .compressed_page_size = 100, .first_row_index = 0 },
         .{ .offset = 100, .compressed_page_size = 100, .first_row_index = 25 },
@@ -307,26 +214,25 @@ test "readSelectedPages: non-contiguous pages use separate reads" {
         .meta_data = format.ColumnMetaData{ .data_page_offset = 0 },
     };
 
-    // Want pages 0, 2, 3 → two runs (0; 2+3).
+    // Want pages 0, 2, 3.
     var wanted = try RowRanges.fromUnsorted(testing.allocator, &[_]RowRange{
         .{ .first = 0, .last = 25 },
         .{ .first = 50, .last = 100 },
     });
     defer wanted.deinit(testing.allocator);
 
-    var result = try readSelectedPages(testing.allocator, src.reader(), &chunk, &oi, wanted, 100);
+    var result = try selectPages(testing.allocator, &chunk, &oi, wanted, 100);
     defer result.deinit(testing.allocator);
 
     try testing.expectEqual(@as(usize, 3), result.selected.len);
-    // Expect 2 readAts: page 0 alone, then pages 2+3 coalesced.
-    try testing.expectEqual(@as(usize, 2), src.reads.items.len);
-    try testing.expectEqual(@as(u64, 0), src.reads.items[0].offset);
-    try testing.expectEqual(@as(usize, 100), src.reads.items[0].length);
-    try testing.expectEqual(@as(u64, 250), src.reads.items[1].offset);
-    try testing.expectEqual(@as(usize, 150), src.reads.items[1].length);
+    // Page 1 is not selected, so page 0 is a range by itself; pages 2 and 3 are adjacent.
+    try expectSpans(&.{
+        .{ .start = 0, .size = 100 },
+        .{ .start = 250, .size = 150 },
+    }, result.spans);
 }
 
-test "readSelectedPages: empty wanted produces empty result" {
+test "selectPages: empty wanted produces empty result" {
     var locs = [_]format.PageLocation{
         .{ .offset = 0, .compressed_page_size = 100, .first_row_index = 0 },
     };
@@ -334,29 +240,17 @@ test "readSelectedPages: empty wanted produces empty result" {
     const chunk = format.ColumnChunk{
         .meta_data = format.ColumnMetaData{ .data_page_offset = 0 },
     };
-    const data: [100]u8 = @splat(0);
-    var src = Source{ .data = &data, .allocator = testing.allocator };
-    defer src.deinit();
 
-    var result = try readSelectedPages(testing.allocator, src.reader(), &chunk, &oi, RowRanges.empty(), 25);
+    var result = try selectPages(testing.allocator, &chunk, &oi, RowRanges.empty(), 25);
     defer result.deinit(testing.allocator);
 
     try testing.expectEqual(@as(usize, 0), result.selected.len);
-    try testing.expectEqual(@as(usize, 0), result.data.len);
-    try testing.expectEqual(@as(usize, 0), src.reads.items.len);
+    try testing.expectEqual(@as(usize, 0), result.spans.len);
 }
 
-test "readSelectedPages: includes dictionary page when present" {
+test "selectPages: includes dictionary page when present" {
     // Dict at 4..54 (after PAR1 magic), data pages at 54, 154, 254.
     // dict_page_offset=0 is the "no dict" sentinel, so we use offset 4.
-    const file_len: usize = 354;
-    const file = try testing.allocator.alloc(u8, file_len);
-    defer testing.allocator.free(file);
-    for (file, 0..) |*b, idx| b.* = @intCast(idx % 251);
-
-    var src = Source{ .data = file, .allocator = testing.allocator };
-    defer src.deinit();
-
     var locs = [_]format.PageLocation{
         .{ .offset = 54, .compressed_page_size = 100, .first_row_index = 0 },
         .{ .offset = 154, .compressed_page_size = 100, .first_row_index = 10 },
@@ -374,40 +268,18 @@ test "readSelectedPages: includes dictionary page when present" {
     var wanted = try RowRanges.fromSingle(testing.allocator, 12, 18);
     defer wanted.deinit(testing.allocator);
 
-    var result = try readSelectedPages(testing.allocator, src.reader(), &chunk, &oi, wanted, 30);
+    var result = try selectPages(testing.allocator, &chunk, &oi, wanted, 30);
     defer result.deinit(testing.allocator);
 
-    try testing.expect(result.has_dictionary);
     try testing.expectEqual(@as(usize, 1), result.selected.len);
     try testing.expectEqual(@as(usize, 1), result.selected[0].page_index);
-
-    // Buffer layout: 50 bytes dict + 100 bytes page 1 = 150 bytes total.
-    try testing.expectEqual(@as(usize, 150), result.data.len);
-    try testing.expectEqualSlices(u8, file[4..54], result.data[0..50]); // dict
-    try testing.expectEqualSlices(u8, file[154..254], result.data[50..150]); // page 1
-
-    // page 1's buffer_offset is after the dict.
-    try testing.expectEqual(@as(usize, 50), result.selected[0].buffer_offset);
-
-    // 2 readAts: dict + page 1.
-    try testing.expectEqual(@as(usize, 2), src.reads.items.len);
-    try testing.expectEqual(@as(u64, 4), src.reads.items[0].offset);
-    try testing.expectEqual(@as(usize, 50), src.reads.items[0].length);
-    try testing.expectEqual(@as(u64, 154), src.reads.items[1].offset);
-    try testing.expectEqual(@as(usize, 100), src.reads.items[1].length);
+    // The dictionary at 4..54, then page 1.
+    try expectSpans(&.{ .{ .start = 4, .size = 50 }, .{ .start = 154, .size = 100 } }, result.spans);
 }
 
-test "readSelectedPages: reads a dictionary page that data_page_offset points at" {
+test "selectPages: selects a dictionary page that data_page_offset points at" {
     // Some writers leave out dictionary_page_offset and set data_page_offset to the
     // dictionary page at 4..54; data pages are at 54 and 154.
-    const file_len: usize = 254;
-    const file = try testing.allocator.alloc(u8, file_len);
-    defer testing.allocator.free(file);
-    for (file, 0..) |*b, idx| b.* = @intCast(idx % 251);
-
-    var src = Source{ .data = file, .allocator = testing.allocator };
-    defer src.deinit();
-
     var locs = [_]format.PageLocation{
         .{ .offset = 54, .compressed_page_size = 100, .first_row_index = 0 },
         .{ .offset = 154, .compressed_page_size = 100, .first_row_index = 10 },
@@ -420,16 +292,37 @@ test "readSelectedPages: reads a dictionary page that data_page_offset points at
     var wanted = try RowRanges.fromSingle(testing.allocator, 12, 18);
     defer wanted.deinit(testing.allocator);
 
-    var result = try readSelectedPages(testing.allocator, src.reader(), &chunk, &oi, wanted, 20);
+    var result = try selectPages(testing.allocator, &chunk, &oi, wanted, 20);
     defer result.deinit(testing.allocator);
 
-    try testing.expect(result.has_dictionary);
     try testing.expectEqual(@as(usize, 1), result.selected.len);
-    try testing.expectEqualSlices(u8, file[4..54], result.data[0..50]);
-    try testing.expectEqualSlices(u8, file[154..254], result.data[50..150]);
+    try expectSpans(&.{ .{ .start = 4, .size = 50 }, .{ .start = 154, .size = 100 } }, result.spans);
 }
 
-test "readSelectedPages: an offset index whose first page is not at row 0 is invalid" {
+test "selectPages: joins adjacent pages up to max_span_bytes" {
+    // 3 adjacent data pages of 3 MiB: pages 0 and 1 make 6 MiB; with page 2 the range would
+    // be 9 MiB, over the 8 MiB limit.
+    const mib: i32 = 1 << 20;
+    var locs = [_]format.PageLocation{
+        .{ .offset = 4, .compressed_page_size = 3 * mib, .first_row_index = 0 },
+        .{ .offset = 4 + 3 * mib, .compressed_page_size = 3 * mib, .first_row_index = 10 },
+        .{ .offset = 4 + 6 * mib, .compressed_page_size = 3 * mib, .first_row_index = 20 },
+    };
+    const oi = format.OffsetIndex{ .page_locations = &locs };
+    const chunk = format.ColumnChunk{ .meta_data = format.ColumnMetaData{ .data_page_offset = 4 } };
+    var wanted = try RowRanges.fromSingle(testing.allocator, 0, 30);
+    defer wanted.deinit(testing.allocator);
+
+    var result = try selectPages(testing.allocator, &chunk, &oi, wanted, 30);
+    defer result.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 3), result.selected.len);
+    try expectSpans(&.{
+        .{ .start = 4, .size = 6 << 20 },
+        .{ .start = 4 + (6 << 20), .size = 3 << 20 },
+    }, result.spans);
+}
+
+test "selectPages: an offset index whose first page is not at row 0 is invalid" {
     var locs = [_]format.PageLocation{
         .{ .offset = 0, .compressed_page_size = 100, .first_row_index = 5 },
     };
@@ -437,11 +330,21 @@ test "readSelectedPages: an offset index whose first page is not at row 0 is inv
     const chunk = format.ColumnChunk{
         .meta_data = format.ColumnMetaData{ .data_page_offset = 0 },
     };
-    const data: [100]u8 = @splat(0);
-    var src = Source{ .data = &data, .allocator = testing.allocator };
-    defer src.deinit();
 
     var wanted = try RowRanges.fromSingle(testing.allocator, 0, 10);
     defer wanted.deinit(testing.allocator);
-    try testing.expectError(error.InvalidPageIndex, readSelectedPages(testing.allocator, src.reader(), &chunk, &oi, wanted, 10));
+    try testing.expectError(error.InvalidPageIndex, selectPages(testing.allocator, &chunk, &oi, wanted, 10));
+}
+
+test "selectPages: rejects selected pages of size 0 and pages that end past maxInt(i64)" {
+    const chunk = format.ColumnChunk{
+        .meta_data = format.ColumnMetaData{ .data_page_offset = 0 },
+    };
+    var wanted = try RowRanges.fromSingle(testing.allocator, 0, 10);
+    defer wanted.deinit(testing.allocator);
+
+    var empty_page = [_]format.PageLocation{.{ .offset = 4, .compressed_page_size = 0, .first_row_index = 0 }};
+    try testing.expectError(error.InvalidPageIndex, selectPages(testing.allocator, &chunk, &.{ .page_locations = &empty_page }, wanted, 10));
+    var past_end = [_]format.PageLocation{.{ .offset = std.math.maxInt(i64) - 10, .compressed_page_size = 100, .first_row_index = 0 }};
+    try testing.expectError(error.IntegerOverflow, selectPages(testing.allocator, &chunk, &.{ .page_locations = &past_end }, wanted, 10));
 }

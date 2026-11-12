@@ -13,6 +13,7 @@ const format = parquet.format;
 const arrow_batch = @import("../core/arrow_batch.zig");
 const leaf_decoder = @import("../core/leaf_decoder.zig");
 const parquet_reader = @import("../core/parquet_reader.zig");
+const test_util = @import("../core/test_util.zig");
 const ArrowArray = parquet.ArrowArray;
 
 const roots = [_][]const u8{ "../test-files-arrow", "../test-files-wild" };
@@ -259,6 +260,72 @@ test "page reader reads headers longer than its first read" {
         }
     }
     try std.testing.expectEqual(@as(i32, 300), expected);
+}
+
+test "page reader reads each span with one read" {
+    const allocator = std.testing.allocator;
+    const thrift = @import("../core/thrift/mod.zig");
+
+    // A required INT32 chunk of 3 PLAIN pages of 100 values. Page 1's header carries
+    // 3000-byte statistics, so it is longer than the first read of a header.
+    const long_stat: [3000]u8 = @splat('x');
+    var chunk: std.ArrayList(u8) = .empty;
+    defer chunk.deinit(allocator);
+    var spans: [3]leaf_decoder.PageReader.Span = undefined;
+    for (0..3) |p| {
+        const start = chunk.items.len;
+        var body: [400]u8 = undefined;
+        for (0..100) |i| std.mem.writeInt(i32, body[i * 4 ..][0..4], @intCast(p * 100 + i), .little);
+        var header: format.PageHeader = .{
+            .type_ = .data_page,
+            .uncompressed_page_size = body.len,
+            .compressed_page_size = body.len,
+            .data_page_header = .{ .num_values = 100 },
+        };
+        if (p == 1) header.data_page_header.?.statistics = .{ .max = &long_stat, .min = &long_stat };
+        var w = thrift.CompactWriter.init(allocator);
+        defer w.deinit();
+        try header.serialize(&w);
+        try chunk.appendSlice(allocator, w.getWritten());
+        try chunk.appendSlice(allocator, &body);
+        spans[p] = .{ .start = start, .size = chunk.items.len - start };
+    }
+
+    const meta: format.ColumnMetaData = .{ .type_ = .int32, .num_values = 300, .total_compressed_size = @intCast(chunk.items.len) };
+    const info: format.ColumnInfo = .{
+        .element = .{ .name = "v", .type_ = .int32, .repetition_type = .required },
+        .max_def_level = 0,
+        .max_rep_level = 0,
+        .column_index = 0,
+    };
+    const cases = [_][]const leaf_decoder.PageReader.Span{
+        &.{ spans[0], spans[2] },
+        &.{spans[1]},
+        &.{ spans[0], spans[1], spans[2] },
+    };
+    const first_values = [_][]const i32{ &.{ 0, 200 }, &.{100}, &.{ 0, 100, 200 } };
+    for (cases, first_values) |selected, firsts| {
+        var source = test_util.RecordingSource{ .data = chunk.items, .allocator = allocator };
+        defer source.deinit();
+        const page_rows = [_]usize{ 100, 100, 100 };
+        const pages = leaf_decoder.PageReader.fromSpans(allocator, source.reader(), selected);
+        var leaf = try leaf_decoder.decodeSelectedPages(allocator, pages, meta, info, .{}, page_rows[0..selected.len]);
+        defer leaf.deinit(allocator);
+
+        try std.testing.expectEqual(selected.len * 100, leaf.buffers.length);
+        for (firsts, 0..) |first, k| {
+            for (0..100) |i| {
+                const at = (k * 100 + i) * 4;
+                try std.testing.expectEqual(first + @as(i32, @intCast(i)), std.mem.readInt(i32, leaf.buffers.values[at..][0..4], .little));
+            }
+        }
+        // One read per span, of the whole span.
+        try std.testing.expectEqual(selected.len, source.reads.items.len);
+        for (selected, source.reads.items) |want, got| {
+            try std.testing.expectEqual(want.start, got.offset);
+            try std.testing.expectEqual(want.size, @as(u64, got.len));
+        }
+    }
 }
 
 // =============================================================================

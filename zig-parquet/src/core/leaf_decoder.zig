@@ -349,9 +349,10 @@ pub fn decodeSelectedPages(
     return cursor.take(cursor.builder.length - cursor.start, cursor.dec.row_starts);
 }
 
-/// The pages of a column chunk, from a buffer holding the whole chunk or read from a source
-/// one page at a time. `next` returns a page's header; its body is read by `body` or passed
-/// over by `skip`.
+/// The pages of a column chunk, from a buffer holding the whole chunk, or read from a source
+/// one page at a time: from a contiguous range of the source, or from a list of byte ranges
+/// (`fromSpans`). `next` returns a page's header; its body is read by `body` or passed over by
+/// `skip`.
 pub const PageReader = struct {
     allocator: Allocator,
     /// Bytes at offsets `window_start..window_start + window.len`.
@@ -359,13 +360,23 @@ pub const PageReader = struct {
     window_start: u64,
     /// Offset of the next unread byte: a page header, or a body after `next`.
     pos: u64,
-    /// Offset of the end of the chunk.
+    /// Offset of the end of the chunk, or of the current span.
     end: u64,
     /// Size of the body of the header last returned by `next`.
     body_size: usize = 0,
     /// When set, `window` is filled from here, into `buf`.
     source: ?SeekableReader = null,
     buf: []u8 = &.{},
+    /// Spans not yet started (`fromSpans`).
+    spans: []const Span = &.{},
+    /// The first header read of a span reads the whole span (`fromSpans`).
+    whole_spans: bool = false,
+
+    /// Bytes `start..start + size` of a source.
+    pub const Span = struct {
+        start: u64,
+        size: u64,
+    };
 
     /// Bytes read for a page header, and read past a body for the next header. A header
     /// longer than this is read again with a 4 times longer prefix.
@@ -382,23 +393,39 @@ pub const PageReader = struct {
         return .{ .allocator = allocator, .window = &.{}, .window_start = start, .pos = start, .end = start +| size, .source = source };
     }
 
+    /// Pages held in `spans` of `source`, in order. Each span holds whole pages, usually one.
+    /// A span is read with one `readAt` when its first header is needed, so the reader holds
+    /// one span at a time. `spans` is borrowed and must outlive the reader.
+    pub fn fromSpans(allocator: Allocator, source: SeekableReader, spans: []const Span) PageReader {
+        return .{ .allocator = allocator, .window = &.{}, .window_start = 0, .pos = 0, .end = 0, .source = source, .spans = spans, .whole_spans = true };
+    }
+
     pub fn deinit(self: *PageReader) void {
         self.allocator.free(self.buf);
     }
 
     /// Whether all pages have been returned.
     pub fn done(self: *const PageReader) bool {
-        return self.pos >= self.end;
+        return self.pos >= self.end and self.spans.len == 0;
     }
 
     /// The next page's header. The caller frees its contents with
     /// `parquet_reader.freePageHeaderContents`, and calls `body` or `skip` before `next`.
     pub fn next(self: *PageReader) !format.PageHeader {
+        while (self.pos >= self.end) {
+            if (self.spans.len == 0) return error.EndOfData;
+            const span = self.spans[0];
+            self.spans = self.spans[1..];
+            self.pos = span.start;
+            self.end = span.start +| span.size;
+        }
         const remaining = self.end - self.pos;
         // `@min` with a comptime bound has a narrow type; `want` grows past it.
         var want: usize = @intCast(@min(remaining, header_prefix));
+        // The rest of the span is read with the header.
+        const extra: u64 = if (self.whole_spans) remaining - want else 0;
         while (true) {
-            const bytes = try self.read(self.pos, want, 0);
+            const bytes = try self.read(self.pos, want, extra);
             // The header is skipped first, which does not allocate, to find out whether `bytes`
             // holds all of it: `PageHeader.parse` does not free what it allocated before
             // reaching the end of its input.
@@ -439,8 +466,8 @@ pub const PageReader = struct {
             return self.window[from..][0..n];
         }
         const source = self.source orelse return error.EndOfData;
-        const more = @min(extra, self.end - (at + n));
-        const len = std.math.add(usize, n, @intCast(more)) catch return error.OutOfMemory;
+        const more = std.math.cast(usize, @min(extra, self.end - (at + n))) orelse return error.OutOfMemory;
+        const len = std.math.add(usize, n, more) catch return error.OutOfMemory;
         if (self.buf.len < len) {
             self.allocator.free(self.buf);
             self.buf = &.{};
@@ -1600,4 +1627,3 @@ pub const ValueReader = struct {
         };
     }
 };
-
