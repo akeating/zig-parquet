@@ -263,7 +263,7 @@ col_writer.max_page_size = 64 * 1024;
 // ... write*Column calls / close as usual
 ```
 
-`max_page_size` defaults to null, which writes each column chunk as one data page; `write_page_index` defaults to false. The page indexes are written after the last row group, before the footer. Each data page of a flat or nested column gets an index entry with its own min, max and null count. Pages of list, struct and map columns end only before a row, so a page can hold more than `max_page_size` bytes when one row does. Inspect what you wrote with `pqi page-index <file>`.
+`max_page_size` defaults to null, which writes each column chunk as one data page; `write_page_index` defaults to false. Set `write_page_index` before writing: changing it after the first column is written (`Writer`) or after `begin()` (`DynamicWriter`) returns `error.InvalidState` at the next write or at `close`. The page indexes are written after the last row group, before the footer. Each data page of a flat or nested column gets an index entry with its own min, max and null count. Pages of list, struct and map columns end only before a row, so a page can hold more than `max_page_size` bytes when one row does. Inspect what you wrote with `pqi page-index <file>`.
 
 ### Row Iterator
 

@@ -251,8 +251,12 @@ pub const DynamicWriter = struct {
     dictionary_cardinality_threshold: ?f32 = null,
     write_page_checksum: bool = true,
     /// Write an OffsetIndex and a ColumnIndex for every leaf column chunk, after the last
-    /// row group and before the footer, and point the chunk's metadata at them.
+    /// row group and before the footer, and point the chunk's metadata at them. Set before
+    /// `begin()`: a row group flushed or a `close` with a different value returns
+    /// `error.InvalidState`, since the file would hold indexes for some row groups only.
     write_page_index: bool = false,
+    /// `write_page_index` at `begin()`.
+    page_index_on: bool = false,
 
     path_properties: std.StringHashMapUnmanaged(ColumnProperties) = .empty,
 
@@ -484,6 +488,7 @@ pub const DynamicWriter = struct {
         if (self.began) return error.InvalidState;
         const n = self.pending_columns.items.len;
         if (n == 0) return error.InvalidState;
+        self.page_index_on = self.write_page_index;
 
         const allocator = self.allocator;
 
@@ -847,6 +852,7 @@ pub const DynamicWriter = struct {
             for (pb) |*maybe| if (maybe.*) |*b| b.deinit();
             allocator.free(pb);
         };
+        if (self.write_page_index != self.page_index_on) return error.InvalidState;
         if (self.write_page_index) {
             const leaf_count = try self.countLeafColumns();
             const builders = allocator.alloc(?page_index_writer.PageIndexBuilder, leaf_count) catch return error.OutOfMemory;
@@ -1302,6 +1308,7 @@ pub const DynamicWriter = struct {
 
     pub fn close(self: *DynamicWriter) DynamicWriterError!void {
         if (!self.began) return error.InvalidState;
+        if (self.write_page_index != self.page_index_on) return error.InvalidState;
         if (self.column_buffers.len > 0 and self.column_buffers[0].items.len > 0) {
             try self.flush();
         }

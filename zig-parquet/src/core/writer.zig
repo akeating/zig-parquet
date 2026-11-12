@@ -108,12 +108,16 @@ pub const Writer = struct {
 
     /// Target size of a data page, in bytes. Null writes each column chunk as one data page.
     /// Pages of list, struct and map columns end only before a row, so a page holds whole
-    /// rows and can exceed this size. Set before writing columns.
+    /// rows and can exceed this size. Applies to the columns written after it is set.
     max_page_size: ?usize = null,
     /// Write an OffsetIndex and a ColumnIndex for every column chunk, after the column data
     /// and before the footer, and point the chunk's metadata at them. Set before writing
-    /// columns.
+    /// columns: once a column is written, writing another column or closing with a
+    /// different value returns `error.InvalidState`, since the file would hold indexes for
+    /// some of its columns only.
     write_page_index: bool = false,
+    /// `write_page_index` when the first column was written.
+    page_index_on: ?bool = null,
     /// Per physical column, the page index entries of its data pages. Null for a column not
     /// yet written, and for every column when `write_page_index` is off.
     page_index_builders: []?page_index_writer.PageIndexBuilder,
@@ -349,7 +353,7 @@ pub const Writer = struct {
         const col_def = self.columns[column_index];
         const writer = self.getWriter();
 
-        const page_index = self.pageIndexFor(physical_idx, physical_type, sortOrderDefined(col_def));
+        const page_index = try self.pageIndexFor(physical_idx, physical_type, sortOrderDefined(col_def));
         var result = if (T == []const u8)
             column_writer.writeColumnChunkByteArrayOptionalWithEncoding(
                 self.allocator,
@@ -434,7 +438,7 @@ pub const Writer = struct {
             col_def.value_encoding,
             self.max_page_size,
             true, // write_page_checksum
-            self.pageIndexFor(physical_idx, .fixed_len_byte_array, sortOrderDefined(col_def)),
+            try self.pageIndexFor(physical_idx, .fixed_len_byte_array, sortOrderDefined(col_def)),
         ) catch |e| return mapColumnError(e);
 
         // INTERVAL type: skip statistics (sort order undefined per Parquet spec)
@@ -856,7 +860,7 @@ pub const Writer = struct {
                 .{
                     .physical_type = leaf_type,
                     .max_page_size = self.max_page_size,
-                    .page_index = if (leaf_type) |t| self.pageIndexFor(physical_idx, t, true) else null,
+                    .page_index = if (leaf_type) |t| try self.pageIndexFor(physical_idx, t, true) else null,
                 },
             ) catch |e| return mapColumnError(e);
 
@@ -974,6 +978,7 @@ pub const Writer = struct {
     pub fn close(self: *Self) WriterError!void {
         if (self.state == .closed) return error.InvalidState;
 
+        try self.checkPageIndexUnchanged();
         if (self.write_page_index) try self.writePageIndexes();
         try self.writeFooterToWriter(self.getWriter());
         try self.flushWriter();
@@ -1652,12 +1657,19 @@ pub const Writer = struct {
 
     /// A new page index builder for physical column `physical_idx`, or null when
     /// `write_page_index` is off.
-    fn pageIndexFor(self: *Self, physical_idx: usize, physical_type: format.PhysicalType, sort_order_defined: bool) ?*page_index_writer.PageIndexBuilder {
+    fn pageIndexFor(self: *Self, physical_idx: usize, physical_type: format.PhysicalType, sort_order_defined: bool) WriterError!?*page_index_writer.PageIndexBuilder {
+        try self.checkPageIndexUnchanged();
+        if (self.page_index_on == null) self.page_index_on = self.write_page_index;
         if (!self.write_page_index) return null;
         // A failed write of the column leaves a builder behind.
         if (self.page_index_builders[physical_idx]) |*b| b.deinit();
         self.page_index_builders[physical_idx] = page_index_writer.PageIndexBuilder.init(self.allocator, physical_type, sort_order_defined);
         return &self.page_index_builders[physical_idx].?;
+    }
+
+    /// `error.InvalidState` when `write_page_index` changed after the first column was written.
+    fn checkPageIndexUnchanged(self: *const Self) WriterError!void {
+        if (self.page_index_on) |on| if (on != self.write_page_index) return error.InvalidState;
     }
 
     /// False for the types whose min and max the writer leaves out of the statistics:
@@ -1701,7 +1713,7 @@ pub const Writer = struct {
             .{
                 .max_page_size = self.max_page_size,
                 .physical_type = pt,
-                .page_index = self.pageIndexFor(physical_idx, pt, sort_order_defined),
+                .page_index = try self.pageIndexFor(physical_idx, pt, sort_order_defined),
             },
         ) catch |e| return mapColumnError(e);
         try self.flushWriter();

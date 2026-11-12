@@ -563,3 +563,36 @@ test "writer page index: nested leaf with a value of another type is an error" {
         try std.testing.expectError(error.TypeMismatch, writer.writeNestedColumn(0, &.{.{ .list_val = &items }}));
     }
 }
+
+test "writer page index: write_page_index changed after writing starts returns InvalidState" {
+    const allocator = std.testing.allocator;
+    const values = [_]i32{ 1, 2, 3 };
+
+    // Typed Writer: switched on after the first column, then off again before close.
+    {
+        const columns = [_]ColumnDef{ .{ .name = "a", .type_ = .int32 }, .{ .name = "b", .type_ = .int32 } };
+        var writer = try parquet.writeToBuffer(allocator, &columns);
+        defer writer.deinit();
+        try writer.writeColumn(i32, 0, &values);
+        writer.write_page_index = true;
+        try std.testing.expectError(error.InvalidState, writer.writeColumn(i32, 1, &values));
+        writer.write_page_index = false;
+        try writer.writeColumn(i32, 1, &values);
+        writer.write_page_index = true;
+        try std.testing.expectError(error.InvalidState, writer.close());
+    }
+
+    // DynamicWriter: switched on after begin().
+    {
+        var writer = try parquet.createBufferDynamic(allocator);
+        defer writer.deinit();
+        try writer.addColumn("a", parquet.TypeInfo.int32, .{});
+        try writer.begin();
+        for (values) |v| {
+            try writer.setInt32(0, v);
+            try writer.addRow();
+        }
+        writer.write_page_index = true;
+        try std.testing.expectError(error.InvalidState, writer.close());
+    }
+}
